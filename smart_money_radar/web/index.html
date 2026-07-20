@@ -1,0 +1,2114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Money Radar</title>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f2;
+      --surface: #ffffff;
+      --surface-soft: #edf1ec;
+      --ink: #171b18;
+      --muted: #68706a;
+      --line: #d7ddd6;
+      --line-strong: #bbc4bb;
+      --green: #19714d;
+      --green-soft: #e4f1e9;
+      --amber: #9a6413;
+      --amber-soft: #f6eddc;
+      --red: #a13c35;
+      --red-soft: #f7e6e4;
+      --blue: #286b93;
+      --blue-soft: #e4eef4;
+      --focus: #286b93;
+      --shadow: 0 8px 24px rgba(27, 37, 29, 0.07);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { background: var(--bg); }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+      letter-spacing: 0;
+    }
+
+    button, select { font: inherit; letter-spacing: 0; }
+
+    button:focus-visible, select:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto minmax(290px, 1fr);
+      align-items: center;
+      gap: 18px;
+      min-height: 66px;
+      padding: 0 24px;
+      background: color-mix(in srgb, var(--surface) 94%, transparent);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(12px);
+    }
+
+    .brand, .brand-mark, .nav, .actions, .status, .section-head,
+    .metric-strip, .detail-title, .status-line, .flow-labels, .target-head {
+      display: flex;
+      align-items: center;
+    }
+
+    .brand { gap: 10px; min-width: 0; }
+
+    .brand-mark {
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      flex: 0 0 auto;
+      color: #ffffff;
+      background: var(--green);
+      border-radius: 6px;
+    }
+
+    .brand-name { font-size: 16px; font-weight: 700; }
+    .brand-sub { color: var(--muted); font-size: 12px; }
+
+    .nav {
+      gap: 3px;
+      padding: 3px;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+
+    .nav-button, .segment-button {
+      border: 0;
+      color: var(--muted);
+      background: transparent;
+      border-radius: 5px;
+      cursor: pointer;
+      min-height: 32px;
+      padding: 0 12px;
+      white-space: nowrap;
+    }
+
+    .nav-button[aria-selected="true"],
+    .segment-button[aria-pressed="true"] {
+      color: var(--ink);
+      background: var(--surface);
+      box-shadow: 0 1px 4px rgba(27, 37, 29, 0.09);
+    }
+
+    .actions { justify-content: flex-end; gap: 8px; min-width: 0; }
+    .status { gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      flex: 0 0 auto;
+    }
+
+    .dot.running { background: var(--amber); }
+    .dot.failed { background: var(--red); }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      color: var(--ink);
+      background: var(--surface);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .button:hover { border-color: var(--green); }
+    .button.primary { color: #ffffff; border-color: var(--green); background: var(--green); }
+    .button:disabled { cursor: not-allowed; opacity: 0.55; }
+    .button svg, .brand-mark svg { width: 16px; height: 16px; }
+    .button[hidden] { display: none; }
+
+    .shell { max-width: 1480px; margin: 0 auto; padding: 22px 24px 48px; }
+
+    .job-banner {
+      display: none;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      padding: 10px 12px;
+      color: var(--amber);
+      background: var(--amber-soft);
+      border: 1px solid color-mix(in srgb, var(--amber) 28%, var(--line));
+      border-radius: 6px;
+    }
+
+    .job-banner.visible { display: grid; }
+    .job-banner.failed { color: var(--red); background: var(--red-soft); }
+
+    .progress {
+      width: 110px;
+      height: 7px;
+      background: color-mix(in srgb, currentColor 16%, transparent);
+      overflow: hidden;
+      border-radius: 4px;
+    }
+
+    .progress > span { display: block; height: 100%; width: 0; background: currentColor; }
+
+    .view { display: none; }
+    .view.active { display: block; }
+
+    .section-head {
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 16px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 3px; font-size: 22px; line-height: 1.2; }
+    h2 { margin: 0; font-size: 16px; line-height: 1.25; }
+    h3 { margin: 0; font-size: 14px; }
+    .section-copy { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .segments {
+      display: inline-flex;
+      gap: 3px;
+      padding: 3px;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+
+    .funding-tabs { margin: -4px 0 14px; }
+    .funding-tabs .segment-button { display: inline-flex; align-items: center; gap: 7px; }
+    .funding-tabs svg { width: 14px; height: 14px; }
+    .funding-subview[hidden] { display: none; }
+
+    .metric-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-bottom: 20px;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .metric-strip.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .metric {
+      min-width: 0;
+      padding: 13px 16px;
+      border-right: 1px solid var(--line);
+    }
+
+    .metric:last-child { border-right: 0; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .metric-value { margin-top: 2px; font-size: 21px; font-weight: 700; overflow-wrap: anywhere; }
+    .metric-note { margin-top: 1px; color: var(--muted); font-size: 12px; }
+
+    .radar-layout, .wallet-layout, .prediction-layout, .funding-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(310px, 0.8fr);
+      gap: 20px;
+      align-items: start;
+    }
+
+    .scan-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px; }
+    .control-group { display: grid; gap: 3px; color: var(--muted); font-size: 11px; }
+    .control-select {
+      min-width: 104px;
+      height: 36px;
+      padding: 0 30px 0 10px;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+    }
+    .auto-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 36px;
+      padding: 0 9px;
+      color: var(--muted);
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .auto-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+    .toggle-track {
+      position: relative;
+      width: 30px;
+      height: 17px;
+      flex: 0 0 auto;
+      border-radius: 9px;
+      background: var(--line-strong);
+      transition: background 140ms ease;
+    }
+    .toggle-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--surface);
+      transition: transform 140ms ease;
+    }
+    .auto-toggle input:checked + .toggle-track { background: var(--green); }
+    .auto-toggle input:checked + .toggle-track::after { transform: translateX(13px); }
+    .auto-toggle input:focus-visible + .toggle-track { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .button.refreshing svg { animation: funding-spin 900ms linear infinite; }
+    @keyframes funding-spin { to { transform: rotate(360deg); } }
+
+    .table-region, .chart-region { min-width: 0; }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border-top: 1px solid var(--line);
+    }
+
+    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    #fundingTable table { min-width: 1260px; }
+    .compact-table table { min-width: 640px; }
+
+    th, td {
+      padding: 10px 11px;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      vertical-align: middle;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+      text-transform: uppercase;
+      background: var(--bg);
+    }
+
+    tbody tr:hover td { background: color-mix(in srgb, var(--green-soft) 42%, transparent); }
+
+    .row-button {
+      max-width: 210px;
+      padding: 0;
+      border: 0;
+      color: var(--ink);
+      background: transparent;
+      font-weight: 650;
+      text-align: left;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .row-button.wallet-open {
+      max-width: none;
+      overflow: visible;
+      text-overflow: clip;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .wallet-cell, .wallet-inline {
+      display: inline-flex;
+      align-items: flex-start;
+      gap: 6px;
+      min-width: 300px;
+      max-width: 440px;
+    }
+
+    .wallet-address {
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    .icon-button {
+      display: inline-flex;
+      flex: 0 0 auto;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      color: var(--muted);
+      background: var(--surface);
+      cursor: pointer;
+    }
+
+    .icon-button:hover { color: var(--green); border-color: var(--green); }
+    .icon-button svg { width: 14px; height: 14px; }
+
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .number { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .muted { color: var(--muted); }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 1px 7px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 650;
+      white-space: nowrap;
+      color: var(--muted);
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+    }
+
+    .badge.good { color: var(--green); background: var(--green-soft); border-color: color-mix(in srgb, var(--green) 25%, var(--line)); }
+    .badge.warn { color: var(--amber); background: var(--amber-soft); border-color: color-mix(in srgb, var(--amber) 25%, var(--line)); }
+    .badge.bad { color: var(--red); background: var(--red-soft); border-color: color-mix(in srgb, var(--red) 25%, var(--line)); }
+    .badge.info { color: var(--blue); background: var(--blue-soft); border-color: color-mix(in srgb, var(--blue) 25%, var(--line)); }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+
+    .detail-panel {
+      min-width: 0;
+      padding: 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      box-shadow: var(--shadow);
+    }
+
+    .detail-title { justify-content: space-between; gap: 10px; margin-bottom: 15px; }
+    .detail-symbol { font-size: 19px; font-weight: 750; overflow-wrap: anywhere; }
+    .detail-contract { margin-top: 2px; color: var(--muted); overflow-wrap: anywhere; }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px 14px;
+      padding: 13px 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .detail-key { color: var(--muted); font-size: 11px; }
+    .detail-value { margin-top: 2px; font-weight: 650; overflow-wrap: anywhere; }
+    .thesis { margin: 14px 0 0; color: var(--muted); }
+
+    .flow { margin-top: 15px; }
+    .flow-labels { justify-content: space-between; gap: 10px; margin-bottom: 6px; font-size: 12px; }
+    .flow-track { display: flex; height: 9px; background: var(--surface-soft); border-radius: 4px; overflow: hidden; }
+    .flow-buy { background: var(--green); }
+    .flow-sell { background: var(--red); }
+
+    .risk-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 12px; }
+
+    .empty {
+      min-height: 220px;
+      display: grid;
+      place-items: center;
+      padding: 28px;
+      color: var(--muted);
+      text-align: center;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .chart-box { padding: 8px 0 0; }
+    .wallet-chart { display: block; width: 100%; height: auto; min-height: 300px; }
+    .chart-grid { stroke: var(--line); stroke-width: 1; }
+    .chart-zone { fill: color-mix(in srgb, var(--green) 9%, transparent); }
+    .chart-axis, .chart-label { fill: var(--muted); font-size: 11px; }
+    .wallet-point { stroke: var(--bg); stroke-width: 1.5; }
+    .wallet-point.strong { fill: var(--green); }
+    .wallet-point.watch { fill: var(--blue); }
+    .wallet-point.weak { fill: var(--amber); }
+    .wallet-point.noise { fill: var(--red); }
+    .wallet-point.ignore { fill: var(--line-strong); }
+
+    .target-list { margin-top: 14px; }
+    .target-row { padding: 10px 0; border-top: 1px solid var(--line); }
+    .target-head { justify-content: space-between; gap: 8px; }
+
+    .prediction-secondary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 24px;
+      margin-top: 26px;
+    }
+    .prediction-secondary > div { min-width: 0; }
+    #predictionWallets table { min-width: 610px; }
+
+    .route-title { max-width: 340px; }
+    .route-leg { padding: 10px 0; border-top: 1px solid var(--line); }
+    .route-leg:first-child { margin-top: 8px; }
+    .route-leg-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .route-leg-meta { margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .route-source { color: var(--green); text-decoration: none; }
+    .route-source:hover { text-decoration: underline; }
+
+    .funding-chart { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+    .funding-chart svg { display: block; width: 100%; height: 92px; }
+    .funding-chart .zero { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+    .funding-chart .spread { fill: none; stroke: var(--green); stroke-width: 2; vector-effect: non-scaling-stroke; }
+    .funding-chart .negative { stroke: var(--red); }
+    .funding-venues { display: flex; flex-wrap: wrap; gap: 7px; margin: -2px 0 14px; }
+    .funding-venue { display: inline-flex; align-items: center; gap: 7px; min-height: 28px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; font-size: 12px; color: var(--muted); }
+    .funding-venue strong { color: var(--ink); font-weight: 650; }
+    .funding-venue-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
+    .funding-venue.live .funding-venue-dot { background: var(--green); }
+    .funding-venue.planned .funding-venue-dot { background: #c69024; }
+    .funding-rate-cell { min-width: 180px; }
+    .funding-rate-line { white-space: nowrap; }
+    .funding-rate-line + .funding-rate-line { margin-top: 4px; }
+    .funding-rate-meta { color: var(--muted); font-size: 11px; }
+    .funding-diagnostics { margin: 2px 0 16px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .funding-diagnostics-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .funding-diagnostics-head h2 { margin: 0; font-size: 14px; }
+    .funding-paper-panel { margin: 2px 0 16px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .funding-paper-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .funding-paper-head h2 { margin: 0; font-size: 14px; }
+    .funding-paper-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .funding-paper-cell { min-width: 0; }
+    .funding-paper-label { color: var(--muted); font-size: 11px; }
+    .funding-paper-value { margin-top: 3px; font-size: 16px; font-weight: 720; }
+    .funding-paper-mini { margin-top: 10px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+    .funding-paper-stack { margin-top: 12px; display: grid; gap: 12px; }
+    .paper-event-list { max-height: 360px; overflow: auto; border-top: 1px solid var(--line); }
+    .reason-item { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start; padding: 7px 0; border-top: 1px solid var(--line); color: var(--muted); }
+    .reason-item:first-of-type { margin-top: 7px; }
+    .constraint-stages { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .constraint-economics { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 10px; }
+    .constraint-economics .detail-value { font-size: 14px; }
+    .near-miss-line { display: grid; grid-template-columns: minmax(90px, .8fr) minmax(150px, 1.4fr) repeat(3, minmax(85px, .7fr)); gap: 10px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line); font-size: 12px; }
+    .near-miss-detail { margin: -2px 0 6px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 900px) { .constraint-economics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .near-miss-line { grid-template-columns: 1fr 1fr; } .near-miss-detail { margin-bottom: 10px; } }
+
+    .reason-block { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--line); }
+    .reason-list { margin: 7px 0 0; padding-left: 18px; color: var(--muted); }
+    .reason-list li + li { margin-top: 5px; }
+    .cluster-members { min-width: 360px; }
+    .cluster-members .wallet-inline { margin-bottom: 6px; }
+
+    .copy-toast {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 30;
+      display: none;
+      max-width: min(360px, calc(100vw - 36px));
+      padding: 9px 11px;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      box-shadow: var(--shadow);
+      font-size: 12px;
+    }
+
+    .copy-toast.visible { display: block; }
+
+    .copy-fallback[hidden] { display: none; }
+    .copy-fallback {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(0, 0, 0, 0.44);
+    }
+    .copy-fallback-panel {
+      width: min(560px, 100%);
+      padding: 16px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .copy-fallback-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .copy-fallback-input {
+      width: 100%;
+      min-height: 40px;
+      padding: 8px 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      color: var(--ink);
+      background: var(--surface-soft);
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    .readiness-band {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 14px;
+      align-items: start;
+      margin-bottom: 18px;
+      padding: 14px 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .readiness-icon {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      color: var(--amber);
+      background: var(--amber-soft);
+      border-radius: 6px;
+    }
+
+    .readiness-icon.ready { color: var(--green); background: var(--green-soft); }
+    .readiness-title { font-weight: 700; }
+    .readiness-reasons { margin: 5px 0 0; padding-left: 18px; color: var(--muted); }
+
+    .backtest-grid, .research-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.65fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .backtest-grid > *, .research-grid > * { min-width: 0; }
+
+    .gate-list { border-top: 1px solid var(--line); }
+    .gate-row {
+      display: grid;
+      grid-template-columns: minmax(150px, 0.65fr) minmax(180px, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      min-height: 54px;
+      border-bottom: 1px solid var(--line);
+    }
+    .gate-track { height: 8px; overflow: hidden; background: var(--surface-soft); border-radius: 4px; }
+    .gate-fill { display: block; height: 100%; background: var(--green); }
+    .gate-value { min-width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
+
+    .subsection { margin-top: 24px; }
+    .subsection > h2 { margin-bottom: 10px; }
+
+    .loading { opacity: 0.6; pointer-events: none; }
+
+    @media (max-width: 1380px) {
+      .actions .status { display: none; }
+    }
+
+    @media (max-width: 1050px) {
+      .topbar { grid-template-columns: 1fr auto; }
+      .nav { grid-row: 2; grid-column: 1 / -1; justify-self: center; margin-bottom: 8px; }
+      .radar-layout, .wallet-layout, .prediction-layout, .funding-layout, .backtest-grid, .research-grid, .prediction-secondary { grid-template-columns: 1fr; }
+      .detail-panel { box-shadow: none; }
+      .metric-strip.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 720px) {
+      .topbar { padding: 10px 14px; gap: 10px; }
+      .brand > div:last-child { min-width: 0; }
+      .brand-name { white-space: nowrap; }
+      .actions .status { display: none; }
+      .button span { display: none; }
+      .button { width: 36px; padding: 0; }
+      .button.primary { width: 36px; }
+      .shell { padding: 16px 14px 36px; }
+      .section-head { align-items: flex-start; flex-direction: column; }
+      .scan-controls { width: 100%; align-items: end; }
+      .control-group { flex: 1 1 112px; }
+      .control-select { width: 100%; }
+      #view-funding .scan-controls {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      #view-funding .control-group { width: 100%; min-width: 0; }
+      #view-funding .auto-toggle { justify-self: start; }
+      #view-funding #fundingScanButton { justify-self: end; }
+      .metric-strip { grid-template-columns: 1fr; }
+      .metric-strip.four { grid-template-columns: 1fr; }
+      .metric { border-right: 0; border-bottom: 1px solid var(--line); }
+      .metric:last-child { border-bottom: 0; }
+      .job-banner { grid-template-columns: auto 1fr; }
+      .job-banner .progress { grid-column: 1 / -1; width: 100%; }
+      .nav { max-width: calc(100vw - 28px); overflow-x: auto; justify-content: flex-start; }
+      .gate-row { grid-template-columns: 1fr auto; gap: 8px; padding: 10px 0; }
+      .gate-track { grid-column: 1 / -1; }
+      .target-head { align-items: flex-start; flex-wrap: wrap; }
+      .target-head .badge {
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      .wallet-cell, .wallet-inline, .cluster-members { min-width: 250px; max-width: 340px; }
+      #walletTable .table-wrap { overflow: visible; }
+      #walletTable table, #walletTable tbody, #walletTable tr, #walletTable td { display: block; width: 100%; }
+      #walletTable thead { display: none; }
+      #walletTable tr { display: flex; flex-wrap: wrap; padding: 12px 0; border-bottom: 1px solid var(--line); }
+      #walletTable td { padding: 3px 0; border: 0; }
+      #walletTable tr > td:first-child { flex: 0 0 100%; }
+      #walletTable td[data-field] { display: inline-flex; align-items: center; gap: 6px; width: auto; margin-right: 14px; }
+      #walletTable td[data-field="Confidence"] { flex-basis: 100%; margin-right: 0; }
+      #walletTable td[data-field]::before { content: attr(data-field); color: var(--muted); font-size: 11px; }
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #171a18;
+        --surface: #202421;
+        --surface-soft: #292e2a;
+        --ink: #edf1ed;
+        --muted: #aab3ab;
+        --line: #353c36;
+        --line-strong: #505a51;
+        --green: #55b786;
+        --green-soft: #1d382a;
+        --amber: #d5a14d;
+        --amber-soft: #3d301d;
+        --red: #dd7870;
+        --red-soft: #402522;
+        --blue: #77acd0;
+        --blue-soft: #213747;
+        --focus: #77acd0;
+        --shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+      }
+      .brand-mark, .button.primary { color: #102017; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark"><i data-lucide="radar" aria-hidden="true"></i></div>
+      <div>
+        <div class="brand-name">Smart Money Radar</div>
+        <div class="brand-sub" id="brandSub">Funding · paper-only</div>
+      </div>
+    </div>
+
+    <nav class="nav" aria-label="Разделы">
+      <button class="nav-button" data-view="funding" aria-selected="true">Funding</button>
+      <button class="nav-button" data-view="prediction" aria-selected="false">Prediction</button>
+    </nav>
+
+    <div class="actions">
+      <div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Загрузка</span></div>
+      <button class="button" id="recomputeButton" type="button" aria-label="Пересчитать модель" hidden>
+        <i data-lucide="refresh-cw" aria-hidden="true"></i><span>Пересчитать</span>
+      </button>
+      <button class="button primary" id="scanButton" type="button" aria-label="Запустить Base scan" hidden>
+        <i data-lucide="scan-search" aria-hidden="true"></i><span>Base scan</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="shell" id="appShell">
+    <div class="job-banner" id="jobBanner" role="status">
+      <i data-lucide="loader-circle" aria-hidden="true"></i>
+      <span id="jobMessage"></span>
+      <div class="progress" aria-hidden="true"><span id="jobProgress"></span></div>
+    </div>
+    <div class="copy-toast" id="copyToast" role="status" aria-live="polite"></div>
+    <div class="copy-fallback" id="copyFallback" hidden>
+      <div class="copy-fallback-panel" role="dialog" aria-modal="true" aria-labelledby="copyFallbackTitle">
+        <div class="copy-fallback-head"><strong id="copyFallbackTitle">Адрес кошелька</strong><button class="icon-button" type="button" id="copyFallbackClose" title="Закрыть" aria-label="Закрыть"><i data-lucide="x" aria-hidden="true"></i></button></div>
+        <input class="copy-fallback-input" id="copyFallbackInput" readonly aria-label="Полный адрес кошелька">
+      </div>
+    </div>
+
+    <section class="view" id="view-radar" hidden aria-hidden="true" data-paused-reason="dune-limit">
+      <div class="section-head">
+        <div>
+          <h1>Radar</h1>
+          <p class="section-copy">Кандидаты после wallet, liquidity и risk-фильтров</p>
+        </div>
+        <div class="segments" aria-label="Фильтр Radar">
+          <button class="segment-button" data-radar-mode="qualified" aria-pressed="true">Сигналы</button>
+          <button class="segment-button" data-radar-mode="review" aria-pressed="false">Проверить</button>
+          <button class="segment-button" data-radar-mode="all" aria-pressed="false">Все наблюдения</button>
+        </div>
+      </div>
+
+      <div id="capitalReadinessBand"></div>
+
+      <div class="metric-strip">
+        <div class="metric"><div class="metric-label">Прошли фильтры</div><div class="metric-value" id="qualifiedCount">0</div><div class="metric-note">research candidates</div></div>
+        <div class="metric"><div class="metric-label">Near-live наблюдения</div><div class="metric-value" id="observationCount">0</div><div class="metric-note">последний Base scan</div></div>
+        <div class="metric"><div class="metric-label">Последнее обновление</div><div class="metric-value" id="lastScanAt">—</div><div class="metric-note">Dune + market/risk enrichment</div></div>
+      </div>
+
+      <div class="radar-layout">
+        <div class="table-region" id="radarTableRegion"></div>
+        <aside class="detail-panel" id="radarDetail"></aside>
+      </div>
+    </section>
+
+    <section class="view" id="view-prediction">
+      <div class="section-head">
+        <div>
+          <h1>Prediction Radar</h1>
+          <p class="section-copy">Paper-кандидаты после depth, fee и resolution checks; без автоматического исполнения</p>
+        </div>
+        <button class="button primary" id="predictionScanButton" type="button" aria-label="Обновить Prediction Radar">
+          <i data-lucide="refresh-cw" aria-hidden="true"></i><span>Обновить</span>
+        </button>
+      </div>
+
+      <div class="metric-strip four">
+        <div class="metric"><div class="metric-label">Paper candidates</div><div class="metric-value" id="predictionRouteCount">0</div><div class="metric-note">неатомарные маршруты</div></div>
+        <div class="metric"><div class="metric-label">Paper PnL</div><div class="metric-value" id="predictionPaperPnl">$0</div><div class="metric-note" id="predictionPaperNote">нет исполнений</div></div>
+        <div class="metric"><div class="metric-label">Стаканы</div><div class="metric-value" id="predictionBookCount">0</div><div class="metric-note">Polymarket + Kalshi</div></div>
+        <div class="metric"><div class="metric-label">Обновлено</div><div class="metric-value" id="predictionUpdatedAt">—</div><div class="metric-note">paper-only execution</div></div>
+      </div>
+
+      <div class="prediction-layout">
+        <div class="table-region" id="predictionTable"></div>
+        <aside class="detail-panel" id="predictionDetail"></aside>
+      </div>
+
+      <div class="prediction-secondary">
+        <div><h2>Prediction wallets</h2><div id="predictionWallets" class="subsection"></div></div>
+        <div><h2>Связи с токенами</h2><div id="predictionTokenLinks" class="subsection"></div></div>
+      </div>
+    </section>
+
+    <section class="view active" id="view-funding">
+      <div class="section-head">
+        <div>
+          <h1>Funding Radar</h1>
+          <p class="section-copy">Rolling carry после settlement forecast, depth, fees, basis и outcome checks</p>
+        </div>
+        <div class="scan-controls">
+          <label class="control-group">Размер
+            <select class="control-select" id="fundingSize" aria-label="Размер каждой ноги">
+              <option value="500" selected>$500</option>
+              <option value="1000">$1k</option>
+              <option value="10000">$10k</option>
+              <option value="50000">$50k</option>
+            </select>
+          </label>
+          <label class="control-group">Логика входа
+            <select class="control-select" id="fundingHorizon" aria-label="Логика входа" disabled>
+              <option value="next" selected>Next settlement</option>
+            </select>
+          </label>
+          <label class="auto-toggle" for="fundingAutoToggle">
+            <input id="fundingAutoToggle" type="checkbox" disabled>
+            <span class="toggle-track" aria-hidden="true"></span>
+            <span id="fundingAutoLabel">Auto 20с</span>
+          </label>
+          <button class="button primary" id="fundingScanButton" type="button" aria-label="Обновить Funding Radar">
+            <i data-lucide="refresh-cw" aria-hidden="true"></i><span>Обновить</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="metric-strip four">
+        <div class="metric"><div class="metric-label">Кандидаты</div><div class="metric-value" id="fundingCandidateCount">—</div><div class="metric-note" id="fundingCandidateNote">загрузка</div></div>
+        <div class="metric"><div class="metric-label">Лучший PnL</div><div class="metric-value" id="fundingBestRoc">—</div><div class="metric-note" id="fundingBestNote">загрузка</div></div>
+        <div class="metric"><div class="metric-label">Все маршруты</div><div class="metric-value" id="fundingCapacity">—</div><div class="metric-note" id="fundingCapacityNote">загрузка</div></div>
+        <div class="metric"><div class="metric-label">Обновлено</div><div class="metric-value" id="fundingUpdatedAt">—</div><div class="metric-note" id="fundingPaperNote">paper-only</div></div>
+      </div>
+
+      <div class="segments funding-tabs" aria-label="Funding раздел">
+        <button class="segment-button" data-funding-subview="routes" aria-pressed="true"><i data-lucide="route" aria-hidden="true"></i><span>Маршруты</span></button>
+        <button class="segment-button" data-funding-subview="paper" aria-pressed="false"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>Paper Trader</span></button>
+      </div>
+
+      <div class="funding-subview" id="fundingRoutesView">
+        <div class="funding-venues" id="fundingVenueHealth" aria-label="Статус площадок Funding Radar"></div>
+        <div id="fundingConstraintPanel"></div>
+
+        <div class="funding-layout">
+          <div class="table-region" id="fundingTable"><div class="empty"><div><strong>Загружаю Funding Radar</strong><br><span>Получаю последний scan, стаканы и диагностику ограничений.</span></div></div></div>
+          <aside class="detail-panel" id="fundingDetail"></aside>
+        </div>
+      </div>
+
+      <div class="funding-subview" id="fundingPaperView" hidden>
+        <div id="fundingPaperTraderPanel"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-wallets" hidden aria-hidden="true" data-paused-reason="dune-limit">
+      <div class="section-head">
+        <div>
+          <h1>Кошельки</h1>
+          <p class="section-copy">Только meaningful targets; dust-покупки не считаются повтором</p>
+        </div>
+        <span class="badge info" id="walletModelBadge">wallet_score_v1_2</span>
+      </div>
+
+      <div class="metric-strip four">
+        <div class="metric"><div class="metric-label">Оценено</div><div class="metric-value" id="walletCount">0</div><div class="metric-note">уникальных адресов</div></div>
+        <div class="metric"><div class="metric-label">Meaningful repeats</div><div class="metric-value" id="repeatCount">0</div><div class="metric-note">две и более цели</div></div>
+        <div class="metric"><div class="metric-label">Исторические цели</div><div class="metric-value" id="observedTargetCount">0</div><div class="metric-note">с импортированными DEX trades</div></div>
+        <div class="metric"><div class="metric-label">Исключено</div><div class="metric-value" id="excludedEntityCount">0</div><div class="metric-note">CEX / service адресов</div></div>
+      </div>
+
+      <div class="wallet-layout">
+        <div class="chart-region">
+          <h2>Интерес и шум</h2>
+          <div class="chart-box" id="walletChart"></div>
+          <div class="subsection"><h2>Top wallet candidates</h2><div id="walletTable"></div></div>
+          <div class="subsection"><h2>Wallet clusters</h2><div id="clusterTable"></div></div>
+        </div>
+        <aside class="detail-panel" id="walletDetail"></aside>
+      </div>
+    </section>
+
+    <section class="view" id="view-research" hidden aria-hidden="true" data-paused-reason="dune-limit">
+      <div class="section-head">
+        <div>
+          <h1>Research Validity</h1>
+          <p class="section-copy">Point-in-time dataset, полный wallet denominator и temporal ML</p>
+        </div>
+        <span class="badge" id="researchGateBadge">dataset собирается</span>
+      </div>
+
+      <div class="metric-strip four">
+        <div class="metric"><div class="metric-label">Token-time snapshots</div><div class="metric-value" id="researchSnapshots">0</div><div class="metric-note">weekly point-in-time</div></div>
+        <div class="metric"><div class="metric-label">Listing events</div><div class="metric-value" id="researchEvents">0</div><div class="metric-note">независимые 90d positives</div></div>
+        <div class="metric"><div class="metric-label">Wallet opportunities</div><div class="metric-value" id="researchWallets">0</div><div class="metric-note">покупки, продажи и промахи</div></div>
+        <div class="metric"><div class="metric-label">Model runs</div><div class="metric-value" id="researchModels">0</div><div class="metric-note">logistic + boosting</div></div>
+      </div>
+
+      <div class="gate-list" id="researchGates"></div>
+
+      <div class="research-grid">
+        <div>
+          <div class="subsection"><h2>Temporal model runs</h2><div id="researchModelTable"></div></div>
+          <div class="subsection"><h2>Bayesian wallet score</h2><div id="researchWalletTable"></div></div>
+        </div>
+        <div>
+          <div class="subsection"><h2>Dataset по сетям</h2><div id="researchChainTable"></div></div>
+          <div class="subsection"><h2>Signal stages</h2><div id="researchSignalTypes"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-backtest" hidden aria-hidden="true" data-paused-reason="dune-limit">
+      <div class="section-head">
+        <div>
+          <h1>Backtest</h1>
+          <p class="section-copy">Chronological walk-forward без использования будущих target rows</p>
+        </div>
+        <span class="badge" id="backtestRunBadge">нет запуска</span>
+      </div>
+
+      <div id="readinessBand"></div>
+      <div class="backtest-grid">
+        <div>
+          <div class="metric-strip four">
+            <div class="metric"><div class="metric-label">Evaluated targets</div><div class="metric-value" id="evaluatedTargets">0</div><div class="metric-note">минимум 10</div></div>
+            <div class="metric"><div class="metric-label">Precision</div><div class="metric-value" id="backtestPrecision">—</div><div class="metric-note">wallet-level next-target</div></div>
+            <div class="metric"><div class="metric-label">Lift</div><div class="metric-value" id="backtestLift">—</div><div class="metric-note">относительно baseline</div></div>
+            <div class="metric"><div class="metric-label">Token hit@5</div><div class="metric-value" id="tokenHitFive">—</div><div class="metric-note">negative-control ranking</div></div>
+          </div>
+          <div class="subsection"><h2>Walk-forward evaluations</h2><div id="backtestTable"></div></div>
+        </div>
+        <div>
+          <h2>Покрытие Base</h2>
+          <div id="coverageTable" class="subsection"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      overview: {}, signals: [], radar: [], wallets: [], clusters: [], backtest: {}, coverage: {}, research: {}, prediction: {}, funding: {}, fundingPaper: {},
+      radarMode: "qualified", fundingMode: "candidates", fundingSubView: "routes", selectedRadar: 0, selectedWallet: 0, selectedPrediction: 0, selectedFunding: 0, busy: false,
+      fundingAuto: false,
+      fundingRefreshInFlight: false, fundingRefreshTimer: null, fundingLastStartMs: 0, fundingPollingRequestId: null
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const money = (value) => value === null || value === undefined ? "—" : "$" + new Intl.NumberFormat("en-US", { notation: Math.abs(value) >= 1000000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+    const moneyPrecise = (value) => value === null || value === undefined ? "—" : "$" + new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+    const num = (value) => new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(value || 0);
+    const pct = (value) => value === null || value === undefined ? "—" : new Intl.NumberFormat("ru-RU", { style: "percent", maximumFractionDigits: 1 }).format(value);
+    const bps = (value) => value === null || value === undefined ? "—" : `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 3 }).format(Number(value) * 10000)} bps`;
+    const fundingPct = (value) => value === null || value === undefined ? "—" : new Intl.NumberFormat("ru-RU", { style: "percent", minimumFractionDigits: 3, maximumFractionDigits: 5 }).format(value);
+    const feePct = (value) => value === null || value === undefined ? "—" : new Intl.NumberFormat("ru-RU", { style: "percent", minimumFractionDigits: 3, maximumFractionDigits: 4 }).format(value);
+    const signedFundingPct = (value) => {
+      if (value === null || value === undefined) return "—";
+      const formatted = fundingPct(Math.abs(Number(value)));
+      return `${Number(value) > 0 ? "+" : Number(value) < 0 ? "−" : ""}${formatted}`;
+    };
+    const marketPrice = (value) => {
+      if (value === null || value === undefined) return "—";
+      const absolute = Math.abs(Number(value));
+      const digits = absolute >= 1000 ? 2 : absolute >= 1 ? 4 : absolute >= 0.01 ? 6 : 8;
+      return new Intl.NumberFormat("en-US", { minimumFractionDigits: Math.min(2, digits), maximumFractionDigits: digits }).format(value);
+    };
+    const shortAddress = (value) => value ? value.slice(0, 8) + "…" + value.slice(-4) : "—";
+    const shortTime = (value) => {
+      if (!value) return "—";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString("ru-RU", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    };
+    const ageHours = (value) => {
+      if (value === null || value === undefined) return "—";
+      return value < 48 ? `${num(value)} ч.` : `${num(value / 24)} дн.`;
+    };
+    const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
+    const refreshIcons = () => { if (window.lucide) lucide.createIcons(); };
+    const walletAddressControl = (address, index) => `<span class="wallet-cell"><button class="row-button wallet-open mono wallet-address" data-wallet-index="${index}">${esc(address)}</button><button class="icon-button" type="button" data-copy-address="${esc(address)}" title="Копировать адрес" aria-label="Копировать адрес"><i data-lucide="copy" aria-hidden="true"></i></button></span>`;
+    const walletInline = (address) => `<span class="wallet-inline"><span class="mono wallet-address">${esc(address)}</span><button class="icon-button" type="button" data-copy-address="${esc(address)}" title="Копировать адрес" aria-label="Копировать адрес"><i data-lucide="copy" aria-hidden="true"></i></button></span>`;
+    const signalTypeName = (value) => ({ discovery: "Discovery", pre_listing: "Pre-listing", accumulation: "Accumulation", hot_momentum: "Hot / Momentum", smart_wallet_accumulation: "Accumulation" })[value] || value || "Observation";
+    const predictionRouteName = (value) => ({ binary_complement: "Binary complement", complete_set: "Complete set", negative_risk_conversion: "Negative risk", logical_implication: "Implication", cross_venue_complement: "Cross-venue" })[value] || value || "Route";
+    const fundingRouteName = (value) => ({ perp_perp: "perp carry" })[value] || String(value || "route").replaceAll("_", " ");
+    const capitalStateName = (value) => ({ research_only: "Research only", shadow_validation: "Shadow validation", trade_eligible: "Trade eligible" })[value] || "Research only";
+    const predictionRiskName = (value) => ({ multi_book_non_atomic_execution: "ноги не атомарны", cancellation_rules_differ: "разные правила отмены", resolution_deadline_differs: "разные сроки резолюции" })[value] || value;
+    const fundingRateKindName = (value) => ({
+      published_next_estimate: "next estimate",
+      published_current_estimate: "current estimate",
+      published_predicted_next: "predicted next",
+      published_next_hour: "next hour",
+      published_next_hour_prediction: "next hour prediction",
+      published_8h_estimate: "8h estimate",
+      published_8h_equivalent_normalized_hourly: "8h display, hourly cashflow",
+      published_continuous_hourly_equivalent: "continuous hourly",
+      published_latest_hour_x18: "latest hour",
+      published_current_fallback: "current fallback",
+      published_last_settlement: "last settlement",
+      test: "test",
+    })[value] || value || "source unknown";
+    const fundingRiskName = (value) => ({
+      non_atomic_two_venue_execution: "ноги не атомарны",
+      public_fee_assumptions: "публичный fee tier",
+      account_margin_unverified: "margin не подтверждён",
+      insufficient_two_sided_depth: "не хватает depth",
+      invalid_orderbook: "некорректный стакан",
+      missing_reference_price: "нет mark/index цены",
+      funding_schedule_unavailable: "нет settlement в горизонте",
+      insufficient_settlement_lead_time: "слишком мало времени до settlement",
+      insufficient_funding_history: "мало истории",
+      sparse_funding_history: "история разрежена",
+      stale_funding_history: "история устарела",
+      stale_funding_nowcast: "nowcast устарел",
+      insufficient_forecast_windows: "неполное обязательное окно 24ч",
+      limited_72h_context: "ограниченный контекст 72ч",
+      limited_14d_context: "ограниченный контекст 14д",
+      limited_30d_regime_context: "ограниченный risk regime 30д",
+      funding_direction_unstable: "spread нестабилен",
+      ticker_identity_unverified: "identity только по тикеру",
+      unit_identity_mismatch: "несовместимые contract units",
+      basis_divergence: "basis расходится",
+      insufficient_basis_history: "мало совместной L2-истории basis",
+      large_basis_requires_carry_coverage: "большой basis требует stress coverage",
+      basis_not_covered_by_funding: "funding не покрывает basis stress",
+      basis_not_covered_by_live_funding: "live funding не покрывает basis stress",
+      net_after_costs_too_low: "расходы съели carry",
+      conservative_net_after_costs_too_low: "Q25 PnL отрицательный",
+      actionable_profit_too_low: "ниже advisory minimum",
+      live_net_pnl_not_positive: "live PnL не положительный",
+      live_actionable_profit_too_low: "live PnL ниже старого actionable minimum",
+      forecast_median_net_negative: "историческая медиана отрицательная",
+      profit_probability_too_low: "низкая P(net > 0)",
+      insufficient_forward_samples: "мало неперекрывающихся исходов",
+      research_only_horizon: "только Research",
+      mature_funding_regime: "зрелый funding-режим",
+      limited_regime_duration_history: "мало завершённых funding-режимов",
+      spread_30d_tail_anomaly: "spread в хвосте 30-дневного режима",
+      spread_90d_tail_anomaly: "spread в хвосте 90-дневного режима",
+      spread_30d_volatility_regime_shift: "скачок волатильности против 30д",
+      spread_90d_volatility_regime_shift: "смена 90-дневного vol regime",
+      funding_rate_at_cap_or_floor: "funding на cap/floor",
+      deep_book_walk_dependency: "зависимость от дальней глубины",
+      insufficient_orderbook_sequence: "мало последовательных L2-снимков",
+      fragile_depth_persistence: "глубина нестабильна во времени",
+      weak_depth_refill: "слабое восстановление depth",
+      return_on_collateral_too_low: "низкий ROC",
+      normalized_interval_projection: "проекция funding interval",
+    })[value] || value;
+    const fundingConstraintName = (value) => ({
+      insufficient_capacity: "недостаточная емкость",
+      data_quality_issue: "ошибка identity / contract units",
+      live_pnl_not_positive: "live PnL не положительный",
+      current_spread_below_cost: "live settlement PnL не покрывает расходы",
+      live_pnl_below_actionable: "live PnL ниже минимально значимой прибыли",
+      forecast_median_below_cost: "медианный forecast не покрывает расходы",
+      downside_q25_below_cost: "Q25 не покрывает расходы",
+      q25_below_actionable_profit: "Q25 ниже минимальной прибыли",
+      profit_probability_below_gate: "вероятность прибыли ниже gate",
+      basis_not_covered_by_funding: "Q25 funding не покрывает basis stress",
+      basis_not_covered_by_live_funding: "live funding не покрывает basis stress",
+      model_or_execution_quality_gate: "quality / execution gate",
+      unclassified_gate: "прочий gate",
+      paper_candidate: "paper candidate",
+    })[value] || value || "нет данных";
+    const fundingUniverseReasonName = (value) => ({
+      unit_identity_mismatch: "несовместимые contract units",
+      funding_schedule_unavailable: "нет settlement в горизонте",
+      non_positive_settlement_carry: "неположительный settlement carry",
+      best_case_carry_below_unavoidable_cost: "best-case carry ниже неизбежных расходов",
+      quick_profit_below_actionable_floor: "quick PnL ниже минимально значимой прибыли",
+      full_execution_required: "прошли в full-depth",
+      projected_interval_full_depth: "projected interval full-depth",
+      near_miss_full_depth: "near-miss full-depth",
+      adaptive_near_miss_full_depth: "adaptive near-miss full-depth",
+      adaptive_projected_interval_full_depth: "adaptive projected full-depth",
+      adaptive_dynamic_gross_full_depth: "dynamic gross full-depth",
+      adaptive_near_break_even_full_depth: "near break-even full-depth",
+      adaptive_quality_score_full_depth: "quality score full-depth",
+      adaptive_liquidity_urgency_full_depth: "liquidity + urgency full-depth",
+      adaptive_diversity_probe_full_depth: "diversity probe full-depth",
+      queued_for_deep_sweep: "deep sweep queue",
+      projected_interval_deep_sweep: "projected deep sweep queue",
+      pinned_revalidation: "обязательная revalidation",
+    })[value] || value || "не классифицировано";
+
+    function fallbackCopyAddress(value) {
+      const input = document.createElement("textarea");
+      input.value = value;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      const copied = document.execCommand("copy");
+      input.remove();
+      return copied;
+    }
+
+    async function copyWithClipboardApi(value) {
+      if (!navigator.clipboard?.writeText) return false;
+      try {
+        return await Promise.race([
+          navigator.clipboard.writeText(value).then(() => true),
+          new Promise((resolve) => window.setTimeout(() => resolve(false), 600)),
+        ]);
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function showCopyFallback(value) {
+      $("copyFallbackInput").value = value;
+      $("copyFallback").hidden = false;
+      $("copyFallbackInput").focus();
+      $("copyFallbackInput").select();
+    }
+
+    function hideCopyFallback() {
+      $("copyFallback").hidden = true;
+    }
+
+    async function copyAddress(value) {
+      let copied = await copyWithClipboardApi(value);
+      if (!copied) {
+        try { copied = fallbackCopyAddress(value); } catch (error) {}
+      }
+      if (!copied) showCopyFallback(value);
+      $("copyToast").textContent = copied ? "Адрес скопирован" : "Выдели адрес и скопируй вручную";
+      $("copyToast").classList.add("visible");
+      window.setTimeout(() => $("copyToast").classList.remove("visible"), 1800);
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, { cache: "no-store", ...options });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || payload.status || `HTTP ${response.status}`);
+      return payload;
+    }
+
+    function fundingApiPath() {
+      const horizon = fundingHorizonRequest();
+      const params = new URLSearchParams({ horizon_mode: horizon.horizon_mode });
+      if (horizon.horizon_hours !== null && horizon.horizon_hours !== undefined) {
+        params.set("horizon_hours", String(horizon.horizon_hours));
+      }
+      return `/api/funding?${params.toString()}`;
+    }
+
+    async function loadAll() {
+      setBusy(true);
+      try {
+        const requests = [
+          ["overview", "/api/overview"],
+          ["prediction", "/api/prediction"],
+          ["funding", fundingApiPath()],
+          ["fundingPaper", "/api/funding-paper"],
+        ];
+        const results = await Promise.allSettled(requests.map(([, path]) => api(path)));
+        const failed = [];
+        results.forEach((result, index) => {
+          const [name] = requests[index];
+          if (result.status === "fulfilled") state[name] = result.value;
+          else failed.push(`${name}: ${result.reason?.message || "ошибка загрузки"}`);
+        });
+        renderAll();
+        resumeFundingRefresh();
+        if (failed.length) {
+          const critical = failed.filter((item) => item.startsWith("overview:") || item.startsWith("funding:"));
+          if (critical.length) showJob({ status: "failed", message: critical.join("; "), progress: 1 });
+        }
+      } catch (error) {
+        showJob({ status: "failed", message: error.message, progress: 1 });
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function loadFundingOnly() {
+      const [overview, funding, fundingPaper] = await Promise.all([api("/api/overview"), api(fundingApiPath()), api("/api/funding-paper")]);
+      state.overview = overview;
+      state.funding = funding;
+      state.fundingPaper = fundingPaper;
+      renderFunding();
+      renderHeader();
+    }
+
+    function renderAll() {
+      renderHeader();
+      renderPrediction();
+      renderFunding();
+      if (window.lucide) lucide.createIcons();
+    }
+
+    function renderHeader() {
+      const job = state.overview.latest_job || {};
+      const capital = state.overview.capital_readiness || {};
+      const running = ["queued", "running"].includes(job.status);
+      $("statusDot").className = "dot" + (running ? " running" : job.status === "failed" ? " failed" : "");
+      $("statusText").textContent = running ? "Scan выполняется" : "Local paper · Funding + Prediction";
+      updateHeaderContext();
+      $("predictionScanButton").disabled = running || state.busy;
+      $("fundingScanButton").disabled = running || state.busy;
+      renderFundingRefreshControls();
+      if (running || job.status === "failed") showJob(job); else hideJob();
+    }
+
+    function updateHeaderContext(view) {
+      const activeView = view || document.querySelector('[data-view][aria-selected="true"]')?.dataset.view || "funding";
+      $("brandSub").textContent = activeView === "funding"
+        ? "Funding · live paper testing"
+        : "Prediction · paper-only";
+      $("recomputeButton").hidden = true;
+      $("scanButton").hidden = true;
+    }
+
+    function showJob(job) {
+      const banner = $("jobBanner");
+      banner.className = "job-banner visible" + (job.status === "failed" ? " failed" : "");
+      $("jobMessage").textContent = job.error || job.message || "Выполняется";
+      $("jobProgress").style.width = `${Math.round((job.progress || 0) * 100)}%`;
+    }
+
+    function hideJob() { $("jobBanner").className = "job-banner"; }
+
+    function setBusy(value) {
+      state.busy = value;
+      $("appShell").classList.toggle("loading", value);
+      $("recomputeButton").disabled = value;
+      const job = state.overview.latest_job || {};
+      const running = ["queued", "running"].includes(job.status);
+      $("scanButton").disabled = value || running || !state.overview.dune_ready;
+      $("predictionScanButton").disabled = value || running;
+      $("fundingScanButton").disabled = value || running;
+      renderFundingRefreshControls();
+    }
+
+    function fundingRefreshIntervalMs() {
+      const seconds = Number(state.funding?.refresh_policy?.auto_refresh_seconds || 20);
+      return Math.max(5, seconds) * 1000;
+    }
+
+    function appJobRunning() {
+      return ["queued", "running"].includes(state.overview?.latest_job?.status);
+    }
+
+    function renderFundingRefreshControls() {
+      const toggle = $("fundingAutoToggle");
+      const label = $("fundingAutoLabel");
+      const button = $("fundingScanButton");
+      if (!toggle || !label || !button) return;
+      const seconds = Math.round(fundingRefreshIntervalMs() / 1000);
+      const autoEnabled = Boolean(state.funding?.refresh_policy?.auto_refresh_enabled);
+      if (!autoEnabled) state.fundingAuto = false;
+      toggle.checked = state.fundingAuto;
+      toggle.disabled = !autoEnabled;
+      label.textContent = state.fundingAuto ? `Auto ${seconds}с` : "Auto off";
+      button.disabled = state.busy || appJobRunning() || state.fundingRefreshInFlight;
+      button.classList.toggle("refreshing", state.fundingRefreshInFlight);
+      button.setAttribute("aria-label", state.fundingRefreshInFlight ? "Funding Radar обновляется" : "Обновить Funding Radar");
+    }
+
+    function clearFundingRefreshTimer() {
+      if (state.fundingRefreshTimer !== null) window.clearTimeout(state.fundingRefreshTimer);
+      state.fundingRefreshTimer = null;
+    }
+
+    function scheduleFundingRefresh(delayMs) {
+      clearFundingRefreshTimer();
+      if (!state.fundingAuto || document.hidden || state.fundingRefreshInFlight) return;
+      state.fundingRefreshTimer = window.setTimeout(() => requestFundingRefresh("auto"), Math.max(100, delayMs));
+    }
+
+    function resumeFundingRefresh() {
+      renderFundingRefreshControls();
+      const serverState = state.funding?.refresh_state || {};
+      if (serverState.running && Number(serverState.request_id) > 0) {
+        state.fundingRefreshInFlight = true;
+        state.fundingLastStartMs = Date.parse(serverState.started_at) || Date.now();
+        renderFundingRefreshControls();
+        if (state.fundingPollingRequestId !== Number(serverState.request_id)) {
+          state.fundingPollingRequestId = Number(serverState.request_id);
+          pollFundingRefresh(Number(serverState.request_id), serverState.mode || "auto");
+        }
+        return;
+      }
+      if (!state.fundingAuto || document.hidden) return;
+      const finishedAt = Date.parse(state.funding?.latest_scan?.finished_at || "") || 0;
+      const remaining = finishedAt ? fundingRefreshIntervalMs() - (Date.now() - finishedAt) : 250;
+      scheduleFundingRefresh(Math.max(250, remaining));
+    }
+
+    async function requestFundingRefresh(mode = "manual") {
+      clearFundingRefreshTimer();
+      if (state.fundingRefreshInFlight) return;
+      if (mode === "auto" && (!state.fundingAuto || document.hidden)) return;
+      if (state.busy || appJobRunning()) {
+        if (mode === "auto") scheduleFundingRefresh(1000);
+        else showJob({ status: "failed", message: "Дождись завершения текущего scan", progress: 1 });
+        return;
+      }
+
+      state.fundingRefreshInFlight = true;
+      state.fundingLastStartMs = Date.now();
+      renderFundingRefreshControls();
+      if (mode === "manual") showJob({ status: "running", message: "Обновляю ставки и стаканы Funding Radar", progress: 0.12 });
+
+      try {
+        const horizon = fundingHorizonRequest();
+        const response = await api("/api/actions/funding-scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            target_notional: Number($("fundingSize").value),
+            horizon_mode: horizon.horizon_mode,
+            horizon_hours: horizon.horizon_hours,
+            scan_mode: mode,
+          }),
+        });
+        const requestId = Number(response.funding_request_id || 0);
+        if (response.status === "already_running" && !response.funding_running) {
+          state.fundingRefreshInFlight = false;
+          renderFundingRefreshControls();
+          if (mode === "auto") scheduleFundingRefresh(1000);
+          else showJob({ status: "failed", message: "Другой scan ещё выполняется", progress: 1 });
+          return;
+        }
+        if (!requestId) throw new Error("Funding scan не вернул request id");
+        state.fundingPollingRequestId = requestId;
+        pollFundingRefresh(requestId, mode);
+      } catch (error) {
+        state.fundingRefreshInFlight = false;
+        state.fundingPollingRequestId = null;
+        renderFundingRefreshControls();
+        if (mode === "manual") showJob({ status: "failed", message: error.message, progress: 1 });
+        if (state.fundingAuto) scheduleFundingRefresh(mode === "auto" ? 2000 : fundingRefreshIntervalMs());
+      }
+    }
+
+    async function pollFundingRefresh(requestId, mode) {
+      if (state.fundingPollingRequestId !== requestId) return;
+      try {
+        const status = await api("/api/funding/status");
+        if (status.running && Number(status.request_id) === requestId) {
+          if (mode === "manual") showJob({ status: "running", message: "Получаю актуальные funding rates и depth", progress: 0.62 });
+          window.setTimeout(() => pollFundingRefresh(requestId, mode), 500);
+          return;
+        }
+        if (Number(status.request_id) < requestId) {
+          window.setTimeout(() => pollFundingRefresh(requestId, mode), 500);
+          return;
+        }
+        state.fundingRefreshInFlight = false;
+        state.fundingPollingRequestId = null;
+        await loadFundingOnly();
+        if (status.last_status === "failed") {
+          if (mode === "manual") showJob({ status: "failed", message: status.last_error || "Funding scan завершился с ошибкой", progress: 1 });
+        } else if (mode === "manual") {
+          hideJob();
+        }
+      } catch (error) {
+        state.fundingRefreshInFlight = false;
+        state.fundingPollingRequestId = null;
+        if (mode === "manual") showJob({ status: "failed", message: error.message, progress: 1 });
+      } finally {
+        renderFundingRefreshControls();
+        if (!state.fundingRefreshInFlight && state.fundingAuto) {
+          const elapsed = Date.now() - state.fundingLastStartMs;
+          scheduleFundingRefresh(Math.max(250, fundingRefreshIntervalMs() - elapsed));
+        }
+      }
+    }
+
+    function radarRows() {
+      if (state.radarMode === "qualified") return state.signals.filter((row) => row.status === "candidate");
+      if (state.radarMode === "review") return state.signals.filter((row) => row.status === "needs_review");
+      return state.radar;
+    }
+
+    function renderRadar() {
+      const qualified = state.signals.filter((row) => row.status === "candidate");
+      const capital = state.overview.capital_readiness || {};
+      const capitalReady = Boolean(capital.trade_eligible);
+      $("capitalReadinessBand").innerHTML = `<div class="readiness-band"><div class="readiness-icon ${capitalReady ? "ready" : ""}"><i data-lucide="${capitalReady ? "shield-check" : "flask-conical"}" aria-hidden="true"></i></div><div><div class="readiness-title">${esc(capitalStateName(capital.capital_state))}${capitalReady ? " · торговый gate пройден" : " · капитал не разрешён"}</div><div class="muted">${capitalReady ? "Все dataset, identity, model и shadow gates пройдены." : esc((capital.reasons || ["Система собирает доказательства."])[0])}</div></div></div>`;
+      $("qualifiedCount").textContent = num(state.overview.qualified_signal_count || qualified.length);
+      $("observationCount").textContent = num(state.overview.radar_observation_count || state.radar.length);
+      $("lastScanAt").textContent = state.radar.length ? shortTime(state.radar[0].observed_at) : "Не запускался";
+      const rows = radarRows();
+      if (state.selectedRadar >= rows.length) state.selectedRadar = 0;
+      const region = $("radarTableRegion");
+      if (!rows.length) {
+        const emptyTitle = state.radarMode === "qualified" ? "Квалифицированных сигналов пока нет" : state.radarMode === "review" ? "Очередь ручной проверки пуста" : "Near-live scan ещё не дал наблюдений";
+        region.innerHTML = `<div class="empty"><div><strong>${emptyTitle}</strong><br><span>Фильтры не будут ослаблены ради заполнения экрана.</span></div></div>`;
+        renderRadarDetail(null);
+        return;
+      }
+      region.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Токен</th><th>Статус</th><th>Кошельки</th><th>Net buy</th><th>Ликвидность</th><th>Risk</th><th>Score</th></tr></thead><tbody>${rows.map((row, index) => radarRow(row, index)).join("")}</tbody></table></div>`;
+      region.querySelectorAll("[data-radar-index]").forEach((button) => button.addEventListener("click", () => { state.selectedRadar = Number(button.dataset.radarIndex); renderRadar(); }));
+      renderRadarDetail(rows[state.selectedRadar]);
+      appendRadarEvidence(rows[state.selectedRadar]);
+      refreshIcons();
+    }
+
+    function radarRow(row, index) {
+      const isSignal = row.signal_id !== undefined;
+      const symbol = isSignal ? row.token_symbol : row.market_token_symbol || row.token_symbol || "UNKNOWN";
+      const wallets = isSignal ? row.evidence?.tracked_wallet_count : row.tracked_wallet_count;
+      const risk = row.risk_score;
+      const score = isSignal ? row.confidence_score : row.weighted_wallet_score;
+      const status = isSignal ? `<span class="badge ${row.status === "needs_review" ? "info" : row.signal_level === "medium" ? "good" : "warn"}">${esc(signalTypeName(row.signal_type))}</span>` : `<span class="badge info">observation</span>`;
+      return `<tr><td><button class="row-button" data-radar-index="${index}">${esc(symbol)}</button><div class="mono muted">${shortAddress(isSignal ? row.contract_address : row.token_address)}</div></td><td>${status}</td><td class="number">${num(wallets)}</td><td class="number">${money(row.net_buy_usd)}</td><td class="number">${money(row.liquidity_usd)}</td><td>${risk === null || risk === undefined ? "—" : num(risk)}</td><td class="number">${score === null || score === undefined ? "—" : num(score)}</td></tr>`;
+    }
+
+    function renderRadarDetail(row) {
+      const root = $("radarDetail");
+      if (!row) {
+        root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">Нет выбранного сигнала</div><div class="detail-contract">Radar остаётся консервативным</div></div></div><p class="thesis">Сигнал появится только после прохождения wallet, liquidity, website и contract-risk gates.</p>`;
+        return;
+      }
+      const isSignal = row.signal_id !== undefined;
+      const evidence = isSignal ? row.evidence || {} : row.evidence || {};
+      const symbol = isSignal ? row.token_symbol : row.market_token_symbol || row.token_symbol || "UNKNOWN";
+      const address = isSignal ? row.contract_address : row.token_address;
+      const buy = isSignal ? evidence.gross_buy_usd : row.gross_buy_usd;
+      const sell = isSignal ? evidence.gross_sell_usd : row.gross_sell_usd;
+      const total = Math.max(1, (buy || 0) + (sell || 0));
+      const missing = evidence.missing_features || ["signal scoring"];
+      const decision = evidence.decision || {};
+      const statusText = isSignal ? decision.decision_state || (row.status === "needs_review" ? "проверить" : row.signal_level) : "observation";
+      const holderCount = isSignal ? evidence.holder_count : row.holder_count;
+      const topHolderRatio = isSignal ? evidence.top_holder_ratio : row.top_holder_ratio;
+      const fdv = isSignal ? evidence.fdv_usd : row.fdv_usd;
+      const pairAgeHours = isSignal ? evidence.pair_age_hours : null;
+      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(symbol)}</div><div class="detail-contract mono">${esc(address)}</div></div><span class="badge ${isSignal && row.status === "candidate" ? "good" : "info"}">${esc(statusText)}</span></div><div class="detail-grid"><div><div class="detail-key">Stage</div><div class="detail-value">${esc(signalTypeName(isSignal ? row.signal_type : null))}</div></div><div><div class="detail-key">Tracked wallets</div><div class="detail-value">${num(isSignal ? evidence.tracked_wallet_count : row.tracked_wallet_count)}</div></div><div><div class="detail-key">Net buy</div><div class="detail-value">${money(row.net_buy_usd)}</div></div><div><div class="detail-key">Liquidity</div><div class="detail-value">${money(row.liquidity_usd)}</div></div><div><div class="detail-key">Risk score</div><div class="detail-value">${row.risk_score ?? "—"}</div></div><div><div class="detail-key">24h volume</div><div class="detail-value">${money(isSignal ? evidence.volume_24h_usd : row.volume_24h_usd)}</div></div><div><div class="detail-key">Confidence</div><div class="detail-value">${isSignal ? num(row.confidence_score) : "не рассчитана"}</div></div><div><div class="detail-key">FDV</div><div class="detail-value">${money(fdv)}</div></div><div><div class="detail-key">Holders / top 10</div><div class="detail-value">${holderCount === null || holderCount === undefined ? "—" : num(holderCount)} / ${pct(topHolderRatio)}</div></div><div><div class="detail-key">Pair age</div><div class="detail-value">${pairAgeHours === null || pairAgeHours === undefined ? "—" : num(pairAgeHours / 24) + " дн."}</div></div><div><div class="detail-key">Buy / sell tax</div><div class="detail-value">${pct(evidence.buy_tax)} / ${pct(evidence.sell_tax)}</div></div></div><div class="flow"><div class="flow-labels"><span>Buy ${money(buy)}</span><span>Sell ${money(sell)}</span></div><div class="flow-track"><span class="flow-buy" style="width:${((buy || 0) / total) * 100}%"></span><span class="flow-sell" style="width:${((sell || 0) / total) * 100}%"></span></div></div><p class="thesis">${esc(isSignal ? row.thesis : "Наблюдение ещё не прошло все обязательные фильтры.")}</p><div class="risk-list">${(row.risk_flags || []).map((flag) => `<span class="badge bad">${esc(flag)}</span>`).join("")}${missing.map((flag) => `<span class="badge warn">нет: ${esc(flag)}</span>`).join("")}</div>`;
+      if (isSignal) {
+        root.insertAdjacentHTML("beforeend", `<div class="reason-block"><h3>Capital decision</h3><div class="muted">${decision.trade_eligible ? "Trade eligible" : "Research only · recommended position $0"}</div>${(decision.blocking_reasons || []).length ? `<ul class="reason-list">${decision.blocking_reasons.slice(0, 3).map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul>` : ""}</div>`);
+      }
+    }
+
+    function appendRadarEvidence(row) {
+      if (!row) return;
+      const root = $("radarDetail");
+      const isSignal = row.signal_id !== undefined;
+        const evidence = row.evidence || {};
+      const address = isSignal ? row.contract_address : row.token_address;
+      const clusters = isSignal ? row.cluster_count : null;
+      const independence = isSignal ? evidence.cluster_independence_ratio : null;
+      const effectiveWallets = isSignal ? evidence.effective_wallet_count : null;
+      const topWalletShare = isSignal ? evidence.top_wallet_net_buy_share : null;
+      const topClusterShare = isSignal ? evidence.top_cluster_net_buy_share : null;
+      const residualFlow = isSignal ? evidence.residual_independent_net_buy_usd : null;
+      const lastTradeAge = isSignal ? evidence.last_trade_age_hours : null;
+      const temperature = isSignal ? evidence.signal_temperature : null;
+      const sourceChecks = isSignal ? evidence.source_checks || {} : {};
+      const blockscout = sourceChecks.blockscout || {};
+      const moralis = sourceChecks.moralis || {};
+      const hypersync = sourceChecks.hypersync || {};
+      const why = evidence.why_signal || [];
+      const counter = evidence.counter_evidence || [];
+      const wallets = evidence.wallets || [];
+      const temperatureLabel = ({ hot: "горячий", early: "ранний", stale: "устаревший" })[temperature] || "—";
+      const onchainBlock = `<div class="reason-block"><h3>Независимость on-chain потока</h3><div class="detail-grid"><div><div class="detail-key">Кластеры / адреса</div><div class="detail-value">${clusters === null || clusters === undefined ? "—" : num(clusters)} / ${num(isSignal ? evidence.tracked_wallet_count : row.tracked_wallet_count)}</div></div><div><div class="detail-key">Независимые голоса</div><div class="detail-value">${effectiveWallets === null || effectiveWallets === undefined ? "—" : num(effectiveWallets)}</div></div><div><div class="detail-key">Крупнейший кошелёк</div><div class="detail-value">${pct(topWalletShare)}</div></div><div><div class="detail-key">Крупнейший кластер</div><div class="detail-value">${pct(topClusterShare)}</div></div><div><div class="detail-key">Остальные кластеры</div><div class="detail-value">${money(residualFlow)}</div></div><div><div class="detail-key">Свежесть</div><div class="detail-value">${esc(temperatureLabel)} · ${ageHours(lastTradeAge)}</div></div></div></div>`;
+      const blockscoutText = blockscout.security_ready ? `verified${blockscout.proxy_type ? ` · ${esc(blockscout.proxy_type)}` : ""}` : "не подтверждён";
+      const sourceBlock = isSignal ? `<div class="reason-block"><h3>Проверка независимыми источниками</h3><div class="detail-grid"><div><div class="detail-key">Blockscout</div><div class="detail-value">${blockscoutText}</div></div><div><div class="detail-key">Holders: GoPlus / Blockscout</div><div class="detail-value">${evidence.holder_count === null || evidence.holder_count === undefined ? "—" : num(evidence.holder_count)} / ${blockscout.holder_count === null || blockscout.holder_count === undefined ? "—" : num(blockscout.holder_count)}</div></div><div><div class="detail-key">Moralis top-10 / EOA</div><div class="detail-value">${pct(moralis.top10_holder_ratio)} / ${pct(moralis.top10_eoa_holder_ratio)}</div></div><div><div class="detail-key">HyperSync direct in / out</div><div class="detail-value">${hypersync.available ? `${num(hypersync.inbound_wallet_count)} / ${num(hypersync.outbound_wallet_count)}` : "—"}</div></div><div><div class="detail-key">Direct transfers</div><div class="detail-value">${hypersync.available ? num(hypersync.transfer_count) : "—"}</div></div><div><div class="detail-key">Проверка потока</div><div class="detail-value">${hypersync.available ? ageHours(hypersync.activity_age_hours) : "—"}</div></div></div></div>` : "";
+      let socialBlock = "";
+      if (state.overview.x_social_gate_enabled) {
+        const socialScore = row.social_silence_score;
+        const xAvailable = isSignal ? evidence.social_x_available : row.social_x_available;
+        const coverage = isSignal ? evidence.social_coverage_score : row.social_coverage_score;
+        const socialText = socialScore === null || socialScore === undefined ? "не рассчитана" : `${num(socialScore)}/100 · ${xAvailable ? "X + news" : "GDELT news proxy"}`;
+        socialBlock = `<div class="reason-block"><h3>Social gate</h3><div class="detail-grid"><div><div class="detail-key">Social silence</div><div class="detail-value">${esc(socialText)}</div></div><div><div class="detail-key">Покрытие</div><div class="detail-value">${coverage === null || coverage === undefined ? "—" : pct(coverage)}</div></div><div><div class="detail-key">Независимость</div><div class="detail-value">${independence === null || independence === undefined ? "—" : pct(independence)}</div></div></div></div>`;
+      }
+      const whyBlock = why.length ? `<div class="reason-block"><h3>Почему токен отобран</h3><ul class="reason-list">${why.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : "";
+      const counterBlock = counter.length ? `<div class="reason-block"><h3>Ограничения</h3><ul class="reason-list">${counter.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : "";
+      const walletBlock = wallets.length ? `<div class="target-list"><h3>Кошельки в сигнале</h3>${wallets.map((wallet) => `<div class="target-row">${walletInline(wallet.wallet_address)}<div class="muted">${esc(wallet.verdict || wallet.label || "")}${wallet.cluster_id ? ` · cluster ${esc(wallet.cluster_id)}` : ""}${wallet.live_net_buy_usd === null || wallet.live_net_buy_usd === undefined ? "" : ` · live ${money(wallet.live_net_buy_usd)}`}</div>${(wallet.why_smart_money || []).slice(0, 1).map((item) => `<div class="muted">${esc(item)}</div>`).join("")}</div>`).join("")}</div>` : "";
+      root.insertAdjacentHTML("beforeend", `<div class="reason-block"><h3>Контракт</h3>${walletInline(address)}</div>${onchainBlock}${sourceBlock}${socialBlock}${whyBlock}${counterBlock}${walletBlock}`);
+    }
+
+    function renderPrediction() {
+      const data = state.prediction || {};
+      const scan = data.latest_scan || {};
+      const routes = data.routes || [];
+      const paper = data.paper_summary || {};
+      if (state.selectedPrediction >= routes.length) state.selectedPrediction = 0;
+      $("predictionRouteCount").textContent = num(routes.length);
+      $("predictionPaperPnl").textContent = moneyPrecise(paper.simulated_net_profit || 0);
+      $("predictionPaperNote").textContent = paper.execution_count ? `${num(paper.filled_count || 0)} filled · ${pct(paper.average_fill_ratio)}` : "нет исполнений";
+      $("predictionBookCount").textContent = num(scan.orderbook_count || 0);
+      $("predictionUpdatedAt").textContent = scan.finished_at ? shortTime(scan.finished_at) : "Не запускался";
+
+      if (!routes.length) {
+        $("predictionTable").innerHTML = `<div class="empty"><div><strong>Paper-кандидатов сейчас нет</strong><br><span>Маршруты, не пережившие fees, depth и resolution checks, скрыты.</span></div></div>`;
+        renderPredictionDetail(null);
+      } else {
+        $("predictionTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Маршрут</th><th>Рынок</th><th>Venue</th><th>Net PnL</th><th>Edge</th><th>Размер</th><th>Lock</th><th>Risk</th></tr></thead><tbody>${routes.map((row, index) => predictionRouteRow(row, index)).join("")}</tbody></table></div>`;
+        $("predictionTable").querySelectorAll("[data-prediction-index]").forEach((button) => button.addEventListener("click", () => { state.selectedPrediction = Number(button.dataset.predictionIndex); renderPrediction(); }));
+        renderPredictionDetail(routes[state.selectedPrediction]);
+      }
+
+      const wallets = (data.wallet_scores || []).slice(0, 10);
+      $("predictionWallets").innerHTML = wallets.length ? `<div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Label</th><th>Closed</th><th>Bayes win</th><th>PnL</th></tr></thead><tbody>${wallets.map((row) => `<tr><td>${walletInline(row.wallet_address)}</td><td><span class="badge ${row.label === "strong_specialist" ? "good" : row.label === "watch" ? "info" : "warn"}">${esc(row.label)}</span></td><td>${num(row.sample_count)}</td><td>${pct(row.posterior_win_rate)}</td><td>${money(row.total_realized_pnl_usd)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Wallet history ещё не собрана</div>`;
+
+      const links = data.token_links || [];
+      $("predictionTokenLinks").innerHTML = links.length ? links.map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.token_symbol)}</strong><span class="badge info">${pct(row.confidence_score)}</span></div><div><a class="route-source" href="${esc(row.source_url || "#")}" target="_blank" rel="noreferrer">${esc(row.event_title)}</a></div><div class="muted">${esc(row.venue)} · ${esc(row.relation_type.replaceAll("_", " "))}</div></div>`).join("") : `<div class="empty">Прямых связей с token registry пока нет</div>`;
+      refreshIcons();
+    }
+
+    function predictionRouteRow(row, index) {
+      const risks = row.risk_flags || [];
+      return `<tr><td><span class="badge ${row.status === "executable" ? "good" : "info"}">${esc(row.status === "executable" ? "Executable" : "Paper")} · ${esc(predictionRouteName(row.route_type))}</span></td><td class="route-title"><button class="row-button" data-prediction-index="${index}">${esc(row.title)}</button></td><td>${esc(row.venue_scope)}</td><td class="number">${moneyPrecise(row.expected_net_profit)}</td><td class="number">${pct(row.net_edge_per_share)}</td><td class="number">${num(row.optimal_size)}</td><td class="number">${row.capital_lock_days === null || row.capital_lock_days === undefined ? "—" : num(row.capital_lock_days) + " дн."}</td><td>${risks.length ? `<span class="badge warn">${risks.length}</span>` : `<span class="badge good">clean</span>`}</td></tr>`;
+    }
+
+    function renderPredictionDetail(row) {
+      const root = $("predictionDetail");
+      if (!row) {
+        const counts = (state.prediction.route_counts || []).reduce((total, item) => total + (item.route_count || 0), 0);
+        root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">No trade</div><div class="detail-contract">${num(counts)} маршрутов проверено</div></div><span class="badge good">защита капитала</span></div><p class="thesis">Radar не показывает теоретический spread, если он не переживает комиссии, доступный объём и правила резолюции.</p>`;
+        return;
+      }
+      const risks = row.risk_flags || [];
+      const rationale = row.rationale || [];
+      const source = row.source_url ? `<a class="route-source" href="${esc(row.source_url)}" target="_blank" rel="noreferrer">Открыть рынок</a>` : "—";
+      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(predictionRouteName(row.route_type))}</div><div class="detail-contract">${esc(row.title)}</div></div><span class="badge good">${num(row.confidence_score)} confidence</span></div><div class="detail-grid"><div><div class="detail-key">Net PnL</div><div class="detail-value">${moneyPrecise(row.expected_net_profit)}</div></div><div><div class="detail-key">Net edge</div><div class="detail-value">${pct(row.net_edge_per_share)}</div></div><div><div class="detail-key">Optimal size</div><div class="detail-value">${num(row.optimal_size)}</div></div><div><div class="detail-key">Capacity</div><div class="detail-value">${num(row.max_executable_size)}</div></div><div><div class="detail-key">Capital</div><div class="detail-value">${moneyPrecise(row.capital_required)}</div></div><div><div class="detail-key">Fees</div><div class="detail-value">${moneyPrecise(row.total_fees)}</div></div><div><div class="detail-key">Slippage</div><div class="detail-value">${moneyPrecise(row.slippage_cost)}</div></div><div><div class="detail-key">Source</div><div class="detail-value">${source}</div></div></div><div class="reason-block"><h3>Ноги</h3>${(row.legs || []).map((leg) => `<div class="route-leg"><div class="route-leg-head"><strong>${esc((leg.action || "").toUpperCase())} ${esc((leg.outcome || "").toUpperCase())}</strong><span class="badge info">${esc(leg.venue)}</span></div><div class="route-leg-meta">${esc(leg.question || leg.market_id)} · VWAP ${num(leg.vwap)} · ${num(leg.filled_size)} shares · fee ${moneyPrecise(leg.fee)}</div></div>`).join("")}</div>${rationale.length ? `<div class="reason-block"><h3>Почему маршрут валиден</h3><ul class="reason-list">${rationale.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}<div class="risk-list">${risks.length ? risks.map((risk) => `<span class="badge warn">${esc(predictionRiskName(risk))}</span>`).join("") : `<span class="badge good">critical risks не найдены</span>`}</div>`;
+      if (row.status !== "executable") {
+        root.insertAdjacentHTML("beforeend", `<div class="reason-block"><h3>Execution status</h3><div class="muted">${esc(row.status)} · маршрут предназначен только для наблюдения по будущему снимку стакана; автоматическое исполнение отключено.</div></div>`);
+      }
+    }
+
+    function fundingHorizonRequest() {
+      return { horizon_mode: "next_settlement", horizon_hours: null };
+    }
+
+    function fundingHorizonControlValue(config) {
+      return "next";
+    }
+
+    function fundingHorizonLabel(row) {
+      return row?.evidence?.horizon?.horizon_label || "—";
+    }
+
+    function fundingRows() {
+      const data = state.funding || {};
+      return data.routes || [];
+    }
+
+    function syncFundingModeButtons() {
+      state.fundingMode = "candidates";
+    }
+
+    function fundingDecisionProfit(row) {
+      const evidence = row.evidence || {};
+      return Number(evidence.decision_mode === "settlement_capture" ? evidence.current_nowcast_net : evidence.conservative_net_profit) || 0;
+    }
+
+    function renderFunding() {
+      const data = state.funding || {};
+      const scan = data.latest_scan || {};
+      const candidates = data.routes || [];
+      state.fundingMode = "candidates";
+      syncFundingModeButtons();
+      const rows = fundingRows();
+      const paper = data.paper_summary || {};
+      if (state.selectedFunding >= rows.length) state.selectedFunding = 0;
+      const bestProfit = candidates.length ? Math.max(...candidates.map((row) => fundingDecisionProfit(row))) : null;
+      const visibleRouteCount = Number(data.visible_route_count ?? candidates.length);
+      const capacityEligibleCount = Number(data.capacity_eligible_route_count || 0);
+      const calculatedRouteCount = Number(scan.route_count || 0);
+      const universe = data.universe_summary || {};
+      const universeRouteCount = Number(universe.route_count || calculatedRouteCount);
+      const executionShortlistCount = Number(universe.execution_shortlist_count || calculatedRouteCount);
+      $("fundingCandidateCount").textContent = num(candidates.length);
+      $("fundingCandidateNote").textContent = `${num(visibleRouteCount)} исполнимых`;
+      $("fundingBestRoc").textContent = bestProfit === null ? "—" : moneyPrecise(bestProfit);
+      $("fundingBestNote").textContent = candidates.length ? "лучший кандидат" : "нет кандидатов";
+      $("fundingCapacity").textContent = num(universeRouteCount);
+      $("fundingCapacityNote").textContent = `${num(executionShortlistCount)} full-depth · ${num(capacityEligibleCount)} capacity ≥ $500`;
+      $("fundingUpdatedAt").textContent = scan.finished_at ? shortTime(scan.finished_at) : "Не запускался";
+      const warningCount = (data.warnings || []).length;
+      const scanTiming = scan.duration_seconds !== null && scan.duration_seconds !== undefined
+        ? `${num(scan.duration_seconds)}с · ${esc(scan.scan_mode || "manual")}`
+        : `${num((data.venues || []).length)} venues`;
+      const scanResult = warningCount
+        ? `${num(warningCount)} warnings`
+        : paper.execution_count
+          ? `${num(paper.profitable_count || 0)} revalidated`
+          : `${num(scan.orderbook_count || 0)} books`;
+      $("fundingPaperNote").textContent = `${scanTiming} · ${scanResult}`;
+      const venueRows = new Map((data.venues || []).map((row) => [String(row.venue), row]));
+      const expectedVenues = [
+        "binance", "bitget", "bybit", "okx", "gate", "bingx", "htx", "kucoin", "mexc", "kraken", "deribit",
+        "backpack", "aster", "hyperliquid", "dydx", "lighter", "paradex", "vertex_base", "drift", "extended", "ethereal",
+        { venue: "jupiter_perps", planned: true, meta: "pool-perp model" },
+        { venue: "gmx_v2", planned: true, meta: "pool-perp model" },
+      ];
+      $("fundingVenueHealth").innerHTML = expectedVenues.map((item) => {
+        const venue = typeof item === "string" ? item : item.venue;
+        const planned = typeof item !== "string" && item.planned;
+        const row = venueRows.get(venue);
+        const diagnostic = fundingVenueDiagnostic(venue, data);
+        const bookText = row && Number(row.book_count || 0) > 0
+          ? `${num(row.book_count)} books`
+          : "depth on demand";
+        const meta = row ? `${num(row.instrument_count)} markets · ${bookText}` : planned ? item.meta : diagnostic || "нет live data";
+        return `<div class="funding-venue ${row ? "live" : planned ? "planned" : ""}"><span class="funding-venue-dot" aria-hidden="true"></span><strong>${esc(venue)}</strong><span>${esc(meta)}</span></div>`;
+      }).join("");
+      renderFundingPaperTrader();
+      renderFundingConstraints(data);
+      const config = scan.config || {};
+      if (config.target_notional) $("fundingSize").value = String(Number(config.target_notional));
+      $("fundingHorizon").value = fundingHorizonControlValue(
+        config.horizon_mode ? config : (data.selected_horizon || {}),
+      );
+
+      if (!rows.length) {
+        const title = "Исполнимых кандидатов сейчас нет";
+        const funnel = data.economics_funnel || {};
+        const blockers = (data.blocker_summary || []).slice(0, 3).map((row) => `${fundingRiskName(row.risk_flag)}: ${num(row.route_count)}`).join(" · ");
+        const note = `${num(universeRouteCount)} маршрутов прошли полный universe-screening без top-N; ${num(executionShortlistCount)} потребовали full-depth проверки. Из ${num(calculatedRouteCount)} рассчитанных со стаканами ${num(funnel.capacity_eligible || capacityEligibleCount)} имеют capacity от $500, ${num(funnel.current_raw_gross_covers_full_cost || 0)} покрывают расходы по текущему settlement, ${num(funnel.current_raw_actionable || 0)} дают live net не ниже минимально значимой прибыли.${blockers ? ` Главные blockers: ${blockers}.` : ""} Решение о входе принимается только по Next settlement; 4ч/8ч — справочные сценарии, если live spread удержится.`;
+        $("fundingTable").innerHTML = `<div class="table-wrap"><table><thead>${fundingRouteTableHead()}</thead><tbody><tr><td colspan="10"><div class="empty"><div><strong>${title}</strong><br><span>${note}</span></div></div></td></tr></tbody></table></div>`;
+        renderFundingDetail(null);
+      } else {
+        $("fundingTable").innerHTML = `<div class="table-wrap"><table><thead>${fundingRouteTableHead()}</thead><tbody>${rows.map((row, index) => fundingRouteRow(row, index)).join("")}</tbody></table></div>`;
+        $("fundingTable").querySelectorAll("[data-funding-index]").forEach((button) => button.addEventListener("click", () => { state.selectedFunding = Number(button.dataset.fundingIndex); renderFunding(); }));
+        renderFundingDetail(rows[state.selectedFunding]);
+      }
+      syncFundingSubView();
+      refreshIcons();
+    }
+
+    function fundingRouteTableHead() {
+      return `<tr><th>Актив</th><th>Маршрут</th><th>Funding / settlement</th><th>Next PnL</th><th>VIP/Maker</th><th>4ч если держится</th><th>8ч если держится</th><th>Нога</th><th>Capacity</th><th>Риск</th></tr>`;
+    }
+
+    function fundingVenueDiagnostic(venue, data) {
+      const warnings = (data.warnings || []).map((item) => String(item || ""));
+      const lowerVenue = String(venue || "").toLowerCase();
+      const match = warnings.find((warning) => warning.toLowerCase().includes(lowerVenue));
+      if (lowerVenue === "drift") {
+        if (match && match.toLowerCase().includes("stale")) return "stale funding";
+        if (match && match.toLowerCase().includes("dlob")) return "нужен DLOB";
+      }
+      if (lowerVenue === "vertex_base") {
+        if (match && match.toLowerCase().includes("ssl")) return "endpoint TLS";
+        if (match) return "endpoint недоступен";
+      }
+      return match ? "warning" : "";
+    }
+
+    function syncFundingSubView() {
+      document.querySelectorAll("[data-funding-subview]").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.fundingSubview === state.fundingSubView));
+      });
+      $("fundingRoutesView").hidden = state.fundingSubView !== "routes";
+      $("fundingPaperView").hidden = state.fundingSubView !== "paper";
+    }
+
+    function renderFundingPaperTrader() {
+      const root = $("fundingPaperTraderPanel");
+      const data = state.fundingPaper || {};
+      const summary = data.summary || {};
+      const accounts = data.accounts || [];
+      const openPositions = data.open_positions || [];
+      const events = data.events || [];
+      const closedPositions = data.closed_positions || [];
+      if (!accounts.length && !openPositions.length && !events.length) {
+        root.innerHTML = `<section class="funding-paper-panel"><div class="funding-paper-head"><h2>Paper Trader</h2><span class="muted">не запущен</span></div><div class="empty"><div><strong>Виртуальный капитал ещё не инициализирован</strong><br><span>Запусти funding-paper-trader, чтобы появились балансы, сделки и CSV.</span></div></div></section>`;
+        return;
+      }
+      const accountRows = accounts.map((row) => `<tr><td><strong>${esc(row.venue)}</strong></td><td class="number">${moneyPrecise(row.starting_balance)}</td><td class="number">${moneyPrecise(row.cash_balance)}</td><td class="number">${moneyPrecise(row.reserved_margin)}</td><td class="number">${moneyPrecise(row.available_balance)}</td><td class="number">${moneyPrecise(row.realized_pnl)}</td></tr>`).join("");
+      const openRows = openPositions.map((row) => `<tr><td><strong>${esc(row.canonical_asset)}</strong><div class="muted">${esc(row.long_venue)} → ${esc(row.short_venue)}</div></td><td class="number">${moneyPrecise(row.target_notional_per_leg)}</td><td class="number">${moneyPrecise(row.expected_live_net)}</td><td>${shortTime(row.max_settlement_at)}</td><td><span class="badge info">${esc(row.status)}</span></td></tr>`).join("");
+      const closedRows = closedPositions.slice(0, 20).map((row) => `<tr><td><strong>${esc(row.canonical_asset)}</strong><div class="muted">${esc(row.long_venue)} → ${esc(row.short_venue)}</div></td><td class="number ${Number(row.actual_net_pnl || 0) > 0 ? "positive" : Number(row.actual_net_pnl || 0) < 0 ? "negative" : ""}">${moneyPrecise(row.actual_net_pnl)}</td><td>${shortTime(row.opened_at)}</td><td>${shortTime(row.closed_at)}</td></tr>`).join("");
+      const eventRows = events.slice(0, 24).map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.event_type)}</strong><span class="badge ${row.telegram_status === "sent" ? "good" : row.telegram_status === "failed" ? "bad" : "info"}">${esc(row.telegram_status || "—")}</span></div><div class="muted">${shortTime(row.created_at)} · ${esc(row.message)}</div></div>`).join("");
+      const llmLabel = data.llm_in_execution_loop ? "LLM loop" : "no LLM loop";
+      root.innerHTML = `<section class="funding-paper-panel" aria-label="Funding Paper Trader"><div class="funding-paper-head"><h2>Paper Trader</h2><span class="muted">deterministic · ${esc(llmLabel)}</span></div><div class="funding-paper-grid"><div class="funding-paper-cell"><div class="funding-paper-label">Starting capital</div><div class="funding-paper-value">${moneyPrecise(summary.starting_capital)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Total cash</div><div class="funding-paper-value">${moneyPrecise(summary.total_cash)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Realized PnL</div><div class="funding-paper-value ${Number(summary.realized_pnl || 0) > 0 ? "positive" : Number(summary.realized_pnl || 0) < 0 ? "negative" : ""}">${moneyPrecise(summary.realized_pnl)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Open / closed</div><div class="funding-paper-value">${num(summary.open_position_count)} / ${num(summary.closed_trade_count)}</div></div></div><div class="funding-paper-stack"><div><h2>Аккаунты по биржам</h2><div class="table-wrap compact-table"><table><thead><tr><th>Venue</th><th>Start</th><th>Cash</th><th>Reserved</th><th>Available</th><th>PnL</th></tr></thead><tbody>${accountRows || `<tr><td colspan="6">—</td></tr>`}</tbody></table></div></div><div class="funding-paper-mini"><div><h2>Открытые позиции</h2><div class="table-wrap compact-table"><table><thead><tr><th>Route</th><th>Нога</th><th>Expected</th><th>Settlement</th><th>Status</th></tr></thead><tbody>${openRows || `<tr><td colspan="5">Нет открытых позиций</td></tr>`}</tbody></table></div></div><div><h2>Закрытые сделки</h2><div class="table-wrap compact-table"><table><thead><tr><th>Route</th><th>PnL</th><th>Open</th><th>Close</th></tr></thead><tbody>${closedRows || `<tr><td colspan="4">Закрытых сделок пока нет</td></tr>`}</tbody></table></div></div></div><div><h2>События и Telegram</h2><div class="paper-event-list">${eventRows || `<div class="empty">Событий пока нет</div>`}</div></div></div></section>`;
+    }
+
+    function renderFundingConstraints(data) {
+      const root = $("fundingConstraintPanel");
+      const diagnostics = data.constraint_diagnostics || {};
+      const universe = data.universe_summary || {};
+      const primary = diagnostics.primary_constraint || null;
+      const medians = diagnostics.median_components || {};
+      const nearMisses = diagnostics.near_misses || [];
+      const funnel = data.economics_funnel || {};
+      const universeRouteCount = Number(universe.route_count || 0);
+      const rows = fundingRows();
+      if (rows.length || (!universeRouteCount && !primary && !Object.keys(funnel).length)) {
+        root.innerHTML = "";
+        return;
+      }
+      const nearMiss = nearMisses[0] || {};
+      const blockerLabel = primary ? fundingConstraintName(primary.stage) : "текущий net после costs <= 0";
+      const bestLive = nearMiss.current_raw_net === undefined ? null : Number(nearMiss.current_raw_net || 0);
+      const nearMissRows = nearMisses.slice(0, 4).map((row) => `<tr><td><strong>${esc(row.canonical_asset || "—")}</strong><div class="muted">${esc(row.long_venue || "—")} → ${esc(row.short_venue || "—")}</div></td><td>${fundingLegsCell(row)}</td><td class="number">${moneyPrecise(row.current_raw_net)}</td><td>${fundingNeededImprovementCell(row)}</td></tr>`).join("");
+      const nearMissTable = nearMissRows ? `<div class="table-wrap compact-table"><table><thead><tr><th>Near miss</th><th>Funding</th><th>Live net</th><th>VIP/Maker</th></tr></thead><tbody>${nearMissRows}</tbody></table></div>` : "";
+      root.innerHTML = `<section class="funding-diagnostics" aria-label="Funding decision summary"><div class="funding-diagnostics-head"><h2>Кандидатов нет</h2><span class="muted">${esc(blockerLabel)}</span></div><div class="constraint-economics"><div><div class="detail-key">Маршрутов</div><div class="detail-value">${num(universeRouteCount)}</div></div><div><div class="detail-key">Full-depth</div><div class="detail-value">${num(universe.execution_shortlist_count || 0)}</div></div><div><div class="detail-key">Покрывают costs</div><div class="detail-value">${num(funnel.current_raw_gross_covers_full_cost || 0)}</div></div><div><div class="detail-key">Live PnL > 0</div><div class="detail-value">${num(funnel.current_raw_positive || funnel.current_raw_actionable || 0)}</div></div><div><div class="detail-key">Лучший live net</div><div class="detail-value">${bestLive === null ? "—" : moneyPrecise(bestLive)}</div></div><div><div class="detail-key">Median gross / cost</div><div class="detail-value">${moneyPrecise(medians.current_raw_gross)} / ${moneyPrecise(medians.execution_cost)}</div></div></div>${nearMissTable}</section>`;
+    }
+
+    function fundingNeededImprovement(row) {
+      return row?.needed_improvement || row?.evidence?.needed_improvement || {};
+    }
+
+    function improvementActionNet(action) {
+      if (!action) return null;
+      const value = action.net_profit_if_filled ?? action.net_profit;
+      return value === null || value === undefined ? null : Number(value);
+    }
+
+    function fundingNeededImprovementCell(row) {
+      const needed = fundingNeededImprovement(row);
+      const best = needed.best_action || null;
+      const bestNet = improvementActionNet(best);
+      if (best && bestNet !== null && Number.isFinite(bestNet)) {
+        const label = best.type === "verified_vip1_taker_taker" ? "VIP1" : "Maker";
+        const improvement = Number(best.improvement_vs_current || 0);
+        const note = best.type === "maker_entry_taker_exit"
+          ? `${fundingMakerOpenLabel(row)} · close taker`
+          : bestNet > 0 ? "positive if filled" : `improves ${moneyPrecise(improvement)}`;
+        return `<strong class="${bestNet > 0 ? "positive" : bestNet < 0 ? "negative" : ""}">${esc(label)} ${moneyPrecise(bestNet)}</strong><div class="muted">${note}</div>`;
+      }
+      return `<strong>—</strong><div class="muted">fee/maker edge нет</div>`;
+    }
+
+    function fundingNeededImprovementBlock(row) {
+      const needed = fundingNeededImprovement(row);
+      if (!Object.keys(needed).length) return "";
+      const maker = needed.maker_entry || {};
+      const vip = needed.vip1 || {};
+      const profiles = vip.applied_profiles || {};
+      const profileText = Object.entries(profiles).map(([venue, profile]) => `${esc(venue)} ${esc(profile.tier || "VIP1")} ${feePct(profile.maker)} / ${feePct(profile.taker)}`).join(" · ");
+      const missing = (vip.missing_profiles || []).length ? `<div class="muted">VIP1 rates not verified: ${vip.missing_profiles.map((venue) => esc(venue)).join(", ")}</div>` : "";
+      const makerText = `<div class="muted">Maker scenario: ${esc(fundingMakerOpenLabel(row))}; закрытие обеих ног taker. Это paper-only proxy, не гарантия fill в очереди.</div>`;
+      return `<div class="reason-block"><h3>VIP / Maker сценарий</h3><div class="detail-grid"><div><div class="detail-key">Maker if filled</div><div class="detail-value">${moneyPrecise(maker.net_profit_if_filled)}</div></div><div><div class="detail-key">VIP1 taker</div><div class="detail-value">${moneyPrecise(vip.net_profit)}</div></div><div><div class="detail-key">Current fees</div><div class="detail-value">${moneyPrecise(needed.current?.fee_cost)}</div></div></div>${makerText}${profileText ? `<div class="muted">Verified VIP1 used: ${profileText}</div>` : ""}${missing}</div>`;
+    }
+
+    function fundingLegBySide(row, side) {
+      return (row.legs || []).find((leg) => leg.side === side) || {};
+    }
+
+    function fundingLegLine(leg, sideLabel) {
+      if (!leg || !leg.venue) return `<div class="funding-rate-line muted">${esc(sideLabel)}: —</div>`;
+      const interval = Number(leg.funding_interval_hours || 0);
+      const publishedInterval = Number(leg.published_funding_interval_hours ?? interval);
+      const publishedRate = Number(leg.published_funding_rate ?? leg.funding_rate);
+      const next = leg.next_funding_at ? shortTime(leg.next_funding_at) : "—";
+      const hourly = leg.hourly_funding_rate === null || leg.hourly_funding_rate === undefined ? "—" : signedFundingPct(leg.hourly_funding_rate);
+      const cashflow = `${signedFundingPct(leg.funding_rate)} / ${num(interval)}ч`;
+      const displayDiffers = Number.isFinite(publishedRate) && (
+        Math.abs(publishedRate - Number(leg.funding_rate || 0)) > 1e-12
+        || Math.abs(publishedInterval - interval) > 1e-9
+      );
+      const published = Number.isFinite(publishedRate) ? `${signedFundingPct(publishedRate)} / ${num(publishedInterval)}ч` : cashflow;
+      const source = fundingRateKindName(leg.funding_rate_kind);
+      const capState = leg.funding_rate_cap_floor_state ? ` · ${esc(leg.funding_rate_cap_floor_state)}` : "";
+      const note = leg.funding_display_note ? ` · ${esc(leg.funding_display_note)}` : "";
+      const normalized = displayDiffers ? `cashflow ${cashflow} · hourly ${hourly}` : `hourly ${hourly}`;
+      return `<div class="funding-rate-line"><span class="badge ${sideLabel === "LONG" ? "info" : "warn"}">${esc(sideLabel)}</span> <strong>${esc(leg.venue)}</strong>: <strong>${published}</strong><div class="funding-rate-meta">${normalized} · next ${esc(next)} · ${esc(source)}${capState}${note}</div></div>`;
+    }
+
+    function fundingLegsCell(row) {
+      const longLeg = fundingLegBySide(row, "long");
+      const shortLeg = fundingLegBySide(row, "short");
+      return `<div class="funding-rate-cell">${fundingLegLine(longLeg, "LONG")}${fundingLegLine(shortLeg, "SHORT")}</div>`;
+    }
+
+    function fundingMakerOpenLabel(row) {
+      const longLeg = fundingLegBySide(row, "long");
+      const shortLeg = fundingLegBySide(row, "short");
+      const longVenue = longLeg.venue || row.long_venue || "LONG";
+      const shortVenue = shortLeg.venue || row.short_venue || "SHORT";
+      return `open maker: ${longVenue} buy + ${shortVenue} sell`;
+    }
+
+    function fundingRouteRow(row, index) {
+      const risks = row.risk_flags || [];
+      const legs = row.legs || [];
+      const longLeg = legs.find((leg) => leg.side === "long") || {};
+      const shortLeg = legs.find((leg) => leg.side === "short") || {};
+      const evidence = row.evidence || {};
+      const conservativeNet = Number(evidence.conservative_net_profit || 0);
+      const liveNowcastNet = Number(evidence.current_nowcast_net || 0);
+      const settlementCapture = evidence.decision_mode === "settlement_capture";
+      const fundingCell = fundingLegsCell(row);
+      const pnlCell = settlementCapture
+        ? `<strong class="${liveNowcastNet > 0 ? "positive" : ""}">${moneyPrecise(liveNowcastNet)}</strong><div class="muted">Q25 ${moneyPrecise(conservativeNet)}</div>`
+        : `<strong>${moneyPrecise(conservativeNet)}</strong><div class="muted">median ${moneyPrecise(row.expected_net_profit)}</div>`;
+      return `<tr><td><button class="row-button" data-funding-index="${index}"><strong>${esc(row.canonical_asset)}</strong></button><div class="muted">${esc(fundingHorizonLabel(row))}</div></td><td class="route-title"><div><span class="badge info">LONG</span> ${esc(row.long_venue)}</div><div class="muted"><span class="badge warn">SHORT</span> ${esc(row.short_venue)}</div></td><td class="number">${fundingCell}</td><td class="number">${pnlCell}</td><td>${fundingNeededImprovementCell(row)}</td><td class="number">${fundingComparisonPnlCell(row, "4h")}</td><td class="number">${fundingComparisonPnlCell(row, "8h")}</td><td class="number"><strong>${money(row.target_notional)}</strong></td><td class="number">${money(row.market_capacity)}</td><td>${fundingRiskCell(risks)}</td></tr>`;
+    }
+
+    function fundingRiskCell(risks) {
+      if (!risks.length) return `<span class="badge good">чисто</span>`;
+      const first = fundingRiskName(risks[0]);
+      const extra = risks.length > 1 ? ` +${risks.length - 1}` : "";
+      return `<span class="badge warn">${esc(first)}${esc(extra)}</span>`;
+    }
+
+    function fundingComparisonPnlCell(row, horizonKey) {
+      const comparison = state.funding?.horizon_comparisons?.[horizonKey]?.routes?.[row.route_key];
+      if (!comparison) return `<span class="muted">—</span>`;
+      const evidence = comparison.evidence || {};
+      const unavailable = evidence.live_projection_unavailable_reason;
+      const liveIfPersists = Number(evidence.live_if_persists_net);
+      if (unavailable) {
+        return `<strong>—</strong><div class="muted">${esc(fundingProjectionUnavailableName(unavailable))}</div>`;
+      }
+      if (Number.isFinite(liveIfPersists)) {
+        const schedule = evidence.live_projection_horizon || {};
+        const events = Number(schedule.settlement_event_count || 0);
+        const paired = Number(schedule.paired_coverage_hours || 0);
+        return `<strong class="${liveIfPersists > 0 ? "positive" : liveIfPersists < 0 ? "negative" : ""}">${moneyPrecise(liveIfPersists)}</strong><div class="muted">${num(events)} settlement · paired ${num(paired)}ч</div>`;
+      }
+      return `<strong>—</strong><div class="muted">нет live projection</div>`;
+    }
+
+    function fundingProjectionUnavailableName(value) {
+      return ({
+        missing_current_route_schedule: "нет расписания",
+        no_settlement_in_horizon: "нет списания",
+        no_paired_settlement_in_horizon: "одна нога без списания",
+      })[value] || value || "нет live projection";
+    }
+
+    function fundingDecisionNoteBlock(title, items, tone) {
+      if (!items.length) return "";
+      const badgeClass = tone === "bad" ? "bad" : tone === "warn" ? "warn" : "info";
+      return `<div class="reason-block"><h3>${esc(title)}</h3>${items.map((item) => `<div class="reason-item"><span class="badge ${badgeClass}">${esc(tone === "bad" ? "block" : tone === "warn" ? "warn" : "note")}</span><span>${esc(item)}</span></div>`).join("")}</div>`;
+    }
+
+    function fundingComparisonAgeLabel(horizonKey) {
+      const comparisonScan = state.funding?.horizon_comparisons?.[horizonKey]?.latest_scan || {};
+      const baseScan = state.funding?.latest_scan || {};
+      const comparisonTime = Date.parse(comparisonScan.finished_at || comparisonScan.started_at || "");
+      const baseTime = Date.parse(baseScan.finished_at || baseScan.started_at || "");
+      if (!Number.isFinite(comparisonTime) || !Number.isFinite(baseTime)) return "";
+      const minutesOlder = Math.max(0, (baseTime - comparisonTime) / 60000);
+      if (minutesOlder < 30) return "";
+      return minutesOlder < 90 ? ` · ${num(minutesOlder)} мин. старше` : ` · ${num(minutesOlder / 60)}ч старше`;
+    }
+
+    function renderFundingDetail(row) {
+      const root = $("fundingDetail");
+      if (!row) {
+        const total = Number(state.funding.universe_summary?.route_count || 0);
+        const fullDepth = Number(state.funding.universe_summary?.execution_shortlist_count || 0);
+        const funnel = state.funding.economics_funnel || {};
+        root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">No trade</div><div class="detail-contract">${num(total)} universe · ${num(fullDepth)} full-depth</div></div><span class="badge good">paper-only</span></div><div class="detail-grid"><div><div class="detail-key">Capacity ≥ $500</div><div class="detail-value">${num(funnel.capacity_eligible || 0)}</div></div><div><div class="detail-key">Покрывают costs</div><div class="detail-value">${num(funnel.current_raw_gross_covers_full_cost || 0)}</div></div><div><div class="detail-key">Live PnL > 0</div><div class="detail-value">${num(funnel.current_raw_positive || funnel.current_raw_actionable || 0)}</div></div></div>`;
+        return;
+      }
+      const evidence = row.evidence || {};
+      const blocking = evidence.blocking_reasons || [];
+      const advisories = evidence.advisory_reasons || [];
+      const risks = row.risk_flags || [];
+      const rationale = row.rationale || [];
+      const horizon = evidence.horizon || {};
+      const researchOnly = Boolean(horizon.research_only);
+      const settlementCapture = evidence.decision_mode === "settlement_capture";
+      const statusClass = row.status === "paper_candidate" && !researchOnly ? "good" : "warn";
+      const statusLabel = researchOnly ? "Research" : row.status === "paper_candidate" ? (settlementCapture ? "Settlement candidate" : "Carry candidate") : "Watch";
+      const conservativeNet = Number(evidence.conservative_net_profit || 0);
+      const liveNowcastNet = Number(evidence.current_nowcast_net || 0);
+      const probability = Number(evidence.net_profit_probability || 0);
+      const simpleLegRows = (row.legs || []).map((leg) => `<div class="route-leg"><div class="route-leg-head"><strong>${esc(leg.side.toUpperCase())} ${esc(leg.symbol)}</strong><span class="badge info">${esc(leg.venue)}</span></div><div class="route-leg-meta">${num(leg.base_quantity || 0)} ${esc(row.canonical_asset)} · notional ${money(leg.notional || 0)} · published ${signedFundingPct(leg.published_funding_rate ?? leg.funding_rate)} / ${num(leg.published_funding_interval_hours ?? leg.funding_interval_hours)}ч · cashflow ${signedFundingPct(leg.funding_rate)} / ${num(leg.funding_interval_hours)}ч · hourly ${signedFundingPct(leg.hourly_funding_rate)}${leg.funding_rate_cap_floor_state ? ` · ${esc(leg.funding_rate_cap_floor_state)}` : ""} · entry ${marketPrice(leg.open_vwap ?? leg.vwap)} · close ${marketPrice(leg.close_vwap)} · next ${shortTime(leg.next_funding_at)}</div></div>`).join("");
+      const neededBlock = fundingNeededImprovementBlock(row);
+      const compactDecision = `<div><div class="detail-key">Live net PnL</div><div class="detail-value">${moneyPrecise(liveNowcastNet)}</div></div><div><div class="detail-key">Q25 net PnL</div><div class="detail-value">${moneyPrecise(conservativeNet)}</div></div>`;
+      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(row.canonical_asset)}</div><div class="detail-contract">LONG ${esc(row.long_venue)} · SHORT ${esc(row.short_venue)} · ${esc(fundingHorizonLabel(row))}</div></div><span class="badge ${statusClass}">${statusLabel}</span></div><div class="detail-grid">${compactDecision}<div><div class="detail-key">Позиция / нога</div><div class="detail-value">${money(row.target_notional)}</div></div><div><div class="detail-key">Capacity</div><div class="detail-value">${money(row.market_capacity)}</div></div><div><div class="detail-key">Fees + slippage</div><div class="detail-value">${moneyPrecise(Number(row.total_fees || 0) + Number(row.slippage_cost || 0))}</div></div><div><div class="detail-key">Basis reserve</div><div class="detail-value">${moneyPrecise(row.basis_reserve)}</div></div><div><div class="detail-key">Шанс прибыли</div><div class="detail-value">${pct(probability)}</div></div><div><div class="detail-key">History role</div><div class="detail-value">${settlementCapture ? "warning only" : "gate"}</div></div></div>${neededBlock}${simpleLegRows ? `<div class="reason-block"><h3>Ноги</h3>${simpleLegRows}</div>` : ""}${fundingDecisionNoteBlock("Почему интересно", rationale, "info")}${fundingDecisionNoteBlock("Что блокирует", blocking, "bad")}${fundingDecisionNoteBlock("Предупреждения", advisories, "warn")}<div class="risk-list">${risks.map((risk) => `<span class="badge warn">${esc(fundingRiskName(risk))}</span>`).join("")}</div>`;
+    }
+
+    function renderWallets() {
+      $("walletCount").textContent = num(state.overview.wallet_score_count || state.wallets.length);
+      $("repeatCount").textContent = num(state.overview.meaningful_repeat_wallet_count || state.wallets.filter((row) => row.target_count >= 2).length);
+      $("observedTargetCount").textContent = num(state.overview.latest_backtest?.metrics?.observed_target_count || 0);
+      $("excludedEntityCount").textContent = num(state.overview.excluded_wallet_count || 0);
+      renderWalletChart();
+      const candidates = state.wallets.filter((row) => ["strong_candidate", "watch_candidate", "weak_candidate"].includes(row.label)).slice(0, 40);
+      if (state.selectedWallet >= candidates.length) state.selectedWallet = 0;
+      $("walletTable").innerHTML = candidates.length ? `<div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Label</th><th>Meaningful</th><th>Interest</th><th>Noise</th><th>Confidence</th></tr></thead><tbody>${candidates.map((row, index) => `<tr><td>${walletAddressControl(row.wallet_address, index)}</td><td data-field="Label"><span class="badge ${row.label === "watch_candidate" ? "info" : "warn"}">${esc(row.label.replace("_candidate", ""))}</span></td><td data-field="Meaningful">${row.target_count}</td><td data-field="Interest">${num(row.interest_score)}</td><td data-field="Noise">${num(row.noise_score)}</td><td data-field="Confidence">${num(row.confidence_score)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Нет wallet candidates</div>`;
+      $("walletTable").querySelectorAll("[data-wallet-index]").forEach((button) => button.addEventListener("click", () => { state.selectedWallet = Number(button.dataset.walletIndex); renderWallets(); }));
+      renderWalletDetail(candidates[state.selectedWallet]);
+      appendWalletEvidence(candidates[state.selectedWallet]);
+      renderClusterTable();
+      refreshIcons();
+    }
+
+    function renderWalletChart() {
+      const rows = state.wallets.slice(0, 300);
+      const x = (value) => 48 + (value / 100) * 580;
+      const y = (value) => 292 - (value / 100) * 250;
+      const grid = [0, 25, 50, 75, 100].map((tick) => `<line class="chart-grid" x1="48" y1="${y(tick)}" x2="628" y2="${y(tick)}"></line><text class="chart-axis" x="38" y="${y(tick) + 4}" text-anchor="end">${tick}</text><line class="chart-grid" x1="${x(tick)}" y1="42" x2="${x(tick)}" y2="292"></line><text class="chart-axis" x="${x(tick)}" y="312" text-anchor="middle">${tick}</text>`).join("");
+      const points = rows.map((row) => `<circle class="wallet-point ${row.label === "strong_candidate" ? "strong" : row.label === "watch_candidate" ? "watch" : row.label === "likely_noise" ? "noise" : row.label === "weak_candidate" ? "weak" : "ignore"}" cx="${x(row.interest_score)}" cy="${y(row.noise_score)}" r="${row.target_count >= 2 ? 5 : 3.5}"><title>${esc(row.wallet_address)} · interest ${num(row.interest_score)} · noise ${num(row.noise_score)}</title></circle>`).join("");
+      $("walletChart").innerHTML = `<svg class="wallet-chart" viewBox="0 0 660 330" role="img" aria-label="Wallet interest versus noise"><rect class="chart-zone" x="454" y="42" width="174" height="100"></rect>${grid}<text class="chart-label" x="338" y="328" text-anchor="middle">Interest score</text><text class="chart-label" x="12" y="168" transform="rotate(-90 12 168)" text-anchor="middle">Noise score</text>${points}</svg>`;
+    }
+
+    function renderWalletDetail(row) {
+      const root = $("walletDetail");
+      if (!row) { root.innerHTML = `<div class="detail-symbol">Нет данных</div>`; return; }
+      const evidence = row.evidence || {};
+      const targets = evidence.targets || [];
+      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${walletInline(row.wallet_address)}</div><div class="detail-contract">${esc(row.label)}</div></div><span class="badge ${row.target_count >= 2 ? "good" : "warn"}">${row.target_count} meaningful</span></div><div class="detail-grid"><div><div class="detail-key">Interest</div><div class="detail-value">${num(row.interest_score)}</div></div><div><div class="detail-key">Noise</div><div class="detail-value">${num(row.noise_score)}</div></div><div><div class="detail-key">Confidence</div><div class="detail-value">${num(row.confidence_score)}</div></div><div><div class="detail-key">Raw targets</div><div class="detail-value">${evidence.raw_target_count ?? "—"}</div></div><div><div class="detail-key">Net meaningful</div><div class="detail-value">${money(evidence.meaningful_net_pre_usd)}</div></div><div><div class="detail-key">Repeatability</div><div class="detail-value">${esc(evidence.repeatability_status || "unknown")}</div></div></div><div class="target-list"><h3>Evidence по целям</h3>${targets.map((target) => `<div class="target-row"><div class="target-head"><strong>${esc(target.symbol)}</strong><span class="badge ${target.is_meaningful ? "good" : "warn"}">${target.is_meaningful ? "meaningful" : esc(target.behavior)}</span></div><div class="muted">Buy ${money(target.pre_buy_usd)} · Net ${money(target.net_pre_usd)} · Pre-sell ${pct(target.pre_sell_ratio)}</div></div>`).join("")}</div>`;
+    }
+
+    function appendWalletEvidence(row) {
+      if (!row) return;
+      const root = $("walletDetail");
+      const evidence = row.evidence || {};
+      const why = evidence.why_smart_money || [];
+      const counter = evidence.counter_evidence || [];
+      const clusterRationale = row.cluster_rationale || [];
+      const clusterText = row.cluster_id
+        ? `<div class="reason-block"><h3>Кластер ${esc(row.cluster_id)}</h3><div class="muted">${row.cluster_member_count || 1} адрес(ов) · независимость ${row.cluster_independence_score === null || row.cluster_independence_score === undefined ? "—" : pct(row.cluster_independence_score)}</div><ul class="reason-list">${clusterRationale.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>`
+        : "";
+      const entityLabel = row.entity_label ? ` · ${esc(row.entity_label)}` : "";
+      root.insertAdjacentHTML("beforeend", `<div class="reason-block"><h3>Проверка сущности</h3><div class="muted">${esc(row.entity_type || "eoa")}${entityLabel} · ${row.excluded_from_research ? "исключён" : "допущен в исследование"}</div></div>${why.length ? `<div class="reason-block"><h3>Почему это smart-money кандидат</h3><ul class="reason-list">${why.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${counter.length ? `<div class="reason-block"><h3>Контраргументы</h3><ul class="reason-list">${counter.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${clusterText}`);
+    }
+
+    function renderClusterTable() {
+      const clusters = (state.clusters || []).filter((cluster) => cluster.member_count > 1);
+      if (!clusters.length) {
+        $("clusterTable").innerHTML = `<div class="empty">Связанных кластеров в текущей выборке не найдено</div>`;
+        return;
+      }
+      $("clusterTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Cluster</th><th>Адреса</th><th>Связь</th><th>Независимость</th></tr></thead><tbody>${clusters.map((cluster) => `<tr><td class="mono wallet-address">${esc(cluster.cluster_id)}</td><td class="cluster-members">${(cluster.members || []).map((member) => walletInline(member.wallet_address)).join("")}</td><td>${(cluster.rationale || []).map((item) => `<div class="muted">${esc(item)}</div>`).join("")}</td><td>${pct(cluster.independence_score)}</td></tr>`).join("")}</tbody></table></div>`;
+    }
+
+    function renderResearch() {
+      const data = state.research || {};
+      const universe = data.universe || {};
+      const outcomes = data.outcomes || {};
+      const wallets = data.wallets || {};
+      const readiness = data.readiness || {};
+      const capital = data.capital_readiness || {};
+      const capitalGates = capital.gates || {};
+      const capitalMetrics = capital.metrics || {};
+      const models = data.model_runs || [];
+      const scores = (data.wallet_scores || []).filter((row) => row.model_version === "wallet_research_v2").slice(0, 25);
+      const gatePassed = Boolean(capital.trade_eligible);
+      $("researchSnapshots").textContent = num(universe.snapshot_count || 0);
+      $("researchEvents").textContent = num(outcomes.independent_positive_event_count || 0);
+      $("researchWallets").textContent = num(wallets.opportunity_count || 0);
+      $("researchModels").textContent = num(models.length);
+      $("researchGateBadge").className = `badge ${gatePassed ? "good" : "warn"}`;
+      $("researchGateBadge").textContent = capitalStateName(capital.capital_state);
+      const gates = [
+        ["Token-time snapshots", universe.snapshot_count || 0, readiness.minimum_snapshot_count || 100000, readiness.snapshot_progress || 0],
+        ["Независимые listings", outcomes.independent_positive_event_count || 0, readiness.minimum_independent_positive_events || 100, readiness.event_progress || 0],
+        ["Mature wallet opportunities", capitalMetrics.matured_wallet_opportunities || 0, 1000, Math.min(1, (capitalMetrics.matured_wallet_opportunities || 0) / 1000)],
+        ["Identity coverage", Math.round((capitalMetrics.identity_coverage || 0) * 100), 95, Math.min(1, (capitalMetrics.identity_coverage || 0) / 0.95)],
+        ["Temporal model", capitalGates.temporal_model ? 1 : 0, 1, capitalGates.temporal_model ? 1 : 0],
+        ["Shadow marks", capitalMetrics.shadow_mark_count || 0, 1000, Math.min(1, (capitalMetrics.shadow_mark_count || 0) / 1000)],
+      ];
+      $("researchGates").innerHTML = gates.map(([label, value, target, progress]) => `<div class="gate-row"><strong>${esc(label)}</strong><div class="gate-track"><span class="gate-fill" style="width:${Math.min(100, progress * 100)}%"></span></div><div class="gate-value">${num(value)} / ${num(target)}</div></div>`).join("");
+
+      $("researchModelTable").innerHTML = models.length ? `<div class="table-wrap"><table><thead><tr><th>Target</th><th>Model</th><th>Status</th><th>Rows</th><th>Events</th><th>AP</th></tr></thead><tbody>${models.map((row) => { const metrics = row.metrics || {}; return `<tr><td>${esc(row.target_label.replace("listed_within_", ""))}</td><td>${esc(row.model_family.replace("_", " "))}</td><td><span class="badge ${row.status === "completed_ready" ? "good" : row.status.startsWith("completed") ? "info" : "warn"}">${esc(row.status)}</span></td><td>${num(metrics.dataset_row_count || 0)}</td><td>${num(metrics.independent_positive_token_count || 0)}</td><td>${metrics.average_precision === null || metrics.average_precision === undefined ? "—" : pct(metrics.average_precision)}</td></tr>`; }).join("")}</tbody></table></div>` : `<div class="empty">Model runs ещё не запускались</div>`;
+
+      $("researchWalletTable").innerHTML = scores.length ? `<div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Label</th><th>Opportunities</th><th>Posterior 90d</th><th>95% lower</th><th>PnL</th><th>Score</th></tr></thead><tbody>${scores.map((row) => `<tr><td>${walletInline(row.wallet_address)}</td><td><span class="badge ${row.label === "institutional_candidate" ? "good" : row.label === "promising" ? "info" : "warn"}">${esc(row.label)}</span></td><td>${num(row.matured_opportunity_count)} / ${num(row.opportunity_count)}</td><td>${pct(row.posterior_hit_rate)}</td><td>${pct(row.posterior_lower_95)}</td><td>${money(row.estimated_pnl_usd)}</td><td>${num(row.research_score)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Полный wallet denominator ещё не импортирован</div>`;
+
+      const chains = data.universe_by_chain || [];
+      $("researchChainTable").innerHTML = chains.length ? chains.map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.chain_id)}</strong><span class="badge info">${num(row.snapshot_count)} snapshots</span></div><div class="muted">${num(row.token_count)} токенов · ${shortTime(row.first_snapshot_at)} — ${shortTime(row.last_snapshot_at)}</div></div>`).join("") : `<div class="empty">Universe ещё не импортирован</div>`;
+      const eventCoverage = data.event_coverage || {};
+      if (chains.length) $("researchChainTable").insertAdjacentHTML("beforeend", `<div class="target-row"><div class="target-head"><strong>Binance events</strong><span class="badge ${eventCoverage.zero_flow_events ? "info" : "warn"}">${num(eventCoverage.event_count || 0)} total</span></div><div class="muted">${num(eventCoverage.events_with_flow || 0)} с pre-announcement flow · ${num(eventCoverage.zero_flow_events || 0)} zero-flow сохранено</div></div>`);
+      const dune = data.dune_usage || {};
+      if (dune.available) $("researchChainTable").insertAdjacentHTML("beforeend", `<div class="target-row"><div class="target-head"><strong>Dune credits</strong><span class="badge ${dune.execution_blocked ? "bad" : "good"}">${num(dune.credits_used)} / ${num(dune.credits_included)}</span></div><div class="muted">${num(dune.credits_remaining)} осталось · период до ${esc(dune.period_end || "—")}${dune.execution_blocked ? ` · execution заблокирован reserve gate ${num(dune.minimum_execution_reserve)}` : " · backfill доступен"}</div></div>`);
+      const duneExecution = (data.dune_executions || [])[0];
+      if (duneExecution) $("researchChainTable").insertAdjacentHTML("beforeend", `<div class="target-row"><div class="target-head"><strong>Последний Dune run</strong><span class="badge ${String(duneExecution.state || "").includes("BLOCKED") ? "bad" : "info"}">${esc(duneExecution.state || "unknown")}</span></div><div class="muted">${num(duneExecution.row_count || 0)} rows · ${esc(duneExecution.source || "—")}</div></div>`);
+
+      const stages = data.signal_types || [];
+      $("researchSignalTypes").innerHTML = stages.length ? stages.map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(signalTypeName(row.signal_type))}</strong><span class="badge ${row.status === "candidate" ? "good" : "info"}">${num(row.signal_count)}</span></div><div class="muted">${esc(row.status)}</div></div>`).join("") : `<div class="empty">Сигналы ещё не пересчитаны</div>`;
+    }
+
+    function renderBacktest() {
+      const run = state.backtest.wallet || {};
+      const negativeRun = state.backtest.negative || {};
+      const negativeMetrics = negativeRun.metrics || {};
+      const metrics = run.metrics || {};
+      const capital = state.overview.capital_readiness || {};
+      const ready = Boolean(capital.trade_eligible);
+      $("backtestRunBadge").textContent = run.backtest_run_id ? `run #${run.backtest_run_id}` : "нет запуска";
+      $("evaluatedTargets").textContent = num(metrics.evaluated_target_count || 0);
+      $("backtestPrecision").textContent = pct(metrics.micro_precision);
+      $("backtestLift").textContent = metrics.lift_over_baseline === null || metrics.lift_over_baseline === undefined ? "—" : num(metrics.lift_over_baseline) + "×";
+      $("tokenHitFive").textContent = pct(negativeMetrics.hit_rate_at_5);
+      const reasons = [...(capital.reasons || [])];
+      if ((metrics.evaluated_target_count || 0) < 10) reasons.push(`нужно минимум 10 evaluated targets, сейчас ${metrics.evaluated_target_count || 0}`);
+      if ((metrics.candidate_wallet_opportunities || 0) < 30) reasons.push(`нужно минимум 30 candidate opportunities, сейчас ${metrics.candidate_wallet_opportunities || 0}`);
+      if ((metrics.candidate_wallet_hits || 0) < (metrics.minimum_required_wallet_hits || 10)) reasons.push(`нужно минимум ${metrics.minimum_required_wallet_hits || 10} wallet hits, сейчас ${metrics.candidate_wallet_hits || 0}`);
+      if ((metrics.lift_over_baseline || 0) < (metrics.minimum_required_lift || 1.5)) reasons.push(`нужен lift не ниже ${metrics.minimum_required_lift || 1.5}×, сейчас ${metrics.lift_over_baseline === null || metrics.lift_over_baseline === undefined ? "—" : num(metrics.lift_over_baseline) + "×"}`);
+      if (!negativeRun.leakage_checks?.negative_control_universe_present) reasons.push("negative token universe ещё не импортирован");
+      else if (!negativeMetrics.ready_for_token_prediction_claims) reasons.push(`negative controls недостаточны: ${negativeMetrics.snapshot_count || 0} snapshots, ${negativeMetrics.negative_candidate_count || 0} negatives`);
+      $("readinessBand").innerHTML = `<div class="readiness-band"><div class="readiness-icon ${ready ? "ready" : ""}"><i data-lucide="${ready ? "shield-check" : "shield-alert"}" aria-hidden="true"></i></div><div><div class="readiness-title">${ready ? "Модель прошла acceptance gate" : "Торговые выводы пока заблокированы"}</div><ul class="readiness-reasons">${[...new Set(reasons)].map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul></div></div>`;
+      const evaluations = run.evaluations || [];
+      $("backtestTable").innerHTML = evaluations.length ? `<div class="table-wrap"><table><thead><tr><th>Дата</th><th>Target</th><th>History</th><th>Predicted</th><th>Hits</th><th>Precision</th><th>Lift</th></tr></thead><tbody>${evaluations.map((row) => `<tr><td>${shortTime(row.snapshot_at)}</td><td>${esc(row.symbol)}</td><td>${row.history_target_count}</td><td>${row.predicted_wallet_count}</td><td>${row.hit_wallet_count}</td><td>${pct(row.precision)}</td><td>${row.lift === null || row.lift === undefined ? "—" : num(row.lift) + "×"}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Walk-forward evaluations пока нет</div>`;
+      const baseTargets = state.coverage.base_targets || [];
+      $("coverageTable").innerHTML = baseTargets.length ? baseTargets.map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.symbol)}</strong><span class="badge ${row.wallet_rows ? "good" : "warn"}">${row.wallet_rows ? `${row.wallet_rows} wallets` : "не импортирован"}</span></div><div class="muted">${shortTime(row.announced_at)} · ${row.meaningful_buyers || 0} meaningful · ${row.point_in_time_mapping ? "mapping at T" : "label mapping"}</div></div>`).join("") : `<div class="empty">Base targets не найдены</div>`;
+    }
+
+    document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
+      document.querySelectorAll("[data-view]").forEach((item) => item.setAttribute("aria-selected", String(item === button)));
+      document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
+      $(`view-${button.dataset.view}`).classList.add("active");
+      updateHeaderContext(button.dataset.view);
+      centerActiveNav(button);
+    }));
+
+    function centerActiveNav(button) {
+      const nav = button?.closest(".nav");
+      if (!nav || nav.scrollWidth <= nav.clientWidth) return;
+      nav.scrollLeft = Math.max(
+        0,
+        button.offsetLeft - (nav.clientWidth - button.offsetWidth) / 2,
+      );
+    }
+
+    centerActiveNav(document.querySelector('[data-view][aria-selected="true"]'));
+
+    document.querySelectorAll("[data-radar-mode]").forEach((button) => button.addEventListener("click", () => {
+      state.radarMode = button.dataset.radarMode;
+      state.selectedRadar = 0;
+      document.querySelectorAll("[data-radar-mode]").forEach((item) => item.setAttribute("aria-pressed", String(item === button)));
+      renderRadar();
+    }));
+
+    document.querySelectorAll("[data-funding-subview]").forEach((button) => button.addEventListener("click", () => {
+      state.fundingSubView = button.dataset.fundingSubview || "routes";
+      syncFundingSubView();
+      refreshIcons();
+    }));
+
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-copy-address]");
+      if (button) copyAddress(button.dataset.copyAddress);
+    });
+
+    $("copyFallbackClose").addEventListener("click", hideCopyFallback);
+    $("copyFallback").addEventListener("click", (event) => {
+      if (event.target === $("copyFallback")) hideCopyFallback();
+    });
+
+    $("recomputeButton").addEventListener("click", async () => {
+      setBusy(true);
+      showJob({ status: "running", message: "Пересчитываю Wallet Score и Backtest", progress: 0.4 });
+      try {
+        await api("/api/actions/recompute", { method: "POST" });
+        hideJob();
+        await loadAll();
+      } catch (error) {
+        showJob({ status: "failed", message: error.message, progress: 1 });
+      } finally { setBusy(false); }
+    });
+
+    $("scanButton").addEventListener("click", async () => {
+      try {
+        const job = await api("/api/actions/live-scan", { method: "POST" });
+        showJob({ status: "running", message: "Base scan поставлен в очередь", progress: 0.05 });
+        $("scanButton").disabled = true;
+        pollJob(job.job_id);
+      } catch (error) { showJob({ status: "failed", message: error.message, progress: 1 }); }
+    });
+
+    $("predictionScanButton").addEventListener("click", async () => {
+      try {
+        const job = await api("/api/actions/prediction-scan", { method: "POST" });
+        showJob({ status: "running", message: "Prediction scan поставлен в очередь", progress: 0.05 });
+        $("predictionScanButton").disabled = true;
+        $("fundingScanButton").disabled = true;
+        $("scanButton").disabled = true;
+        pollJob(job.job_id);
+      } catch (error) { showJob({ status: "failed", message: error.message, progress: 1 }); }
+    });
+
+    $("fundingScanButton").addEventListener("click", () => requestFundingRefresh("manual"));
+
+    $("fundingHorizon").addEventListener("change", async () => {
+      state.selectedFunding = 0;
+      clearFundingRefreshTimer();
+      try {
+        await loadFundingOnly();
+      } catch (error) {
+        showJob({ status: "failed", message: error.message, progress: 1 });
+      }
+    });
+
+    $("fundingAutoToggle").addEventListener("change", (event) => {
+      if (!state.funding?.refresh_policy?.auto_refresh_enabled) {
+        state.fundingAuto = false;
+        renderFundingRefreshControls();
+        return;
+      }
+      state.fundingAuto = Boolean(event.target.checked);
+      try { localStorage.setItem("funding-auto", state.fundingAuto ? "on" : "off"); } catch (error) {}
+      renderFundingRefreshControls();
+      if (state.fundingAuto) scheduleFundingRefresh(250);
+      else clearFundingRefreshTimer();
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) clearFundingRefreshTimer();
+      else resumeFundingRefresh();
+    });
+
+    async function pollJob(jobId) {
+      try {
+        const job = await api("/api/jobs/latest");
+        showJob(job);
+        if (["success", "failed"].includes(job.status)) {
+          $("scanButton").disabled = false;
+          $("predictionScanButton").disabled = false;
+          if (job.status === "success") await loadAll();
+          renderFundingRefreshControls();
+          return;
+        }
+      } catch (error) { showJob({ status: "failed", message: error.message, progress: 1 }); return; }
+      window.setTimeout(() => pollJob(jobId), 3000);
+    }
+
+    refreshIcons();
+    loadAll();
+  </script>
+</body>
+</html>

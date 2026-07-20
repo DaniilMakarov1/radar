@@ -1,0 +1,18 @@
+[project]
+name = "smart-money-radar"
+version = "0.1.0"
+description = "Research-first on-chain screener for early smart-money accumulation before public hype and potential Binance listings."
+requires-python = ">=3.11"
+dependencies = [
+    "joblib>=1.5,<2",
+    "scikit-learn>=1.7,<2",
+    "scipy>=1.16,<2",
+    "websocket-client>=1.8,<2",
+]
+
+[project.scripts]
+smr = "smart_money_radar.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

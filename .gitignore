@@ -1,0 +1,30 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+.funding-paper-trader.pid
+
+# Local runtime data
+data/*.sqlite
+data/*.sqlite-*
+data/*.db
+data/*.db-*
+warehouse/*.sqlite
+warehouse/*.sqlite-*
+warehouse/*.db
+warehouse/*.db-*
+logs/
+
+# Generated artifacts
+exports/
+reports/*.png
+reports/*.jpg
+reports/*.jpeg
+reports/*.html
+reports/latest.md
