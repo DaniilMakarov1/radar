@@ -22,6 +22,13 @@ HYPERSYNC_URLS = {
 TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 )
+UNISWAP_V2_SWAP_TOPIC = (
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+)
+UNISWAP_V3_SWAP_TOPIC = (
+    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+)
+SWAP_TOPICS = (UNISWAP_V2_SWAP_TOPIC, UNISWAP_V3_SWAP_TOPIC)
 BASE_BLOCKS_PER_DAY = 43_200
 
 
@@ -262,6 +269,204 @@ class HyperSyncClient:
             payload=result,
         )
 
+    def recent_wallet_transfer_events(
+        self,
+        chain_id: str,
+        wallet_addresses: list[str],
+        observed_at: str | None = None,
+        window_hours: int = 24,
+        max_pages: int = 3,
+    ) -> dict[str, Any]:
+        if not self.api_token:
+            raise OnchainDataError("HYPERSYNC_API_TOKEN is missing")
+        base_url = HYPERSYNC_URLS.get(chain_id)
+        if not base_url:
+            raise OnchainDataError(f"HyperSync is not configured for {chain_id}")
+        headers = {"Authorization": f"Bearer {self.api_token}"}
+        height_payload = self.http.get_json(f"{base_url}/height", headers=headers)
+        height = int(height_payload["height"])
+        wallets = sorted(
+            {
+                address.lower()
+                for address in wallet_addresses
+                if is_evm_address(address)
+            }
+        )
+        if not wallets:
+            return {
+                "chain_id": chain_id,
+                "observed_at": observed_at or utc_now_iso(),
+                "from_block": height,
+                "to_block": height,
+                "next_block": height,
+                "events": [],
+                "page_count": 0,
+                "tracked_wallets": [],
+            }
+        padded_wallets = [pad_evm_topic(address) for address in wallets]
+        blocks_per_hour = BASE_BLOCKS_PER_DAY / 24
+        from_block = max(0, height - int(max(1, window_hours) * blocks_per_hour))
+        cursor = from_block
+        events = []
+        page_count = 0
+        for _ in range(max(1, max_pages)):
+            payload = {
+                "from_block": cursor,
+                "to_block": height,
+                "logs": [
+                    {
+                        "topics": [[TRANSFER_TOPIC], [], padded_wallets],
+                    },
+                    {
+                        "topics": [[TRANSFER_TOPIC], padded_wallets, []],
+                    },
+                ],
+                "field_selection": {
+                    "block": ["number", "timestamp"],
+                    "log": [
+                        "block_number",
+                        "log_index",
+                        "transaction_hash",
+                        "address",
+                        "topic0",
+                        "topic1",
+                        "topic2",
+                        "data",
+                    ],
+                },
+            }
+            result = self.http.post_json(
+                f"{base_url}/query",
+                payload,
+                headers=headers,
+            )
+            page_count += 1
+            page_events = normalize_hypersync_transfer_events(
+                chain_id=chain_id,
+                payload=result,
+                tracked_wallets=wallets,
+            )
+            events.extend(page_events)
+            next_block = optional_int(result.get("next_block"))
+            if next_block is None or next_block <= cursor or next_block >= height:
+                cursor = height
+                break
+            cursor = next_block
+        return {
+            "chain_id": chain_id,
+            "observed_at": observed_at or utc_now_iso(),
+            "from_block": from_block,
+            "to_block": height,
+            "next_block": cursor,
+            "events": dedupe_transfer_events(events),
+            "page_count": page_count,
+            "tracked_wallets": wallets,
+        }
+
+    def recent_pool_swap_events(
+        self,
+        chain_id: str,
+        pair_addresses: list[str],
+        observed_at: str | None = None,
+        window_hours: int = 24,
+        max_pages: int = 3,
+        from_block: int | None = None,
+        to_block: int | None = None,
+    ) -> dict[str, Any]:
+        if not self.api_token:
+            raise OnchainDataError("HYPERSYNC_API_TOKEN is missing")
+        base_url = HYPERSYNC_URLS.get(chain_id)
+        if not base_url:
+            raise OnchainDataError(f"HyperSync is not configured for {chain_id}")
+        headers = {"Authorization": f"Bearer {self.api_token}"}
+        height_payload = self.http.get_json(f"{base_url}/height", headers=headers)
+        height = int(height_payload["height"])
+        pairs = sorted(
+            {
+                address.lower()
+                for address in pair_addresses
+                if is_evm_address(address)
+            }
+        )
+        if not pairs:
+            return {
+                "chain_id": chain_id,
+                "observed_at": observed_at or utc_now_iso(),
+                "from_block": height,
+                "to_block": height,
+                "next_block": height,
+                "events": [],
+                "page_count": 0,
+                "pair_addresses": [],
+            }
+        blocks_per_hour = BASE_BLOCKS_PER_DAY / 24
+        start_block = (
+            max(0, int(from_block))
+            if from_block is not None
+            else max(0, height - int(max(1, window_hours) * blocks_per_hour))
+        )
+        end_block = min(height, int(to_block)) if to_block is not None else height
+        cursor = start_block
+        events = []
+        page_count = 0
+        for _ in range(max(1, max_pages)):
+            payload = {
+                "from_block": cursor,
+                "to_block": end_block,
+                "logs": [
+                    {
+                        "address": pairs,
+                        "topics": [[*SWAP_TOPICS]],
+                    },
+                ],
+                "field_selection": {
+                    "block": ["number", "timestamp"],
+                    "log": [
+                        "block_number",
+                        "log_index",
+                        "transaction_hash",
+                        "address",
+                        "topic0",
+                        "topic1",
+                        "topic2",
+                        "data",
+                    ],
+                    "transaction": ["hash", "from", "to"],
+                },
+            }
+            try:
+                result = self.http.post_json(
+                    f"{base_url}/query",
+                    payload,
+                    headers=headers,
+                )
+            except OnchainDataError as exc:
+                if exc.status_code != 400:
+                    raise
+                payload["field_selection"].pop("transaction", None)
+                result = self.http.post_json(
+                    f"{base_url}/query",
+                    payload,
+                    headers=headers,
+                )
+            page_count += 1
+            events.extend(normalize_hypersync_swap_events(chain_id, result))
+            next_block = optional_int(result.get("next_block"))
+            if next_block is None or next_block <= cursor or next_block >= end_block:
+                cursor = end_block
+                break
+            cursor = next_block
+        return {
+            "chain_id": chain_id,
+            "observed_at": observed_at or utc_now_iso(),
+            "from_block": start_block,
+            "to_block": end_block,
+            "next_block": cursor,
+            "events": dedupe_swap_events(events),
+            "page_count": page_count,
+            "pair_addresses": pairs,
+        }
+
 
 def normalize_blockscout_snapshot(
     chain_id: str,
@@ -427,6 +632,216 @@ def normalize_hypersync_snapshot(
             "recent_transaction_hashes": transaction_hashes[-20:],
         },
     }
+
+
+def normalize_hypersync_swap_events(
+    chain_id: str,
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    block_times: dict[int, str] = {}
+    tx_metadata: dict[str, dict[str, str | None]] = {}
+    events = []
+    for batch in payload.get("data", []):
+        if not isinstance(batch, dict):
+            continue
+        for transaction in batch.get("transactions", []):
+            if not isinstance(transaction, dict):
+                continue
+            tx_hash = str(
+                transaction.get("hash")
+                or transaction.get("transaction_hash")
+                or ""
+            ).lower()
+            if not tx_hash:
+                continue
+            tx_metadata[tx_hash] = {
+                "tx_from": normalize_evm_address(
+                    transaction.get("from") or transaction.get("from_address")
+                ),
+                "tx_to": normalize_evm_address(
+                    transaction.get("to") or transaction.get("to_address")
+                ),
+            }
+        for block in batch.get("blocks", []):
+            if not isinstance(block, dict) or block.get("number") is None:
+                continue
+            timestamp = hex_timestamp_to_iso(block.get("timestamp"))
+            if timestamp:
+                block_times[int(block["number"])] = timestamp
+        for log in batch.get("logs", []):
+            if not isinstance(log, dict):
+                continue
+            pair_address = str(log.get("address") or "").lower()
+            if not is_evm_address(pair_address):
+                continue
+            topic0 = str(log.get("topic0") or "").lower()
+            decoded = decode_swap_log(topic0, log.get("data"))
+            if not decoded:
+                continue
+            block_number = optional_int(log.get("block_number"))
+            tx_hash = str(log.get("transaction_hash") or "").lower()
+            tx = tx_metadata.get(tx_hash, {})
+            events.append(
+                {
+                    "chain_id": chain_id,
+                    "pair_address": pair_address,
+                    "block_number": block_number,
+                    "block_time": block_times.get(block_number)
+                    if block_number is not None
+                    else None,
+                    "tx_hash": tx_hash,
+                    "tx_from": tx.get("tx_from"),
+                    "tx_to": tx.get("tx_to"),
+                    "log_index": optional_int(log.get("log_index")),
+                    "topic0": topic0,
+                    "sender": topic_to_evm_address(log.get("topic1")),
+                    "recipient": topic_to_evm_address(log.get("topic2")),
+                    **decoded,
+                }
+            )
+    return events
+
+
+def decode_swap_log(topic0: str, data: Any) -> dict[str, Any] | None:
+    words = abi_words(data)
+    if topic0 == UNISWAP_V2_SWAP_TOPIC and len(words) >= 4:
+        return {
+            "protocol_shape": "v2",
+            "amount0_in_raw": str(unsigned_word(words[0])),
+            "amount1_in_raw": str(unsigned_word(words[1])),
+            "amount0_out_raw": str(unsigned_word(words[2])),
+            "amount1_out_raw": str(unsigned_word(words[3])),
+        }
+    if topic0 == UNISWAP_V3_SWAP_TOPIC and len(words) >= 2:
+        return {
+            "protocol_shape": "v3",
+            "amount0_delta_raw": str(signed_word(words[0])),
+            "amount1_delta_raw": str(signed_word(words[1])),
+        }
+    return None
+
+
+def abi_words(value: Any) -> list[bytes]:
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return []
+    try:
+        data = bytes.fromhex(value[2:])
+    except ValueError:
+        return []
+    return [data[index : index + 32] for index in range(0, len(data), 32)]
+
+
+def unsigned_word(word: bytes) -> int:
+    return int.from_bytes(word.rjust(32, b"\x00")[-32:], "big")
+
+
+def signed_word(word: bytes) -> int:
+    number = unsigned_word(word)
+    if number >= 2**255:
+        number -= 2**256
+    return number
+
+
+def dedupe_swap_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped = {}
+    for event in events:
+        key = (
+            event.get("tx_hash"),
+            event.get("log_index"),
+            event.get("block_number"),
+            event.get("pair_address"),
+        )
+        deduped[key] = event
+    return list(deduped.values())
+
+
+def normalize_hypersync_transfer_events(
+    chain_id: str,
+    payload: dict[str, Any],
+    tracked_wallets: list[str],
+) -> list[dict[str, Any]]:
+    tracked_topics = {pad_evm_topic(address): address for address in tracked_wallets}
+    block_times: dict[int, str] = {}
+    events = []
+    for batch in payload.get("data", []):
+        if not isinstance(batch, dict):
+            continue
+        for block in batch.get("blocks", []):
+            if not isinstance(block, dict) or block.get("number") is None:
+                continue
+            timestamp = hex_timestamp_to_iso(block.get("timestamp"))
+            if timestamp:
+                block_times[int(block["number"])] = timestamp
+        for log in batch.get("logs", []):
+            if not isinstance(log, dict):
+                continue
+            token_address = str(log.get("address") or "").lower()
+            if not is_evm_address(token_address):
+                continue
+            from_address = topic_to_evm_address(log.get("topic1"))
+            to_address = topic_to_evm_address(log.get("topic2"))
+            if not from_address or not to_address:
+                continue
+            from_tracked = pad_evm_topic(from_address) in tracked_topics
+            to_tracked = pad_evm_topic(to_address) in tracked_topics
+            if not from_tracked and not to_tracked:
+                continue
+            block_number = optional_int(log.get("block_number"))
+            amount_raw = hex_to_int(log.get("data")) or 0
+            events.append(
+                {
+                    "chain_id": chain_id,
+                    "token_address": token_address,
+                    "block_number": block_number,
+                    "block_time": block_times.get(block_number)
+                    if block_number is not None
+                    else None,
+                    "tx_hash": str(log.get("transaction_hash") or "").lower(),
+                    "log_index": optional_int(log.get("log_index")),
+                    "from_address": from_address,
+                    "to_address": to_address,
+                    "from_tracked": from_tracked,
+                    "to_tracked": to_tracked,
+                    "amount_raw": amount_raw,
+                }
+            )
+    return events
+
+
+def dedupe_transfer_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped = {}
+    for event in events:
+        key = (
+            event.get("tx_hash"),
+            event.get("log_index"),
+            event.get("block_number"),
+            event.get("token_address"),
+        )
+        deduped[key] = event
+    return list(deduped.values())
+
+
+def topic_to_evm_address(value: Any) -> str | None:
+    topic = str(value or "").lower()
+    if not topic.startswith("0x") or len(topic) != 66:
+        return None
+    address = "0x" + topic[-40:]
+    return address if is_evm_address(address) else None
+
+
+def normalize_evm_address(value: Any) -> str | None:
+    address = str(value or "").lower()
+    return address if is_evm_address(address) else None
+
+
+def hex_to_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value)
+        return int(text, 16) if text.startswith("0x") else int(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def moralis_chain_name(chain_id: str) -> str:

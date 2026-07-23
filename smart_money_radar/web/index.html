@@ -7,24 +7,24 @@
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f4f6f2;
-      --surface: #ffffff;
-      --surface-soft: #edf1ec;
-      --ink: #171b18;
-      --muted: #68706a;
-      --line: #d7ddd6;
-      --line-strong: #bbc4bb;
-      --green: #19714d;
-      --green-soft: #e4f1e9;
-      --amber: #9a6413;
-      --amber-soft: #f6eddc;
-      --red: #a13c35;
-      --red-soft: #f7e6e4;
-      --blue: #286b93;
-      --blue-soft: #e4eef4;
-      --focus: #286b93;
-      --shadow: 0 8px 24px rgba(27, 37, 29, 0.07);
+      color-scheme: dark;
+      --bg: #101312;
+      --surface: #171b1a;
+      --surface-soft: #202725;
+      --ink: #f1f5f2;
+      --muted: #98a39c;
+      --line: #2d3632;
+      --line-strong: #435047;
+      --green: #51c28b;
+      --green-soft: #173326;
+      --amber: #e3ad50;
+      --amber-soft: #372917;
+      --red: #f07167;
+      --red-soft: #3a1e20;
+      --blue: #7ab7d8;
+      --blue-soft: #17303e;
+      --focus: #7ab7d8;
+      --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
     }
 
     * { box-sizing: border-box; }
@@ -42,9 +42,9 @@
       letter-spacing: 0;
     }
 
-    button, select { font: inherit; letter-spacing: 0; }
+    button, select, input, textarea { font: inherit; letter-spacing: 0; }
 
-    button:focus-visible, select:focus-visible {
+    button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
       outline: 2px solid var(--focus);
       outline-offset: 2px;
     }
@@ -77,7 +77,7 @@
       width: 34px;
       height: 34px;
       flex: 0 0 auto;
-      color: #ffffff;
+      color: #07110c;
       background: var(--green);
       border-radius: 6px;
     }
@@ -138,6 +138,7 @@
       background: var(--surface);
       cursor: pointer;
       white-space: nowrap;
+      text-decoration: none;
     }
 
     .button:hover { border-color: var(--green); }
@@ -212,6 +213,7 @@
     }
 
     .metric-strip.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .metric-strip.five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 
     .metric {
       min-width: 0;
@@ -224,7 +226,7 @@
     .metric-value { margin-top: 2px; font-size: 21px; font-weight: 700; overflow-wrap: anywhere; }
     .metric-note { margin-top: 1px; color: var(--muted); font-size: 12px; }
 
-    .radar-layout, .wallet-layout, .prediction-layout, .funding-layout {
+    .radar-layout, .wallet-layout, .prediction-layout, .funding-layout, .dune-layout {
       display: grid;
       grid-template-columns: minmax(0, 1.7fr) minmax(310px, 0.8fr);
       gap: 20px;
@@ -241,6 +243,29 @@
       background: var(--surface);
       border: 1px solid var(--line-strong);
       border-radius: 6px;
+    }
+    .control-input {
+      min-width: 96px;
+      width: 100%;
+      height: 36px;
+      padding: 0 10px;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+    }
+    .control-textarea {
+      width: 100%;
+      min-height: 190px;
+      resize: vertical;
+      padding: 12px;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
     }
     .auto-toggle {
       display: inline-flex;
@@ -292,6 +317,7 @@
 
     table { width: 100%; border-collapse: collapse; min-width: 720px; }
     #fundingTable table { min-width: 1260px; }
+    #duneResult table { min-width: 860px; }
     .compact-table table { min-width: 640px; }
 
     th, td {
@@ -456,8 +482,89 @@
       gap: 24px;
       margin-top: 26px;
     }
+    .prediction-secondary.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .prediction-secondary > div { min-width: 0; }
     #predictionWallets table { min-width: 610px; }
+
+    .dune-toolbar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .dune-query-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .dune-query-button {
+      min-height: 58px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      background: var(--surface);
+      text-align: left;
+      cursor: pointer;
+    }
+    .dune-query-button[aria-pressed="true"] {
+      border-color: var(--green);
+      background: color-mix(in srgb, var(--green-soft) 70%, var(--surface));
+    }
+    .dune-query-button strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .dune-query-button span {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }
+    .dune-source-grid { display: grid; gap: 0; border-top: 1px solid var(--line); }
+    .dune-source-row {
+      display: grid;
+      grid-template-columns: minmax(140px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .dune-scan-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .dune-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .dune-result-meta {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 30px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .dune-cell {
+      max-width: 320px;
+      overflow-wrap: anywhere;
+    }
+    .dune-cell.mono { white-space: normal; }
+    .dune-execution-list { margin-top: 10px; border-top: 1px solid var(--line); }
 
     .route-title { max-width: 340px; }
     .route-leg { padding: 10px 0; border-top: 1px solid var(--line); }
@@ -488,13 +595,22 @@
     .funding-paper-panel { margin: 2px 0 16px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
     .funding-paper-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
     .funding-paper-head h2 { margin: 0; font-size: 14px; }
+    .paper-head-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
     .funding-paper-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
     .funding-paper-cell { min-width: 0; }
     .funding-paper-label { color: var(--muted); font-size: 11px; }
     .funding-paper-value { margin-top: 3px; font-size: 16px; font-weight: 720; }
-    .funding-paper-mini { margin-top: 10px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+    .funding-paper-mini { margin-top: 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
     .funding-paper-stack { margin-top: 12px; display: grid; gap: 12px; }
     .paper-event-list { max-height: 360px; overflow: auto; border-top: 1px solid var(--line); }
+    .paper-event-list.compact { max-height: 220px; }
+    .paper-trade-history { max-height: 520px; overflow: auto; }
+    .paper-event-message { white-space: pre-line; overflow-wrap: anywhere; }
+    details.paper-collapsible { border-top: 1px solid var(--line); padding-top: 10px; }
+    details.paper-collapsible summary { cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text); font-weight: 720; }
+    details.paper-collapsible summary::-webkit-details-marker { display: none; }
+    details.paper-collapsible summary::after { content: "Раскрыть"; color: var(--muted); font-size: 11px; font-weight: 520; }
+    details.paper-collapsible[open] summary::after { content: "Свернуть"; }
     .reason-item { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start; padding: 7px 0; border-top: 1px solid var(--line); color: var(--muted); }
     .reason-item:first-of-type { margin-top: 7px; }
     .constraint-stages { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
@@ -618,9 +734,10 @@
     @media (max-width: 1050px) {
       .topbar { grid-template-columns: 1fr auto; }
       .nav { grid-row: 2; grid-column: 1 / -1; justify-self: center; margin-bottom: 8px; }
-      .radar-layout, .wallet-layout, .prediction-layout, .funding-layout, .backtest-grid, .research-grid, .prediction-secondary { grid-template-columns: 1fr; }
+      .radar-layout, .wallet-layout, .prediction-layout, .funding-layout, .dune-layout, .backtest-grid, .research-grid, .prediction-secondary { grid-template-columns: 1fr; }
       .detail-panel { box-shadow: none; }
       .metric-strip.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric-strip.five { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
 
     @media (max-width: 720px) {
@@ -645,6 +762,8 @@
       #view-funding #fundingScanButton { justify-self: end; }
       .metric-strip { grid-template-columns: 1fr; }
       .metric-strip.four { grid-template-columns: 1fr; }
+      .metric-strip.five { grid-template-columns: 1fr; }
+      .dune-query-list, .dune-scan-grid { grid-template-columns: 1fr; }
       .metric { border-right: 0; border-bottom: 1px solid var(--line); }
       .metric:last-child { border-bottom: 0; }
       .job-banner { grid-template-columns: auto 1fr; }
@@ -708,6 +827,7 @@
     <nav class="nav" aria-label="Разделы">
       <button class="nav-button" data-view="funding" aria-selected="true">Funding</button>
       <button class="nav-button" data-view="prediction" aria-selected="false">Prediction</button>
+      <button class="nav-button" data-view="dune" aria-selected="false">Dune</button>
     </nav>
 
     <div class="actions">
@@ -773,16 +893,23 @@
         </button>
       </div>
 
-      <div class="metric-strip four">
+      <div class="metric-strip five">
         <div class="metric"><div class="metric-label">Paper candidates</div><div class="metric-value" id="predictionRouteCount">0</div><div class="metric-note">неатомарные маршруты</div></div>
+        <div class="metric"><div class="metric-label">Route candidates</div><div class="metric-value" id="predictionCandidateCount">0</div><div class="metric-note" id="predictionCandidateNote">arbitrage funnel</div></div>
         <div class="metric"><div class="metric-label">Paper PnL</div><div class="metric-value" id="predictionPaperPnl">$0</div><div class="metric-note" id="predictionPaperNote">нет исполнений</div></div>
         <div class="metric"><div class="metric-label">Стаканы</div><div class="metric-value" id="predictionBookCount">0</div><div class="metric-note">Polymarket + Kalshi</div></div>
-        <div class="metric"><div class="metric-label">Обновлено</div><div class="metric-value" id="predictionUpdatedAt">—</div><div class="metric-note">paper-only execution</div></div>
+        <div class="metric"><div class="metric-label">Обновлено</div><div class="metric-value" id="predictionUpdatedAt">—</div><div class="metric-note" id="predictionFreshnessNote">paper-only execution</div></div>
       </div>
 
       <div class="prediction-layout">
         <div class="table-region" id="predictionTable"></div>
         <aside class="detail-panel" id="predictionDetail"></aside>
+      </div>
+
+      <div class="prediction-secondary three">
+        <div><h2>Strategy monitor</h2><div id="predictionStrategyMonitor" class="subsection"></div></div>
+        <div><h2>Candidate alerts</h2><div id="predictionAlerts" class="subsection"></div></div>
+        <div><h2>Paper Trader</h2><div id="predictionPaperTrader" class="subsection"></div></div>
       </div>
 
       <div class="prediction-secondary">
@@ -846,6 +973,108 @@
 
       <div class="funding-subview" id="fundingPaperView" hidden>
         <div id="fundingPaperTraderPanel"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-dune">
+      <div class="section-head">
+        <div>
+          <h1>Dune</h1>
+          <p class="section-copy">Локальный SQL-портал поверх Base ingestion, funding, prediction и research views</p>
+        </div>
+        <div class="scan-controls">
+          <label class="control-group">Limit
+            <select class="control-select" id="duneLimit" aria-label="Лимит строк Dune">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="250">250</option>
+              <option value="1000">1000</option>
+            </select>
+          </label>
+          <button class="button" id="duneRefreshButton" type="button" aria-label="Обновить Dune status">
+            <i data-lucide="refresh-cw" aria-hidden="true"></i><span>Status</span>
+          </button>
+          <button class="button primary" id="duneLocalScanButton" type="button" aria-label="Запустить local Base scan">
+            <i data-lucide="database-zap" aria-hidden="true"></i><span>Local scan</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="metric-strip four">
+        <div class="metric"><div class="metric-label">Saved queries</div><div class="metric-value" id="duneQueryCount">0</div><div class="metric-note">локальные шаблоны</div></div>
+        <div class="metric"><div class="metric-label">Analytics views</div><div class="metric-value" id="duneViewCount">0</div><div class="metric-note">SQLite вместо Dune tables</div></div>
+        <div class="metric"><div class="metric-label">Local rows</div><div class="metric-value" id="duneLocalRowCount">0</div><div class="metric-note">последние snapshots</div></div>
+        <div class="metric"><div class="metric-label">Last execution</div><div class="metric-value" id="duneLastExecution">—</div><div class="metric-note" id="duneLastExecutionNote">read-only SQL</div></div>
+      </div>
+
+      <div class="dune-layout">
+        <div class="table-region">
+          <div>
+            <h2>Saved queries</h2>
+            <div id="duneSavedQueries" class="dune-query-list"></div>
+          </div>
+
+          <div class="subsection">
+            <h2>SQL editor</h2>
+            <textarea class="control-textarea" id="duneSql" spellcheck="false" aria-label="Local analytics SQL"></textarea>
+            <div class="dune-toolbar">
+              <button class="button primary" id="duneRunSqlButton" type="button" aria-label="Выполнить SQL">
+                <i data-lucide="play" aria-hidden="true"></i><span>Run SQL</span>
+              </button>
+              <button class="button" id="duneRunSavedButton" type="button" aria-label="Выполнить выбранный saved query">
+                <i data-lucide="list-checks" aria-hidden="true"></i><span>Run saved</span>
+              </button>
+              <span class="muted" id="duneSelectedQuery">saved query не выбран</span>
+            </div>
+          </div>
+
+          <div class="subsection">
+            <h2>Result</h2>
+            <div class="dune-result-meta" id="duneResultMeta"></div>
+            <div id="duneResult"><div class="empty">Выбери saved query или запусти read-only SQL.</div></div>
+          </div>
+        </div>
+
+        <aside class="detail-panel">
+          <div class="detail-title">
+            <div>
+              <div class="detail-symbol">Local warehouse</div>
+              <div class="detail-contract">SQLite · Base · latest snapshots</div>
+            </div>
+            <span class="badge good" id="duneStorageBadge">no raw logs</span>
+          </div>
+
+          <div class="reason-block">
+            <h3>Sources</h3>
+            <div id="duneLocalSources" class="dune-source-grid"></div>
+          </div>
+
+          <div class="reason-block">
+            <h3>Local scan config</h3>
+            <div class="dune-scan-grid">
+              <label class="control-group">Window hours<input class="control-input" id="duneWindowHours" type="number" min="1" max="168" value="24"></label>
+              <label class="control-group">Wallets<input class="control-input" id="duneMaxWallets" type="number" min="1" max="500" value="50"></label>
+              <label class="control-group">Tokens<input class="control-input" id="duneMaxTokens" type="number" min="1" max="250" value="25"></label>
+              <label class="control-group">Min wallets<input class="control-input" id="duneMinWallets" type="number" min="1" max="20" value="1"></label>
+              <label class="control-group">HyperSync pages<input class="control-input" id="duneMaxPages" type="number" min="1" max="10" value="1"></label>
+              <label class="control-group">Pairs/token<input class="control-input" id="duneMaxPairs" type="number" min="1" max="20" value="5"></label>
+              <label class="control-group">Min liquidity<input class="control-input" id="duneMinLiquidity" type="number" min="0" step="100" value="1000"></label>
+            </div>
+            <label class="dune-checkbox"><input id="duneUseCursor" type="checkbox"> Use cursor for pool swaps</label>
+            <label class="dune-checkbox"><input id="duneGenerateSignals" type="checkbox" checked> Generate local signals</label>
+            <label class="dune-checkbox"><input id="duneAllowFallback" type="checkbox" checked> Allow transfer proxy fallback</label>
+          </div>
+
+          <div class="reason-block">
+            <h3>Retention</h3>
+            <div id="duneRetention"></div>
+          </div>
+
+          <div class="reason-block">
+            <h3>Recent executions</h3>
+            <div id="duneExecutions" class="dune-execution-list"></div>
+          </div>
+        </aside>
       </div>
     </section>
 
@@ -936,10 +1165,12 @@
 
   <script>
     const state = {
-      overview: {}, signals: [], radar: [], wallets: [], clusters: [], backtest: {}, coverage: {}, research: {}, prediction: {}, funding: {}, fundingPaper: {},
+      overview: {}, signals: [], radar: [], wallets: [], clusters: [], backtest: {}, coverage: {}, research: {}, prediction: {}, funding: {}, fundingPaper: {}, dune: {}, duneResult: null,
       radarMode: "qualified", fundingMode: "candidates", fundingSubView: "routes", selectedRadar: 0, selectedWallet: 0, selectedPrediction: 0, selectedFunding: 0, busy: false,
       fundingAuto: false,
-      fundingRefreshInFlight: false, fundingRefreshTimer: null, fundingLastStartMs: 0, fundingPollingRequestId: null
+      fundingRefreshInFlight: false, fundingRefreshTimer: null, fundingLastStartMs: 0, fundingPollingRequestId: null,
+      predictionRefreshInFlight: false, predictionRefreshTimer: null,
+      selectedDuneQuery: "", duneBusy: false, duneScanInFlight: false
     };
 
     const $ = (id) => document.getElementById(id);
@@ -1128,10 +1359,32 @@
     }
 
     async function api(path, options = {}) {
-      const response = await fetch(path, { cache: "no-store", ...options });
-      const payload = await response.json();
+      let response;
+      try {
+        response = await fetch(path, { cache: "no-store", ...options });
+      } catch (error) {
+        throw new Error(apiFetchErrorMessage(path, error));
+      }
+      const text = await response.text();
+      let payload = {};
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch (error) {
+          payload = { error: text };
+        }
+      }
       if (!response.ok) throw new Error(payload.error || payload.status || `HTTP ${response.status}`);
       return payload;
+    }
+
+    function apiFetchErrorMessage(path, error) {
+      const text = String(error?.message || error || "Failed to fetch");
+      if (text.includes("Failed to fetch") || text.includes("NetworkError")) {
+        const origin = window.location?.origin || "http://127.0.0.1:8787";
+        return `API недоступен для ${path}. Открой приложение через ${origin} и обнови страницу. Если уже открыт этот адрес, перезапусти dashboard.`;
+      }
+      return text;
     }
 
     function fundingApiPath() {
@@ -1151,6 +1404,7 @@
           ["prediction", "/api/prediction"],
           ["funding", fundingApiPath()],
           ["fundingPaper", "/api/funding-paper"],
+          ["dune", "/api/dune"],
         ];
         const results = await Promise.allSettled(requests.map(([, path]) => api(path)));
         const failed = [];
@@ -1161,6 +1415,7 @@
         });
         renderAll();
         resumeFundingRefresh();
+        resumePredictionRefresh();
         if (failed.length) {
           const critical = failed.filter((item) => item.startsWith("overview:") || item.startsWith("funding:"));
           if (critical.length) showJob({ status: "failed", message: critical.join("; "), progress: 1 });
@@ -1181,10 +1436,25 @@
       renderHeader();
     }
 
+    async function loadPredictionOnly() {
+      state.prediction = await api("/api/prediction");
+      renderPrediction();
+      renderHeader();
+    }
+
+    async function loadDuneOnly() {
+      state.dune = await api("/api/dune");
+      const job = state.dune.latest_job || {};
+      if (["queued", "running"].includes(job.status)) state.overview.latest_job = job;
+      renderDune();
+      renderHeader();
+    }
+
     function renderAll() {
       renderHeader();
       renderPrediction();
       renderFunding();
+      renderDune();
       if (window.lucide) lucide.createIcons();
     }
 
@@ -1193,10 +1463,11 @@
       const capital = state.overview.capital_readiness || {};
       const running = ["queued", "running"].includes(job.status);
       $("statusDot").className = "dot" + (running ? " running" : job.status === "failed" ? " failed" : "");
-      $("statusText").textContent = running ? "Scan выполняется" : "Local paper · Funding + Prediction";
+      $("statusText").textContent = running ? "Scan выполняется" : "Local paper · Funding + Prediction + Dune";
       updateHeaderContext();
       $("predictionScanButton").disabled = running || state.busy;
       $("fundingScanButton").disabled = running || state.busy;
+      setDuneControlsDisabled();
       renderFundingRefreshControls();
       if (running || job.status === "failed") showJob(job); else hideJob();
     }
@@ -1205,7 +1476,9 @@
       const activeView = view || document.querySelector('[data-view][aria-selected="true"]')?.dataset.view || "funding";
       $("brandSub").textContent = activeView === "funding"
         ? "Funding · live paper testing"
-        : "Prediction · paper-only";
+        : activeView === "dune"
+          ? "Dune · local analytics"
+          : "Prediction · paper-only";
       $("recomputeButton").hidden = true;
       $("scanButton").hidden = true;
     }
@@ -1228,12 +1501,31 @@
       $("scanButton").disabled = value || running || !state.overview.dune_ready;
       $("predictionScanButton").disabled = value || running;
       $("fundingScanButton").disabled = value || running;
+      setDuneControlsDisabled();
       renderFundingRefreshControls();
+    }
+
+    function setDuneControlsDisabled() {
+      const overviewJob = state.overview.latest_job || {};
+      const duneJob = state.dune.latest_job || {};
+      const running = ["queued", "running"].includes(overviewJob.status)
+        || ["queued", "running"].includes(duneJob.status);
+      const busy = state.busy || state.duneBusy;
+      ["duneRunSqlButton", "duneRunSavedButton", "duneRefreshButton"].forEach((id) => {
+        const element = $(id);
+        if (element) element.disabled = busy;
+      });
+      const scanButton = $("duneLocalScanButton");
+      if (scanButton) scanButton.disabled = busy || running || state.fundingRefreshInFlight || state.duneScanInFlight;
     }
 
     function fundingRefreshIntervalMs() {
       const seconds = Number(state.funding?.refresh_policy?.auto_refresh_seconds || 20);
       return Math.max(5, seconds) * 1000;
+    }
+
+    function predictionRefreshIntervalMs() {
+      return 300 * 1000;
     }
 
     function appJobRunning() {
@@ -1261,10 +1553,21 @@
       state.fundingRefreshTimer = null;
     }
 
+    function clearPredictionRefreshTimer() {
+      if (state.predictionRefreshTimer !== null) window.clearTimeout(state.predictionRefreshTimer);
+      state.predictionRefreshTimer = null;
+    }
+
     function scheduleFundingRefresh(delayMs) {
       clearFundingRefreshTimer();
       if (!state.fundingAuto || document.hidden || state.fundingRefreshInFlight) return;
       state.fundingRefreshTimer = window.setTimeout(() => requestFundingRefresh("auto"), Math.max(100, delayMs));
+    }
+
+    function schedulePredictionRefresh(delayMs) {
+      clearPredictionRefreshTimer();
+      if (document.hidden || state.predictionRefreshInFlight) return;
+      state.predictionRefreshTimer = window.setTimeout(() => refreshPredictionSnapshot(), Math.max(100, delayMs));
     }
 
     function resumeFundingRefresh() {
@@ -1284,6 +1587,31 @@
       const finishedAt = Date.parse(state.funding?.latest_scan?.finished_at || "") || 0;
       const remaining = finishedAt ? fundingRefreshIntervalMs() - (Date.now() - finishedAt) : 250;
       scheduleFundingRefresh(Math.max(250, remaining));
+    }
+
+    function resumePredictionRefresh() {
+      if (document.hidden) return;
+      const finishedAt = Date.parse(state.prediction?.latest_scan?.finished_at || "") || 0;
+      const remaining = finishedAt ? predictionRefreshIntervalMs() - (Date.now() - finishedAt) : predictionRefreshIntervalMs();
+      schedulePredictionRefresh(Math.max(1000, remaining));
+    }
+
+    async function refreshPredictionSnapshot() {
+      clearPredictionRefreshTimer();
+      if (document.hidden || state.predictionRefreshInFlight) return;
+      if (state.busy || appJobRunning()) {
+        schedulePredictionRefresh(1000);
+        return;
+      }
+      state.predictionRefreshInFlight = true;
+      try {
+        await loadPredictionOnly();
+      } catch (error) {
+        showJob({ status: "failed", message: error.message, progress: 1 });
+      } finally {
+        state.predictionRefreshInFlight = false;
+        schedulePredictionRefresh(predictionRefreshIntervalMs());
+      }
     }
 
     async function requestFundingRefresh(mode = "manual") {
@@ -1476,25 +1804,48 @@
       const data = state.prediction || {};
       const scan = data.latest_scan || {};
       const routes = data.routes || [];
+      const candidates = data.route_candidates || [];
+      const candidateSummary = data.candidate_summary || {};
+      const candidateStatuses = candidateSummary.status_counts || [];
       const paper = data.paper_summary || {};
-      if (state.selectedPrediction >= routes.length) state.selectedPrediction = 0;
+      const visibleRows = routes.length ? routes : candidates;
+      if (state.selectedPrediction >= visibleRows.length) state.selectedPrediction = 0;
       $("predictionRouteCount").textContent = num(routes.length);
+      const candidateCount = candidateSummary.candidate_count || candidates.length;
+      $("predictionCandidateCount").textContent = num(candidateCount);
+      const reviewCount = candidateStatuses.find((row) => row.candidate_status === "contract_review")?.candidate_count || 0;
+      const nearMissCount = candidateStatuses.find((row) => row.candidate_status === "near_miss")?.candidate_count || 0;
+      $("predictionCandidateNote").textContent = candidateCount ? `${num(reviewCount)} review · ${num(nearMissCount)} near` : "нет кандидатов";
       $("predictionPaperPnl").textContent = moneyPrecise(paper.simulated_net_profit || 0);
       $("predictionPaperNote").textContent = paper.execution_count ? `${num(paper.filled_count || 0)} filled · ${pct(paper.average_fill_ratio)}` : "нет исполнений";
       $("predictionBookCount").textContent = num(scan.orderbook_count || 0);
       $("predictionUpdatedAt").textContent = scan.finished_at ? shortTime(scan.finished_at) : "Не запускался";
+      $("predictionFreshnessNote").textContent = scan.freshness_status === "stale" ? "scan устарел" : "paper-only execution";
 
-      if (!routes.length) {
-        $("predictionTable").innerHTML = `<div class="empty"><div><strong>Paper-кандидатов сейчас нет</strong><br><span>Маршруты, не пережившие fees, depth и resolution checks, скрыты.</span></div></div>`;
+      if (!routes.length && !candidates.length) {
+        const staleText = scan.freshness_status === "stale" ? "Последний scan устарел; обнови модуль, чтобы увидеть свежие возможности." : "В последнем scan нет подходящих prediction-возможностей.";
+        $("predictionTable").innerHTML = `<div class="empty"><div><strong>Кандидатов нет</strong><br><span>${esc(staleText)}</span></div></div>`;
         renderPredictionDetail(null);
+      } else if (!routes.length) {
+        $("predictionTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Кандидат</th><th>Рынок</th><th>Площадка</th><th>Net PnL</th><th>Edge</th><th>Shares</th><th>Score</th><th>Причина</th></tr></thead><tbody>${candidates.map((row, index) => predictionCandidateRow(row, index)).join("")}</tbody></table></div>`;
+        $("predictionTable").querySelectorAll("[data-prediction-candidate-index]").forEach((button) => button.addEventListener("click", () => { state.selectedPrediction = Number(button.dataset.predictionCandidateIndex); renderPrediction(); }));
+        renderPredictionCandidateDetail(candidates[state.selectedPrediction]);
       } else {
-        $("predictionTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Маршрут</th><th>Рынок</th><th>Venue</th><th>Net PnL</th><th>Edge</th><th>Размер</th><th>Lock</th><th>Risk</th></tr></thead><tbody>${routes.map((row, index) => predictionRouteRow(row, index)).join("")}</tbody></table></div>`;
+        $("predictionTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Маршрут</th><th>Рынок</th><th>Площадка</th><th>Net PnL</th><th>Edge</th><th>Shares</th><th>Lock</th><th>Risk</th></tr></thead><tbody>${routes.map((row, index) => predictionRouteRow(row, index)).join("")}</tbody></table></div>`;
         $("predictionTable").querySelectorAll("[data-prediction-index]").forEach((button) => button.addEventListener("click", () => { state.selectedPrediction = Number(button.dataset.predictionIndex); renderPrediction(); }));
         renderPredictionDetail(routes[state.selectedPrediction]);
       }
 
+      renderPredictionStrategyMonitor(data);
+      renderPredictionAlerts(data);
+      renderPredictionPaperTrader(data);
+
       const wallets = (data.wallet_scores || []).slice(0, 10);
-      $("predictionWallets").innerHTML = wallets.length ? `<div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Label</th><th>Closed</th><th>Bayes win</th><th>PnL</th></tr></thead><tbody>${wallets.map((row) => `<tr><td>${walletInline(row.wallet_address)}</td><td><span class="badge ${row.label === "strong_specialist" ? "good" : row.label === "watch" ? "info" : "warn"}">${esc(row.label)}</span></td><td>${num(row.sample_count)}</td><td>${pct(row.posterior_win_rate)}</td><td>${money(row.total_realized_pnl_usd)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Wallet history ещё не собрана</div>`;
+      const walletSummary = data.wallet_summary || {};
+      const walletCacheNote = walletSummary.cache_status
+        ? `<div class="muted">cache ${esc(walletSummary.cache_status)} · ${walletSummary.latest_observed_at ? shortTime(walletSummary.latest_observed_at) : "нет данных"}</div>`
+        : "";
+      $("predictionWallets").innerHTML = wallets.length ? `${walletCacheNote}<div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Label</th><th>Closed</th><th>Bayes win</th><th>PnL</th></tr></thead><tbody>${wallets.map((row) => `<tr><td>${walletInline(row.wallet_address)}</td><td><span class="badge ${row.label === "strong_specialist" ? "good" : row.label === "watch" ? "info" : "warn"}">${esc(row.label)}</span></td><td>${num(row.sample_count)}</td><td>${pct(row.posterior_win_rate)}</td><td>${money(row.total_realized_pnl_usd)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Wallet history ещё не собрана</div>`;
 
       const links = data.token_links || [];
       $("predictionTokenLinks").innerHTML = links.length ? links.map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.token_symbol)}</strong><span class="badge info">${pct(row.confidence_score)}</span></div><div><a class="route-source" href="${esc(row.source_url || "#")}" target="_blank" rel="noreferrer">${esc(row.event_title)}</a></div><div class="muted">${esc(row.venue)} · ${esc(row.relation_type.replaceAll("_", " "))}</div></div>`).join("") : `<div class="empty">Прямых связей с token registry пока нет</div>`;
@@ -1503,14 +1854,52 @@
 
     function predictionRouteRow(row, index) {
       const risks = row.risk_flags || [];
-      return `<tr><td><span class="badge ${row.status === "executable" ? "good" : "info"}">${esc(row.status === "executable" ? "Executable" : "Paper")} · ${esc(predictionRouteName(row.route_type))}</span></td><td class="route-title"><button class="row-button" data-prediction-index="${index}">${esc(row.title)}</button></td><td>${esc(row.venue_scope)}</td><td class="number">${moneyPrecise(row.expected_net_profit)}</td><td class="number">${pct(row.net_edge_per_share)}</td><td class="number">${num(row.optimal_size)}</td><td class="number">${row.capital_lock_days === null || row.capital_lock_days === undefined ? "—" : num(row.capital_lock_days) + " дн."}</td><td>${risks.length ? `<span class="badge warn">${risks.length}</span>` : `<span class="badge good">clean</span>`}</td></tr>`;
+      return `<tr><td><span class="badge ${row.status === "executable" ? "good" : "info"}">${esc(row.status === "executable" ? "Executable" : "Paper")} · ${esc(predictionRouteName(row.route_type))}</span></td><td class="route-title">${predictionMarketCell(row, `data-prediction-index="${index}"`)}</td><td>${esc(predictionVenueName(row.venue_scope))}</td><td class="number">${moneyPrecise(row.expected_net_profit)}</td><td class="number">${pct(row.net_edge_per_share)}</td><td class="number">${num(row.optimal_size)}</td><td class="number">${row.capital_lock_days === null || row.capital_lock_days === undefined ? "—" : num(row.capital_lock_days) + " дн."}</td><td>${risks.length ? `<span class="badge warn">${risks.length}</span>` : `<span class="badge good">clean</span>`}</td></tr>`;
+    }
+
+    function predictionCandidateRow(row, index) {
+      const statusClass = predictionCandidateStatusClass(row.candidate_status);
+      return `<tr><td><span class="badge ${statusClass}">${esc(predictionCandidateStatusName(row.candidate_status))}</span><div class="muted">${esc(predictionRouteName(row.route_type))}</div></td><td class="route-title">${predictionMarketCell(row, `data-prediction-candidate-index="${index}"`)}</td><td>${esc(predictionVenueName(row.venue_scope))}</td><td class="number">${moneyPrecise(row.expected_net_profit)}</td><td class="number">${pct(row.net_edge_per_share)}</td><td class="number">${num(row.optimal_size)}</td><td class="number">${num(row.candidate_score)}</td><td class="muted">${esc(row.blocking_reason || row.screen_reason || "—")}</td></tr>`;
+    }
+
+    function predictionMarketCell(row, buttonAttribute) {
+      const link = predictionSourceLink(row);
+      return `<button class="row-button" ${buttonAttribute}>${esc(row.title)}</button>${link ? `<div class="muted">${link}</div>` : ""}`;
+    }
+
+    function predictionSourceLink(row) {
+      if (!row?.source_url) return "";
+      return `<a class="route-source" href="${esc(row.source_url)}" target="_blank" rel="noreferrer">Открыть ${esc(predictionVenueName(row.venue_scope))}</a>`;
+    }
+
+    function predictionVenueName(value) {
+      const text = String(value || "");
+      return ({
+        hyperliquid_hip4: "Hyperliquid HIP-4",
+        "hyperliquid_hip4+kalshi": "Hyperliquid HIP-4 + Kalshi",
+        "hyperliquid_hip4+polymarket": "Hyperliquid HIP-4 + Polymarket",
+        polymarket: "Polymarket",
+        kalshi: "Kalshi",
+        "polymarket+kalshi": "Polymarket + Kalshi",
+      })[text] || text || "—";
+    }
+
+    function predictionCandidateStatusName(value) {
+      return ({ paper_candidate: "Paper", contract_review: "Review", near_miss: "Near miss", incomplete_book: "No depth" })[value] || value || "Candidate";
+    }
+
+    function predictionCandidateStatusClass(value) {
+      return ({ paper_candidate: "good", contract_review: "warn", near_miss: "info", incomplete_book: "warn" })[value] || "info";
     }
 
     function renderPredictionDetail(row) {
       const root = $("predictionDetail");
       if (!row) {
+        const scan = (state.prediction || {}).latest_scan || {};
         const counts = (state.prediction.route_counts || []).reduce((total, item) => total + (item.route_count || 0), 0);
-        root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">No trade</div><div class="detail-contract">${num(counts)} маршрутов проверено</div></div><span class="badge good">защита капитала</span></div><p class="thesis">Radar не показывает теоретический spread, если он не переживает комиссии, доступный объём и правила резолюции.</p>`;
+        const note = scan.freshness_status === "stale" ? "последний scan устарел" : `${num(counts)} маршрутов проверено в последнем scan`;
+        const thesis = scan.freshness_status === "stale" ? "Обнови Prediction Radar, чтобы дашборд снова показывал только свежие возможности." : "В текущем снимке нет prediction-возможностей, которые стоит разбирать в дашборде.";
+        root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">Кандидатов нет</div><div class="detail-contract">${esc(note)}</div></div><span class="badge good">защита капитала</span></div><p class="thesis">${esc(thesis)}</p>`;
         return;
       }
       const risks = row.risk_flags || [];
@@ -1520,6 +1909,46 @@
       if (row.status !== "executable") {
         root.insertAdjacentHTML("beforeend", `<div class="reason-block"><h3>Execution status</h3><div class="muted">${esc(row.status)} · маршрут предназначен только для наблюдения по будущему снимку стакана; автоматическое исполнение отключено.</div></div>`);
       }
+    }
+
+    function renderPredictionCandidateDetail(row) {
+      const root = $("predictionDetail");
+      if (!row) {
+        renderPredictionDetail(null);
+        return;
+      }
+      const evidence = row.evidence || {};
+      const risks = row.risk_flags || [];
+      const rationale = evidence.rationale || [];
+      const blocking = evidence.blocking_reasons || [];
+      const advisory = evidence.advisory_reasons || [];
+      const source = row.source_url ? `<a class="route-source" href="${esc(row.source_url)}" target="_blank" rel="noreferrer">Открыть рынок</a>` : "—";
+      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(predictionCandidateStatusName(row.candidate_status))} · ${esc(predictionRouteName(row.route_type))}</div><div class="detail-contract">${esc(row.title)}</div></div><span class="badge ${predictionCandidateStatusClass(row.candidate_status)}">${num(row.candidate_score)} score</span></div><div class="detail-grid"><div><div class="detail-key">Route status</div><div class="detail-value">${esc(row.route_status)}</div></div><div><div class="detail-key">Net PnL</div><div class="detail-value">${moneyPrecise(row.expected_net_profit)}</div></div><div><div class="detail-key">Net edge</div><div class="detail-value">${pct(row.net_edge_per_share)}</div></div><div><div class="detail-key">Optimal size</div><div class="detail-value">${num(row.optimal_size)}</div></div><div><div class="detail-key">Capacity</div><div class="detail-value">${num(row.max_executable_size)}</div></div><div><div class="detail-key">Source</div><div class="detail-value">${source}</div></div><div><div class="detail-key">Reason</div><div class="detail-value">${esc(row.blocking_reason || row.screen_reason || "—")}</div></div></div>${rationale.length ? `<div class="reason-block"><h3>Почему интересно</h3><ul class="reason-list">${rationale.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${blocking.length ? `<div class="reason-block"><h3>Что блокирует</h3><ul class="reason-list">${blocking.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${advisory.length ? `<div class="reason-block"><h3>Предупреждения</h3><ul class="reason-list">${advisory.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}<div class="risk-list">${risks.length ? risks.map((risk) => `<span class="badge warn">${esc(predictionRiskName(risk))}</span>`).join("") : `<span class="badge good">critical risks не найдены</span>`}</div>`;
+    }
+
+    function renderPredictionStrategyMonitor(data) {
+      const rows = ((data.opportunity_dashboard || {}).strategy_counts || []);
+      const root = $("predictionStrategyMonitor");
+      if (!rows.length) {
+        root.innerHTML = `<div class="empty">Кандидатов нет</div>`;
+        return;
+      }
+      root.innerHTML = `<div class="table-wrap compact-table"><table><thead><tr><th>Strategy</th><th>Всего</th><th>Paper</th><th>Review</th><th>Near</th><th>Depth</th></tr></thead><tbody>${rows.map((row) => `<tr><td><strong>${esc(row.strategy_name || row.strategy_bucket)}</strong></td><td class="number">${num(row.candidate_count)}</td><td class="number">${num(row.paper_candidate)}</td><td class="number">${num(row.contract_review)}</td><td class="number">${num(row.near_miss)}</td><td class="number">${num(row.incomplete_book)}</td></tr>`).join("")}</tbody></table></div>`;
+    }
+
+    function renderPredictionAlerts(data) {
+      const board = data.opportunity_dashboard || {};
+      const alerts = board.alerts || [];
+      $("predictionAlerts").innerHTML = alerts.length ? alerts.map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.strategy_name || row.strategy_bucket || "Strategy")}</strong><span class="badge ${row.level === "good" ? "good" : row.level === "warn" ? "warn" : "info"}">${esc(row.alert_type || "alert")}</span></div><div>${esc(row.title || "—")}</div><div class="muted">${moneyPrecise(row.expected_net_profit)} · edge ${pct(row.net_edge_per_share)} · ${esc(row.reason || "")}</div></div>`).join("") : `<div class="empty">Кандидатов нет</div>`;
+    }
+
+    function renderPredictionPaperTrader(data) {
+      const paper = data.paper_summary || {};
+      const trader = data.paper_trader || {};
+      const rows = trader.strategy_rows || [];
+      const summary = `<div class="constraint-economics"><div><div class="detail-key">Executions</div><div class="detail-value">${num(paper.execution_count || 0)}</div></div><div><div class="detail-key">Filled</div><div class="detail-value">${num(paper.filled_count || 0)}</div></div><div><div class="detail-key">Profitable</div><div class="detail-value">${num(paper.profitable_count || 0)}</div></div><div><div class="detail-key">Paper PnL</div><div class="detail-value">${moneyPrecise(paper.simulated_net_profit || 0)}</div></div></div>`;
+      const table = rows.length ? `<div class="table-wrap compact-table"><table><thead><tr><th>Strategy</th><th>Status</th><th>Exec</th><th>Fill</th><th>PnL</th></tr></thead><tbody>${rows.map((row) => `<tr><td><strong>${esc(row.strategy_name || row.strategy_bucket)}</strong></td><td><span class="badge info">${esc(row.status)}</span></td><td class="number">${num(row.execution_count)}</td><td class="number">${pct(row.average_fill_ratio)}</td><td class="number">${moneyPrecise(row.simulated_net_profit)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">Paper execution появится после следующего scan с paper-кандидатом</div>`;
+      $("predictionPaperTrader").innerHTML = `${summary}${table}<div class="muted">storage: ${esc(trader.storage_policy || "latest_scan_only")}</div>`;
     }
 
     function fundingHorizonRequest() {
@@ -1559,13 +1988,14 @@
       if (state.selectedFunding >= rows.length) state.selectedFunding = 0;
       const bestProfit = candidates.length ? Math.max(...candidates.map((row) => fundingDecisionProfit(row))) : null;
       const visibleRouteCount = Number(data.visible_route_count ?? candidates.length);
+      const minVisibleProfit = Number(data.minimum_visible_profit || 1);
       const capacityEligibleCount = Number(data.capacity_eligible_route_count || 0);
       const calculatedRouteCount = Number(scan.route_count || 0);
       const universe = data.universe_summary || {};
       const universeRouteCount = Number(universe.route_count || calculatedRouteCount);
       const executionShortlistCount = Number(universe.execution_shortlist_count || calculatedRouteCount);
       $("fundingCandidateCount").textContent = num(candidates.length);
-      $("fundingCandidateNote").textContent = `${num(visibleRouteCount)} исполнимых`;
+      $("fundingCandidateNote").textContent = `${num(visibleRouteCount)} кандидатов · net ≥ ${moneyPrecise(minVisibleProfit)}`;
       $("fundingBestRoc").textContent = bestProfit === null ? "—" : moneyPrecise(bestProfit);
       $("fundingBestNote").textContent = candidates.length ? "лучший кандидат" : "нет кандидатов";
       $("fundingCapacity").textContent = num(universeRouteCount);
@@ -1585,6 +2015,7 @@
       const expectedVenues = [
         "binance", "bitget", "bybit", "okx", "gate", "bingx", "htx", "kucoin", "mexc", "kraken", "deribit",
         "backpack", "aster", "hyperliquid", "dydx", "lighter", "paradex", "vertex_base", "drift", "extended", "ethereal",
+        "woox", "coinex", "bitmart", "phemex", "aevo",
         { venue: "jupiter_perps", planned: true, meta: "pool-perp model" },
         { venue: "gmx_v2", planned: true, meta: "pool-perp model" },
       ];
@@ -1657,17 +2088,39 @@
       const accounts = data.accounts || [];
       const openPositions = data.open_positions || [];
       const events = data.events || [];
+      const systemEvents = data.system_events || events.filter((row) => !["open", "close", "settlement_pending"].includes(row.event_type));
       const closedPositions = data.closed_positions || [];
+      const exportButton = `<a class="button" href="/api/funding-paper/export.csv" download="funding-paper-trades.csv" aria-label="Экспорт сделок funding paper trader в CSV"><i data-lucide="download" aria-hidden="true"></i><span>CSV</span></a>`;
       if (!accounts.length && !openPositions.length && !events.length) {
-        root.innerHTML = `<section class="funding-paper-panel"><div class="funding-paper-head"><h2>Paper Trader</h2><span class="muted">не запущен</span></div><div class="empty"><div><strong>Виртуальный капитал ещё не инициализирован</strong><br><span>Запусти funding-paper-trader, чтобы появились балансы, сделки и CSV.</span></div></div></section>`;
+        root.innerHTML = `<section class="funding-paper-panel"><div class="funding-paper-head"><h2>Paper Trader</h2><div class="paper-head-actions"><span class="muted">не запущен</span>${exportButton}</div></div><div class="empty"><div><strong>Виртуальный капитал ещё не инициализирован</strong><br><span>Запусти funding-paper-trader, чтобы появились балансы, сделки и CSV.</span></div></div></section>`;
+        refreshIcons();
         return;
       }
       const accountRows = accounts.map((row) => `<tr><td><strong>${esc(row.venue)}</strong></td><td class="number">${moneyPrecise(row.starting_balance)}</td><td class="number">${moneyPrecise(row.cash_balance)}</td><td class="number">${moneyPrecise(row.reserved_margin)}</td><td class="number">${moneyPrecise(row.available_balance)}</td><td class="number">${moneyPrecise(row.realized_pnl)}</td></tr>`).join("");
       const openRows = openPositions.map((row) => `<tr><td><strong>${esc(row.canonical_asset)}</strong><div class="muted">${esc(row.long_venue)} → ${esc(row.short_venue)}</div></td><td class="number">${moneyPrecise(row.target_notional_per_leg)}</td><td class="number">${moneyPrecise(row.expected_live_net)}</td><td>${shortTime(row.max_settlement_at)}</td><td><span class="badge info">${esc(row.status)}</span></td></tr>`).join("");
-      const closedRows = closedPositions.slice(0, 20).map((row) => `<tr><td><strong>${esc(row.canonical_asset)}</strong><div class="muted">${esc(row.long_venue)} → ${esc(row.short_venue)}</div></td><td class="number ${Number(row.actual_net_pnl || 0) > 0 ? "positive" : Number(row.actual_net_pnl || 0) < 0 ? "negative" : ""}">${moneyPrecise(row.actual_net_pnl)}</td><td>${shortTime(row.opened_at)}</td><td>${shortTime(row.closed_at)}</td></tr>`).join("");
-      const eventRows = events.slice(0, 24).map((row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.event_type)}</strong><span class="badge ${row.telegram_status === "sent" ? "good" : row.telegram_status === "failed" ? "bad" : "info"}">${esc(row.telegram_status || "—")}</span></div><div class="muted">${shortTime(row.created_at)} · ${esc(row.message)}</div></div>`).join("");
+      const tradeRows = [
+        ...openPositions.map((row) => ({ ...row, trade_state: "open" })),
+        ...closedPositions.map((row) => ({ ...row, trade_state: "closed" })),
+      ].sort((a, b) => Date.parse(b.opened_at || b.created_at || "") - Date.parse(a.opened_at || a.created_at || ""));
+      const tradeHistoryRows = tradeRows.slice(0, 80).map((row) => {
+        const isClosed = row.trade_state === "closed";
+        const pnl = isClosed ? row.actual_net_pnl : row.expected_live_net;
+        const pnlClass = Number(pnl || 0) > 0 ? "positive" : Number(pnl || 0) < 0 ? "negative" : "";
+        const closeText = isClosed ? shortTime(row.closed_at) : shortTime(row.max_settlement_at);
+        const reasonText = isClosed ? (row.close_reason_label || "Закрыта") : "Позиция открыта";
+        const windowText = isClosed ? (row.close_window_label || "") : "Ждем ближайший funding settlement.";
+        const qualityText = isClosed ? (row.pnl_quality_label || "") : "";
+        const reasonCell = isClosed
+          ? `<strong>${esc(reasonText)}</strong>${windowText ? `<div class="muted">${esc(windowText)}</div>` : ""}${qualityText ? `<div class="muted">${esc(qualityText)}</div>` : ""}`
+          : `<span class="badge info">${esc(reasonText)}</span>${windowText ? `<div class="muted">${esc(windowText)}</div>` : ""}`;
+        return `<tr><td><strong>${esc(row.canonical_asset)}</strong><div class="muted">${esc(row.long_venue)} → ${esc(row.short_venue)}</div></td><td class="number">${moneyPrecise(row.target_notional_per_leg)}</td><td class="number ${pnlClass}">${moneyPrecise(pnl)}</td><td>${shortTime(row.opened_at)}</td><td>${closeText}</td><td>${reasonCell}</td></tr>`;
+      }).join("");
+      const cleanEventMessage = (message) => String(message || "").replace(/<[^>]+>/g, "").replace(/\n{3,}/g, "\n\n").trim();
+      const eventBadge = (row) => row.telegram_status === "sent" ? "good" : row.telegram_status === "failed" ? "bad" : "info";
+      const eventCard = (row) => `<div class="target-row"><div class="target-head"><strong>${esc(row.event_type)}</strong><span class="badge ${eventBadge(row)}">${esc(row.telegram_status || "—")}</span></div><div class="muted">${shortTime(row.created_at)}</div><div class="muted paper-event-message">${esc(cleanEventMessage(row.message))}</div></div>`;
+      const systemEventRows = systemEvents.slice(0, 60).map(eventCard).join("");
       const llmLabel = data.llm_in_execution_loop ? "LLM loop" : "no LLM loop";
-      root.innerHTML = `<section class="funding-paper-panel" aria-label="Funding Paper Trader"><div class="funding-paper-head"><h2>Paper Trader</h2><span class="muted">deterministic · ${esc(llmLabel)}</span></div><div class="funding-paper-grid"><div class="funding-paper-cell"><div class="funding-paper-label">Starting capital</div><div class="funding-paper-value">${moneyPrecise(summary.starting_capital)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Total cash</div><div class="funding-paper-value">${moneyPrecise(summary.total_cash)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Realized PnL</div><div class="funding-paper-value ${Number(summary.realized_pnl || 0) > 0 ? "positive" : Number(summary.realized_pnl || 0) < 0 ? "negative" : ""}">${moneyPrecise(summary.realized_pnl)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Open / closed</div><div class="funding-paper-value">${num(summary.open_position_count)} / ${num(summary.closed_trade_count)}</div></div></div><div class="funding-paper-stack"><div><h2>Аккаунты по биржам</h2><div class="table-wrap compact-table"><table><thead><tr><th>Venue</th><th>Start</th><th>Cash</th><th>Reserved</th><th>Available</th><th>PnL</th></tr></thead><tbody>${accountRows || `<tr><td colspan="6">—</td></tr>`}</tbody></table></div></div><div class="funding-paper-mini"><div><h2>Открытые позиции</h2><div class="table-wrap compact-table"><table><thead><tr><th>Route</th><th>Нога</th><th>Expected</th><th>Settlement</th><th>Status</th></tr></thead><tbody>${openRows || `<tr><td colspan="5">Нет открытых позиций</td></tr>`}</tbody></table></div></div><div><h2>Закрытые сделки</h2><div class="table-wrap compact-table"><table><thead><tr><th>Route</th><th>PnL</th><th>Open</th><th>Close</th></tr></thead><tbody>${closedRows || `<tr><td colspan="4">Закрытых сделок пока нет</td></tr>`}</tbody></table></div></div></div><div><h2>События и Telegram</h2><div class="paper-event-list">${eventRows || `<div class="empty">Событий пока нет</div>`}</div></div></div></section>`;
+      root.innerHTML = `<section class="funding-paper-panel" aria-label="Funding Paper Trader"><div class="funding-paper-head"><h2>Paper Trader</h2><div class="paper-head-actions"><span class="muted">deterministic · ${esc(llmLabel)}</span>${exportButton}</div></div><div class="funding-paper-grid"><div class="funding-paper-cell"><div class="funding-paper-label">Starting capital</div><div class="funding-paper-value">${moneyPrecise(summary.starting_capital)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Total cash</div><div class="funding-paper-value">${moneyPrecise(summary.total_cash)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Realized PnL</div><div class="funding-paper-value ${Number(summary.realized_pnl || 0) > 0 ? "positive" : Number(summary.realized_pnl || 0) < 0 ? "negative" : ""}">${moneyPrecise(summary.realized_pnl)}</div></div><div class="funding-paper-cell"><div class="funding-paper-label">Open / closed</div><div class="funding-paper-value">${num(summary.open_position_count)} / ${num(summary.closed_trade_count)}</div></div></div><div class="funding-paper-stack"><div class="funding-paper-mini"><div><h2>Открытые позиции</h2><div class="table-wrap compact-table"><table><thead><tr><th>Route</th><th>Нога</th><th>Expected</th><th>Settlement</th><th>Status</th></tr></thead><tbody>${openRows || `<tr><td colspan="5">Нет открытых позиций</td></tr>`}</tbody></table></div></div></div><div><h2>История входов и выходов</h2><div class="table-wrap compact-table paper-trade-history"><table><thead><tr><th>Route</th><th>Нога</th><th>PnL</th><th>Open</th><th>Close / settlement</th><th>Причина</th></tr></thead><tbody>${tradeHistoryRows || `<tr><td colspan="6">Входов и выходов пока нет</td></tr>`}</tbody></table></div></div><details class="paper-collapsible"><summary>Технические события и Telegram <span class="muted">${num(systemEvents.length)}</span></summary><div class="paper-event-list compact">${systemEventRows || `<div class="empty">Технических событий пока нет</div>`}</div></details><details class="paper-collapsible"><summary>Аккаунты по биржам <span class="muted">${num(accounts.length)}</span></summary><div class="table-wrap compact-table"><table><thead><tr><th>Venue</th><th>Start</th><th>Cash</th><th>Reserved</th><th>Available</th><th>PnL</th></tr></thead><tbody>${accountRows || `<tr><td colspan="6">—</td></tr>`}</tbody></table></div></details></div></section>`;
     }
 
     function renderFundingConstraints(data) {
@@ -1687,9 +2140,7 @@
       const nearMiss = nearMisses[0] || {};
       const blockerLabel = primary ? fundingConstraintName(primary.stage) : "текущий net после costs <= 0";
       const bestLive = nearMiss.current_raw_net === undefined ? null : Number(nearMiss.current_raw_net || 0);
-      const nearMissRows = nearMisses.slice(0, 4).map((row) => `<tr><td><strong>${esc(row.canonical_asset || "—")}</strong><div class="muted">${esc(row.long_venue || "—")} → ${esc(row.short_venue || "—")}</div></td><td>${fundingLegsCell(row)}</td><td class="number">${moneyPrecise(row.current_raw_net)}</td><td>${fundingNeededImprovementCell(row)}</td></tr>`).join("");
-      const nearMissTable = nearMissRows ? `<div class="table-wrap compact-table"><table><thead><tr><th>Near miss</th><th>Funding</th><th>Live net</th><th>VIP/Maker</th></tr></thead><tbody>${nearMissRows}</tbody></table></div>` : "";
-      root.innerHTML = `<section class="funding-diagnostics" aria-label="Funding decision summary"><div class="funding-diagnostics-head"><h2>Кандидатов нет</h2><span class="muted">${esc(blockerLabel)}</span></div><div class="constraint-economics"><div><div class="detail-key">Маршрутов</div><div class="detail-value">${num(universeRouteCount)}</div></div><div><div class="detail-key">Full-depth</div><div class="detail-value">${num(universe.execution_shortlist_count || 0)}</div></div><div><div class="detail-key">Покрывают costs</div><div class="detail-value">${num(funnel.current_raw_gross_covers_full_cost || 0)}</div></div><div><div class="detail-key">Live PnL > 0</div><div class="detail-value">${num(funnel.current_raw_positive || funnel.current_raw_actionable || 0)}</div></div><div><div class="detail-key">Лучший live net</div><div class="detail-value">${bestLive === null ? "—" : moneyPrecise(bestLive)}</div></div><div><div class="detail-key">Median gross / cost</div><div class="detail-value">${moneyPrecise(medians.current_raw_gross)} / ${moneyPrecise(medians.execution_cost)}</div></div></div>${nearMissTable}</section>`;
+      root.innerHTML = `<section class="funding-diagnostics" aria-label="Funding decision summary"><div class="funding-diagnostics-head"><h2>Кандидатов нет</h2><span class="muted">${esc(blockerLabel)}</span></div><div class="constraint-economics"><div><div class="detail-key">Маршрутов</div><div class="detail-value">${num(universeRouteCount)}</div></div><div><div class="detail-key">Full-depth</div><div class="detail-value">${num(universe.execution_shortlist_count || 0)}</div></div><div><div class="detail-key">Покрывают costs</div><div class="detail-value">${num(funnel.current_raw_gross_covers_full_cost || 0)}</div></div><div><div class="detail-key">Live PnL > 0</div><div class="detail-value">${num(funnel.current_raw_positive || funnel.current_raw_actionable || 0)}</div></div><div><div class="detail-key">Лучший live net</div><div class="detail-value">${bestLive === null ? "—" : moneyPrecise(bestLive)}</div></div><div><div class="detail-key">Median gross / cost</div><div class="detail-value">${moneyPrecise(medians.current_raw_gross)} / ${moneyPrecise(medians.execution_cost)}</div></div></div></section>`;
     }
 
     function fundingNeededImprovement(row) {
@@ -1778,7 +2229,7 @@
       const settlementCapture = evidence.decision_mode === "settlement_capture";
       const fundingCell = fundingLegsCell(row);
       const pnlCell = settlementCapture
-        ? `<strong class="${liveNowcastNet > 0 ? "positive" : ""}">${moneyPrecise(liveNowcastNet)}</strong><div class="muted">Q25 ${moneyPrecise(conservativeNet)}</div>`
+        ? `<strong class="${liveNowcastNet > 0 ? "positive" : ""}">${moneyPrecise(liveNowcastNet)}</strong><div class="muted">next settlement · after costs</div>`
         : `<strong>${moneyPrecise(conservativeNet)}</strong><div class="muted">median ${moneyPrecise(row.expected_net_profit)}</div>`;
       return `<tr><td><button class="row-button" data-funding-index="${index}"><strong>${esc(row.canonical_asset)}</strong></button><div class="muted">${esc(fundingHorizonLabel(row))}</div></td><td class="route-title"><div><span class="badge info">LONG</span> ${esc(row.long_venue)}</div><div class="muted"><span class="badge warn">SHORT</span> ${esc(row.short_venue)}</div></td><td class="number">${fundingCell}</td><td class="number">${pnlCell}</td><td>${fundingNeededImprovementCell(row)}</td><td class="number">${fundingComparisonPnlCell(row, "4h")}</td><td class="number">${fundingComparisonPnlCell(row, "8h")}</td><td class="number"><strong>${money(row.target_notional)}</strong></td><td class="number">${money(row.market_capacity)}</td><td>${fundingRiskCell(risks)}</td></tr>`;
     }
@@ -1857,8 +2308,237 @@
       const probability = Number(evidence.net_profit_probability || 0);
       const simpleLegRows = (row.legs || []).map((leg) => `<div class="route-leg"><div class="route-leg-head"><strong>${esc(leg.side.toUpperCase())} ${esc(leg.symbol)}</strong><span class="badge info">${esc(leg.venue)}</span></div><div class="route-leg-meta">${num(leg.base_quantity || 0)} ${esc(row.canonical_asset)} · notional ${money(leg.notional || 0)} · published ${signedFundingPct(leg.published_funding_rate ?? leg.funding_rate)} / ${num(leg.published_funding_interval_hours ?? leg.funding_interval_hours)}ч · cashflow ${signedFundingPct(leg.funding_rate)} / ${num(leg.funding_interval_hours)}ч · hourly ${signedFundingPct(leg.hourly_funding_rate)}${leg.funding_rate_cap_floor_state ? ` · ${esc(leg.funding_rate_cap_floor_state)}` : ""} · entry ${marketPrice(leg.open_vwap ?? leg.vwap)} · close ${marketPrice(leg.close_vwap)} · next ${shortTime(leg.next_funding_at)}</div></div>`).join("");
       const neededBlock = fundingNeededImprovementBlock(row);
-      const compactDecision = `<div><div class="detail-key">Live net PnL</div><div class="detail-value">${moneyPrecise(liveNowcastNet)}</div></div><div><div class="detail-key">Q25 net PnL</div><div class="detail-value">${moneyPrecise(conservativeNet)}</div></div>`;
+      const compactDecision = `<div><div class="detail-key">Next net PnL</div><div class="detail-value">${moneyPrecise(liveNowcastNet)}</div></div><div><div class="detail-key">History Q25 warning</div><div class="detail-value">${moneyPrecise(conservativeNet)}</div></div>`;
       root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(row.canonical_asset)}</div><div class="detail-contract">LONG ${esc(row.long_venue)} · SHORT ${esc(row.short_venue)} · ${esc(fundingHorizonLabel(row))}</div></div><span class="badge ${statusClass}">${statusLabel}</span></div><div class="detail-grid">${compactDecision}<div><div class="detail-key">Позиция / нога</div><div class="detail-value">${money(row.target_notional)}</div></div><div><div class="detail-key">Capacity</div><div class="detail-value">${money(row.market_capacity)}</div></div><div><div class="detail-key">Fees + slippage</div><div class="detail-value">${moneyPrecise(Number(row.total_fees || 0) + Number(row.slippage_cost || 0))}</div></div><div><div class="detail-key">Basis reserve</div><div class="detail-value">${moneyPrecise(row.basis_reserve)}</div></div><div><div class="detail-key">Шанс прибыли</div><div class="detail-value">${pct(probability)}</div></div><div><div class="detail-key">History role</div><div class="detail-value">${settlementCapture ? "warning only" : "gate"}</div></div></div>${neededBlock}${simpleLegRows ? `<div class="reason-block"><h3>Ноги</h3>${simpleLegRows}</div>` : ""}${fundingDecisionNoteBlock("Почему интересно", rationale, "info")}${fundingDecisionNoteBlock("Что блокирует", blocking, "bad")}${fundingDecisionNoteBlock("Предупреждения", advisories, "warn")}<div class="risk-list">${risks.map((risk) => `<span class="badge warn">${esc(fundingRiskName(risk))}</span>`).join("")}</div>`;
+    }
+
+    function renderDune() {
+      const data = state.dune || {};
+      const catalog = data.catalog || {};
+      const queries = catalog.queries || [];
+      const views = catalog.views || [];
+      const sources = data.local_sources || [];
+      const executions = data.latest_executions || [];
+      if (!state.selectedDuneQuery && queries.length) state.selectedDuneQuery = queries[0].query_slug;
+      $("duneQueryCount").textContent = num(queries.length);
+      $("duneViewCount").textContent = num(views.length);
+      $("duneLocalRowCount").textContent = num(sources.reduce((total, row) => total + Number(row.row_count || 0), 0));
+      const latest = executions[0] || null;
+      $("duneLastExecution").textContent = latest ? `#${latest.analytics_execution_id}` : "—";
+      $("duneLastExecutionNote").textContent = latest ? `${latest.status || "unknown"} · ${num(latest.row_count || 0)} rows` : "read-only SQL";
+      const editor = $("duneSql");
+      if (editor && !editor.value.trim()) editor.value = data.default_sql || "SELECT * FROM analytics_funding_routes";
+      applyDuneScanDefaults(data.scan_defaults || {});
+      renderDuneQueries(queries);
+      renderDuneSources(sources, views);
+      renderDuneRetention(data.retention || {});
+      renderDuneExecutions(executions);
+      renderDuneResult();
+      setDuneControlsDisabled();
+      refreshIcons();
+    }
+
+    function applyDuneScanDefaults(defaults) {
+      const marker = $("duneWindowHours");
+      if (!marker || marker.dataset.loaded === "true") return;
+      const values = {
+        duneWindowHours: defaults.window_hours,
+        duneMaxWallets: defaults.max_wallets,
+        duneMaxTokens: defaults.max_tokens,
+        duneMinWallets: defaults.minimum_wallets,
+        duneMaxPages: defaults.max_hypersync_pages,
+        duneMaxPairs: defaults.max_pairs_per_token,
+        duneMinLiquidity: defaults.min_pair_liquidity_usd,
+      };
+      Object.entries(values).forEach(([id, value]) => {
+        if ($(id) && value !== null && value !== undefined) $(id).value = String(value);
+      });
+      if ($("duneUseCursor")) $("duneUseCursor").checked = Boolean(defaults.use_cursor);
+      if ($("duneGenerateSignals")) $("duneGenerateSignals").checked = defaults.generate_signals !== false;
+      if ($("duneAllowFallback")) $("duneAllowFallback").checked = defaults.allow_transfer_fallback !== false;
+      marker.dataset.loaded = "true";
+    }
+
+    function renderDuneQueries(queries) {
+      const root = $("duneSavedQueries");
+      if (!queries.length) {
+        root.innerHTML = `<div class="empty">Saved queries ещё не инициализированы</div>`;
+        $("duneSelectedQuery").textContent = "saved query не выбран";
+        return;
+      }
+      root.innerHTML = queries.map((row) => `<button class="dune-query-button" type="button" data-dune-query="${esc(row.query_slug)}" aria-pressed="${row.query_slug === state.selectedDuneQuery}"><strong>${esc(row.title || row.query_slug)}</strong><span>${esc(row.description || row.query_slug)}</span></button>`).join("");
+      root.querySelectorAll("[data-dune-query]").forEach((button) => button.addEventListener("click", () => {
+        state.selectedDuneQuery = button.dataset.duneQuery || "";
+        renderDuneQueries(queries);
+      }));
+      const selected = queries.find((row) => row.query_slug === state.selectedDuneQuery);
+      $("duneSelectedQuery").textContent = selected ? selected.title : "saved query не выбран";
+    }
+
+    function renderDuneSources(sources, views) {
+      const root = $("duneLocalSources");
+      const sourceRows = sources.map((row) => {
+        const hasRows = Number(row.row_count || 0) > 0;
+        return `<div class="dune-source-row"><div><strong>${esc(row.label)}</strong><div class="muted">${esc(row.table)} · ${esc(row.source)} · ${num(row.snapshot_count || 0)} snapshot</div><div class="muted">${row.latest_observed_at ? shortTime(row.latest_observed_at) : "нет снимка"}</div></div><span class="badge ${hasRows ? "good" : "info"}">${num(row.row_count || 0)}</span></div>`;
+      }).join("");
+      const viewRows = views.map((row) => `<div class="dune-source-row"><div><strong>${esc(row.name)}</strong><div class="muted">analytics view</div></div><span class="badge info">view</span></div>`).join("");
+      root.innerHTML = sourceRows + (viewRows ? `<div class="reason-block"><h3>Views</h3>${viewRows}</div>` : "");
+    }
+
+    function renderDuneRetention(retention) {
+      const rawLogs = retention.raw_logs_stored ? "on" : "off";
+      $("duneStorageBadge").className = `badge ${retention.raw_logs_stored ? "warn" : "good"}`;
+      $("duneStorageBadge").textContent = retention.raw_logs_stored ? "raw logs on" : "no raw logs";
+      $("duneRetention").innerHTML = `<div class="target-row"><div class="target-head"><strong>Raw HyperSync logs</strong><span class="badge ${retention.raw_logs_stored ? "warn" : "good"}">${esc(rawLogs)}</span></div><div class="muted">Сырые события не сохраняются после scan.</div></div><div class="target-row"><div class="target-head"><strong>Local snapshots</strong><span class="badge good">latest ${num(retention.local_snapshot_retention || 1)}</span></div><div class="muted">Старые local_dex и market snapshots удаляются после каждого запуска.</div></div><div class="target-row"><div class="target-head"><strong>SQL executions</strong><span class="badge info">latest ${num(retention.analytics_execution_retention || 5)}</span></div><div class="muted">Сохраняется только техническая metadata: status, row_count, hash; строки результата не пишутся в базу.</div></div>`;
+    }
+
+    function renderDuneExecutions(executions) {
+      const root = $("duneExecutions");
+      if (!executions.length) {
+        root.innerHTML = `<div class="empty">Запусков SQL ещё нет</div>`;
+        return;
+      }
+      root.innerHTML = executions.map((row) => `<div class="target-row"><div class="target-head"><strong>#${num(row.analytics_execution_id)}</strong><span class="badge ${row.status === "completed" ? "good" : row.status === "failed" ? "bad" : "info"}">${esc(row.status)}</span></div><div class="muted">${esc(row.query_slug || "custom sql")} · ${num(row.row_count || 0)} rows · ${num(row.elapsed_ms || 0)}ms · ${shortTime(row.started_at)}</div>${row.error ? `<div class="muted">${esc(row.error)}</div>` : ""}</div>`).join("");
+    }
+
+    function renderDuneResult() {
+      const result = state.duneResult || null;
+      const error = state.duneResultError || "";
+      if (error) {
+        $("duneResultMeta").innerHTML = `<span class="badge bad">error</span><span>${esc(error)}</span>`;
+        $("duneResult").innerHTML = `<div class="empty"><div><strong>SQL не выполнен</strong><br><span>${esc(error)}</span></div></div>`;
+        return;
+      }
+      if (!result) {
+        $("duneResultMeta").innerHTML = `<span class="badge info">read-only</span><span>Результаты запросов не сохраняются в SQLite.</span>`;
+        return;
+      }
+      const columns = result.columns || [];
+      const rows = result.rows || [];
+      $("duneResultMeta").innerHTML = `<span class="badge good">execution #${num(result.analytics_execution_id)}</span><span>${num(result.row_count || rows.length)} rows · limit ${num(result.limit || 0)} · ${esc(result.query_slug || "custom sql")}</span>`;
+      if (!columns.length) {
+        $("duneResult").innerHTML = `<div class="empty">Запрос вернул пустую схему</div>`;
+        return;
+      }
+      if (!rows.length) {
+        $("duneResult").innerHTML = `<div class="table-wrap"><table><thead><tr>${columns.map((column) => `<th>${esc(column)}</th>`).join("")}</tr></thead><tbody><tr><td colspan="${columns.length}"><div class="empty">Строк нет</div></td></tr></tbody></table></div>`;
+        return;
+      }
+      $("duneResult").innerHTML = `<div class="table-wrap"><table><thead><tr>${columns.map((column) => `<th>${esc(column)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td class="${duneCellClass(row[column])}">${formatDuneCell(row[column])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+    }
+
+    function duneCellClass(value) {
+      if (typeof value === "number") return "number dune-cell";
+      if (typeof value === "string" && value.startsWith("0x")) return "mono dune-cell";
+      return "dune-cell";
+    }
+
+    function formatDuneCell(value) {
+      if (value === null || value === undefined) return "—";
+      if (typeof value === "number") return Number.isInteger(value) ? num(value) : num(value);
+      if (typeof value === "object") return esc(JSON.stringify(value));
+      return esc(value);
+    }
+
+    function setDuneBusy(value) {
+      state.duneBusy = value;
+      setDuneControlsDisabled();
+    }
+
+    function duneLimit() {
+      return Number($("duneLimit").value || 100);
+    }
+
+    async function runDuneSavedQuery() {
+      const queries = state.dune?.catalog?.queries || [];
+      const slug = state.selectedDuneQuery || queries[0]?.query_slug || "";
+      if (!slug) {
+        state.duneResultError = "Нет выбранного saved query";
+        renderDuneResult();
+        return;
+      }
+      setDuneBusy(true);
+      state.duneResultError = "";
+      $("duneResultMeta").innerHTML = `<span class="badge info">running</span><span>Выполняю ${esc(slug)}</span>`;
+      try {
+        const response = await api("/api/dune/saved-query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, limit: duneLimit() }),
+        });
+        state.duneResult = response.result;
+        await loadDuneOnly();
+      } catch (error) {
+        state.duneResult = null;
+        state.duneResultError = error.message;
+        renderDuneResult();
+      } finally {
+        setDuneBusy(false);
+      }
+    }
+
+    async function runDuneSql() {
+      const sql = $("duneSql").value;
+      setDuneBusy(true);
+      state.duneResultError = "";
+      $("duneResultMeta").innerHTML = `<span class="badge info">running</span><span>Выполняю custom SQL</span>`;
+      try {
+        const response = await api("/api/dune/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sql, limit: duneLimit() }),
+        });
+        state.duneResult = response.result;
+        await loadDuneOnly();
+      } catch (error) {
+        state.duneResult = null;
+        state.duneResultError = error.message;
+        renderDuneResult();
+      } finally {
+        setDuneBusy(false);
+      }
+    }
+
+    function duneScanPayload() {
+      return {
+        window_hours: Number($("duneWindowHours").value || 24),
+        max_wallets: Number($("duneMaxWallets").value || 50),
+        max_tokens: Number($("duneMaxTokens").value || 25),
+        minimum_wallets: Number($("duneMinWallets").value || 1),
+        max_hypersync_pages: Number($("duneMaxPages").value || 1),
+        max_pairs_per_token: Number($("duneMaxPairs").value || 5),
+        min_pair_liquidity_usd: Number($("duneMinLiquidity").value || 1000),
+        use_cursor: $("duneUseCursor").checked,
+        generate_signals: $("duneGenerateSignals").checked,
+        allow_transfer_fallback: $("duneAllowFallback").checked,
+      };
+    }
+
+    async function requestDuneLocalScan() {
+      if (state.duneScanInFlight) return;
+      state.duneScanInFlight = true;
+      setDuneControlsDisabled();
+      try {
+        const job = await api("/api/actions/dune-local-scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(duneScanPayload()),
+        });
+        state.overview.latest_job = {
+          job_id: job.job_id,
+          job_type: "dune_local_base_scan",
+          status: "queued",
+          progress: 0.05,
+          message: "Local Base scan поставлен в очередь",
+        };
+        showJob({ status: "running", message: "Local Base scan поставлен в очередь", progress: 0.05 });
+        setDuneControlsDisabled();
+        pollJob(job.job_id);
+      } catch (error) {
+        state.duneScanInFlight = false;
+        setDuneControlsDisabled();
+        showJob({ status: "failed", message: error.message, progress: 1 });
+      }
     }
 
     function renderWallets() {
@@ -2087,23 +2767,54 @@
       else clearFundingRefreshTimer();
     });
 
+    $("duneRefreshButton").addEventListener("click", async () => {
+      setDuneBusy(true);
+      try {
+        await loadDuneOnly();
+      } catch (error) {
+        showJob({ status: "failed", message: error.message, progress: 1 });
+      } finally {
+        setDuneBusy(false);
+      }
+    });
+
+    $("duneRunSqlButton").addEventListener("click", runDuneSql);
+    $("duneRunSavedButton").addEventListener("click", runDuneSavedQuery);
+    $("duneLocalScanButton").addEventListener("click", requestDuneLocalScan);
+
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) clearFundingRefreshTimer();
-      else resumeFundingRefresh();
+      if (document.hidden) {
+        clearFundingRefreshTimer();
+        clearPredictionRefreshTimer();
+      } else {
+        resumeFundingRefresh();
+        resumePredictionRefresh();
+      }
     });
 
     async function pollJob(jobId) {
       try {
-        const job = await api("/api/jobs/latest");
+        const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
         showJob(job);
+        if (job.job_type === "dune_local_base_scan" && ["success", "failed"].includes(job.status)) {
+          state.duneScanInFlight = false;
+        }
         if (["success", "failed"].includes(job.status)) {
           $("scanButton").disabled = false;
           $("predictionScanButton").disabled = false;
+          $("fundingScanButton").disabled = false;
           if (job.status === "success") await loadAll();
+          setDuneControlsDisabled();
           renderFundingRefreshControls();
           return;
         }
-      } catch (error) { showJob({ status: "failed", message: error.message, progress: 1 }); return; }
+      } catch (error) {
+        state.duneScanInFlight = false;
+        setDuneControlsDisabled();
+        showJob({ status: "failed", message: error.message, progress: 1 });
+        return;
+      }
+      setDuneControlsDisabled();
       window.setTimeout(() => pollJob(jobId), 3000);
     }
 

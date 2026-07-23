@@ -7,12 +7,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from smart_money_radar.funding.adapters import (
+    AevoFundingClient,
     AsterFundingClient,
     BackpackFundingClient,
     BinanceFundingClient,
     BingXFundingClient,
+    BitMartFundingClient,
     BitgetFundingClient,
     BybitFundingClient,
+    CoinExFundingClient,
     DeribitFundingClient,
     DydxFundingClient,
     DriftFundingClient,
@@ -30,6 +33,7 @@ from smart_money_radar.funding.adapters import (
     OKXFundingClient,
     ParadexFundingClient,
     VertexFundingClient,
+    WOOXFundingClient,
 )
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.normalization import (
@@ -39,16 +43,59 @@ from smart_money_radar.funding.normalization import (
     normalize_stored_orderbook_units,
 )
 from smart_money_radar.funding.paper import simulate_paper_revalidations
+from smart_money_radar.funding.retention import apply_funding_retention_plan
 from smart_money_radar.funding.scanner import (
     execution_shortlist,
     funding_universe_row,
     rank_perp_pairs,
     scan_ranked_pairs,
 )
+from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
 
 
-FUNDING_AUTO_SCAN_RETENTION = 360
+FUNDING_SCAN_RETENTION = 1
+FUNDING_HISTORY_RETENTION_PER_MARKET = 24
+RETENTION_SCAN_MODES = {"auto", "watch"}
+
+
+def active_default_funding_clients() -> list[FundingVenueClient]:
+    return [
+        BinanceFundingClient(),
+        BitgetFundingClient(),
+        HyperliquidFundingClient(),
+        BybitFundingClient(),
+        OKXFundingClient(),
+        DydxFundingClient(),
+        GateFundingClient(),
+        HTXFundingClient(),
+        BackpackFundingClient(),
+        DriftFundingClient(),
+        EtherealFundingClient(),
+        ExtendedFundingClient(),
+        AsterFundingClient(),
+        LighterFundingClient(),
+        KuCoinFundingClient(),
+        MEXCFundingClient(),
+        ParadexFundingClient(),
+        KrakenFundingClient(),
+        DeribitFundingClient(),
+        VertexFundingClient(),
+        WOOXFundingClient(),
+        CoinExFundingClient(),
+        BitMartFundingClient(),
+        AevoFundingClient(),
+    ]
+
+
+def filter_deactivated_funding_clients(
+    clients: list[FundingVenueClient],
+) -> list[FundingVenueClient]:
+    return [
+        client
+        for client in clients
+        if str(client.venue).lower() not in DEACTIVATED_FUNDING_VENUES
+    ]
 
 
 def run_funding_scan(
@@ -90,7 +137,7 @@ def run_funding_scan(
     if observed_datetime.tzinfo is None:
         observed_datetime = observed_datetime.replace(tzinfo=UTC)
     if venue_clients is not None:
-        configured_clients = list(venue_clients)
+        configured_clients = filter_deactivated_funding_clients(list(venue_clients))
     elif any(
         client is not None
         for client in (
@@ -108,30 +155,9 @@ def run_funding_scan(
             )
             if client is not None
         ]
+        configured_clients = filter_deactivated_funding_clients(configured_clients)
     else:
-        configured_clients = [
-            BinanceFundingClient(),
-            BitgetFundingClient(),
-            HyperliquidFundingClient(),
-            BybitFundingClient(),
-            OKXFundingClient(),
-            DydxFundingClient(),
-            GateFundingClient(),
-            BingXFundingClient(),
-            HTXFundingClient(),
-            BackpackFundingClient(),
-            DriftFundingClient(),
-            EtherealFundingClient(),
-            ExtendedFundingClient(),
-            AsterFundingClient(),
-            LighterFundingClient(),
-            KuCoinFundingClient(),
-            MEXCFundingClient(),
-            ParadexFundingClient(),
-            KrakenFundingClient(),
-            DeribitFundingClient(),
-            VertexFundingClient(),
-        ]
+        configured_clients = active_default_funding_clients()
     clients = {str(client.venue): client for client in configured_clients}
     warnings: list[str] = []
     counts = {
@@ -226,6 +252,7 @@ def run_funding_scan(
         counts["market_snapshot_count"] = store.insert_funding_market_snapshots(
             scan_id,
             markets,
+            include_raw_json=settings.store_diagnostic_raw_json,
         )
 
         universe_candidates = rank_perp_pairs(
@@ -459,6 +486,7 @@ def run_funding_scan(
         counts["orderbook_count"] = store.insert_funding_orderbooks(
             scan_id,
             fresh_books,
+            include_raw_json=settings.store_diagnostic_raw_json,
         )
         counts["orderbook_count"] = len(books)
         routes = scan_ranked_pairs(
@@ -484,8 +512,12 @@ def run_funding_scan(
         )
         store.insert_funding_scan_warnings(scan_id, warnings)
         store.finish_funding_scan(scan_id, "success", **counts)
-        if normalized_scan_mode == "auto":
-            store.prune_funding_auto_scans(FUNDING_AUTO_SCAN_RETENTION)
+        if normalized_scan_mode in RETENTION_SCAN_MODES:
+            apply_funding_retention_plan(
+                store,
+                keep_latest_scans=FUNDING_SCAN_RETENTION,
+                keep_latest_history_per_market=FUNDING_HISTORY_RETENTION_PER_MARKET,
+            )
         return {
             "funding_scan_id": scan_id,
             "status": "success",
@@ -614,29 +646,9 @@ def backfill_funding_history(
     observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
     history_start = observed.astimezone(UTC) - timedelta(days=max(30, min(days, 90)))
     history_start_ms = int(history_start.timestamp() * 1000)
-    clients_list = venue_clients or [
-        BinanceFundingClient(),
-        BitgetFundingClient(),
-        HyperliquidFundingClient(),
-        BybitFundingClient(),
-        OKXFundingClient(),
-        DydxFundingClient(),
-        GateFundingClient(),
-        BingXFundingClient(),
-        HTXFundingClient(),
-        BackpackFundingClient(),
-        DriftFundingClient(),
-        EtherealFundingClient(),
-        ExtendedFundingClient(),
-        AsterFundingClient(),
-        LighterFundingClient(),
-        KuCoinFundingClient(),
-        MEXCFundingClient(),
-        ParadexFundingClient(),
-        KrakenFundingClient(),
-        DeribitFundingClient(),
-        VertexFundingClient(),
-    ]
+    clients_list = filter_deactivated_funding_clients(
+        list(venue_clients) if venue_clients is not None else active_default_funding_clients()
+    )
     clients = {str(client.venue): client for client in clients_list}
     catalog_results: list[tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]] = []
     warnings: list[str] = []
@@ -726,6 +738,11 @@ def backfill_funding_history(
             observed_at,
             rows,
         )
+    retention = apply_funding_retention_plan(
+        store,
+        keep_latest_scans=FUNDING_SCAN_RETENTION,
+        keep_latest_history_per_market=FUNDING_HISTORY_RETENTION_PER_MARKET,
+    )
     warnings.extend(
         f"{venue} {symbol} history skipped: {error}"
         for (venue, symbol), error in sorted(failures.items())
@@ -741,6 +758,7 @@ def backfill_funding_history(
         "synced_market_count": len(histories),
         "remaining_market_count": max(0, len(pending) - len(histories)),
         "imported_row_count": imported_rows,
+        "retention": retention,
         "warnings": warnings,
     }
 

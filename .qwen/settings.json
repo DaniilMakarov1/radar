@@ -1,0 +1,49 @@
+{
+  "tools": {
+    "approvalMode": "yolo"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)",
+      "Bash(git *)",
+      "Bash(pip *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(diff *)",
+      "Bash(sqlite3 *)",
+      "Bash(curl *)",
+      "Bash(jq *)",
+      "Bash(node *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(which *)",
+      "Bash(echo *)",
+      "Bash(printf *)",
+      "Bash(touch *)",
+      "Bash(chmod *)",
+      "Bash(du *)",
+      "Bash(df *)",
+      "Bash(env *)",
+      "Bash(export *)",
+      "Bash(source *)",
+      "Bash(kill *)",
+      "Bash(ps *)",
+      "Bash(launchctl *)",
+      "Bash(open *)",
+      "Bash(pbcopy *)",
+      "Bash(pbpaste *)"
+    ]
+  },
+  "$version": 4
+}

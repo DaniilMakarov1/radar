@@ -2,22 +2,27 @@ from __future__ import annotations
 
 import csv
 import signal
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from html import escape as html_escape
 from pathlib import Path
 from types import FrameType
 from typing import Any
 
 from smart_money_radar.config import PROJECT_ROOT
 from smart_money_radar.funding.adapters import (
+    AevoFundingClient,
     AsterFundingClient,
     BackpackFundingClient,
     BinanceFundingClient,
     BingXFundingClient,
+    BitMartFundingClient,
     BitgetFundingClient,
     BybitFundingClient,
+    CoinExFundingClient,
     DeribitFundingClient,
     DriftFundingClient,
     DydxFundingClient,
@@ -33,7 +38,9 @@ from smart_money_radar.funding.adapters import (
     MEXCFundingClient,
     OKXFundingClient,
     ParadexFundingClient,
+    PhemexFundingClient,
     VertexFundingClient,
+    WOOXFundingClient,
 )
 from smart_money_radar.funding.adapters.base import FundingDataError, FundingHttpClient
 from smart_money_radar.funding.economics import evaluate_perp_route
@@ -42,9 +49,18 @@ from smart_money_radar.funding.normalization import (
     normalize_orderbook_canonical_units,
     normalize_stored_orderbook_units,
 )
+from smart_money_radar.funding.presentation import (
+    filter_deactivated_funding_paper_payload,
+)
+from smart_money_radar.funding.retention import apply_funding_retention_plan
 from smart_money_radar.funding.service import run_funding_scan
+from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.notifications import TelegramNotifier
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
+
+
+FUNDING_HISTORY_RETENTION_PER_MARKET = 24
+FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 
 
 @dataclass(frozen=True)
@@ -52,21 +68,25 @@ class FundingPaperTraderConfig:
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
     entry_window_seconds: int = 180
-    entry_min_lead_seconds: int = 30
-    entry_max_lead_seconds: int = 60
+    entry_min_lead_seconds: int = 0
+    entry_max_lead_seconds: int = 15
     arm_window_seconds: int = 900
+    final_recheck_freeze_seconds: int = 15
+    max_entry_snapshot_age_seconds: int = 30
     settlement_grace_seconds: int = 90
     max_settlement_publication_lag_seconds: int = 300
     collateral_reserve_fraction: float = 0.10
     min_live_net_profit: float = 0.0
-    scan_interval_seconds: int = 60
+    scan_interval_seconds: int = 300
+    monitor_interval_seconds: int = 120
     hot_interval_seconds: int = 10
-    status_report_interval_seconds: int = 1_800
+    hot_route_recheck_workers: int = 6
+    status_report_interval_seconds: int = 3_600
     status_report_max_routes: int = 5
+    retention_interval_seconds: int = 300
     iterations: int | None = None
     export_dir: Path = PROJECT_ROOT / "exports" / "funding_paper"
     telegram_enabled: bool = True
-    close_after_first_settlement_pair: bool = True
     focused_recheck_enabled: bool = True
 
     def validated(self) -> "FundingPaperTraderConfig":
@@ -79,12 +99,20 @@ class FundingPaperTraderConfig:
                 min(int(self.entry_min_lead_seconds), 300),
             ),
             entry_max_lead_seconds=max(
-                15,
+                1,
                 min(int(self.entry_max_lead_seconds), 900),
             ),
             arm_window_seconds=max(
                 int(self.entry_window_seconds),
                 min(int(self.arm_window_seconds), 7_200),
+            ),
+            final_recheck_freeze_seconds=max(
+                0,
+                min(int(self.final_recheck_freeze_seconds), 60),
+            ),
+            max_entry_snapshot_age_seconds=max(
+                5,
+                min(int(self.max_entry_snapshot_age_seconds), 300),
             ),
             settlement_grace_seconds=max(
                 15,
@@ -100,7 +128,12 @@ class FundingPaperTraderConfig:
             ),
             min_live_net_profit=max(0.0, float(self.min_live_net_profit)),
             scan_interval_seconds=max(10, int(self.scan_interval_seconds)),
+            monitor_interval_seconds=max(10, int(self.monitor_interval_seconds)),
             hot_interval_seconds=max(5, int(self.hot_interval_seconds)),
+            hot_route_recheck_workers=max(
+                1,
+                min(int(self.hot_route_recheck_workers), 16),
+            ),
             status_report_interval_seconds=max(
                 0,
                 min(int(self.status_report_interval_seconds), 86_400),
@@ -109,6 +142,10 @@ class FundingPaperTraderConfig:
                 1,
                 min(int(self.status_report_max_routes), 20),
             ),
+            retention_interval_seconds=max(
+                30,
+                min(int(self.retention_interval_seconds), 3_600),
+            ),
             iterations=(
                 None
                 if self.iterations is None
@@ -116,9 +153,6 @@ class FundingPaperTraderConfig:
             ),
             export_dir=Path(self.export_dir),
             telegram_enabled=bool(self.telegram_enabled),
-            close_after_first_settlement_pair=bool(
-                self.close_after_first_settlement_pair
-            ),
             focused_recheck_enabled=bool(self.focused_recheck_enabled),
         ).normalized_entry_leads()
 
@@ -150,6 +184,7 @@ class FundingPaperTrader:
         self.hot_routes: dict[str, dict[str, Any]] = {}
         self.last_full_scan_monotonic = 0.0
         self.last_status_report_monotonic = 0.0
+        self.last_retention_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
         self.stop_requested = False
         self.stop_reason: str | None = None
@@ -292,8 +327,16 @@ class FundingPaperTrader:
         return self.run_full_iteration()
 
     def should_run_hot_iteration(self) -> bool:
+        if self.store.funding_paper_open_positions():
+            return True
         if not self.hot_routes or self.last_full_scan_monotonic <= 0:
             return False
+        now = datetime.now(UTC)
+        if any(
+            route_monitor_decision(route, now, self.config)["urgent"]
+            for route in self.hot_routes.values()
+        ):
+            return True
         elapsed = time.monotonic() - self.last_full_scan_monotonic
         return elapsed < self.config.scan_interval_seconds
 
@@ -321,8 +364,10 @@ class FundingPaperTrader:
         self.update_hot_routes([*routes, *watch_routes])
         close_events = self.process_open_positions()
         entry_events = self.process_entry_candidates(routes)
+        repriced_count = self.refresh_and_publish_repriced_pnl()
         snapshot = self.store.record_funding_paper_equity_snapshot()
         export_funding_paper_csv(self.store, self.config.export_dir)
+        self.apply_watch_scan_retention(minimum_keep_latest_scans=max(1, len(routes) + 1))
         result = {
             "mode": "full_market",
             "funding_scan_id": scan_result["funding_scan_id"],
@@ -330,22 +375,30 @@ class FundingPaperTrader:
             "watch_count": len(watch_routes),
             "opened_count": len(entry_events),
             "closed_count": sum(1 for event in close_events if event == "closed"),
+            "repriced_count": repriced_count,
             "pending_count": sum(
                 1 for event in close_events if event == "settlement_pending"
             ),
+            "held_count": sum(1 for event in close_events if event == "held"),
+            "open_position_count": snapshot["open_position_count"],
             "hot_route_count": count_hot_routes([*routes, *watch_routes], self.config),
+            "urgent_route_count": count_urgent_routes([*routes, *watch_routes], self.config),
+            "universe_route_count": scan_result.get("universe_route_count"),
+            "execution_shortlist_count": scan_result.get("execution_shortlist_count"),
+            "route_count": scan_result.get("route_count"),
             "equity": snapshot,
         }
-        self.record_event(
-            "scan",
-            (
-                "Funding paper scan "
-                f"{scan_result['funding_scan_id']}: candidates={len(routes)}, "
-                f"opened={result['opened_count']}, closed={result['closed_count']}"
-            ),
-            result,
-            notify=False,
-        )
+        if should_record_routine_scan(result):
+            self.record_event(
+                "scan",
+                (
+                    "Funding paper scan "
+                    f"{scan_result['funding_scan_id']}: candidates={len(routes)}, "
+                    f"opened={result['opened_count']}, closed={result['closed_count']}"
+                ),
+                result,
+                notify=False,
+            )
         self.maybe_record_status_report(result, routes, watch_routes)
         return result
 
@@ -368,8 +421,12 @@ class FundingPaperTrader:
             routes,
             recheck_before_open=False,
         )
+        repriced_count = self.refresh_and_publish_repriced_pnl()
         snapshot = self.store.record_funding_paper_equity_snapshot()
         export_funding_paper_csv(self.store, self.config.export_dir)
+        self.apply_watch_scan_retention(
+            minimum_keep_latest_scans=max(1, len(rechecked_routes) + 1)
+        )
         scan_ids = [
             int(row.get("funding_scan_id") or 0)
             for row in rechecked_routes
@@ -382,24 +439,74 @@ class FundingPaperTrader:
             "watch_count": len(watch_routes),
             "opened_count": len(entry_events),
             "closed_count": sum(1 for event in close_events if event == "closed"),
+            "repriced_count": repriced_count,
             "pending_count": sum(
                 1 for event in close_events if event == "settlement_pending"
             ),
+            "held_count": sum(1 for event in close_events if event == "held"),
+            "open_position_count": snapshot["open_position_count"],
             "hot_route_count": len(self.hot_routes),
+            "urgent_route_count": count_urgent_routes(
+                list(self.hot_routes.values()),
+                self.config,
+            ),
             "equity": snapshot,
         }
-        self.record_event(
-            "hot_scan",
-            (
-                "Funding paper hot scan: "
-                f"tracked={len(self.hot_routes)}, candidates={len(routes)}, "
-                f"opened={result['opened_count']}, closed={result['closed_count']}"
-            ),
-            result,
-            notify=False,
-        )
+        if should_record_routine_scan(result):
+            self.record_event(
+                "hot_scan",
+                (
+                    "Funding paper hot scan: "
+                    f"tracked={len(self.hot_routes)}, candidates={len(routes)}, "
+                    f"opened={result['opened_count']}, closed={result['closed_count']}"
+                ),
+                result,
+                notify=False,
+            )
         self.maybe_record_status_report(result, routes, watch_routes)
         return result
+
+    def apply_watch_scan_retention(
+        self,
+        *,
+        minimum_keep_latest_scans: int = FUNDING_PAPER_WATCH_SCAN_RETENTION,
+    ) -> None:
+        now_monotonic = time.monotonic()
+        if (
+            self.last_retention_monotonic > 0
+            and now_monotonic - self.last_retention_monotonic
+            < self.config.retention_interval_seconds
+        ):
+            return
+        keep_latest_scans = max(
+            FUNDING_PAPER_WATCH_SCAN_RETENTION,
+            int(minimum_keep_latest_scans),
+        )
+        try:
+            apply_funding_retention_plan(
+                self.store,
+                keep_latest_scans=keep_latest_scans,
+                keep_latest_history_per_market=FUNDING_HISTORY_RETENTION_PER_MARKET,
+            )
+            self.last_retention_monotonic = time.monotonic()
+        except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+            if not is_retention_skip_error(exc):
+                raise
+            self.last_retention_monotonic = time.monotonic()
+            try:
+                self.record_event(
+                    "retention_skipped",
+                    (
+                        "Funding Paper Trader retention skipped\n"
+                        f"Reason: {type(exc).__name__}: {exc}; "
+                        "trading loop continues."
+                    ),
+                    {"error": str(exc), "keep_latest_scans": keep_latest_scans},
+                    notify=False,
+                    severity="warning",
+                )
+            except sqlite3.DatabaseError:
+                pass
 
     def maybe_record_status_report(
         self,
@@ -417,22 +524,22 @@ class FundingPaperTrader:
         ):
             return
         self.last_status_report_monotonic = now_monotonic
-        dashboard = self.store.funding_paper_dashboard()
+        dashboard = filter_deactivated_funding_paper_payload(
+            self.store.funding_paper_dashboard(refresh_estimates=False)
+        )
+        publishable_routes = [
+            route for route in routes if status_publishable_candidate(route, self.config)
+        ]
         payload = {
             "result": result,
             "summary": dashboard.get("summary") or {},
             "candidate_routes": [
                 route_summary(route)
-                for route in ranked_status_routes(routes)[
+                for route in ranked_status_routes(publishable_routes)[
                     : self.config.status_report_max_routes
                 ]
             ],
-            "watch_routes": [
-                route_summary(route)
-                for route in ranked_status_routes(watch_routes)[
-                    : self.config.status_report_max_routes
-                ]
-            ],
+            "internal_watch_count": len(watch_routes),
         }
         self.record_event(
             "status_report",
@@ -489,17 +596,23 @@ class FundingPaperTrader:
                 self.hot_routes.pop(route_key, None)
 
     def refresh_hot_routes(self) -> list[dict[str, Any]]:
-        refreshed: list[dict[str, Any]] = []
-        now = datetime.now(UTC)
-        for route_key, route in list(self.hot_routes.items()):
-            fresh = self.focused_recheck_route(route)
+        route_items = list(self.hot_routes.items())
+        if not route_items:
+            return []
+        refreshed_by_key: dict[str, dict[str, Any]] = {}
+
+        def handle_result(
+            route_key: str,
+            route: dict[str, Any],
+            fresh: dict[str, Any] | None,
+        ) -> None:
             if not fresh:
                 self.hot_routes.pop(route_key, None)
-                continue
-            decision = route_monitor_decision(fresh, now, self.config)
+                return
+            decision = route_monitor_decision(fresh, datetime.now(UTC), self.config)
             if decision["hot"]:
                 self.hot_routes[route_key] = fresh
-                refreshed.append(fresh)
+                refreshed_by_key[route_key] = fresh
             else:
                 self.hot_routes.pop(route_key, None)
                 self.record_event(
@@ -512,16 +625,114 @@ class FundingPaperTrader:
                     notify=False,
                     severity="warning",
                 )
-        return refreshed
+
+        workers = min(self.config.hot_route_recheck_workers, len(route_items))
+        if workers <= 1:
+            for route_key, route in route_items:
+                handle_result(route_key, route, self.focused_recheck_route(route))
+            return [
+                refreshed_by_key[route_key]
+                for route_key, _route in route_items
+                if route_key in refreshed_by_key
+            ]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(self.focused_recheck_route, route): (route_key, route)
+                for route_key, route in route_items
+            }
+            for future in as_completed(futures):
+                route_key, route = futures[future]
+                try:
+                    fresh = future.result()
+                except Exception as exc:
+                    self.record_event(
+                        "focused_recheck_failed",
+                        (
+                            "Funding Paper Trader focused recheck failed\n"
+                            f"{route.get('canonical_asset')}: "
+                            f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
+                            f"Error: {type(exc).__name__}: {exc}"
+                        ),
+                        {"route": route_summary(route), "error": str(exc)},
+                        route_key=route.get("route_key"),
+                        notify=False,
+                        severity="warning",
+                    )
+                    fresh = None
+                handle_result(route_key, route, fresh)
+        return [
+            refreshed_by_key[route_key]
+            for route_key, _route in route_items
+            if route_key in refreshed_by_key
+        ]
 
     def focused_recheck_route(self, route: dict[str, Any]) -> dict[str, Any] | None:
         if not self.config.focused_recheck_enabled:
             return self.store.latest_funding_route_by_key(str(route.get("route_key") or ""))
+        now = datetime.now(UTC)
+        if final_recheck_freeze_window_active(route, now, self.config):
+            frozen = final_recheck_fallback_route(
+                route,
+                now,
+                self.config,
+                "final_recheck_freeze_window",
+            )
+            if frozen is not None:
+                return frozen
+            self.record_event(
+                "focused_recheck_skipped",
+                (
+                    "Funding Paper Trader skipped final recheck\n"
+                    f"{route.get('canonical_asset')}: "
+                    f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
+                    "Reason: no fresh snapshot available inside final freeze window."
+                ),
+                {
+                    "route": route_summary(route),
+                    "reason": "fresh_snapshot_missing_inside_final_freeze_window",
+                    "snapshot_age_seconds": route_data_age_seconds(route, now),
+                    "max_snapshot_age_seconds": self.config.max_entry_snapshot_age_seconds,
+                    "freeze_seconds": self.config.final_recheck_freeze_seconds,
+                    "lead_seconds": route_settlement_leads(route, now),
+                },
+                route_key=route.get("route_key"),
+                notify=False,
+                severity="warning",
+            )
+            return None
         try:
             fresh = self.direct_focused_recheck_route(route)
             if fresh is not None:
                 return fresh
         except Exception as exc:
+            fallback = final_recheck_fallback_route(
+                route,
+                datetime.now(UTC),
+                self.config,
+                "focused_recheck_failed_inside_freeze_window",
+            )
+            if fallback is not None:
+                self.record_event(
+                    "focused_recheck_fallback",
+                    (
+                        "Funding Paper Trader used last successful focused snapshot\n"
+                        f"{route.get('canonical_asset')}: "
+                        f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
+                        f"Reason: {type(exc).__name__}: {exc}"
+                    ),
+                    {
+                        "route": route_summary(fallback),
+                        "error": str(exc),
+                        "fallback": (fallback.get("evidence") or {}).get(
+                            "focused_recheck"
+                        ),
+                    },
+                    route_key=route.get("route_key"),
+                    notify=False,
+                    severity="warning",
+                )
+                return fallback
             self.record_event(
                 "focused_recheck_failed",
                 (
@@ -616,6 +827,7 @@ class FundingPaperTrader:
             counts["market_snapshot_count"] = self.store.insert_funding_market_snapshots(
                 scan_id,
                 markets,
+                include_raw_json=settings.store_diagnostic_raw_json,
             )
             books = self.fetch_direct_orderbooks(
                 [
@@ -627,6 +839,7 @@ class FundingPaperTrader:
             counts["orderbook_count"] = self.store.insert_funding_orderbooks(
                 scan_id,
                 list(books.values()),
+                include_raw_json=settings.store_diagnostic_raw_json,
             )
             observed_datetime = datetime.fromisoformat(
                 observed_at.replace("Z", "+00:00")
@@ -764,10 +977,14 @@ class FundingPaperTrader:
         return books
 
     def next_sleep_seconds(self, result: dict[str, Any]) -> int:
-        if int(result.get("hot_route_count") or 0) > 0:
+        if int(result.get("open_position_count") or 0) > 0:
             return self.config.hot_interval_seconds
         if int(result.get("pending_count") or 0) > 0:
             return self.config.hot_interval_seconds
+        if int(result.get("urgent_route_count") or 0) > 0:
+            return self.config.hot_interval_seconds
+        if int(result.get("hot_route_count") or 0) > 0:
+            return self.config.monitor_interval_seconds
         return self.config.scan_interval_seconds
 
     def process_entry_candidates(
@@ -781,7 +998,14 @@ class FundingPaperTrader:
         accounts = {
             row["venue"]: row for row in self.store.funding_paper_account_rows()
         }
+        open_route_keys = {
+            str(position.get("route_key") or "")
+            for position in self.store.funding_paper_open_positions()
+        }
         for route in routes:
+            route_key = str(route.get("route_key") or "")
+            if route_key and route_key in open_route_keys:
+                continue
             decision = route_entry_decision(route, accounts, now, self.config)
             if decision["armed"] and route["route_key"] not in self.armed_routes:
                 self.armed_routes.add(route["route_key"])
@@ -803,8 +1027,9 @@ class FundingPaperTrader:
                     self.record_event(
                         "open_skipped",
                         (
-                            "Funding Paper Trader SKIP OPEN\n"
-                            f"{route.get('canonical_asset')}: focused recheck did not return the route."
+                            "<b>Funding Paper Trader SKIP OPEN</b>\n\n"
+                            f"<b>{tg(route.get('canonical_asset'))}</b>\n"
+                            "Focused recheck did not return the route."
                         ),
                         {"route": route_summary(route), "reason": "focused_route_missing"},
                         funding_scan_id=route.get("funding_scan_id"),
@@ -835,6 +1060,8 @@ class FundingPaperTrader:
             position = build_position_from_route(active_route, decision, self.config)
             position_id = self.store.open_funding_paper_position(position)
             opened.append(position_id)
+            if route_key:
+                open_route_keys.add(route_key)
             self.record_event(
                 "open",
                 open_message(active_route, decision, position),
@@ -858,6 +1085,8 @@ class FundingPaperTrader:
         outcomes: list[str] = []
         now = datetime.now(UTC)
         for position in self.store.funding_paper_open_positions():
+            self.refresh_open_position_route(position)
+            now = datetime.now(UTC)
             result = close_decision(position, now, self.store, self.config)
             if result["status"] == "wait":
                 continue
@@ -879,6 +1108,32 @@ class FundingPaperTrader:
                     )
                 outcomes.append("settlement_pending")
                 continue
+            if result["status"] == "hold":
+                accrued = self.store.accrue_funding_paper_settlement(
+                    position_id,
+                    result["accrual"],
+                )
+                self.pending_notified_positions.discard(position_id)
+                if accrued:
+                    self.record_event(
+                        "hold",
+                        hold_message(position, result["accrual"]),
+                        {
+                            "position": position_summary(position),
+                            "accrual": result["accrual"],
+                        },
+                        funding_paper_position_id=position_id,
+                        funding_scan_id=result["accrual"].get(
+                            "next_funding_scan_id"
+                        ),
+                        funding_route_id=result["accrual"].get(
+                            "next_funding_route_id"
+                        ),
+                        route_key=position.get("route_key"),
+                        notify=True,
+                    )
+                outcomes.append("held")
+                continue
             if result["status"] == "close":
                 self.store.close_funding_paper_position(position_id, result["close"])
                 self.record_event(
@@ -896,6 +1151,51 @@ class FundingPaperTrader:
                 )
                 outcomes.append("closed")
         return outcomes
+
+    def refresh_open_position_route(self, position: dict[str, Any]) -> None:
+        if not self.config.focused_recheck_enabled:
+            return
+        route_key = str(position.get("route_key") or "")
+        if not route_key:
+            return
+        seed = self.hot_routes.get(route_key) or self.store.latest_funding_route_by_key(
+            route_key
+        )
+        if not seed:
+            return
+        fresh = self.focused_recheck_route(seed)
+        if fresh:
+            self.hot_routes[route_key] = fresh
+
+    def refresh_and_publish_repriced_pnl(self) -> int:
+        repriced_count = self.store.refresh_estimated_funding_paper_positions()
+        self.publish_repriced_pnl_events()
+        return repriced_count
+
+    def publish_repriced_pnl_events(self) -> int:
+        published = 0
+        min_created_at = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        for event in self.store.funding_paper_pending_reprice_events(
+            min_created_at=min_created_at,
+        ):
+            event_id = int(event["event_id"])
+            if not self.config.telegram_enabled:
+                self.store.update_funding_paper_event_telegram_status(
+                    event_id,
+                    "disabled",
+                )
+                continue
+            result = self.notifier.send(
+                reprice_message(event["position"], event.get("payload") or {})
+            )
+            self.store.update_funding_paper_event_telegram_status(
+                event_id,
+                result.status,
+                result.error,
+            )
+            if result.status == "sent":
+                published += 1
+        return published
 
     def record_event(
         self,
@@ -932,6 +1232,30 @@ class FundingPaperTrader:
                 result.error,
             )
         return event_id
+
+
+def should_record_routine_scan(result: dict[str, Any]) -> bool:
+    return any(
+        int(result.get(key) or 0) > 0
+        for key in (
+            "candidate_count",
+            "watch_count",
+            "opened_count",
+            "closed_count",
+            "pending_count",
+            "hot_route_count",
+            "urgent_route_count",
+        )
+    )
+
+
+def is_retention_skip_error(exc: sqlite3.DatabaseError) -> bool:
+    message = str(exc).lower()
+    if isinstance(exc, sqlite3.OperationalError):
+        return "database is locked" in message or "database is busy" in message
+    if isinstance(exc, sqlite3.IntegrityError):
+        return "foreign key" in message
+    return False
 
 
 def route_entry_decision(
@@ -975,6 +1299,15 @@ def route_entry_decision(
                 )
                 if available < required:
                     reasons.append(f"{venue}_insufficient_paper_balance")
+    entry_window_ready = all(
+        lead is not None and 0 <= lead <= config.entry_max_lead_seconds
+        for lead in leads.values()
+    )
+    snapshot_age = route_data_age_seconds(route, now)
+    if entry_window_ready and (
+        snapshot_age is None or snapshot_age > config.max_entry_snapshot_age_seconds
+    ):
+        reasons.append("entry_snapshot_stale")
     required_live_net = required_live_net_profit(route, config)
     armed = bool(
         long_leg
@@ -1001,6 +1334,8 @@ def route_entry_decision(
         "arm_window_seconds": config.arm_window_seconds,
         "live_net": live_net,
         "required_live_net": required_live_net,
+        "snapshot_age_seconds": snapshot_age,
+        "max_entry_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
     }
 
 
@@ -1047,8 +1382,16 @@ def route_monitor_decision(
             for lead in leads.values()
         )
     )
+    urgent = bool(
+        hot
+        and all(
+            lead is not None and 0 <= lead <= config.entry_window_seconds
+            for lead in leads.values()
+        )
+    )
     return {
         "hot": hot,
+        "urgent": urgent,
         "reasons": reasons,
         "lead_seconds": leads,
         "live_net": live_net,
@@ -1118,24 +1461,168 @@ def close_decision(
 
     settlement = settlement_rates_for_position(position, store)
     missing = [side for side, row in settlement.items() if row is None]
-    publication_deadline = max_settlement + timedelta(
-        seconds=config.max_settlement_publication_lag_seconds
-    )
-    if missing and now < publication_deadline:
-        return {
-            "status": "settlement_pending",
-            "reason": "funding_history_not_published",
-            "missing": missing,
-            "publication_deadline": publication_deadline.isoformat(),
-        }
     close_route = store.latest_funding_route_by_key(str(position["route_key"]))
+    hold = position_hold_decision(position, close_route, now, config)
+    if hold["hold"]:
+        accrual = build_settlement_accrual_payload(
+            position,
+            settlement,
+            close_route or {},
+            use_entry_estimate_for_missing=bool(missing),
+            hold_decision=hold,
+        )
+        return {"status": "hold", "accrual": accrual}
     close = build_close_payload(
         position,
         settlement,
         close_route,
         use_entry_estimate_for_missing=bool(missing),
+        close_reason=str(hold["close_reason"]),
+        hold_decision=hold,
     )
     return {"status": "close", "close": close}
+
+
+def position_hold_decision(
+    position: dict[str, Any],
+    route: dict[str, Any] | None,
+    now: datetime,
+    config: FundingPaperTraderConfig,
+) -> dict[str, Any]:
+    if not route:
+        return {
+            "hold": False,
+            "close_reason": "arbitrage_window_unverifiable_route_missing",
+            "reasons": ["latest_route_missing"],
+        }
+    legs = route.get("legs") or []
+    long_leg = leg_by_side(legs, "long")
+    short_leg = leg_by_side(legs, "short")
+    reasons: list[str] = []
+    route_age = route_data_age_seconds(route, now)
+    if route_age is None:
+        reasons.append("route_snapshot_age_missing")
+    elif route_age > config.max_entry_snapshot_age_seconds:
+        reasons.append("route_snapshot_stale")
+    if not long_leg or not short_leg:
+        reasons.append("missing_route_legs")
+    data_quality_flags = {
+        "unit_identity_mismatch",
+        "basis_divergence",
+    }
+    route_flags = set(str(flag) for flag in route.get("risk_flags") or [])
+    evidence = route.get("evidence") or {}
+    route_flags.update(
+        str(flag) for flag in evidence.get("blocking_risk_flags") or []
+    )
+    if route_flags.intersection(data_quality_flags):
+        reasons.append("data_quality_issue")
+    next_settlements: dict[str, str] = {}
+    for side, leg in (("long", long_leg), ("short", short_leg)):
+        if not leg:
+            continue
+        settlement = parse_iso(leg.get("next_funding_at"))
+        if settlement is None:
+            reasons.append(f"{side}_next_settlement_missing")
+            continue
+        if settlement <= now:
+            reasons.append(f"{side}_next_settlement_not_future")
+            continue
+        next_settlements[side] = settlement.isoformat()
+    live_net = optional_float(evidence.get("current_nowcast_net"))
+    if live_net is None:
+        reasons.append("live_net_missing")
+    elif live_net <= max(0.0, float(config.min_live_net_profit)):
+        reasons.append("live_net_not_positive")
+    close_reason = close_reason_from_hold_reasons(reasons)
+    return {
+        "hold": not reasons,
+        "close_reason": close_reason,
+        "reasons": reasons,
+        "live_net": live_net,
+        "route_snapshot_age_seconds": route_age,
+        "max_route_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
+        "next_settlements": next_settlements,
+        "route_status": route.get("status"),
+    }
+
+
+def close_reason_from_hold_reasons(reasons: list[str]) -> str:
+    if "live_net_not_positive" in reasons:
+        return "arbitrage_window_closed_live_net_non_positive"
+    if "data_quality_issue" in reasons:
+        return "arbitrage_window_data_quality_issue"
+    if (
+        "route_snapshot_stale" in reasons
+        or "route_snapshot_age_missing" in reasons
+    ):
+        return "arbitrage_window_unverifiable_route_stale"
+    if "latest_route_missing" in reasons:
+        return "arbitrage_window_unverifiable_route_missing"
+    if any("settlement" in reason for reason in reasons):
+        return "arbitrage_window_unverifiable_next_settlement_missing"
+    if "live_net_missing" in reasons:
+        return "arbitrage_window_unverifiable_live_net_missing"
+    return "arbitrage_window_unverifiable"
+
+
+def build_settlement_accrual_payload(
+    position: dict[str, Any],
+    settlement: dict[str, dict[str, Any] | None],
+    continuation_route: dict[str, Any],
+    *,
+    use_entry_estimate_for_missing: bool,
+    hold_decision: dict[str, Any],
+) -> dict[str, Any]:
+    current_long = current_position_leg(position, "long")
+    current_short = current_position_leg(position, "short")
+    long_rate = settlement_rate_or_entry(settlement.get("long"), current_long)
+    short_rate = settlement_rate_or_entry(settlement.get("short"), current_short)
+    long_notional = float(position.get("long_notional") or 0.0)
+    short_notional = float(position.get("short_notional") or 0.0)
+    long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
+    short_funding_pnl = funding_leg_pnl("short", short_notional, short_rate)
+    next_legs = continuation_route.get("legs") or []
+    next_long = leg_by_side(next_legs, "long") or {}
+    next_short = leg_by_side(next_legs, "short") or {}
+    next_long_settlement = str(next_long.get("next_funding_at") or "")
+    next_short_settlement = str(next_short.get("next_funding_at") or "")
+    next_max_settlement = max(
+        parse_iso(next_long_settlement) or datetime.min.replace(tzinfo=UTC),
+        parse_iso(next_short_settlement) or datetime.min.replace(tzinfo=UTC),
+    ).isoformat()
+    funding_pnl_delta = long_funding_pnl + short_funding_pnl
+    evidence = continuation_route.get("evidence") or {}
+    settlement_payload_value = {
+        "long": settlement_payload(settlement.get("long"), current_long, long_rate),
+        "short": settlement_payload(settlement.get("short"), current_short, short_rate),
+        "funding_pnl_delta": funding_pnl_delta,
+        "history_missing_fallback": use_entry_estimate_for_missing,
+        "continued_live_net": evidence.get("current_nowcast_net"),
+    }
+    return {
+        "settlement_key": ":".join(
+            [
+                str(position.get("funding_paper_position_id") or ""),
+                str(position.get("max_settlement_at") or ""),
+            ]
+        ),
+        "long_cash_delta": long_funding_pnl,
+        "short_cash_delta": short_funding_pnl,
+        "funding_pnl_delta": funding_pnl_delta,
+        "history_missing_fallback": use_entry_estimate_for_missing,
+        "settlement": settlement_payload_value,
+        "hold_decision": hold_decision,
+        "next_funding_scan_id": continuation_route.get("funding_scan_id"),
+        "next_funding_route_id": continuation_route.get("funding_route_id"),
+        "next_long_settlement_at": next_long_settlement,
+        "next_short_settlement_at": next_short_settlement,
+        "next_max_settlement_at": next_max_settlement,
+        "next_entry_legs": next_legs,
+        "next_entry_evidence": evidence,
+        "next_expected_live_gross": evidence.get("current_nowcast_gross"),
+        "next_expected_live_net": evidence.get("current_nowcast_net"),
+    }
 
 
 def settlement_rates_for_position(
@@ -1162,16 +1649,22 @@ def build_close_payload(
     close_route: dict[str, Any] | None,
     *,
     use_entry_estimate_for_missing: bool,
+    close_reason: str,
+    hold_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    entry_long = leg_by_side(position.get("entry_legs") or [], "long") or {}
-    entry_short = leg_by_side(position.get("entry_legs") or [], "short") or {}
+    entry_long = current_position_leg(position, "long")
+    entry_short = current_position_leg(position, "short")
     long_rate = settlement_rate_or_entry(settlement.get("long"), entry_long)
     short_rate = settlement_rate_or_entry(settlement.get("short"), entry_short)
     long_notional = float(position.get("long_notional") or 0.0)
     short_notional = float(position.get("short_notional") or 0.0)
     long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
     short_funding_pnl = funding_leg_pnl("short", short_notional, short_rate)
-    actual_funding_pnl = long_funding_pnl + short_funding_pnl
+    accrued_funding_pnl = float(
+        (position.get("notes") or {}).get("accrued_funding_pnl") or 0.0
+    )
+    current_funding_pnl = long_funding_pnl + short_funding_pnl
+    actual_funding_pnl = accrued_funding_pnl + current_funding_pnl
     actual_execution_cost = float(position.get("expected_execution_cost") or 0.0)
     actual_net_pnl = actual_funding_pnl - actual_execution_cost
     long_cash_delta = long_funding_pnl - actual_execution_cost / 2.0
@@ -1185,16 +1678,15 @@ def build_close_payload(
         "actual_net_pnl": actual_net_pnl,
         "long_cash_delta": long_cash_delta,
         "short_cash_delta": short_cash_delta,
-        "close_reason": (
-            "settlement_capture_complete_estimated_missing_history"
-            if use_entry_estimate_for_missing
-            else "settlement_capture_complete"
-        ),
+        "close_reason": close_reason,
+        "hold_decision": hold_decision or {},
         "close_legs": (close_route or {}).get("legs") or [],
         "close_evidence": close_evidence,
         "settlement": {
             "long": settlement_payload(settlement.get("long"), entry_long, long_rate),
             "short": settlement_payload(settlement.get("short"), entry_short, short_rate),
+            "current_funding_pnl": current_funding_pnl,
+            "accrued_funding_pnl": accrued_funding_pnl,
             "entry_expected_live_net": position.get("expected_live_net"),
             "entry_expected_live_gross": position.get("expected_live_gross"),
             "history_missing_fallback": use_entry_estimate_for_missing,
@@ -1204,6 +1696,19 @@ def build_close_payload(
             "execution_cost_source": "entry_route_expected_execution_cost",
         },
     }
+
+
+def current_position_leg(position: dict[str, Any], side: str) -> dict[str, Any]:
+    leg = dict(leg_by_side(position.get("entry_legs") or [], side) or {})
+    leg.setdefault("side", side)
+    leg.setdefault("venue", position.get(f"{side}_venue"))
+    leg.setdefault("symbol", position.get(f"{side}_symbol"))
+    leg.setdefault("notional", position.get(f"{side}_notional"))
+    leg.setdefault("base_quantity", position.get("base_quantity"))
+    leg["next_funding_at"] = position.get(f"{side}_settlement_at") or leg.get(
+        "next_funding_at"
+    )
+    return leg
 
 
 def funding_leg_pnl(side: str, notional: float, funding_rate: float) -> float:
@@ -1227,9 +1732,10 @@ def settlement_payload(
     funding_rate: float,
 ) -> dict[str, Any]:
     return {
-        "venue": entry_leg.get("venue"),
-        "symbol": entry_leg.get("symbol"),
-        "settlement_at": entry_leg.get("next_funding_at"),
+        "venue": (settlement_row or {}).get("venue") or entry_leg.get("venue"),
+        "symbol": (settlement_row or {}).get("symbol") or entry_leg.get("symbol"),
+        "settlement_at": (settlement_row or {}).get("funding_at")
+        or entry_leg.get("next_funding_at"),
         "funding_rate": funding_rate,
         "source": "history" if settlement_row is not None else "entry_estimate_fallback",
         "history_row": settlement_row,
@@ -1270,6 +1776,73 @@ def optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def route_settlement_leads(
+    route: dict[str, Any],
+    now: datetime,
+) -> dict[str, float | None]:
+    leads: dict[str, float | None] = {"long": None, "short": None}
+    for side in ("long", "short"):
+        leg = leg_by_side(route.get("legs") or [], side)
+        settlement = parse_iso((leg or {}).get("next_funding_at"))
+        if settlement is not None:
+            leads[side] = (settlement - now).total_seconds()
+    return leads
+
+
+def route_data_age_seconds(route: dict[str, Any], now: datetime) -> float | None:
+    evidence = route.get("evidence") or {}
+    focused = evidence.get("focused_recheck") or {}
+    observed = parse_iso(focused.get("observed_at")) or parse_iso(route.get("observed_at"))
+    if observed is None:
+        return None
+    return max(0.0, (now - observed).total_seconds())
+
+
+def final_recheck_freeze_window_active(
+    route: dict[str, Any],
+    now: datetime,
+    config: FundingPaperTraderConfig,
+) -> bool:
+    if config.final_recheck_freeze_seconds <= 0:
+        return False
+    leads = route_settlement_leads(route, now)
+    return all(
+        lead is not None and 0 <= lead < config.final_recheck_freeze_seconds
+        for lead in leads.values()
+    )
+
+
+def final_recheck_fallback_route(
+    route: dict[str, Any],
+    now: datetime,
+    config: FundingPaperTraderConfig,
+    reason: str,
+) -> dict[str, Any] | None:
+    if not final_recheck_freeze_window_active(route, now, config):
+        return None
+    leads = route_settlement_leads(route, now)
+    age = route_data_age_seconds(route, now)
+    if age is None or age > config.max_entry_snapshot_age_seconds:
+        return None
+    fallback = dict(route)
+    evidence = dict(fallback.get("evidence") or {})
+    previous_recheck = dict(evidence.get("focused_recheck") or {})
+    evidence["focused_recheck"] = {
+        **previous_recheck,
+        "mode": "final_freeze_last_success_v1",
+        "reason": reason,
+        "snapshot_age_seconds": age,
+        "max_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
+        "freeze_seconds": config.final_recheck_freeze_seconds,
+        "lead_seconds": leads,
+        "used_at": now.isoformat(),
+    }
+    evidence["entry_snapshot_source"] = "last_successful_focused_recheck"
+    evidence["entry_snapshot_frozen"] = True
+    fallback["evidence"] = evidence
+    return fallback
 
 
 def venues_from_routes(routes: list[dict[str, Any]]) -> list[str]:
@@ -1314,13 +1887,18 @@ def funding_client_for_venue(
     *,
     fast: bool = False,
 ) -> FundingVenueClient | None:
+    if venue.lower() in DEACTIVATED_FUNDING_VENUES:
+        return None
     factories: dict[str, type[FundingVenueClient]] = {
+        "aevo": AevoFundingClient,
         "aster": AsterFundingClient,
         "backpack": BackpackFundingClient,
         "binance": BinanceFundingClient,
         "bingx": BingXFundingClient,
+        "bitmart": BitMartFundingClient,
         "bitget": BitgetFundingClient,
         "bybit": BybitFundingClient,
+        "coinex": CoinExFundingClient,
         "deribit": DeribitFundingClient,
         "drift": DriftFundingClient,
         "dydx": DydxFundingClient,
@@ -1335,7 +1913,9 @@ def funding_client_for_venue(
         "mexc": MEXCFundingClient,
         "okx": OKXFundingClient,
         "paradex": ParadexFundingClient,
+        "phemex": PhemexFundingClient,
         "vertex_base": VertexFundingClient,
+        "woox": WOOXFundingClient,
     }
     factory = factories.get(str(venue))
     if factory is None:
@@ -1359,18 +1939,19 @@ def count_hot_routes(
     config: FundingPaperTraderConfig,
 ) -> int:
     now = datetime.now(UTC)
-    hot = 0
-    for route in routes:
-        legs = route.get("legs") or []
-        leads = []
-        for side in ("long", "short"):
-            leg = leg_by_side(legs, side)
-            settlement = parse_iso((leg or {}).get("next_funding_at"))
-            if settlement is not None:
-                leads.append((settlement - now).total_seconds())
-        if len(leads) == 2 and all(0 <= lead <= config.arm_window_seconds for lead in leads):
-            hot += 1
-    return hot
+    return sum(
+        1 for route in routes if route_monitor_decision(route, now, config)["hot"]
+    )
+
+
+def count_urgent_routes(
+    routes: list[dict[str, Any]],
+    config: FundingPaperTraderConfig,
+) -> int:
+    now = datetime.now(UTC)
+    return sum(
+        1 for route in routes if route_monitor_decision(route, now, config)["urgent"]
+    )
 
 
 def route_summary(route: dict[str, Any]) -> dict[str, Any]:
@@ -1403,6 +1984,19 @@ def status_route_sort_key(route: dict[str, Any]) -> tuple[float, float]:
     return live_net, live_net - threshold
 
 
+def status_publishable_candidate(
+    route: dict[str, Any],
+    config: FundingPaperTraderConfig,
+) -> bool:
+    if route.get("status") != "paper_candidate":
+        return False
+    evidence = route.get("evidence") or {}
+    live_net = optional_float(evidence.get("current_nowcast_net"))
+    if live_net is None or live_net <= 0:
+        return False
+    return live_net >= required_live_net_profit(route, config)
+
+
 def status_report_message(
     result: dict[str, Any],
     routes: list[dict[str, Any]],
@@ -1410,41 +2004,62 @@ def status_report_message(
     summary: dict[str, Any],
     config: FundingPaperTraderConfig,
 ) -> str:
-    candidates = ranked_status_routes(routes)
+    candidates = ranked_status_routes(
+        [
+            route
+            for route in routes
+            if status_publishable_candidate(route, config)
+        ]
+    )
     watched = ranked_status_routes(watch_routes)
     max_routes = int(config.status_report_max_routes)
+    universe_count = int(result.get("universe_route_count") or 0)
+    route_count = int(result.get("route_count") or 0)
+    full_depth_count = int(result.get("execution_shortlist_count") or route_count)
     lines = [
-        "Funding Paper Trader STATUS",
+        "<b>Funding Paper Trader STATUS</b>",
+        "",
         (
-            f"Mode: {result.get('mode')} | scan: "
-            f"{result.get('funding_scan_id') or '-'}"
+            f"<b>Mode:</b> <code>{tg(result.get('mode'))}</code> | "
+            f"<b>Scan:</b> <code>{tg(result.get('funding_scan_id') or '-')}</code>"
         ),
         (
-            f"Candidates: {len(routes)} | watch: {len(watch_routes)} | "
-            f"hot: {result.get('hot_route_count') or 0}"
+            f"<b>Candidates: {len(candidates)}</b> | "
+            f"Watch/internal: {len(watch_routes)} | Monitor: {result.get('hot_route_count') or 0} | "
+            f"Urgent: {result.get('urgent_route_count') or 0}"
         ),
         (
-            f"Open: {int(summary.get('open_position_count') or 0)} | "
-            f"closed: {int(summary.get('closed_trade_count') or 0)} | "
-            f"realized PnL: ${float(summary.get('realized_pnl') or 0):.2f}"
+            f"<b>Open:</b> {int(summary.get('open_position_count') or 0)} | "
+            f"Closed: {int(summary.get('closed_trade_count') or 0)} | "
+            f"Realized PnL: <b>${float(summary.get('realized_pnl') or 0):.2f}</b>"
         ),
     ]
+    if universe_count or full_depth_count:
+        lines.extend(
+            [
+                "",
+                (
+                    f"<b>Market scan</b>\n"
+                    f"Universe screened: <b>{universe_count:,}</b>\n"
+                    f"Full-depth modeled: <b>{full_depth_count:,}</b>"
+                ),
+            ]
+        )
     if candidates:
-        lines.append("Candidates:")
+        lines.extend(["", "<b>Candidates</b>"])
         lines.extend(
             status_route_line(route, index)
             for index, route in enumerate(candidates[:max_routes], start=1)
         )
         hidden = len(candidates) - max_routes
         if hidden > 0:
-            lines.append(f"...and {hidden} more")
+            lines.append(f"<i>...and {hidden} more</i>")
     else:
-        lines.append("Candidates: нет")
+        lines.extend(["", "<b>Candidates:</b> нет"])
         if watched:
-            lines.append("Closest watch:")
-            lines.extend(
-                status_route_line(route, index)
-                for index, route in enumerate(watched[:max_routes], start=1)
+            lines.append(
+                "<i>Watch routes are hidden from status: they are monitored "
+                "internally but are not trade candidates.</i>"
             )
     return "\n".join(lines)
 
@@ -1460,11 +2075,14 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     live_net = float(evidence.get("current_nowcast_net") or 0.0)
     threshold = float(evidence.get("actionable_profit_threshold") or 0.0)
     return (
-        f"{index}. {route.get('canonical_asset')}: "
-        f"LONG {route.get('long_venue')} {format_rate(long_leg.get('funding_rate'))} / "
-        f"SHORT {route.get('short_venue')} {format_rate(short_leg.get('funding_rate'))} | "
-        f"net ${live_net:.2f} need ${threshold:.2f} | "
-        f"settlement L {format_seconds(long_lead)}, S {format_seconds(short_lead)}"
+        f"\n<b>{index}. {tg(route.get('canonical_asset'))}</b>\n"
+        f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
+        f"{format_rate(long_leg.get('funding_rate'))}\n"
+        f"SHORT <code>{tg(route.get('short_venue'))} {tg(route.get('short_symbol'))}</code> "
+        f"{format_rate(short_leg.get('funding_rate'))}\n"
+        f"Next net PnL after costs: <b>{format_signed_money(live_net)}</b> | "
+        f"Min: ${threshold:.2f}\n"
+        f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"
     )
 
 
@@ -1491,12 +2109,14 @@ def position_summary(position: dict[str, Any]) -> dict[str, Any]:
 def armed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     leads = decision.get("lead_seconds") or {}
     return (
-        "Funding Paper Trader ARMED\n"
-        f"{route['canonical_asset']}: LONG {route['long_venue']} / SHORT {route['short_venue']}\n"
-        f"Live net: ${float(decision.get('live_net') or 0):.2f} "
-        f"(need ${float(decision.get('required_live_net') or 0):.2f})\n"
+        "<b>Funding Paper Trader ARMED</b>\n\n"
+        f"<b>{tg(route['canonical_asset'])}</b>\n"
+        f"LONG <code>{tg(route['long_venue'])}</code> / "
+        f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"Live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
+        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"До funding: long {format_seconds(leads.get('long'))}, "
-        f"short {format_seconds(leads.get('short'))}."
+        f"short {format_seconds(leads.get('short'))}"
     )
 
 
@@ -1507,55 +2127,313 @@ def open_message(
 ) -> str:
     leads = decision.get("lead_seconds") or {}
     return (
-        "Funding Paper Trader OPEN\n"
-        f"{route['canonical_asset']}: LONG {route['long_venue']} / SHORT {route['short_venue']}\n"
-        f"Size: ${float(position.get('target_notional') or 0):.0f} per leg\n"
-        f"Expected live net: ${float(position.get('expected_live_net') or 0):.2f} "
-        f"(need ${float(decision.get('required_live_net') or 0):.2f})\n"
+        "<b>Funding Paper Trader OPEN</b>\n\n"
+        f"<b>{tg(route['canonical_asset'])}</b>\n"
+        f"LONG <code>{tg(route['long_venue'])}</code> / "
+        f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"Size: <b>${float(position.get('target_notional') or 0):.0f}</b> per leg\n"
+        f"Expected live net: <b>${float(position.get('expected_live_net') or 0):.2f}</b>\n"
+        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"До funding: long {format_seconds(leads.get('long'))}, "
-        f"short {format_seconds(leads.get('short'))}."
+        f"short {format_seconds(leads.get('short'))}"
     )
 
 
 def skipped_open_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     return (
-        "Funding Paper Trader SKIP OPEN\n"
-        f"{route['canonical_asset']}: LONG {route['long_venue']} / SHORT {route['short_venue']}\n"
-        f"Fresh live net: ${float(decision.get('live_net') or 0):.2f} "
-        f"(need ${float(decision.get('required_live_net') or 0):.2f})\n"
-        f"Reasons: {', '.join(decision.get('reasons') or []) or 'recheck failed'}."
+        "<b>Funding Paper Trader SKIP OPEN</b>\n\n"
+        f"<b>{tg(route['canonical_asset'])}</b>\n"
+        f"LONG <code>{tg(route['long_venue'])}</code> / "
+        f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"Fresh live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
+        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
+        f"Reasons: {tg(', '.join(decision.get('reasons') or []) or 'recheck failed')}"
     )
 
 
 def disarmed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     return (
-        "Funding Paper Trader DISARMED\n"
-        f"{route.get('canonical_asset')}: LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
-        f"Fresh live net: ${float(decision.get('live_net') or 0):.2f} "
-        f"(need ${float(decision.get('required_live_net') or 0):.2f})\n"
-        f"Reasons: {', '.join(decision.get('reasons') or []) or 'not hot'}."
+        "<b>Funding Paper Trader DISARMED</b>\n\n"
+        f"<b>{tg(route.get('canonical_asset'))}</b>\n"
+        f"LONG <code>{tg(route.get('long_venue'))}</code> / "
+        f"SHORT <code>{tg(route.get('short_venue'))}</code>\n\n"
+        f"Fresh live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
+        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
+        f"Reasons: {tg(', '.join(decision.get('reasons') or []) or 'not hot')}"
     )
 
 
 def pending_message(position: dict[str, Any], result: dict[str, Any]) -> str:
     return (
-        "Funding Paper Trader SETTLEMENT PENDING\n"
-        f"{position['canonical_asset']}: LONG {position['long_venue']} / SHORT {position['short_venue']}\n"
-        f"Причина: {result.get('reason')}. Жду публикацию funding history."
+        "<b>Funding Paper Trader SETTLEMENT PENDING</b>\n\n"
+        f"<b>{tg(position['canonical_asset'])}</b>\n"
+        f"LONG <code>{tg(position['long_venue'])}</code> / "
+        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
+        f"Причина: {tg(result.get('reason'))}\n"
+        "Жду публикацию funding history."
+    )
+
+
+def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
+    settlement = accrual.get("settlement") or {}
+    quality = (
+        "Начисление предварительное: одна или обе funding history еще не "
+        "опубликованы, использована ставка на входе."
+        if accrual.get("history_missing_fallback")
+        else "Начисление финальное: использована опубликованная funding history."
+    )
+    hold_decision = accrual.get("hold_decision") or {}
+    return (
+        "<b>Funding Paper Trader HOLD</b>\n\n"
+        f"<b>{tg(position['canonical_asset'])}</b>\n"
+        f"LONG <code>{tg(position['long_venue'])}</code> / "
+        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
+        "Funding settlement начислен, позиция остается открытой: "
+        "арбитражное окно все еще положительное.\n"
+        f"Settlement PnL: <b>{format_money(accrual.get('funding_pnl_delta'))}</b>\n"
+        f"Current live net: {format_money(hold_decision.get('live_net'))}\n"
+        f"Next settlement: {tg(accrual.get('next_max_settlement_at'))}\n"
+        f"{tg(quality)}\n"
+        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
+        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
     )
 
 
 def close_message(position: dict[str, Any], close: dict[str, Any]) -> str:
     settlement = close.get("settlement") or {}
-    return (
-        "Funding Paper Trader CLOSE\n"
-        f"{position['canonical_asset']}: LONG {position['long_venue']} / SHORT {position['short_venue']}\n"
-        f"Funding PnL: ${float(close.get('actual_funding_pnl') or 0):.2f}\n"
-        f"Execution cost: ${float(close.get('actual_execution_cost') or 0):.2f}\n"
-        f"Net PnL: ${float(close.get('actual_net_pnl') or 0):.2f}\n"
-        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
-        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}."
+    quality = (
+        "Качество PnL: предварительный расчет. Одна или обе биржи еще не "
+        "опубликовали funding history, поэтому пока использованы ставки на входе. "
+        "После публикации бот пересчитает PnL."
+        if settlement.get("history_missing_fallback")
+        else "Качество PnL: финальный расчет по опубликованной funding history."
     )
+    window = close_window_message(close)
+    details = close_decision_details_message(position, close)
+    return (
+        "<b>Funding Paper Trader CLOSE</b>\n\n"
+        f"<b>{tg(position['canonical_asset'])}</b>\n"
+        f"LONG <code>{tg(position['long_venue'])}</code> / "
+        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
+        f"Причина закрытия: {tg(close_reason_message(close.get('close_reason')))}\n"
+        f"{tg(window)}\n"
+        f"{details}\n\n"
+        f"Funding PnL: <b>${float(close.get('actual_funding_pnl') or 0):.2f}</b>\n"
+        f"Execution cost: ${float(close.get('actual_execution_cost') or 0):.2f}\n"
+        f"Net PnL: <b>${float(close.get('actual_net_pnl') or 0):.2f}</b>\n"
+        f"{tg(quality)}\n"
+        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
+        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
+    )
+
+
+def close_decision_details_message(
+    position: dict[str, Any],
+    close: dict[str, Any],
+) -> str:
+    entry_legs = position.get("entry_legs") or []
+    close_legs = close.get("close_legs") or []
+    hold_decision = close.get("hold_decision") or {}
+    close_evidence = close.get("close_evidence") or {}
+    live_net = optional_float(hold_decision.get("live_net"))
+    if live_net is None:
+        live_net = optional_float(close_evidence.get("current_nowcast_net"))
+    required = optional_float(close_evidence.get("actionable_profit_threshold"))
+    route_age = optional_float(hold_decision.get("route_snapshot_age_seconds"))
+    reasons = hold_reason_labels(hold_decision.get("reasons") or [])
+    lines = ["", "<b>Детали решения</b>"]
+    if live_net is not None:
+        need_text = (
+            f"; нужно >= {format_money(required)}"
+            if required is not None
+            else ""
+        )
+        lines.append(f"Fresh live net: <b>{format_signed_money(live_net)}</b>{need_text}.")
+    if reasons:
+        lines.append(f"Триггеры: {tg('; '.join(reasons))}.")
+    if route_age is not None:
+        lines.append(f"Возраст fresh snapshot: {route_age:.0f}s.")
+    if entry_legs:
+        lines.append(
+            "На входе: "
+            + " | ".join(
+                funding_leg_compact_line(leg)
+                for leg in sorted(entry_legs, key=leg_side_sort)
+            )
+            + "."
+        )
+    if close_legs:
+        lines.append(
+            "После settlement: "
+            + " | ".join(
+                funding_leg_compact_line(leg)
+                for leg in sorted(close_legs, key=leg_side_sort)
+            )
+            + "."
+        )
+        mismatch = funding_settlement_mismatch_line(close_legs)
+        if mismatch:
+            lines.append(mismatch)
+    return "\n".join(lines)
+
+
+def leg_side_sort(leg: dict[str, Any]) -> int:
+    return 0 if str(leg.get("side") or "").lower() == "long" else 1
+
+
+def funding_leg_compact_line(leg: dict[str, Any]) -> str:
+    side = str(leg.get("side") or "").upper()
+    venue = leg.get("venue")
+    symbol = leg.get("symbol")
+    interval = format_interval_hours(leg.get("funding_interval_hours"))
+    return (
+        f"{tg(side)} <code>{tg(venue)} {tg(symbol)}</code> "
+        f"{format_rate(leg.get('funding_rate'))}/{interval}, "
+        f"next {tg(format_datetime_utc(leg.get('next_funding_at')))}"
+    )
+
+
+def funding_settlement_mismatch_line(legs: list[dict[str, Any]]) -> str:
+    long_leg = leg_by_side(legs, "long") or {}
+    short_leg = leg_by_side(legs, "short") or {}
+    long_next = parse_iso(long_leg.get("next_funding_at"))
+    short_next = parse_iso(short_leg.get("next_funding_at"))
+    long_interval = optional_float(long_leg.get("funding_interval_hours"))
+    short_interval = optional_float(short_leg.get("funding_interval_hours"))
+    notes: list[str] = []
+    if long_next and short_next and abs((long_next - short_next).total_seconds()) > 60:
+        notes.append(
+            "следующие funding settlement не совпадают: "
+            f"long {tg(format_datetime_utc(long_next.isoformat()))}, "
+            f"short {tg(format_datetime_utc(short_next.isoformat()))}"
+        )
+    if (
+        long_interval is not None
+        and short_interval is not None
+        and abs(long_interval - short_interval) > 1e-9
+    ):
+        notes.append(
+            "интервалы funding разные: "
+            f"long {format_interval_hours(long_interval)}, "
+            f"short {format_interval_hours(short_interval)}"
+        )
+    if not notes:
+        return ""
+    return (
+        "Важно: "
+        + "; ".join(notes)
+        + ". Следующее удержание уже считается новой проверкой окна, "
+        "а не автоматическим продолжением старой сделки."
+    )
+
+
+def hold_reason_labels(reasons: list[Any]) -> list[str]:
+    labels = {
+        "live_net_not_positive": "fresh live net стал <= 0",
+        "live_net_missing": "не удалось проверить fresh live net",
+        "data_quality_issue": "свежие данные маршрута несовместимы",
+        "latest_route_missing": "нет свежего route snapshot",
+        "route_snapshot_stale": "fresh snapshot устарел",
+        "route_snapshot_age_missing": "непонятен возраст fresh snapshot",
+        "missing_route_legs": "не хватает одной из ног маршрута",
+        "long_next_settlement_missing": "не найден следующий settlement long-ноги",
+        "short_next_settlement_missing": "не найден следующий settlement short-ноги",
+        "long_next_settlement_not_future": "следующий settlement long-ноги уже прошел",
+        "short_next_settlement_not_future": "следующий settlement short-ноги уже прошел",
+    }
+    return [labels.get(str(reason), str(reason)) for reason in reasons]
+
+
+def reprice_message(position: dict[str, Any], payload: dict[str, Any]) -> str:
+    settlement = position.get("settlement") or {}
+    quality = (
+        "Качество PnL: частичный пересчет. Одна из бирж все еще не "
+        "опубликовала funding history, поэтому оставшаяся нога рассчитана по "
+        "ставке на входе."
+        if payload.get("history_missing_fallback")
+        else "Качество PnL: финальный пересчет по опубликованной funding history."
+    )
+    return (
+        "<b>Funding Paper Trader PnL REPRICED</b>\n\n"
+        f"<b>{tg(position.get('canonical_asset'))}</b>\n"
+        f"LONG <code>{tg(position.get('long_venue'))}</code> / "
+        f"SHORT <code>{tg(position.get('short_venue'))}</code>\n\n"
+        "Биржи опубликовали funding history, бот пересчитал результат.\n"
+        f"Funding PnL: <b>{format_signed_money(position.get('actual_funding_pnl'))}</b>\n"
+        f"Execution cost: {format_money(position.get('actual_execution_cost'))}\n"
+        f"Net PnL: <b>{format_signed_money(position.get('actual_net_pnl'))}</b>\n"
+        f"{tg(quality)}\n"
+        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
+        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
+    )
+
+
+def close_reason_message(value: Any) -> str:
+    return {
+        "arbitrage_window_closed_live_net_non_positive": (
+            "арбитражное окно закрылось, live net стал неположительным"
+        ),
+        "arbitrage_window_data_quality_issue": (
+            "свежие данные маршрута выглядят несовместимыми"
+        ),
+        "arbitrage_window_unverifiable_route_missing": (
+            "не удалось получить свежий route snapshot"
+        ),
+        "arbitrage_window_unverifiable_route_stale": (
+            "route snapshot устарел, продолжение окна не подтверждено"
+        ),
+        "arbitrage_window_unverifiable_next_settlement_missing": (
+            "не удалось определить следующий funding settlement"
+        ),
+        "arbitrage_window_unverifiable_live_net_missing": (
+            "не удалось проверить live net"
+        ),
+        "arbitrage_window_unverifiable": (
+            "продолжение окна не подтверждено"
+        ),
+    }.get(str(value or ""), str(value or "продолжение окна не подтверждено"))
+
+
+def close_window_message(close: dict[str, Any]) -> str:
+    evidence = close.get("close_evidence") or {}
+    live_net = optional_float(evidence.get("current_nowcast_net"))
+    if live_net is None:
+        if close.get("close_funding_route_id"):
+            return "Состояние окна при закрытии: close-scan был, но live net не рассчитан."
+        return "Состояние окна при закрытии: свежий route snapshot не найден."
+    if live_net > 0:
+        return (
+            "Состояние окна при закрытии: окно еще выглядело положительным, "
+            f"live net {format_money(live_net)}."
+        )
+    if live_net < 0:
+        return (
+            "Состояние окна при закрытии: окно уже не выглядело положительным, "
+            f"live net {format_money(live_net)}."
+        )
+    return "Состояние окна при закрытии: live net около $0.00."
+
+
+def format_money(value: Any) -> str:
+    try:
+        return f"${float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def format_signed_money(value: Any) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    sign = "+" if amount > 0 else ""
+    return f"{sign}${amount:.2f}" if amount >= 0 else f"-${abs(amount):.2f}"
+
+
+def tg(value: Any) -> str:
+    if value is None:
+        return "-"
+    return html_escape(str(value), quote=False)
 
 
 def format_seconds(value: Any) -> str:
@@ -1564,6 +2442,22 @@ def format_seconds(value: Any) -> str:
     seconds = max(0, int(float(value)))
     minutes, rest = divmod(seconds, 60)
     return f"{minutes}m {rest}s"
+
+
+def format_datetime_utc(value: Any) -> str:
+    timestamp = parse_iso(value)
+    if timestamp is None:
+        return "-"
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def format_interval_hours(value: Any) -> str:
+    hours = optional_float(value)
+    if hours is None:
+        return "-"
+    if abs(hours - round(hours)) < 1e-9:
+        return f"{int(round(hours))}h"
+    return f"{hours:.2f}h"
 
 
 def format_rate(value: Any) -> str:
@@ -1584,7 +2478,9 @@ def export_funding_paper_csv(
     export_dir: Path,
 ) -> dict[str, Path]:
     export_dir.mkdir(parents=True, exist_ok=True)
-    dashboard = store.funding_paper_dashboard()
+    dashboard = filter_deactivated_funding_paper_payload(
+        store.funding_paper_dashboard(refresh_estimates=False)
+    )
     outputs = {
         "accounts": export_dir / "paper_accounts.csv",
         "open_positions": export_dir / "paper_open_positions.csv",

@@ -18,23 +18,16 @@ from smart_money_radar.config import (
     SCHEMA_PATH,
     ChainConfig,
 )
+from smart_money_radar.funding.normalization import CANONICAL_ASSET_UNIT_MULTIPLIERS
+from smart_money_radar.prediction.strategies import (
+    build_prediction_opportunity_dashboard,
+    build_prediction_strategy_counts,
+    prediction_strategy_bucket,
+    prediction_strategy_name,
+)
 
 
-FUNDING_UNIT_MULTIPLIERS = {
-    "1000BONK": 1_000.0,
-    "KBONK": 1_000.0,
-    "1000FLOKI": 1_000.0,
-    "KFLOKI": 1_000.0,
-    "1000LUNC": 1_000.0,
-    "1000000MOG": 1_000_000.0,
-    "1000PEPE": 1_000.0,
-    "KPEPE": 1_000.0,
-    "1000RATS": 1_000.0,
-    "1000SATS": 1_000.0,
-    "1000SHIB": 1_000.0,
-    "KSHIB": 1_000.0,
-    "1000XEC": 1_000.0,
-}
+FUNDING_UNIT_MULTIPLIERS = CANONICAL_ASSET_UNIT_MULTIPLIERS
 
 
 def funding_unit_multiplier(row: dict[str, Any]) -> float:
@@ -55,6 +48,65 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def prediction_scan_freshness(
+    scan: dict[str, Any],
+    maximum_age_minutes: float = 15.0,
+) -> dict[str, Any]:
+    timestamp = scan.get("finished_at") or scan.get("started_at")
+    if not timestamp:
+        return {
+            "dashboard_fresh": False,
+            "freshness_status": "not_started",
+            "scan_age_minutes": None,
+            "maximum_dashboard_age_minutes": maximum_age_minutes,
+        }
+    try:
+        observed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return {
+            "dashboard_fresh": False,
+            "freshness_status": "invalid_timestamp",
+            "scan_age_minutes": None,
+            "maximum_dashboard_age_minutes": maximum_age_minutes,
+        }
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    age_minutes = max(
+        0.0,
+        (datetime.now(UTC) - observed.astimezone(UTC)).total_seconds() / 60.0,
+    )
+    fresh = age_minutes <= max(0.0, maximum_age_minutes)
+    return {
+        "dashboard_fresh": fresh,
+        "freshness_status": "fresh" if fresh else "stale",
+        "scan_age_minutes": age_minutes,
+        "maximum_dashboard_age_minutes": maximum_age_minutes,
+    }
+
+
+def prediction_scan_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+    if not row:
+        return {}
+    scan = dict(row)
+    scan["config"] = json.loads(scan.pop("config_json") or "{}")
+    try:
+        maximum_dashboard_age_minutes = float(
+            (scan.get("config") or {}).get(
+                "dashboard_freshness_minutes",
+                15.0,
+            )
+        )
+    except (TypeError, ValueError):
+        maximum_dashboard_age_minutes = 15.0
+    scan.update(
+        prediction_scan_freshness(
+            scan,
+            maximum_age_minutes=maximum_dashboard_age_minutes,
+        )
+    )
+    return scan
+
+
 class SQLiteStore:
     def __init__(self, db_path: Path = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
@@ -72,7 +124,61 @@ class SQLiteStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = NORMAL")
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            self._ensure_prediction_scan_columns(connection)
             self.upsert_chains(connection, CHAINS)
+
+    def _ensure_prediction_scan_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(prediction_scans)")
+        }
+        for name in (
+            "hyperliquid_event_count",
+            "hyperliquid_market_count",
+            "hyperliquid_orderbook_count",
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE prediction_scans ADD COLUMN {name} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+
+    def sqlite_maintenance(
+        self,
+        *,
+        vacuum: bool = False,
+        analyze: bool = True,
+        optimize: bool = True,
+        wal_checkpoint: bool = True,
+    ) -> dict[str, Any]:
+        before_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        operations: list[str] = []
+        with self.connect() as connection:
+            if wal_checkpoint:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                operations.append("wal_checkpoint")
+            if analyze:
+                connection.execute("ANALYZE")
+                operations.append("analyze")
+            if optimize:
+                connection.execute("PRAGMA optimize")
+                operations.append("optimize")
+        if vacuum:
+            connection = sqlite3.connect(self.db_path, timeout=60.0)
+            try:
+                connection.execute("PRAGMA busy_timeout = 60000")
+                connection.execute("VACUUM")
+                operations.append("vacuum")
+            finally:
+                connection.close()
+        after_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        return {
+            "database_path": str(self.db_path),
+            "operations": operations,
+            "before_bytes": before_bytes,
+            "after_bytes": after_bytes,
+            "saved_bytes": max(0, before_bytes - after_bytes),
+        }
 
     def upsert_chains(
         self,
@@ -1996,6 +2102,7 @@ class SQLiteStore:
         chain_id: str,
         execution_id: str | None,
         rows: list[dict[str, Any]],
+        source: str = "dune_base_live_radar",
     ) -> int:
         now = utc_now_iso()
         records = []
@@ -2024,6 +2131,7 @@ class SQLiteStore:
                 ],
                 "accumulating_wallet_flows": wallet_flows,
             }
+            evidence.update(row.get("evidence") or {})
             records.append(
                 (
                     chain_id,
@@ -2042,7 +2150,7 @@ class SQLiteStore:
                     normalize_optional_dune_timestamp(row.get("first_trade_at")),
                     normalize_optional_dune_timestamp(row.get("last_trade_at")),
                     float(row.get("weighted_wallet_score") or 0),
-                    "dune_base_live_radar",
+                    source,
                     execution_id,
                     json.dumps(evidence, sort_keys=True),
                     now,
@@ -2096,6 +2204,45 @@ class SQLiteStore:
                 records,
             )
         return len(records)
+
+    def prune_radar_observations_by_source(
+        self,
+        source: str,
+        keep_latest_snapshots: int = 1,
+    ) -> int:
+        retained = max(0, int(keep_latest_snapshots))
+        with self.connect() as connection:
+            if retained == 0:
+                cursor = connection.execute(
+                    "DELETE FROM radar_observations WHERE source = ?",
+                    (source,),
+                )
+                return int(cursor.rowcount if cursor.rowcount is not None else 0)
+            retained_times = [
+                row["observed_at"]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT observed_at
+                    FROM radar_observations
+                    WHERE source = ?
+                    ORDER BY observed_at DESC
+                    LIMIT ?
+                    """,
+                    (source, retained),
+                )
+            ]
+            if not retained_times:
+                return 0
+            placeholders = ",".join("?" for _ in retained_times)
+            cursor = connection.execute(
+                f"""
+                DELETE FROM radar_observations
+                WHERE source = ?
+                  AND observed_at NOT IN ({placeholders})
+                """,
+                [source, *retained_times],
+            )
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
 
     def upsert_token_market_snapshots(
         self,
@@ -2168,6 +2315,380 @@ class SQLiteStore:
                 records,
             )
         return len(records)
+
+    def prune_token_market_snapshots_by_source(
+        self,
+        source: str,
+        keep_latest_snapshots: int = 1,
+    ) -> int:
+        retained = max(0, int(keep_latest_snapshots))
+        with self.connect() as connection:
+            if retained == 0:
+                cursor = connection.execute(
+                    "DELETE FROM token_market_snapshots WHERE source = ?",
+                    (source,),
+                )
+                return int(cursor.rowcount if cursor.rowcount is not None else 0)
+            retained_times = [
+                row["observed_at"]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT observed_at
+                    FROM token_market_snapshots
+                    WHERE source = ?
+                    ORDER BY observed_at DESC
+                    LIMIT ?
+                    """,
+                    (source, retained),
+                )
+            ]
+            if not retained_times:
+                return 0
+            placeholders = ",".join("?" for _ in retained_times)
+            cursor = connection.execute(
+                f"""
+                DELETE FROM token_market_snapshots
+                WHERE source = ?
+                  AND observed_at NOT IN ({placeholders})
+                """,
+                [source, *retained_times],
+            )
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
+
+    def local_ingestion_cursor(
+        self,
+        source: str,
+        chain_id: str,
+        cursor_key: str = "default",
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM local_ingestion_cursors
+                WHERE source = ? AND chain_id = ? AND cursor_key = ?
+                """,
+                (source, chain_id, cursor_key),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+        return item
+
+    def upsert_local_ingestion_cursor(
+        self,
+        source: str,
+        chain_id: str,
+        cursor_key: str,
+        block_number: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO local_ingestion_cursors (
+                    source,
+                    chain_id,
+                    cursor_key,
+                    block_number,
+                    updated_at,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, chain_id, cursor_key)
+                DO UPDATE SET
+                    block_number = excluded.block_number,
+                    updated_at = excluded.updated_at,
+                    metadata_json = excluded.metadata_json
+                """,
+                (
+                    source,
+                    chain_id,
+                    cursor_key,
+                    int(block_number),
+                    utc_now_iso(),
+                    json.dumps(metadata or {}, sort_keys=True),
+                ),
+            )
+
+    def import_local_dex_trades(self, trades: list[dict[str, Any]]) -> int:
+        now = utc_now_iso()
+        records = [
+            (
+                row["chain_id"],
+                row.get("project"),
+                row.get("dex_id"),
+                str(row["pair_address"]).lower(),
+                str(row["token_address"]).lower(),
+                row.get("token_symbol"),
+                str(row["wallet_address"]).lower(),
+                str(row["tx_hash"]).lower(),
+                int(row.get("log_index") or 0),
+                row.get("block_number"),
+                normalize_optional_dune_timestamp(row.get("block_time")),
+                row["side"],
+                str(row.get("amount_raw") or "0"),
+                row.get("amount_token"),
+                row.get("amount_usd"),
+                row.get("price_usd"),
+                normalize_dune_timestamp(row.get("observed_at") or now),
+                int(row.get("window_hours") or 0),
+                row.get("source") or "local_hypersync_dex_trades",
+                json.dumps(row.get("evidence", {}), sort_keys=True),
+                now,
+            )
+            for row in trades
+        ]
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO local_dex_trades (
+                    chain_id,
+                    project,
+                    dex_id,
+                    pair_address,
+                    token_address,
+                    token_symbol,
+                    wallet_address,
+                    tx_hash,
+                    log_index,
+                    block_number,
+                    block_time,
+                    side,
+                    amount_raw,
+                    amount_token,
+                    amount_usd,
+                    price_usd,
+                    observed_at,
+                    window_hours,
+                    source,
+                    evidence_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    chain_id,
+                    tx_hash,
+                    log_index,
+                    token_address,
+                    wallet_address,
+                    source
+                )
+                DO UPDATE SET
+                    project = excluded.project,
+                    dex_id = excluded.dex_id,
+                    pair_address = excluded.pair_address,
+                    token_symbol = excluded.token_symbol,
+                    block_number = excluded.block_number,
+                    block_time = excluded.block_time,
+                    side = excluded.side,
+                    amount_raw = excluded.amount_raw,
+                    amount_token = excluded.amount_token,
+                    amount_usd = excluded.amount_usd,
+                    price_usd = excluded.price_usd,
+                    observed_at = excluded.observed_at,
+                    window_hours = excluded.window_hours,
+                    evidence_json = excluded.evidence_json
+                """,
+                records,
+            )
+        return len(records)
+
+    def import_local_dex_rollups(self, rollups: list[dict[str, Any]]) -> int:
+        now = utc_now_iso()
+        records = [
+            (
+                row["chain_id"],
+                str(row["token_address"]).lower(),
+                row.get("token_symbol"),
+                normalize_dune_timestamp(row.get("observed_at") or now),
+                int(row.get("window_hours") or 0),
+                int(row.get("tracked_wallet_count") or 0),
+                int(row.get("strong_wallet_count") or 0),
+                int(row.get("watch_wallet_count") or 0),
+                float(row.get("gross_buy_usd") or 0),
+                float(row.get("gross_sell_usd") or 0),
+                float(row.get("net_buy_usd") or 0),
+                int(row.get("buy_trade_count") or 0),
+                int(row.get("sell_trade_count") or 0),
+                normalize_optional_dune_timestamp(row.get("first_trade_at")),
+                normalize_optional_dune_timestamp(row.get("last_trade_at")),
+                float(row.get("weighted_wallet_score") or 0),
+                row.get("source") or "local_hypersync_dex_trades",
+                json.dumps(row.get("evidence", {}), sort_keys=True),
+                now,
+            )
+            for row in rollups
+        ]
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO local_dex_rollups (
+                    chain_id,
+                    token_address,
+                    token_symbol,
+                    observed_at,
+                    window_hours,
+                    tracked_wallet_count,
+                    strong_wallet_count,
+                    watch_wallet_count,
+                    gross_buy_usd,
+                    gross_sell_usd,
+                    net_buy_usd,
+                    buy_trade_count,
+                    sell_trade_count,
+                    first_trade_at,
+                    last_trade_at,
+                    weighted_wallet_score,
+                    source,
+                    evidence_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chain_id, token_address, observed_at, window_hours, source)
+                DO UPDATE SET
+                    token_symbol = excluded.token_symbol,
+                    tracked_wallet_count = excluded.tracked_wallet_count,
+                    strong_wallet_count = excluded.strong_wallet_count,
+                    watch_wallet_count = excluded.watch_wallet_count,
+                    gross_buy_usd = excluded.gross_buy_usd,
+                    gross_sell_usd = excluded.gross_sell_usd,
+                    net_buy_usd = excluded.net_buy_usd,
+                    buy_trade_count = excluded.buy_trade_count,
+                    sell_trade_count = excluded.sell_trade_count,
+                    first_trade_at = excluded.first_trade_at,
+                    last_trade_at = excluded.last_trade_at,
+                    weighted_wallet_score = excluded.weighted_wallet_score,
+                    evidence_json = excluded.evidence_json
+                """,
+                records,
+            )
+        return len(records)
+
+    def prune_local_dex_trades_by_source(
+        self,
+        source: str,
+        keep_latest_snapshots: int = 1,
+    ) -> int:
+        return self._prune_local_snapshot_table(
+            table_name="local_dex_trades",
+            source=source,
+            keep_latest_snapshots=keep_latest_snapshots,
+        )
+
+    def prune_local_dex_rollups_by_source(
+        self,
+        source: str,
+        keep_latest_snapshots: int = 1,
+    ) -> int:
+        return self._prune_local_snapshot_table(
+            table_name="local_dex_rollups",
+            source=source,
+            keep_latest_snapshots=keep_latest_snapshots,
+        )
+
+    def _prune_local_snapshot_table(
+        self,
+        table_name: str,
+        source: str,
+        keep_latest_snapshots: int,
+    ) -> int:
+        if table_name not in {"local_dex_trades", "local_dex_rollups"}:
+            raise ValueError(f"Unsupported local snapshot table: {table_name}")
+        retained = max(0, int(keep_latest_snapshots))
+        with self.connect() as connection:
+            if retained == 0:
+                cursor = connection.execute(
+                    f"DELETE FROM {table_name} WHERE source = ?",
+                    (source,),
+                )
+                return int(cursor.rowcount if cursor.rowcount is not None else 0)
+            retained_times = [
+                row["observed_at"]
+                for row in connection.execute(
+                    f"""
+                    SELECT DISTINCT observed_at
+                    FROM {table_name}
+                    WHERE source = ?
+                    ORDER BY observed_at DESC
+                    LIMIT ?
+                    """,
+                    (source, retained),
+                )
+            ]
+            if not retained_times:
+                return 0
+            placeholders = ",".join("?" for _ in retained_times)
+            cursor = connection.execute(
+                f"""
+                DELETE FROM {table_name}
+                WHERE source = ?
+                  AND observed_at NOT IN ({placeholders})
+                """,
+                [source, *retained_times],
+            )
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
+
+    def prune_signals_by_evidence_source_mode(
+        self,
+        source_mode: str,
+        keep_latest_detected: int = 1,
+    ) -> int:
+        retained = max(0, int(keep_latest_detected))
+        pattern = f'%\"source_mode\": \"{source_mode}\"%'
+        with self.connect() as connection:
+            retained_times = (
+                [
+                    row["detected_at"]
+                    for row in connection.execute(
+                        """
+                        SELECT DISTINCT detected_at
+                        FROM signals
+                        WHERE evidence_json LIKE ?
+                        ORDER BY detected_at DESC
+                        LIMIT ?
+                        """,
+                        (pattern, retained),
+                    )
+                ]
+                if retained
+                else []
+            )
+            parameters: list[Any] = [pattern]
+            retained_clause = ""
+            if retained_times:
+                placeholders = ",".join("?" for _ in retained_times)
+                retained_clause = f" AND detected_at NOT IN ({placeholders})"
+                parameters.extend(retained_times)
+            signal_ids = [
+                row["signal_id"]
+                for row in connection.execute(
+                    f"""
+                    SELECT signal_id
+                    FROM signals
+                    WHERE evidence_json LIKE ?
+                    {retained_clause}
+                    """,
+                    parameters,
+                )
+            ]
+            if not signal_ids:
+                return 0
+            placeholders = ",".join("?" for _ in signal_ids)
+            connection.execute(
+                f"DELETE FROM signal_shadow_marks WHERE signal_id IN ({placeholders})",
+                signal_ids,
+            )
+            connection.execute(
+                f"DELETE FROM signal_wallets WHERE signal_id IN ({placeholders})",
+                signal_ids,
+            )
+            cursor = connection.execute(
+                f"DELETE FROM signals WHERE signal_id IN ({placeholders})",
+                signal_ids,
+            )
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
 
     def upsert_token_risk_snapshots(
         self,
@@ -2315,10 +2836,22 @@ class SQLiteStore:
             )
         return len(records)
 
-    def latest_radar_observations(self, limit: int = 100) -> list[dict[str, Any]]:
+    def latest_radar_observations(
+        self,
+        limit: int = 100,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        source_filter = ""
+        latest_source_filter = ""
+        parameters: list[Any] = []
+        if source:
+            source_filter = "AND ro.source = ?"
+            latest_source_filter = "WHERE source = ?"
+            parameters.extend([source, source])
+        parameters.append(max(1, min(int(limit), 1000)))
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     ro.*,
                     ms.token_name AS market_token_name,
@@ -2452,11 +2985,16 @@ class SQLiteStore:
                       ORDER BY ats2.observed_at DESC
                       LIMIT 1
                   )
-                WHERE ro.observed_at = (SELECT MAX(observed_at) FROM radar_observations)
+                WHERE ro.observed_at = (
+                    SELECT MAX(observed_at)
+                    FROM radar_observations
+                    {latest_source_filter}
+                )
+                {source_filter}
                 ORDER BY ro.net_buy_usd DESC
                 LIMIT ?
                 """,
-                (max(1, min(int(limit), 1000)),),
+                parameters,
             ).fetchall()
         output = []
         for row in rows:
@@ -2659,7 +3197,64 @@ class SQLiteStore:
                 ),
             )
 
+    def app_job(self, job_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM app_jobs
+                WHERE job_id = ?
+                """,
+                (int(job_id),),
+            ).fetchone()
+        return self._app_job_from_row(row)
+
     def latest_app_job(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM app_jobs
+                WHERE status IN ('queued', 'running')
+                ORDER BY job_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM app_jobs
+                    ORDER BY job_id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+        return self._app_job_from_row(row)
+
+    def fail_running_app_jobs(self, error: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE app_jobs
+                SET status = 'failed',
+                    finished_at = ?,
+                    progress = 1.0,
+                    message = COALESCE(message, 'Interrupted job'),
+                    error = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (utc_now_iso(), error),
+            )
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
+
+    def _app_job_from_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        item = dict(row)
+        item["result"] = json.loads(item.pop("result_json"))
+        return item
+
+    def latest_app_job_by_request_time(self) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -2669,11 +3264,7 @@ class SQLiteStore:
                 LIMIT 1
                 """
             ).fetchone()
-        if not row:
-            return None
-        item = dict(row)
-        item["result"] = json.loads(item.pop("result_json"))
-        return item
+        return self._app_job_from_row(row)
 
     def dashboard_coverage(self) -> dict[str, Any]:
         with self.connect() as connection:
@@ -4698,6 +5289,9 @@ class SQLiteStore:
         *,
         polymarket_event_count: int = 0,
         kalshi_event_count: int = 0,
+        hyperliquid_event_count: int = 0,
+        hyperliquid_market_count: int = 0,
+        hyperliquid_orderbook_count: int = 0,
         market_count: int = 0,
         orderbook_count: int = 0,
         route_count: int = 0,
@@ -4712,6 +5306,9 @@ class SQLiteStore:
                     finished_at = ?,
                     polymarket_event_count = ?,
                     kalshi_event_count = ?,
+                    hyperliquid_event_count = ?,
+                    hyperliquid_market_count = ?,
+                    hyperliquid_orderbook_count = ?,
                     market_count = ?,
                     orderbook_count = ?,
                     route_count = ?,
@@ -4724,6 +5321,9 @@ class SQLiteStore:
                     utc_now_iso(),
                     polymarket_event_count,
                     kalshi_event_count,
+                    hyperliquid_event_count,
+                    hyperliquid_market_count,
+                    hyperliquid_orderbook_count,
                     market_count,
                     orderbook_count,
                     route_count,
@@ -4732,6 +5332,20 @@ class SQLiteStore:
                     scan_id,
                 ),
             )
+
+    def fail_running_prediction_scans(self, error: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE prediction_scans
+                SET status = 'failed',
+                    finished_at = ?,
+                    error = ?
+                WHERE status = 'running'
+                """,
+                (utc_now_iso(), error),
+            )
+            return int(cursor.rowcount if cursor.rowcount is not None else 0)
 
     def upsert_prediction_catalog(
         self,
@@ -5054,6 +5668,87 @@ class SQLiteStore:
             )
         return len(rows)
 
+    def upsert_prediction_verified_contract_mappings(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        if not rows:
+            return 0
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO prediction_verified_contract_mappings (
+                    venue_a,
+                    market_id_a,
+                    venue_b,
+                    market_id_b,
+                    relation_type,
+                    status,
+                    confidence_score,
+                    verified_by,
+                    verified_at,
+                    notes,
+                    rationale_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue_a, market_id_a, venue_b, market_id_b)
+                DO UPDATE SET
+                    relation_type = excluded.relation_type,
+                    status = excluded.status,
+                    confidence_score = excluded.confidence_score,
+                    verified_by = excluded.verified_by,
+                    verified_at = excluded.verified_at,
+                    notes = excluded.notes,
+                    rationale_json = excluded.rationale_json,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        row["venue_a"],
+                        row["market_id_a"],
+                        row["venue_b"],
+                        row["market_id_b"],
+                        row.get("relation_type", "equivalent"),
+                        row.get("status", "active"),
+                        float(row.get("confidence_score", 1.0)),
+                        row.get("verified_by"),
+                        row.get("verified_at", now),
+                        row.get("notes"),
+                        json.dumps(row.get("rationale", [])),
+                        row.get("created_at", now),
+                        now,
+                    )
+                    for row in rows
+                ],
+            )
+        return len(rows)
+
+    def prediction_verified_contract_mappings(
+        self,
+        *,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT *
+            FROM prediction_verified_contract_mappings
+        """
+        parameters: tuple[Any, ...] = ()
+        if active_only:
+            query += " WHERE status = ?"
+            parameters = ("active",)
+        query += " ORDER BY confidence_score DESC, updated_at DESC"
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["rationale"] = json.loads(item.pop("rationale_json") or "[]")
+            output.append(item)
+        return output
+
     def insert_prediction_routes(
         self,
         scan_id: int,
@@ -5131,6 +5826,359 @@ class SQLiteStore:
                     {**route, "prediction_route_id": int(cursor.lastrowid)}
                 )
         return output
+
+    def insert_prediction_route_candidates(
+        self,
+        scan_id: int,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        if not rows:
+            return 0
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO prediction_route_candidates (
+                    prediction_scan_id,
+                    route_key,
+                    route_type,
+                    venue_scope,
+                    event_id,
+                    title,
+                    candidate_status,
+                    route_status,
+                    candidate_score,
+                    expected_net_profit,
+                    net_edge_per_share,
+                    optimal_size,
+                    max_executable_size,
+                    blocking_reason,
+                    screen_reason,
+                    observed_at,
+                    risk_flags_json,
+                    evidence_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(prediction_scan_id, route_key)
+                DO UPDATE SET
+                    route_type = excluded.route_type,
+                    venue_scope = excluded.venue_scope,
+                    event_id = excluded.event_id,
+                    title = excluded.title,
+                    candidate_status = excluded.candidate_status,
+                    route_status = excluded.route_status,
+                    candidate_score = excluded.candidate_score,
+                    expected_net_profit = excluded.expected_net_profit,
+                    net_edge_per_share = excluded.net_edge_per_share,
+                    optimal_size = excluded.optimal_size,
+                    max_executable_size = excluded.max_executable_size,
+                    blocking_reason = excluded.blocking_reason,
+                    screen_reason = excluded.screen_reason,
+                    observed_at = excluded.observed_at,
+                    risk_flags_json = excluded.risk_flags_json,
+                    evidence_json = excluded.evidence_json
+                """,
+                [
+                    (
+                        scan_id,
+                        row["route_key"],
+                        row["route_type"],
+                        row["venue_scope"],
+                        row.get("event_id"),
+                        row["title"],
+                        row["candidate_status"],
+                        row["route_status"],
+                        row.get("candidate_score", 0),
+                        row.get("expected_net_profit"),
+                        row.get("net_edge_per_share"),
+                        row.get("optimal_size", 0),
+                        row.get("max_executable_size", 0),
+                        row.get("blocking_reason"),
+                        row["screen_reason"],
+                        row["observed_at"],
+                        json.dumps(row.get("risk_flags", [])),
+                        json.dumps(row.get("evidence", {}), sort_keys=True),
+                    )
+                    for row in rows
+                ],
+            )
+        return len(rows)
+
+    def upsert_prediction_candidate_backlog(
+        self,
+        scan_id: int,
+        candidates: list[dict[str, Any]],
+        routes: list[dict[str, Any]],
+        *,
+        limit: int = 200,
+    ) -> dict[str, int]:
+        now = utc_now_iso()
+        route_map = {str(route.get("route_key")): route for route in routes}
+        rows = []
+        for candidate in candidates:
+            expected_net_profit = optional_float(candidate.get("expected_net_profit"))
+            if expected_net_profit is None or expected_net_profit <= 0:
+                continue
+            route = route_map.get(str(candidate.get("route_key")))
+            capital_lock_days = optional_float((route or {}).get("capital_lock_days"))
+            if capital_lock_days is not None and capital_lock_days <= 0:
+                continue
+            rows.append((candidate, route or {}, expected_net_profit))
+
+        active_keys = [str(candidate["route_key"]) for candidate, _, _ in rows]
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO prediction_candidate_backlog (
+                    route_key,
+                    route_type,
+                    strategy_bucket,
+                    venue_scope,
+                    event_id,
+                    title,
+                    candidate_status,
+                    route_status,
+                    first_prediction_scan_id,
+                    last_prediction_scan_id,
+                    first_seen_at,
+                    last_seen_at,
+                    seen_count,
+                    active,
+                    candidate_score,
+                    expected_net_profit,
+                    best_expected_net_profit,
+                    net_edge_per_share,
+                    best_net_edge_per_share,
+                    optimal_size,
+                    max_executable_size,
+                    source_url,
+                    risk_flags_json,
+                    evidence_json,
+                    legs_json,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(route_key) DO UPDATE SET
+                    route_type = excluded.route_type,
+                    strategy_bucket = excluded.strategy_bucket,
+                    venue_scope = excluded.venue_scope,
+                    event_id = excluded.event_id,
+                    title = excluded.title,
+                    candidate_status = excluded.candidate_status,
+                    route_status = excluded.route_status,
+                    last_prediction_scan_id = excluded.last_prediction_scan_id,
+                    last_seen_at = excluded.last_seen_at,
+                    seen_count = prediction_candidate_backlog.seen_count + 1,
+                    active = 1,
+                    candidate_score = excluded.candidate_score,
+                    expected_net_profit = excluded.expected_net_profit,
+                    best_expected_net_profit = CASE
+                        WHEN excluded.expected_net_profit > COALESCE(prediction_candidate_backlog.best_expected_net_profit, -1e100)
+                        THEN excluded.expected_net_profit
+                        ELSE prediction_candidate_backlog.best_expected_net_profit
+                    END,
+                    net_edge_per_share = excluded.net_edge_per_share,
+                    best_net_edge_per_share = CASE
+                        WHEN excluded.net_edge_per_share > COALESCE(prediction_candidate_backlog.best_net_edge_per_share, -1e100)
+                        THEN excluded.net_edge_per_share
+                        ELSE prediction_candidate_backlog.best_net_edge_per_share
+                    END,
+                    optimal_size = excluded.optimal_size,
+                    max_executable_size = excluded.max_executable_size,
+                    source_url = excluded.source_url,
+                    risk_flags_json = excluded.risk_flags_json,
+                    evidence_json = excluded.evidence_json,
+                    legs_json = excluded.legs_json,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        candidate["route_key"],
+                        candidate["route_type"],
+                        candidate.get("strategy_bucket")
+                        or prediction_strategy_bucket(candidate.get("route_type")),
+                        candidate["venue_scope"],
+                        candidate.get("event_id"),
+                        candidate["title"],
+                        candidate["candidate_status"],
+                        candidate["route_status"],
+                        scan_id,
+                        scan_id,
+                        candidate["observed_at"],
+                        candidate["observed_at"],
+                        candidate.get("candidate_score", 0),
+                        expected_net_profit,
+                        expected_net_profit,
+                        candidate.get("net_edge_per_share"),
+                        candidate.get("net_edge_per_share"),
+                        candidate.get("optimal_size", 0),
+                        candidate.get("max_executable_size", 0),
+                        route.get("source_url"),
+                        json.dumps(candidate.get("risk_flags", [])),
+                        json.dumps(candidate.get("evidence", {}), sort_keys=True),
+                        json.dumps(route.get("legs", [])),
+                        now,
+                    )
+                    for candidate, route, expected_net_profit in rows
+                ],
+            )
+            if active_keys:
+                placeholders = ",".join("?" for _ in active_keys)
+                connection.execute(
+                    f"""
+                    UPDATE prediction_candidate_backlog
+                    SET active = 0, updated_at = ?
+                    WHERE route_key NOT IN ({placeholders})
+                    """,
+                    (now, *active_keys),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE prediction_candidate_backlog
+                    SET active = 0, updated_at = ?
+                    """,
+                    (now,),
+                )
+            before_prune = connection.execute(
+                "SELECT COUNT(*) FROM prediction_candidate_backlog"
+            ).fetchone()[0]
+            keep = max(1, int(limit))
+            connection.execute(
+                """
+                DELETE FROM prediction_candidate_backlog
+                WHERE prediction_candidate_backlog_id NOT IN (
+                    SELECT prediction_candidate_backlog_id
+                    FROM prediction_candidate_backlog
+                    ORDER BY active DESC,
+                             last_seen_at DESC,
+                             COALESCE(best_expected_net_profit, expected_net_profit, 0) DESC
+                    LIMIT ?
+                )
+                """,
+                (keep,),
+            )
+            after_prune = connection.execute(
+                "SELECT COUNT(*) FROM prediction_candidate_backlog"
+            ).fetchone()[0]
+        return {
+            "upserted_candidates": len(rows),
+            "active_candidates": len(active_keys),
+            "pruned_candidates": max(0, int(before_prune) - int(after_prune)),
+        }
+
+    def upsert_prediction_trade_backlog(
+        self,
+        scan_id: int,
+        paper_rows: list[dict[str, Any]],
+        routes: list[dict[str, Any]],
+        *,
+        limit: int = 200,
+    ) -> dict[str, int]:
+        if not paper_rows:
+            return {"upserted_trades": 0, "pruned_trades": 0}
+        route_map = {
+            int(route["prediction_route_id"]): route
+            for route in routes
+            if route.get("prediction_route_id") is not None
+        }
+        now = utc_now_iso()
+        rows = []
+        for paper in paper_rows:
+            status = str(paper.get("status") or "")
+            filled_size = optional_float(paper.get("filled_size")) or 0.0
+            if status == "rejected" or filled_size <= 0:
+                continue
+            route = route_map.get(int(paper.get("prediction_route_id") or 0))
+            if not route:
+                continue
+            trade_key = (
+                f"paper:{paper.get('model_version')}:{scan_id}:{route['route_key']}"
+            )
+            rows.append((trade_key, paper, route))
+        if not rows:
+            return {"upserted_trades": 0, "pruned_trades": 0}
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO prediction_trade_backlog (
+                    trade_key,
+                    source_type,
+                    prediction_scan_id,
+                    route_key,
+                    route_type,
+                    venue_scope,
+                    title,
+                    status,
+                    model_version,
+                    created_at,
+                    expected_net_profit,
+                    simulated_net_profit,
+                    filled_size,
+                    fill_ratio,
+                    payload_json
+                )
+                VALUES (?, 'paper_execution', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_key) DO UPDATE SET
+                    status = excluded.status,
+                    expected_net_profit = excluded.expected_net_profit,
+                    simulated_net_profit = excluded.simulated_net_profit,
+                    filled_size = excluded.filled_size,
+                    fill_ratio = excluded.fill_ratio,
+                    payload_json = excluded.payload_json
+                """,
+                [
+                    (
+                        trade_key,
+                        scan_id,
+                        route["route_key"],
+                        route["route_type"],
+                        route["venue_scope"],
+                        route["title"],
+                        paper["status"],
+                        paper.get("model_version"),
+                        now,
+                        paper.get("expected_net_profit"),
+                        paper.get("simulated_net_profit"),
+                        paper.get("filled_size"),
+                        paper.get("fill_ratio"),
+                        json.dumps(
+                            {
+                                "paper": paper,
+                                "route": {
+                                    "route_key": route.get("route_key"),
+                                    "risk_flags": route.get("risk_flags") or [],
+                                    "evidence": route.get("evidence") or {},
+                                },
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                    for trade_key, paper, route in rows
+                ],
+            )
+            before_prune = connection.execute(
+                "SELECT COUNT(*) FROM prediction_trade_backlog"
+            ).fetchone()[0]
+            connection.execute(
+                """
+                DELETE FROM prediction_trade_backlog
+                WHERE prediction_trade_backlog_id NOT IN (
+                    SELECT prediction_trade_backlog_id
+                    FROM prediction_trade_backlog
+                    ORDER BY created_at DESC,
+                             COALESCE(simulated_net_profit, expected_net_profit, 0) DESC
+                    LIMIT ?
+                )
+                """,
+                (max(1, int(limit)),),
+            )
+            after_prune = connection.execute(
+                "SELECT COUNT(*) FROM prediction_trade_backlog"
+            ).fetchone()[0]
+        return {
+            "upserted_trades": len(rows),
+            "pruned_trades": max(0, int(before_prune) - int(after_prune)),
+        }
 
     def previous_prediction_routes(
         self,
@@ -5248,7 +6296,7 @@ class SQLiteStore:
         return len(rows)
 
     def prune_prediction_history(self, keep_scans: int = 10_080) -> dict[str, int]:
-        keep = max(2, int(keep_scans))
+        keep = max(1, int(keep_scans))
         with self.connect() as connection:
             old_rows = connection.execute(
                 """
@@ -5261,10 +6309,19 @@ class SQLiteStore:
             ).fetchall()
             old_ids = [int(row["prediction_scan_id"]) for row in old_rows]
             if not old_ids:
-                return {"deleted_scans": 0, "deleted_routes": 0, "deleted_books": 0}
+                return {
+                    "deleted_scans": 0,
+                    "deleted_routes": 0,
+                    "deleted_route_candidates": 0,
+                    "deleted_books": 0,
+                }
             placeholders = ",".join("?" for _ in old_ids)
             route_count = connection.execute(
                 f"SELECT COUNT(*) FROM prediction_routes WHERE prediction_scan_id IN ({placeholders})",
+                old_ids,
+            ).fetchone()[0]
+            candidate_count = connection.execute(
+                f"SELECT COUNT(*) FROM prediction_route_candidates WHERE prediction_scan_id IN ({placeholders})",
                 old_ids,
             ).fetchone()[0]
             book_count = connection.execute(
@@ -5286,6 +6343,7 @@ class SQLiteStore:
             for table in (
                 "prediction_constraints",
                 "prediction_contract_matches",
+                "prediction_route_candidates",
                 "prediction_routes",
                 "prediction_orderbook_snapshots",
             ):
@@ -5300,6 +6358,7 @@ class SQLiteStore:
         return {
             "deleted_scans": len(old_ids),
             "deleted_routes": int(route_count),
+            "deleted_route_candidates": int(candidate_count),
             "deleted_books": int(book_count),
         }
 
@@ -5520,13 +6579,20 @@ class SQLiteStore:
     def replace_prediction_event_token_links(
         self,
         rows: list[dict[str, Any]],
-        source: str = "auto_keyword_v1",
+        source: str = "deterministic_direct_mention_v2",
     ) -> int:
         now = utc_now_iso()
+        source_names = {
+            str(row.get("source") or source)
+            for row in rows
+            if str(row.get("source") or source).strip()
+        }
+        source_names.add(source)
+        placeholders = ",".join("?" for _ in source_names)
         with self.connect() as connection:
             connection.execute(
-                "DELETE FROM prediction_event_token_links WHERE source = ?",
-                (source,),
+                f"DELETE FROM prediction_event_token_links WHERE source IN ({placeholders})",
+                sorted(source_names),
             )
             connection.executemany(
                 """
@@ -5572,16 +6638,49 @@ class SQLiteStore:
                 """
                 SELECT *
                 FROM prediction_scans
+                WHERE status = 'success'
                 ORDER BY prediction_scan_id DESC
                 LIMIT 1
                 """
             ).fetchone()
-            latest_scan = dict(scan_row) if scan_row else {}
-            if latest_scan:
-                latest_scan["config"] = json.loads(
-                    latest_scan.pop("config_json") or "{}"
-                )
-            scan_id = latest_scan.get("prediction_scan_id")
+            if scan_row is None:
+                scan_row = connection.execute(
+                    """
+                    SELECT *
+                    FROM prediction_scans
+                    WHERE status != 'running'
+                    ORDER BY prediction_scan_id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            active_scan_row = connection.execute(
+                """
+                SELECT *
+                FROM prediction_scans
+                WHERE status = 'running'
+                ORDER BY prediction_scan_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            failed_scan_row = connection.execute(
+                """
+                SELECT *
+                FROM prediction_scans
+                WHERE status = 'failed'
+                ORDER BY prediction_scan_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            latest_scan = prediction_scan_payload(scan_row)
+            active_scan = prediction_scan_payload(active_scan_row)
+            latest_failed_scan = prediction_scan_payload(failed_scan_row)
+            if not latest_scan and active_scan:
+                latest_scan = active_scan
+            scan_id = (
+                latest_scan.get("prediction_scan_id")
+                if latest_scan.get("dashboard_fresh")
+                else None
+            )
             if scan_id:
                 route_rows = connection.execute(
                     """
@@ -5589,10 +6688,35 @@ class SQLiteStore:
                     FROM prediction_routes
                     WHERE prediction_scan_id = ?
                       AND status IN ('executable', 'paper_candidate')
+                      AND COALESCE(expected_net_profit, 0) > 0
+                      AND (
+                          capital_lock_days IS NULL
+                          OR capital_lock_days > 0
+                      )
                     ORDER BY expected_net_profit DESC, confidence_score DESC
                     LIMIT ?
                     """,
                     (scan_id, route_limit),
+                ).fetchall()
+                near_zero_rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM prediction_routes
+                    WHERE prediction_scan_id = ?
+                      AND status = 'not_profitable'
+                      AND expected_net_profit IS NOT NULL
+                      AND expected_net_profit <= 0
+                      AND COALESCE(net_edge_per_share, -1) >= -0.01
+                      AND (
+                          capital_lock_days IS NULL
+                          OR capital_lock_days > 0
+                      )
+                    ORDER BY net_edge_per_share DESC,
+                             expected_net_profit DESC,
+                             confidence_score DESC
+                    LIMIT ?
+                    """,
+                    (scan_id, max(1, int(route_limit))),
                 ).fetchall()
                 route_counts = [
                     dict(row)
@@ -5603,6 +6727,128 @@ class SQLiteStore:
                         WHERE prediction_scan_id = ?
                         GROUP BY route_type, status
                         ORDER BY route_type, status
+                        """,
+                        (scan_id,),
+                    ).fetchall()
+                ]
+                candidate_rows = connection.execute(
+                    """
+                    SELECT
+                        candidate.*,
+                        route.source_url AS source_url
+                    FROM prediction_route_candidates candidate
+                    LEFT JOIN prediction_routes route
+                      ON route.prediction_scan_id = candidate.prediction_scan_id
+                     AND route.route_key = candidate.route_key
+                    WHERE candidate.prediction_scan_id = ?
+                      AND COALESCE(candidate.expected_net_profit, 0) > 0
+                      AND (
+                          route.prediction_route_id IS NULL
+                          OR route.capital_lock_days IS NULL
+                          OR route.capital_lock_days > 0
+                      )
+                    ORDER BY candidate.candidate_score DESC,
+                             candidate.expected_net_profit DESC
+                    """,
+                    (scan_id,),
+                ).fetchall()
+                candidate_counts = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT
+                            candidate.candidate_status,
+                            COUNT(*) AS candidate_count,
+                            MAX(candidate.candidate_score) AS best_score,
+                            MAX(candidate.expected_net_profit) AS best_expected_net_profit
+                        FROM prediction_route_candidates candidate
+                        LEFT JOIN prediction_routes route
+                          ON route.prediction_scan_id = candidate.prediction_scan_id
+                         AND route.route_key = candidate.route_key
+                        WHERE candidate.prediction_scan_id = ?
+                          AND COALESCE(candidate.expected_net_profit, 0) > 0
+                          AND (
+                              route.prediction_route_id IS NULL
+                              OR route.capital_lock_days IS NULL
+                              OR route.capital_lock_days > 0
+                          )
+                        GROUP BY candidate.candidate_status
+                        ORDER BY candidate_count DESC,
+                                 candidate.candidate_status
+                        """,
+                        (scan_id,),
+                    ).fetchall()
+                ]
+                candidate_status_rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT
+                            candidate.route_type,
+                            candidate.candidate_status,
+                            COUNT(*) AS candidate_count
+                        FROM prediction_route_candidates candidate
+                        LEFT JOIN prediction_routes route
+                          ON route.prediction_scan_id = candidate.prediction_scan_id
+                         AND route.route_key = candidate.route_key
+                        WHERE candidate.prediction_scan_id = ?
+                          AND COALESCE(candidate.expected_net_profit, 0) > 0
+                          AND (
+                              route.prediction_route_id IS NULL
+                              OR route.capital_lock_days IS NULL
+                              OR route.capital_lock_days > 0
+                          )
+                        GROUP BY candidate.route_type,
+                                 candidate.candidate_status
+                        ORDER BY candidate.route_type,
+                                 candidate.candidate_status
+                        """,
+                        (scan_id,),
+                    ).fetchall()
+                ]
+                candidate_screen_reasons = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT
+                            candidate.screen_reason,
+                            COUNT(*) AS candidate_count
+                        FROM prediction_route_candidates candidate
+                        LEFT JOIN prediction_routes route
+                          ON route.prediction_scan_id = candidate.prediction_scan_id
+                         AND route.route_key = candidate.route_key
+                        WHERE candidate.prediction_scan_id = ?
+                          AND COALESCE(candidate.expected_net_profit, 0) > 0
+                          AND (
+                              route.prediction_route_id IS NULL
+                              OR route.capital_lock_days IS NULL
+                              OR route.capital_lock_days > 0
+                          )
+                        GROUP BY candidate.screen_reason
+                        ORDER BY candidate_count DESC,
+                                 candidate.screen_reason
+                        LIMIT 10
+                        """,
+                        (scan_id,),
+                    ).fetchall()
+                ]
+                paper_strategy_rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT
+                            route.route_type,
+                            execution.status,
+                            COUNT(*) AS execution_count,
+                            SUM(COALESCE(execution.simulated_net_profit, 0)) AS simulated_net_profit,
+                            AVG(execution.fill_ratio) AS average_fill_ratio,
+                            SUM(CASE WHEN execution.status IN ('filled_profitable', 'partial_profitable') THEN 1 ELSE 0 END) AS profitable_count
+                        FROM prediction_paper_executions execution
+                        JOIN prediction_routes route
+                          ON route.prediction_route_id = execution.prediction_route_id
+                        WHERE execution.prediction_scan_id = ?
+                        GROUP BY route.route_type, execution.status
+                        ORDER BY simulated_net_profit DESC, execution_count DESC
                         """,
                         (scan_id,),
                     ).fetchall()
@@ -5662,10 +6908,58 @@ class SQLiteStore:
                 ]
             else:
                 route_rows = []
+                near_zero_rows = []
                 route_counts = []
+                candidate_rows = []
+                candidate_counts = []
+                candidate_status_rows = []
+                candidate_screen_reasons = []
+                paper_strategy_rows = []
                 paper_summary = {}
                 match_summary = {}
                 venue_rows = []
+            backlog_rows = connection.execute(
+                """
+                SELECT *
+                FROM prediction_candidate_backlog
+                ORDER BY active DESC,
+                         last_seen_at DESC,
+                         COALESCE(best_expected_net_profit, expected_net_profit, 0) DESC
+                LIMIT ?
+                """,
+                (route_limit,),
+            ).fetchall()
+            trade_backlog_rows = connection.execute(
+                """
+                SELECT *
+                FROM prediction_trade_backlog
+                ORDER BY created_at DESC,
+                         COALESCE(simulated_net_profit, expected_net_profit, 0) DESC
+                LIMIT ?
+                """,
+                (route_limit,),
+            ).fetchall()
+            backlog_summary = dict(
+                connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS candidate_backlog_count,
+                        COALESCE(SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END), 0) AS active_candidate_count,
+                        MAX(last_seen_at) AS latest_candidate_seen_at
+                    FROM prediction_candidate_backlog
+                    """
+                ).fetchone()
+            )
+            trade_backlog_summary = dict(
+                connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS trade_backlog_count,
+                        MAX(created_at) AS latest_trade_seen_at
+                    FROM prediction_trade_backlog
+                    """
+                ).fetchone()
+            )
             wallet_rows = connection.execute(
                 """
                 SELECT *
@@ -5689,6 +6983,20 @@ class SQLiteStore:
                 LIMIT 30
                 """
             ).fetchall()
+            wallet_summary = dict(
+                connection.execute(
+                    """
+                    SELECT
+                        'prediction_wallet_v1_3_event_level' AS model_version,
+                        COUNT(*) AS wallet_count,
+                        COALESCE(SUM(CASE WHEN label = 'watch' THEN 1 ELSE 0 END), 0) AS watch_count,
+                        COALESCE(SUM(CASE WHEN label = 'negative_sample' THEN 1 ELSE 0 END), 0) AS negative_count,
+                        MAX(observed_at) AS latest_observed_at
+                    FROM prediction_wallet_scores
+                    WHERE model_version = 'prediction_wallet_v1_3_event_level'
+                    """
+                ).fetchone()
+            )
 
         routes = []
         for row in route_rows:
@@ -5698,6 +7006,61 @@ class SQLiteStore:
             item["risk_flags"] = json.loads(item.pop("risk_flags_json") or "[]")
             item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
             routes.append(item)
+        near_zero_routes = []
+        for row in near_zero_rows:
+            item = dict(row)
+            item["legs"] = json.loads(item.pop("legs_json") or "[]")
+            item["rationale"] = json.loads(item.pop("rationale_json") or "[]")
+            item["risk_flags"] = json.loads(item.pop("risk_flags_json") or "[]")
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            item["missing_net_edge_per_share"] = max(
+                0.0,
+                -float(item.get("net_edge_per_share") or 0.0),
+            )
+            near_zero_routes.append(item)
+        candidates = []
+        for row in candidate_rows:
+            item = dict(row)
+            item["risk_flags"] = json.loads(item.pop("risk_flags_json") or "[]")
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            item["strategy_bucket"] = item.get("strategy_bucket") or prediction_strategy_bucket(
+                item.get("route_type")
+            )
+            item["strategy_name"] = prediction_strategy_name(item["strategy_bucket"])
+            candidates.append(item)
+        candidate_backlog = []
+        for row in backlog_rows:
+            item = dict(row)
+            item["active"] = bool(item.get("active"))
+            item["risk_flags"] = json.loads(item.pop("risk_flags_json") or "[]")
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            item["legs"] = json.loads(item.pop("legs_json") or "[]")
+            item["strategy_bucket"] = item.get("strategy_bucket") or prediction_strategy_bucket(
+                item.get("route_type")
+            )
+            item["strategy_name"] = prediction_strategy_name(item["strategy_bucket"])
+            candidate_backlog.append(item)
+        trade_backlog = []
+        for row in trade_backlog_rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            trade_backlog.append(item)
+        candidate_count = sum(
+            int(row.get("candidate_count") or 0) for row in candidate_counts
+        )
+        strategy_counts = build_prediction_strategy_counts(candidate_status_rows)
+        opportunity_dashboard = build_prediction_opportunity_dashboard(
+            candidates,
+            strategy_counts,
+            candidate_screen_reasons,
+        )
+        visible_candidates = candidates[: max(0, int(route_limit))]
+        paper_strategy_summary = []
+        for row in paper_strategy_rows:
+            item = dict(row)
+            item["strategy_bucket"] = prediction_strategy_bucket(item.get("route_type"))
+            item["strategy_name"] = prediction_strategy_name(item["strategy_bucket"])
+            paper_strategy_summary.append(item)
         wallets = []
         for row in wallet_rows:
             item = dict(row)
@@ -5709,17 +7072,80 @@ class SQLiteStore:
             item = dict(row)
             item["rationale"] = json.loads(item.pop("rationale_json") or "[]")
             links.append(item)
+        maximum_wallet_age_hours = 24.0
+        try:
+            maximum_wallet_age_hours = float(
+                (latest_scan.get("config") or {}).get(
+                    "wallet_refresh_hours",
+                    maximum_wallet_age_hours,
+                )
+            )
+        except (TypeError, ValueError):
+            maximum_wallet_age_hours = 24.0
+        latest_wallet_at = wallet_summary.get("latest_observed_at")
+        cache_age_hours = None
+        stale = True
+        if latest_wallet_at:
+            try:
+                observed = datetime.fromisoformat(
+                    str(latest_wallet_at).replace("Z", "+00:00")
+                )
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=UTC)
+                cache_age_hours = (
+                    datetime.now(UTC) - observed.astimezone(UTC)
+                ).total_seconds() / 3600.0
+                stale = cache_age_hours > maximum_wallet_age_hours
+            except ValueError:
+                stale = True
+        wallet_summary["cache_age_hours"] = cache_age_hours
+        wallet_summary["maximum_age_hours"] = maximum_wallet_age_hours
+        wallet_summary["stale"] = stale
+        wallet_summary["cache_status"] = (
+            "not_collected"
+            if not latest_wallet_at
+            else "stale"
+            if stale
+            else "fresh"
+        )
         return {
             "latest_scan": latest_scan,
+            "active_scan": active_scan,
+            "latest_failed_scan": latest_failed_scan,
             "routes": routes,
+            "near_zero_routes": near_zero_routes,
             "route_counts": route_counts,
+            "route_candidates": visible_candidates,
+            "candidate_summary": {
+                "candidate_count": candidate_count,
+                "status_counts": candidate_counts,
+                "strategy_counts": strategy_counts,
+                "screen_reasons": candidate_screen_reasons,
+            },
+            "opportunity_dashboard": opportunity_dashboard,
+            "paper_trader": {
+                "strategy_rows": paper_strategy_summary,
+                "storage_policy": "latest_scan_only",
+            },
             "paper_summary": paper_summary,
             "match_summary": match_summary,
+            "candidate_backlog": candidate_backlog,
+            "trade_backlog": trade_backlog,
+            "backlog_summary": {
+                **backlog_summary,
+                **trade_backlog_summary,
+                "storage_policy": "bounded_latest_200",
+            },
             "venues": venue_rows,
             "wallet_scores": wallets,
+            "wallet_summary": wallet_summary,
             "token_links": links,
             "execution_mode": "paper_only_research",
             "llm_in_execution_loop": False,
+            "retention_policy": {
+                "prediction_scan_snapshots": 1,
+                "dashboard_writes_history": False,
+            },
         }
 
     def start_funding_scan(self, config: dict[str, Any]) -> int:
@@ -5847,6 +7273,8 @@ class SQLiteStore:
         self,
         scan_id: int,
         rows: list[dict[str, Any]],
+        *,
+        include_raw_json: bool = True,
     ) -> int:
         with self.connect() as connection:
             connection.executemany(
@@ -5875,7 +7303,10 @@ class SQLiteStore:
                         row.get("open_interest_usd"),
                         row.get("volume_24h_usd"),
                         row["observed_at"],
-                        json.dumps(row.get("raw", {}), sort_keys=True),
+                        json.dumps(
+                            row.get("raw", {}) if include_raw_json else {},
+                            sort_keys=True,
+                        ),
                     )
                     for row in rows
                 ],
@@ -6017,6 +7448,8 @@ class SQLiteStore:
         self,
         scan_id: int,
         rows: list[dict[str, Any]],
+        *,
+        include_raw_json: bool = True,
     ) -> int:
         with self.connect() as connection:
             connection.executemany(
@@ -6041,7 +7474,10 @@ class SQLiteStore:
                         row.get("mid_price"),
                         row.get("bid_depth_usd", 0),
                         row.get("ask_depth_usd", 0),
-                        json.dumps(row.get("raw", {}), sort_keys=True),
+                        json.dumps(
+                            row.get("raw", {}) if include_raw_json else {},
+                            sort_keys=True,
+                        ),
                     )
                     for row in rows
                 ],
@@ -6486,8 +7922,37 @@ class SQLiteStore:
         scan_id: int,
         rows: list[dict[str, Any]],
     ) -> int:
+        if not rows:
+            return 0
         now = utc_now_iso()
         with self.connect() as connection:
+            route_ids = [
+                int(row["funding_route_id"])
+                for row in rows
+                if row.get("funding_route_id") is not None
+            ]
+            existing_route_ids: set[int] = set()
+            if route_ids:
+                placeholders = ",".join("?" for _ in route_ids)
+                existing_route_ids = {
+                    int(row["funding_route_id"])
+                    for row in connection.execute(
+                        f"""
+                        SELECT funding_route_id
+                        FROM funding_routes
+                        WHERE funding_route_id IN ({placeholders})
+                        """,
+                        route_ids,
+                    )
+                }
+            insert_rows = [
+                row
+                for row in rows
+                if row.get("funding_route_id") is not None
+                and int(row["funding_route_id"]) in existing_route_ids
+            ]
+            if not insert_rows:
+                return 0
             connection.executemany(
                 """
                 INSERT INTO funding_paper_executions (
@@ -6524,10 +7989,10 @@ class SQLiteStore:
                         row.get("repriced_net_profit"),
                         json.dumps(row.get("result", {}), sort_keys=True),
                     )
-                    for row in rows
+                    for row in insert_rows
                 ],
             )
-        return len(rows)
+        return len(insert_rows)
 
     def funding_dashboard(
         self,
@@ -6564,7 +8029,13 @@ class SQLiteStore:
                 f"""
                 SELECT * FROM funding_scans
                 WHERE {scan_where}
-                ORDER BY funding_scan_id DESC
+                ORDER BY
+                    CASE
+                        WHEN json_extract(config_json, '$.focused_route_key') IS NULL
+                        THEN 0
+                        ELSE 1
+                    END,
+                    funding_scan_id DESC
                 LIMIT 1
                 """,
                 scan_params,
@@ -6605,6 +8076,16 @@ class SQLiteStore:
                     research_scan.get("finished_at"),
                 )
             scan_id = latest_scan.get("funding_scan_id")
+            minimum_visible_profit = max(
+                1.0,
+                float(
+                    (latest_scan.get("config") or {}).get(
+                        "minimum_net_profit",
+                        1.0,
+                    )
+                    or 1.0
+                ),
+            )
             instrument_collapse_audit: dict[str, Any] = {}
             if scan_id:
                 candidate_rows = connection.execute(
@@ -6613,15 +8094,26 @@ class SQLiteStore:
                     WHERE funding_scan_id = ? AND status = 'paper_candidate'
                       AND market_capacity >= ?
                       AND (
-                          expected_net_profit > 0
-                          OR CAST(json_extract(
-                              evidence_json,
-                              '$.conservative_net_profit'
-                          ) AS REAL) > 0
-                          OR CAST(json_extract(
-                              evidence_json,
-                              '$.current_nowcast_net'
-                          ) AS REAL) > 0
+                          (
+                              COALESCE(json_extract(
+                                  evidence_json,
+                                  '$.decision_mode'
+                              ), '') = 'settlement_capture'
+                              AND COALESCE(CAST(json_extract(
+                                  evidence_json,
+                                  '$.current_nowcast_net'
+                              ) AS REAL), 0) >= ?
+                          )
+                          OR (
+                              COALESCE(json_extract(
+                                  evidence_json,
+                                  '$.decision_mode'
+                              ), '') != 'settlement_capture'
+                              AND COALESCE(CAST(json_extract(
+                                  evidence_json,
+                                  '$.conservative_net_profit'
+                              ) AS REAL), expected_net_profit, 0) >= ?
+                          )
                       )
                     ORDER BY CAST(json_extract(
                                  evidence_json,
@@ -6633,7 +8125,12 @@ class SQLiteStore:
                              ) AS REAL) DESC,
                              expected_net_profit DESC
                     """,
-                    (scan_id, FUNDING_MINIMUM_ACTIONABLE_NOTIONAL),
+                    (
+                        scan_id,
+                        FUNDING_MINIMUM_ACTIONABLE_NOTIONAL,
+                        minimum_visible_profit,
+                        minimum_visible_profit,
+                    ),
                 ).fetchall()
                 watch_rows = connection.execute(
                     """
@@ -6831,7 +8328,11 @@ class SQLiteStore:
                 universe_reasons = []
                 top_universe_routes = []
                 horizon_comparisons = {}
-        candidates = [decode_funding_route(dict(row)) for row in candidate_rows]
+        candidates = [
+            row
+            for row in (decode_funding_route(dict(row)) for row in candidate_rows)
+            if funding_route_decision_profit(row) >= minimum_visible_profit
+        ]
         horizon_comparisons = add_current_live_horizon_projections(
             candidates,
             horizon_comparisons,
@@ -7114,7 +8615,9 @@ class SQLiteStore:
             "venues": venues,
             "warnings": warnings,
             "minimum_visible_capacity": FUNDING_MINIMUM_ACTIONABLE_NOTIONAL,
-            "visible_route_count": len(candidates) + len(watch) + len(maker_setups),
+            "visible_route_count": len(candidates),
+            "internal_watch_route_count": len(watch),
+            "internal_maker_setup_count": len(maker_setups),
             "capacity_eligible_route_count": capacity_eligible_route_count,
             "universe_summary": {
                 "route_count": int(
@@ -7166,7 +8669,7 @@ class SQLiteStore:
                 {"risk_flag": flag, "route_count": count}
                 for flag, count in blocker_counts.most_common(8)
             ],
-            "minimum_visible_profit": 0.0,
+            "minimum_visible_profit": minimum_visible_profit,
             "history_sync": self.funding_history_sync_summary(),
             "execution_mode": "paper_only_research",
             "llm_in_execution_loop": False,
@@ -7536,6 +9039,158 @@ class SQLiteStore:
                     ),
                 )
 
+    def accrue_funding_paper_settlement(
+        self,
+        position_id: int,
+        accrual: dict[str, Any],
+    ) -> bool:
+        now = utc_now_iso()
+        settlement_key = str(accrual.get("settlement_key") or "")
+        if not settlement_key:
+            raise ValueError("settlement_key is required")
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM funding_paper_positions
+                WHERE funding_paper_position_id = ?
+                """,
+                (int(position_id),),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Unknown funding paper position {position_id}")
+            position = decode_funding_paper_position(dict(row))
+            if position["status"] == "closed":
+                return False
+            notes = dict(position.get("notes") or {})
+            accrued_keys = [
+                str(key) for key in notes.get("accrued_settlement_keys") or []
+            ]
+            if settlement_key in accrued_keys:
+                return False
+            long_cash_delta = float(accrual.get("long_cash_delta") or 0.0)
+            short_cash_delta = float(accrual.get("short_cash_delta") or 0.0)
+            funding_delta = long_cash_delta + short_cash_delta
+            accrued_funding_pnl = (
+                float(notes.get("accrued_funding_pnl") or 0.0) + funding_delta
+            )
+            accrued_settlements = list(notes.get("accrued_settlements") or [])
+            accrued_settlements.append(accrual.get("settlement") or {})
+            accrued_keys.append(settlement_key)
+            notes.update(
+                {
+                    "accrued_funding_pnl": accrued_funding_pnl,
+                    "accrued_settlement_count": len(accrued_keys),
+                    "accrued_settlement_keys": accrued_keys[-100:],
+                    "accrued_settlements": accrued_settlements[-100:],
+                    "latest_hold_decision": accrual.get("hold_decision") or {},
+                    "latest_accrual_at": now,
+                }
+            )
+            expected_live_gross = safe_float(
+                accrual.get("next_expected_live_gross"),
+                position.get("expected_live_gross"),
+            )
+            expected_live_net = safe_float(
+                accrual.get("next_expected_live_net"),
+                position.get("expected_live_net"),
+            )
+            connection.execute(
+                """
+                UPDATE funding_paper_positions
+                SET status = 'open',
+                    long_settlement_at = ?,
+                    short_settlement_at = ?,
+                    max_settlement_at = ?,
+                    expected_live_gross = ?,
+                    expected_live_net = ?,
+                    actual_funding_pnl = ?,
+                    actual_net_pnl = ?,
+                    entry_legs_json = ?,
+                    entry_evidence_json = ?,
+                    settlement_json = ?,
+                    notes_json = ?
+                WHERE funding_paper_position_id = ?
+                """,
+                (
+                    accrual.get("next_long_settlement_at"),
+                    accrual.get("next_short_settlement_at"),
+                    accrual.get("next_max_settlement_at"),
+                    expected_live_gross,
+                    expected_live_net,
+                    accrued_funding_pnl,
+                    accrued_funding_pnl,
+                    json.dumps(accrual.get("next_entry_legs") or []),
+                    json.dumps(
+                        accrual.get("next_entry_evidence") or {},
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        {
+                            "latest_accrual": accrual.get("settlement") or {},
+                            "accrued_funding_pnl": accrued_funding_pnl,
+                            "history_missing_fallback": bool(
+                                accrual.get("history_missing_fallback")
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    json.dumps(notes, sort_keys=True),
+                    int(position_id),
+                ),
+            )
+            for side, venue, cash_delta in (
+                ("long", position["long_venue"], long_cash_delta),
+                ("short", position["short_venue"], short_cash_delta),
+            ):
+                connection.execute(
+                    """
+                    UPDATE funding_paper_accounts
+                    SET cash_balance = cash_balance + ?,
+                        realized_pnl = realized_pnl + ?,
+                        updated_at = ?
+                    WHERE venue = ?
+                    """,
+                    (cash_delta, cash_delta, now, venue),
+                )
+                account = connection.execute(
+                    """
+                    SELECT cash_balance, reserved_margin
+                    FROM funding_paper_accounts
+                    WHERE venue = ?
+                    """,
+                    (venue,),
+                ).fetchone()
+                if account:
+                    connection.execute(
+                        """
+                        INSERT INTO funding_paper_balance_ledger (
+                            created_at, venue, funding_paper_position_id,
+                            event_type, cash_delta, reserved_delta,
+                            cash_balance_after, reserved_margin_after,
+                            payload_json
+                        )
+                        VALUES (?, ?, ?, 'funding_accrual', ?, 0, ?, ?, ?)
+                        """,
+                        (
+                            now,
+                            venue,
+                            int(position_id),
+                            cash_delta,
+                            float(account["cash_balance"]),
+                            float(account["reserved_margin"]),
+                            json.dumps(
+                                {
+                                    "side": side,
+                                    "settlement_key": settlement_key,
+                                    "settlement": accrual.get("settlement") or {},
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+        return True
+
     def set_funding_paper_position_status(
         self,
         position_id: int,
@@ -7559,6 +9214,24 @@ class SQLiteStore:
     ) -> int:
         now = utc_now_iso()
         with self.connect() as connection:
+            funding_paper_position_id = existing_row_id(
+                connection,
+                "funding_paper_positions",
+                "funding_paper_position_id",
+                event.get("funding_paper_position_id"),
+            )
+            funding_scan_id = existing_row_id(
+                connection,
+                "funding_scans",
+                "funding_scan_id",
+                event.get("funding_scan_id"),
+            )
+            funding_route_id = existing_row_id(
+                connection,
+                "funding_routes",
+                "funding_route_id",
+                event.get("funding_route_id"),
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO funding_paper_events (
@@ -7573,9 +9246,9 @@ class SQLiteStore:
                     event.get("created_at") or now,
                     event["event_type"],
                     event.get("severity") or "info",
-                    event.get("funding_paper_position_id"),
-                    event.get("funding_scan_id"),
-                    event.get("funding_route_id"),
+                    funding_paper_position_id,
+                    funding_scan_id,
+                    funding_route_id,
                     event.get("route_key"),
                     event["message"],
                     json.dumps(event.get("payload") or {}, sort_keys=True),
@@ -7600,6 +9273,56 @@ class SQLiteStore:
                 """,
                 (str(status), error, int(event_id)),
             )
+
+    def funding_paper_pending_reprice_events(
+        self,
+        limit: int = 20,
+        min_created_at: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        age_filter = ""
+        if min_created_at:
+            age_filter = "AND event.created_at >= ?"
+            params.append(str(min_created_at))
+        params.append(max(1, int(limit)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    event.funding_paper_event_id AS event_id,
+                    event.created_at AS event_created_at,
+                    event.payload_json AS event_payload_json,
+                    position.*
+                FROM funding_paper_events event
+                JOIN funding_paper_positions position
+                  ON position.funding_paper_position_id =
+                     event.funding_paper_position_id
+                WHERE event.event_type = 'pnl_repriced'
+                  AND event.telegram_status IN ('not_configured', 'queued')
+                  {age_filter}
+                ORDER BY event.funding_paper_event_id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        events = []
+        for raw in rows:
+            item = dict(raw)
+            event_id = int(item.pop("event_id"))
+            event_created_at = item.pop("event_created_at")
+            event_payload = json.loads(item.pop("event_payload_json") or "{}")
+            position = add_funding_paper_display_fields(
+                decode_funding_paper_position(item)
+            )
+            events.append(
+                {
+                    "event_id": event_id,
+                    "created_at": event_created_at,
+                    "payload": event_payload,
+                    "position": position,
+                }
+            )
+        return events
 
     def record_funding_paper_equity_snapshot(self) -> dict[str, Any]:
         now = utc_now_iso()
@@ -7686,15 +9409,194 @@ class SQLiteStore:
         candidates = [dict(row) for row in rows]
         if not candidates:
             return None
-        return min(
-            candidates,
-            key=lambda row: abs(
-                (
-                    parse_iso_datetime(row.get("funding_at")) or center
-                - center
-                ).total_seconds()
-            ),
-        )
+
+        def distance_seconds(row: dict[str, Any]) -> float:
+            funding_at = parse_iso_datetime(row.get("funding_at")) or center
+            return abs((funding_at - center).total_seconds())
+
+        return min(candidates, key=distance_seconds)
+
+    def refresh_estimated_funding_paper_positions(self) -> int:
+        now = utc_now_iso()
+        updated = 0
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM funding_paper_positions
+                WHERE status = 'closed'
+                  AND COALESCE(CAST(json_extract(
+                      settlement_json,
+                      '$.history_missing_fallback'
+                  ) AS INTEGER), 0) = 1
+                ORDER BY closed_at DESC, funding_paper_position_id DESC
+                """
+            ).fetchall()
+            for raw in rows:
+                position = decode_funding_paper_position(dict(raw))
+                settlement = dict(position.get("settlement") or {})
+                new_settlement = dict(settlement)
+                old_leg_pnl: dict[str, float] = {}
+                new_leg_pnl: dict[str, float] = {}
+                history_missing = False
+                changed = False
+                for side in ("long", "short"):
+                    leg = dict((settlement.get(side) or {}))
+                    venue = str(position.get(f"{side}_venue") or leg.get("venue") or "")
+                    symbol = str(
+                        position.get(f"{side}_symbol") or leg.get("symbol") or ""
+                    )
+                    settlement_at = str(
+                        position.get(f"{side}_settlement_at")
+                        or leg.get("settlement_at")
+                        or ""
+                    )
+                    notional = float(position.get(f"{side}_notional") or 0.0)
+                    old_rate = funding_paper_settlement_rate(leg)
+                    old_leg_pnl[side] = funding_paper_leg_pnl(
+                        side,
+                        notional,
+                        old_rate,
+                    )
+                    history_row = funding_history_rate_near_from_connection(
+                        connection,
+                        venue,
+                        symbol,
+                        settlement_at,
+                    )
+                    if history_row is None:
+                        history_missing = True
+                        new_rate = old_rate
+                    else:
+                        new_rate = float(history_row.get("funding_rate") or 0.0)
+                        if (
+                            leg.get("source") != "history"
+                            or abs(new_rate - old_rate) > 1e-12
+                        ):
+                            changed = True
+                        leg.update(
+                            {
+                                "venue": venue,
+                                "symbol": symbol,
+                                "settlement_at": settlement_at,
+                                "funding_rate": new_rate,
+                                "source": "history",
+                                "history_row": history_row,
+                            }
+                        )
+                    new_leg_pnl[side] = funding_paper_leg_pnl(
+                        side,
+                        notional,
+                        new_rate,
+                    )
+                    new_settlement[side] = leg
+                if not changed:
+                    continue
+                actual_funding_pnl = sum(new_leg_pnl.values())
+                actual_execution_cost = float(
+                    position.get("actual_execution_cost")
+                    or position.get("expected_execution_cost")
+                    or 0.0
+                )
+                actual_net_pnl = actual_funding_pnl - actual_execution_cost
+                new_settlement["history_missing_fallback"] = history_missing
+                notes = dict(position.get("notes") or {})
+                notes["pnl_repriced_at"] = now
+                notes["pnl_reprice_source"] = "published_funding_history"
+                connection.execute(
+                    """
+                    UPDATE funding_paper_positions
+                    SET actual_funding_pnl = ?,
+                        actual_net_pnl = ?,
+                        settlement_json = ?,
+                        notes_json = ?
+                    WHERE funding_paper_position_id = ?
+                    """,
+                    (
+                        actual_funding_pnl,
+                        actual_net_pnl,
+                        json.dumps(new_settlement, sort_keys=True),
+                        json.dumps(notes, sort_keys=True),
+                        int(position["funding_paper_position_id"]),
+                    ),
+                )
+                for side in ("long", "short"):
+                    cash_delta = new_leg_pnl[side] - old_leg_pnl[side]
+                    if abs(cash_delta) < 1e-12:
+                        continue
+                    venue = str(position.get(f"{side}_venue") or "")
+                    connection.execute(
+                        """
+                        UPDATE funding_paper_accounts
+                        SET cash_balance = cash_balance + ?,
+                            realized_pnl = realized_pnl + ?,
+                            updated_at = ?
+                        WHERE venue = ?
+                        """,
+                        (cash_delta, cash_delta, now, venue),
+                    )
+                    account = connection.execute(
+                        """
+                        SELECT cash_balance, reserved_margin
+                        FROM funding_paper_accounts
+                        WHERE venue = ?
+                        """,
+                        (venue,),
+                    ).fetchone()
+                    if account:
+                        connection.execute(
+                            """
+                            INSERT INTO funding_paper_balance_ledger (
+                                created_at, venue, funding_paper_position_id,
+                                event_type, cash_delta, reserved_delta,
+                                cash_balance_after, reserved_margin_after,
+                                payload_json
+                            )
+                            VALUES (?, ?, ?, 'history_reprice', ?, 0, ?, ?, ?)
+                            """,
+                            (
+                                now,
+                                venue,
+                                int(position["funding_paper_position_id"]),
+                                cash_delta,
+                                float(account["cash_balance"]),
+                                float(account["reserved_margin"]),
+                                json.dumps(
+                                    {
+                                        "side": side,
+                                        "old_leg_pnl": old_leg_pnl[side],
+                                        "new_leg_pnl": new_leg_pnl[side],
+                                    },
+                                    sort_keys=True,
+                                ),
+                            ),
+                        )
+                connection.execute(
+                    """
+                    INSERT INTO funding_paper_events (
+                        created_at, event_type, severity,
+                        funding_paper_position_id, route_key, message,
+                        payload_json, telegram_status
+                    )
+                    VALUES (?, 'pnl_repriced', 'info', ?, ?, ?, ?, 'not_configured')
+                    """,
+                    (
+                        now,
+                        int(position["funding_paper_position_id"]),
+                        position.get("route_key"),
+                        "Funding paper PnL repriced from published funding history",
+                        json.dumps(
+                            {
+                                "actual_funding_pnl": actual_funding_pnl,
+                                "actual_net_pnl": actual_net_pnl,
+                                "history_missing_fallback": history_missing,
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                updated += 1
+        return updated
 
     def latest_funding_route_by_key(
         self,
@@ -7737,7 +9639,13 @@ class SQLiteStore:
             ).fetchone()
         return decode_funding_route(dict(row)) if row else None
 
-    def funding_paper_dashboard(self) -> dict[str, Any]:
+    def funding_paper_dashboard(
+        self,
+        *,
+        refresh_estimates: bool = True,
+    ) -> dict[str, Any]:
+        if refresh_estimates:
+            self.refresh_estimated_funding_paper_positions()
         with self.connect() as connection:
             accounts = [
                 dict(row)
@@ -7773,6 +9681,8 @@ class SQLiteStore:
                     """
                 ).fetchall()
             ]
+            for position in [*open_positions, *closed_positions]:
+                add_funding_paper_display_fields(position)
             events = [
                 decode_funding_paper_event(dict(row))
                 for row in connection.execute(
@@ -7782,6 +9692,34 @@ class SQLiteStore:
                     ORDER BY funding_paper_event_id DESC
                     LIMIT 100
                     """
+                ).fetchall()
+            ]
+            trade_event_types = ("open", "close", "settlement_pending")
+            trade_placeholders = ",".join("?" for _ in trade_event_types)
+            trade_events = [
+                decode_funding_paper_event(dict(row))
+                for row in connection.execute(
+                    f"""
+                    SELECT *
+                    FROM funding_paper_events
+                    WHERE event_type IN ({trade_placeholders})
+                    ORDER BY funding_paper_event_id DESC
+                    LIMIT 100
+                    """,
+                    trade_event_types,
+                ).fetchall()
+            ]
+            system_events = [
+                decode_funding_paper_event(dict(row))
+                for row in connection.execute(
+                    f"""
+                    SELECT *
+                    FROM funding_paper_events
+                    WHERE event_type NOT IN ({trade_placeholders})
+                    ORDER BY funding_paper_event_id DESC
+                    LIMIT 80
+                    """,
+                    trade_event_types,
                 ).fetchall()
             ]
             equity = [
@@ -7848,10 +9786,32 @@ class SQLiteStore:
             "open_positions": open_positions,
             "closed_positions": closed_positions,
             "events": events,
+            "trade_events": trade_events,
+            "system_events": system_events,
             "equity": list(reversed(equity)),
             "execution_mode": "deterministic_paper_trader",
             "llm_in_execution_loop": False,
         }
+
+    def funding_paper_trade_report_rows(
+        self,
+        *,
+        refresh_estimates: bool = True,
+    ) -> list[dict[str, Any]]:
+        if refresh_estimates:
+            self.refresh_estimated_funding_paper_positions()
+        with self.connect() as connection:
+            rows = [
+                decode_funding_paper_position(dict(row))
+                for row in connection.execute(
+                    """
+                    SELECT *
+                    FROM funding_paper_positions
+                    ORDER BY opened_at DESC, funding_paper_position_id DESC
+                    """
+                ).fetchall()
+            ]
+        return [funding_paper_trade_report_row(row) for row in rows]
 
 
 def decode_funding_route(item: dict[str, Any]) -> dict[str, Any]:
@@ -7862,6 +9822,70 @@ def decode_funding_route(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def funding_route_decision_profit(row: dict[str, Any]) -> float:
+    evidence = row.get("evidence") or {}
+    if evidence.get("decision_mode") == "settlement_capture":
+        return safe_float(evidence.get("current_nowcast_net"))
+    return safe_float(
+        evidence.get("conservative_net_profit"),
+        row.get("expected_net_profit"),
+    )
+
+
+def safe_float(*values: Any) -> float:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def funding_history_rate_near_from_connection(
+    connection: Any,
+    venue: str,
+    symbol: str,
+    settlement_at: str,
+    tolerance_seconds: int = 900,
+) -> dict[str, Any] | None:
+    center = parse_iso_datetime(settlement_at)
+    if center is None:
+        return None
+    start = center - timedelta(seconds=max(60, int(tolerance_seconds)))
+    end = center + timedelta(seconds=max(60, int(tolerance_seconds)))
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM funding_rate_history
+        WHERE venue = ? AND symbol = ?
+          AND funding_at BETWEEN ? AND ?
+        ORDER BY funding_at
+        """,
+        (str(venue), str(symbol), start.isoformat(), end.isoformat()),
+    ).fetchall()
+    candidates = [dict(row) for row in rows]
+    if not candidates:
+        return None
+
+    def distance_seconds(row: dict[str, Any]) -> float:
+        funding_at = parse_iso_datetime(row.get("funding_at")) or center
+        return abs((funding_at - center).total_seconds())
+
+    return min(candidates, key=distance_seconds)
+
+
+def funding_paper_settlement_rate(leg: dict[str, Any]) -> float:
+    return safe_float(leg.get("funding_rate"))
+
+
+def funding_paper_leg_pnl(side: str, notional: float, funding_rate: float) -> float:
+    if str(side).lower() == "long":
+        return -float(notional) * float(funding_rate)
+    return float(notional) * float(funding_rate)
+
+
 def decode_funding_paper_position(item: dict[str, Any]) -> dict[str, Any]:
     item["entry_legs"] = json.loads(item.pop("entry_legs_json") or "[]")
     item["entry_evidence"] = json.loads(item.pop("entry_evidence_json") or "{}")
@@ -7869,7 +9893,155 @@ def decode_funding_paper_position(item: dict[str, Any]) -> dict[str, Any]:
     item["close_evidence"] = json.loads(item.pop("close_evidence_json") or "{}")
     item["settlement"] = json.loads(item.pop("settlement_json") or "{}")
     item["notes"] = json.loads(item.pop("notes_json") or "{}")
+    item["target_notional_per_leg"] = item.get("target_notional")
     return item
+
+
+def add_funding_paper_display_fields(item: dict[str, Any]) -> dict[str, Any]:
+    item["close_reason_label"] = funding_paper_close_reason_label(
+        item.get("close_reason")
+    )
+    item["pnl_quality_label"] = funding_paper_pnl_quality_label(item)
+    item["close_window_label"] = funding_paper_close_window_label(item)
+    return item
+
+
+def funding_paper_trade_report_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ID": row.get("funding_paper_position_id"),
+        "Статус": funding_paper_status_label(row.get("status")),
+        "Открыто": report_datetime(row.get("opened_at")),
+        "Закрыто": report_datetime(row.get("closed_at")),
+        "Актив": row.get("canonical_asset"),
+        "Маршрут": (
+            f"LONG {row.get('long_venue')} / SHORT {row.get('short_venue')}"
+        ),
+        "Long": row.get("long_venue"),
+        "Short": row.get("short_venue"),
+        "Объем $": report_money(row.get("target_notional")),
+        "Long notional $": report_money(row.get("long_notional")),
+        "Short notional $": report_money(row.get("short_notional")),
+        "Base qty": report_quantity(row.get("base_quantity")),
+        "Expected net $": report_money(row.get("expected_live_net")),
+        "Funding PnL $": report_money(row.get("actual_funding_pnl")),
+        "Costs $": report_money(row.get("actual_execution_cost")),
+        "Net PnL $": report_money(row.get("actual_net_pnl")),
+        "Причина закрытия": funding_paper_close_reason_label(
+            row.get("close_reason")
+        ),
+        "Состояние окна при закрытии": funding_paper_close_window_label(row),
+        "Качество PnL": funding_paper_pnl_quality_label(row),
+    }
+
+
+def report_datetime(value: Any) -> str:
+    timestamp = parse_iso_datetime(value)
+    if timestamp is None:
+        return ""
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def report_money(value: Any) -> str:
+    number = optional_report_float(value)
+    return "" if number is None else f"{number:.2f}"
+
+
+def report_quantity(value: Any) -> str:
+    number = optional_report_float(value)
+    if number is None:
+        return ""
+    return f"{number:.2f}"
+
+
+def optional_report_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def funding_paper_status_label(value: Any) -> str:
+    return {
+        "open": "Открыта",
+        "settlement_pending": "Ждет settlement",
+        "closed": "Закрыта",
+    }.get(str(value or ""), str(value or ""))
+
+
+def funding_paper_close_reason_label(value: Any) -> str:
+    return {
+        "arbitrage_window_closed_live_net_non_positive": (
+            "Окно арбитража закрылось: live net стал неположительным."
+        ),
+        "arbitrage_window_data_quality_issue": (
+            "Закрыто: свежие данные маршрута выглядят несовместимыми."
+        ),
+        "arbitrage_window_unverifiable_route_missing": (
+            "Закрыто: свежий route snapshot не найден, продолжение окна не подтверждено."
+        ),
+        "arbitrage_window_unverifiable_route_stale": (
+            "Закрыто: route snapshot устарел, продолжение окна не подтверждено."
+        ),
+        "arbitrage_window_unverifiable_next_settlement_missing": (
+            "Закрыто: не удалось определить следующий funding settlement."
+        ),
+        "arbitrage_window_unverifiable_live_net_missing": (
+            "Закрыто: не удалось проверить live net."
+        ),
+        "arbitrage_window_unverifiable": (
+            "Закрыто: продолжение арбитражного окна не подтверждено."
+        ),
+        "settlement_capture_complete": (
+            "Закрыто старой логикой paper-теста. Новая логика удерживает "
+            "позицию, пока окно остается положительным."
+        ),
+        "settlement_capture_complete_estimated_missing_history": (
+            "Закрыто старой логикой paper-теста. Новая логика удерживает "
+            "позицию, пока окно остается положительным."
+        ),
+        "first_settlement_pair_complete": (
+            "Закрыто старой логикой paper-теста. Новая логика удерживает "
+            "позицию, пока окно остается положительным."
+        ),
+        "test": "Тестовое закрытие.",
+        "": "",
+    }.get(str(value or ""), str(value or ""))
+
+
+def funding_paper_pnl_quality_label(row: dict[str, Any]) -> str:
+    if row.get("status") != "closed":
+        return ""
+    settlement = row.get("settlement") or {}
+    if settlement.get("history_missing_fallback"):
+        return (
+            "Предварительный PnL: одна или обе funding history не были "
+            "опубликованы вовремя, поэтому расчет сделан по ставкам на входе."
+        )
+    return "Финальный PnL: рассчитан по опубликованной funding history."
+
+
+def funding_paper_close_window_label(row: dict[str, Any]) -> str:
+    if row.get("status") != "closed":
+        return ""
+    evidence = row.get("close_evidence") or {}
+    live_net = optional_report_float(evidence.get("current_nowcast_net"))
+    if live_net is not None:
+        if live_net > 0:
+            return (
+                "Окно при закрытии еще выглядело положительным: live net "
+                f"{report_money(live_net)}."
+            )
+        if live_net < 0:
+            return (
+                "Окно при закрытии уже не выглядело положительным: live net "
+                f"{report_money(live_net)}."
+            )
+        return "Окно при закрытии было около нуля: live net $0.00."
+    if row.get("close_funding_route_id"):
+        return "Close-scan был, но live net в нем не рассчитан."
+    return "Свежий route snapshot при закрытии не найден."
 
 
 def decode_funding_paper_event(item: dict[str, Any]) -> dict[str, Any]:
@@ -8540,6 +10712,27 @@ def safe_ratio(numerator: float, denominator: float) -> float:
     if denominator <= 0:
         return 0.0
     return numerator / denominator
+
+
+def existing_row_id(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    value: Any,
+) -> int | None:
+    if value is None:
+        return None
+    try:
+        row_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    if row_id <= 0:
+        return None
+    row = connection.execute(
+        f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1",
+        (row_id,),
+    ).fetchone()
+    return row_id if row else None
 
 
 def optional_bool_int(value: Any) -> int | None:

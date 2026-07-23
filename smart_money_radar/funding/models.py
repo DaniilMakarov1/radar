@@ -30,8 +30,8 @@ class FundingScanConfig:
     basis_stress_fraction: float = 0.25
     operations_buffer_bps: float = 2.0
     minimum_persistence: float = 0.55
-    minimum_net_profit: float = 5.0
-    minimum_net_return_bps: float = 10.0
+    minimum_net_profit: float = 1.0
+    minimum_net_return_bps: float = 0.0
     minimum_profit_probability: float = 0.70
     minimum_forward_samples: int = 20
     minimum_settlement_lead_seconds: int = 0
@@ -46,6 +46,7 @@ class FundingScanConfig:
     max_full_depth_orderbook_markets: int | None = None
     orderbook_cache_ttl_seconds: int = 0
     market_snapshot_cache_ttl_seconds: int = 0
+    store_diagnostic_raw_json: bool = False
     adaptive_near_miss_min_score: float = 55.0
     adaptive_near_miss_min_cost_coverage: float = 0.35
     adaptive_near_miss_emergency_floor_bps: float = 2.0
@@ -176,6 +177,7 @@ class FundingScanConfig:
                 0,
                 min(int(self.market_snapshot_cache_ttl_seconds), 60),
             ),
+            store_diagnostic_raw_json=bool(self.store_diagnostic_raw_json),
             adaptive_near_miss_min_score=max(
                 0.0,
                 min(float(self.adaptive_near_miss_min_score), 100.0),
@@ -212,12 +214,17 @@ class FundingScanConfig:
 
 
 DEFAULT_TAKER_FEE_RATES = {
+    "aevo": 0.0008,
     "aster": 0.0004,
     "backpack": 0.0005,
     "bingx": 0.0005,
     "binance": 0.0005,
+    "bitmart": 0.0006,
+    "bitunix": 0.0006,
     "bitget": 0.0006,
+    "blofin": 0.0006,
     "bybit": 0.00055,
+    "coinex": 0.0005,
     "dydx": 0.0006,
     "ethereal": 0.0003,
     "gate": 0.00075,
@@ -231,18 +238,25 @@ DEFAULT_TAKER_FEE_RATES = {
     "mexc": 0.0002,
     "okx": 0.0005,
     "paradex": 0.0002,
+    "phemex": 0.0006,
     "drift": 0.001,
     "vertex_base": 0.0003,
+    "woox": 0.0005,
 }
 
 
 DEFAULT_MAKER_FEE_RATES = {
+    "aevo": 0.0005,
     "aster": 0.0,
     "backpack": 0.0002,
     "bingx": 0.0002,
     "binance": 0.0002,
+    "bitmart": 0.0002,
+    "bitunix": 0.0002,
     "bitget": 0.0002,
+    "blofin": 0.0002,
     "bybit": 0.0002,
+    "coinex": 0.0003,
     "dydx": 0.0001,
     "ethereal": 0.0,
     "gate": 0.0002,
@@ -256,6 +270,8 @@ DEFAULT_MAKER_FEE_RATES = {
     "mexc": 0.0,
     "okx": 0.0002,
     "paradex": 0.0,
+    "phemex": 0.0001,
     "drift": 0.0,
     "vertex_base": 0.0,
+    "woox": 0.0002,
 }

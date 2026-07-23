@@ -364,10 +364,10 @@ zero-slippage cost bound. `--max-candidates` is a test/debug override only; its
 default value `0` means unlimited, and the dashboard always uses unlimited mode.
 
 The dashboard's `Почему нет кандидатов` band classifies every route by its first
-failed gate, so counts are mutually exclusive. It also shows median current gross,
-full modeled cost, the dollar break-even gap, and the five routes nearest to
-covering their costs. The older risk summary remains available as a non-exclusive
-diagnostic and should not be used to add blocker counts together.
+failed gate, so counts are mutually exclusive. It shows only aggregate economics:
+route universe size, full-depth count, routes covering complete execution costs,
+live positive routes, best live net, and median gross/cost. Near-miss route rows
+are kept out of the decision screen.
 
 When no route qualifies, the dashboard shows a sequential economics funnel for
 routes with at least $500 capacity: gross carry covering the complete execution
@@ -386,6 +386,32 @@ funding history stays out of the critical path and is maintained by the backfill
 job. If auto-refresh is re-enabled later, refreshes must not overlap, and automatic
 scans should reuse the last completed scan configuration so stale browser tabs
 cannot silently overwrite the active size or horizon.
+
+The paper trader uses three polling speeds. `--scan-interval-seconds` is the base
+full-market scan interval used when no actionable route is being monitored. It is
+300 seconds in the local screen runner. `--monitor-interval-seconds` is the focused
+route recheck interval for a found candidate/watch route before the final entry
+window; it is 120 seconds. `--hot-interval-seconds` is the urgent focused recheck
+interval, currently 10 seconds, used when both legs are inside the 180-second
+entry window or when a paper position is waiting for settlement publication.
+Paper entries are authorized in the last 0-15 seconds before the shared
+settlement, but the last fresh venue API recheck must start before that final
+freeze window. Inside `--final-recheck-freeze-seconds` the bot does not start a
+new request; it can use the last successful focused snapshot only if it is no
+older than `--max-entry-snapshot-age-seconds` (30 seconds by default). If no fresh
+snapshot exists, the paper entry is skipped.
+
+Funding scan snapshots are operational diagnostics, not the training ledger. The
+system keeps only the latest scan snapshot plus any scans/routes linked to paper
+executions or positions. Training and evaluation should rely on
+`funding_paper_*` tables and `funding_rate_history`, while old
+`funding_market_snapshots`, `funding_orderbook_snapshots`, `funding_routes`, and
+`funding_route_universe` rows can be pruned:
+
+```bash
+python3 -m smart_money_radar.cli funding-prune
+python3 -m smart_money_radar.cli funding-prune --apply
+```
 
 ## Current Limitations
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import http.client
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from typing import Any
 
@@ -13,6 +16,7 @@ POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"
 POLYMARKET_CLOB_URL = "https://clob.polymarket.com"
 POLYMARKET_DATA_URL = "https://data-api.polymarket.com"
 KALSHI_API_URL = "https://external-api.kalshi.com/trade-api/v2"
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 DEFAULT_KALSHI_EVENT_SEEDS = ("KXMENWORLDCUP-26",)
 
 
@@ -23,14 +27,15 @@ class PredictionDataError(RuntimeError):
 class PredictionHttpClient:
     def __init__(
         self,
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 8,
         min_delay_seconds: float = 0.08,
-        max_retries: int = 3,
+        max_retries: int = 1,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.min_delay_seconds = min_delay_seconds
         self.max_retries = max_retries
         self._last_request_at = 0.0
+        self._lock = threading.Lock()
 
     def get_json(self, url: str) -> Any:
         return self._request_json("GET", url)
@@ -49,9 +54,7 @@ class PredictionHttpClient:
             headers["Content-Type"] = "application/json"
 
         for attempt in range(self.max_retries + 1):
-            elapsed = time.monotonic() - self._last_request_at
-            if elapsed < self.min_delay_seconds:
-                time.sleep(self.min_delay_seconds - elapsed)
+            self._reserve_request_slot()
             request = urllib.request.Request(
                 url,
                 data=body,
@@ -64,10 +67,8 @@ class PredictionHttpClient:
                     timeout=self.timeout_seconds,
                 ) as response:
                     result = json.loads(response.read().decode("utf-8"))
-                self._last_request_at = time.monotonic()
                 return result
             except urllib.error.HTTPError as exc:
-                self._last_request_at = time.monotonic()
                 detail = exc.read().decode("utf-8", errors="replace")
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
                     time.sleep(1.25 * (attempt + 1))
@@ -75,13 +76,25 @@ class PredictionHttpClient:
                 raise PredictionDataError(
                     f"HTTP {exc.code} for {url}: {detail[:300]}"
                 ) from exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                self._last_request_at = time.monotonic()
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                json.JSONDecodeError,
+                http.client.HTTPException,
+                ConnectionError,
+            ) as exc:
                 if attempt < self.max_retries:
                     time.sleep(1.25 * (attempt + 1))
                     continue
                 raise PredictionDataError(f"Request failed for {url}: {exc}") from exc
         raise PredictionDataError(f"Request failed for {url}")
+
+    def _reserve_request_slot(self) -> None:
+        with self._lock:
+            elapsed = time.monotonic() - self._last_request_at
+            if elapsed < self.min_delay_seconds:
+                time.sleep(self.min_delay_seconds - elapsed)
+            self._last_request_at = time.monotonic()
 
 
 class PolymarketClient:
@@ -226,23 +239,41 @@ class KalshiClient:
             )
         )[: max(1, limit)]
 
-        events: list[dict[str, Any]] = []
-        for event_id in event_ids:
-            payload = self.http.get_json(
-                f"{KALSHI_API_URL}/events/{urllib.parse.quote(event_id)}"
-                "?with_nested_markets=true"
-            )
-            if not isinstance(payload, dict) or not isinstance(payload.get("event"), dict):
-                continue
-            event = dict(payload["event"])
-            nested_markets = event.get("markets")
-            if not isinstance(nested_markets, list):
-                nested_markets = payload.get("markets")
-            event["markets"] = [
-                row for row in (nested_markets or []) if isinstance(row, dict)
-            ]
-            events.append(event)
-        return events
+        if not event_ids:
+            return []
+
+        events_by_index: dict[int, dict[str, Any]] = {}
+        max_workers = min(8, len(event_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.event_with_markets, event_id): index
+                for index, event_id in enumerate(event_ids)
+            }
+            for future in as_completed(futures):
+                event = future.result()
+                if event:
+                    events_by_index[futures[future]] = event
+        return [
+            events_by_index[index]
+            for index in range(len(event_ids))
+            if index in events_by_index
+        ]
+
+    def event_with_markets(self, event_id: str) -> dict[str, Any] | None:
+        payload = self.http.get_json(
+            f"{KALSHI_API_URL}/events/{urllib.parse.quote(event_id)}"
+            "?with_nested_markets=true"
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("event"), dict):
+            return None
+        event = dict(payload["event"])
+        nested_markets = event.get("markets")
+        if not isinstance(nested_markets, list):
+            nested_markets = payload.get("markets")
+        event["markets"] = [
+            row for row in (nested_markets or []) if isinstance(row, dict)
+        ]
+        return event
 
     def orderbooks(self, market_ids: list[str]) -> dict[str, dict[str, Any]]:
         unique_ids = list(dict.fromkeys(str(market_id) for market_id in market_ids if market_id))
@@ -262,6 +293,49 @@ class KalshiClient:
                     continue
                 books[str(row["ticker"])] = row
         return books
+
+
+class HyperliquidClient:
+    def __init__(self, http: PredictionHttpClient | None = None) -> None:
+        self.http = http or PredictionHttpClient()
+
+    def outcome_meta(self) -> dict[str, Any]:
+        payload = self.http.post_json(HYPERLIQUID_INFO_URL, {"type": "outcomeMeta"})
+        return payload if isinstance(payload, dict) else {}
+
+    def all_mids(self) -> dict[str, str]:
+        payload = self.http.post_json(HYPERLIQUID_INFO_URL, {"type": "allMids"})
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            str(key): str(value)
+            for key, value in payload.items()
+            if str(key).startswith("#")
+        }
+
+    def l2_books(self, coins: list[str]) -> dict[str, dict[str, Any]]:
+        unique_coins = list(dict.fromkeys(str(coin) for coin in coins if coin))
+        if not unique_coins:
+            return {}
+        output: dict[str, dict[str, Any]] = {}
+        max_workers = min(8, len(unique_coins))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.l2_book, coin): coin
+                for coin in unique_coins
+            }
+            for future in as_completed(futures):
+                book = future.result()
+                if book and book.get("coin"):
+                    output[str(book["coin"])] = book
+        return output
+
+    def l2_book(self, coin: str) -> dict[str, Any]:
+        payload = self.http.post_json(
+            HYPERLIQUID_INFO_URL,
+            {"type": "l2Book", "coin": coin},
+        )
+        return payload if isinstance(payload, dict) else {}
 
 
 def as_float(value: Any, default: float = 0.0) -> float:

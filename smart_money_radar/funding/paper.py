@@ -47,7 +47,10 @@ def simulate_paper_revalidations(
             status = "revalidated_not_profitable"
         output.append(
             {
-                "funding_route_id": previous["funding_route_id"],
+                "funding_route_id": (
+                    current.get("funding_route_id") if current else None
+                )
+                or previous["funding_route_id"],
                 "model_version": PAPER_MODEL_VERSION,
                 "status": status,
                 "requested_notional": requested,

@@ -11,12 +11,17 @@ from typing import Any
 from unittest.mock import patch
 
 from smart_money_radar.funding.adapters.base import FundingDataError, FundingHttpClient
+from smart_money_radar.funding.adapters.aevo import AevoFundingClient
 from smart_money_radar.funding.adapters.aster import AsterFundingClient
 from smart_money_radar.funding.adapters.backpack import BackpackFundingClient
 from smart_money_radar.funding.adapters.binance import BinanceFundingClient
 from smart_money_radar.funding.adapters.bingx import BingXFundingClient
+from smart_money_radar.funding.adapters.bitmart import BitMartFundingClient
+from smart_money_radar.funding.adapters.bitunix import BitunixFundingClient
 from smart_money_radar.funding.adapters.bitget import BitgetFundingClient
+from smart_money_radar.funding.adapters.blofin import BloFinFundingClient
 from smart_money_radar.funding.adapters.bybit import BybitFundingClient
+from smart_money_radar.funding.adapters.coinex import CoinExFundingClient
 from smart_money_radar.funding.adapters.deribit import DeribitFundingClient
 from smart_money_radar.funding.adapters.dydx import DydxFundingClient
 from smart_money_radar.funding.adapters.drift import DriftFundingClient
@@ -41,11 +46,18 @@ from smart_money_radar.funding.adapters.okx import (
     okx_funding_snapshot,
 )
 from smart_money_radar.funding.adapters.paradex import ParadexFundingClient
+from smart_money_radar.funding.adapters.phemex import PhemexFundingClient
 from smart_money_radar.funding.adapters.vertex import (
     VertexFundingClient,
     vertex_response_data,
 )
-from smart_money_radar.dashboard import funding_query_horizon, funding_request_config
+from smart_money_radar.funding.adapters.woox import WOOXFundingClient
+from smart_money_radar.dashboard import (
+    filter_deactivated_funding_paper_payload,
+    filter_deactivated_funding_paper_export_rows,
+    funding_query_horizon,
+    funding_request_config,
+)
 from smart_money_radar.funding.economics import (
     current_schedule_carry_rate,
     evaluate_perp_route,
@@ -72,16 +84,21 @@ from smart_money_radar.funding.liquidity import (
     estimate_maker_fill,
 )
 from smart_money_radar.funding.normalization import (
+    canonical_quote_asset_symbol,
     canonical_asset_unit_multiplier,
     funding_hourly_buckets,
     funding_persistence,
     inferred_funding_intervals,
+    is_linear_contract_type,
     normalize_catalog_canonical_units,
     normalize_orderbook_canonical_units,
+    normalized_contract_type,
 )
 from smart_money_radar.funding.paper import simulate_paper_revalidations
 from smart_money_radar.funding.scanner import execution_shortlist, rank_perp_pairs
 from smart_money_radar.funding.service import (
+    DEACTIVATED_FUNDING_VENUES,
+    active_default_funding_clients,
     backfill_funding_history,
     client_history_request_start_at,
     executable_history_market_keys,
@@ -92,6 +109,74 @@ from smart_money_radar.storage import SQLiteStore, utc_now_iso
 
 
 class FundingRadarTest(unittest.TestCase):
+    def test_risky_venues_are_not_active_default_funding_clients(self) -> None:
+        venues = {str(client.venue) for client in active_default_funding_clients()}
+
+        self.assertFalse(venues & DEACTIVATED_FUNDING_VENUES)
+
+    def test_deactivated_venues_are_hidden_from_funding_paper_dashboard(self) -> None:
+        payload = filter_deactivated_funding_paper_payload(
+            {
+                "summary": {},
+                "accounts": [
+                    {
+                        "venue": "binance",
+                        "starting_balance": 1_000,
+                        "cash_balance": 1_010,
+                        "reserved_margin": 0,
+                        "realized_pnl": 10,
+                    },
+                    {
+                        "venue": "bitunix",
+                        "starting_balance": 1_000,
+                        "cash_balance": 980,
+                        "reserved_margin": 0,
+                        "realized_pnl": -20,
+                    },
+                ],
+                "open_positions": [],
+                "closed_positions": [
+                    {
+                        "long_venue": "binance",
+                        "short_venue": "okx",
+                        "actual_net_pnl": 10,
+                    },
+                    {
+                        "long_venue": "phemex",
+                        "short_venue": "bitunix",
+                        "actual_net_pnl": 5,
+                    },
+                ],
+                "events": [
+                    {"message": "LONG binance / SHORT okx"},
+                    {"message": "LONG phemex / SHORT bitunix"},
+                ],
+                "trade_events": [{"message": "LONG phemex / SHORT bitunix"}],
+                "system_events": [{"message": "healthy"}],
+            }
+        )
+
+        self.assertEqual([row["venue"] for row in payload["accounts"]], ["binance"])
+        self.assertEqual(payload["summary"]["realized_pnl"], 10)
+        self.assertEqual(payload["summary"]["closed_trade_count"], 1)
+        self.assertEqual(payload["closed_positions"][0]["short_venue"], "okx")
+        self.assertEqual(payload["events"], [{"message": "LONG binance / SHORT okx"}])
+        self.assertEqual(payload["trade_events"], [])
+
+    def test_deactivated_venues_are_hidden_from_funding_paper_export(self) -> None:
+        rows = filter_deactivated_funding_paper_export_rows(
+            [
+                {"Long": "binance", "Short": "okx", "Маршрут": "LONG binance / SHORT okx"},
+                {
+                    "Long": "phemex",
+                    "Short": "bitunix",
+                    "Маршрут": "LONG phemex / SHORT bitunix",
+                },
+            ]
+        )
+
+        self.assertEqual(rows, [{"Long": "binance", "Short": "okx", "Маршрут": "LONG binance / SHORT okx"}])
+
     def test_http_client_wraps_remote_disconnect_as_venue_error(self) -> None:
         client = FundingHttpClient(max_retries=0)
         with patch(
@@ -405,6 +490,22 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(markets[0]["mark_price"], 0.000003456)
         self.assertAlmostEqual(markets[1]["mark_price"], 0.0000034601)
         self.assertAlmostEqual(markets[2]["mark_price"], 0.000003465)
+
+    def test_extended_scaled_contract_aliases_are_whitelisted(self) -> None:
+        self.assertEqual(canonical_asset_unit_multiplier("MPEPE"), 1_000_000)
+        self.assertEqual(canonical_asset_unit_multiplier("1000000BONK"), 1_000_000)
+        self.assertEqual(canonical_asset_unit_multiplier("10000SHIB"), 10_000)
+        self.assertEqual(canonical_asset_unit_multiplier("MANTA"), 1)
+        self.assertEqual(canonical_asset_unit_multiplier("MOVE"), 1)
+
+    def test_quote_and_contract_type_normalization_helpers(self) -> None:
+        self.assertEqual(canonical_quote_asset_symbol("USDT"), "USD")
+        self.assertEqual(canonical_quote_asset_symbol("USDC"), "USD")
+        self.assertEqual(canonical_quote_asset_symbol("FDUSD"), "USD")
+        self.assertEqual(normalized_contract_type("inverse_perpetual"), "inverse_perpetual")
+        self.assertEqual(normalized_contract_type("linear"), "linear_perpetual")
+        self.assertTrue(is_linear_contract_type("USDTM"))
+        self.assertFalse(is_linear_contract_type("inverse"))
 
     def test_route_uses_round_trip_costs_and_total_collateral(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -773,6 +874,34 @@ class FundingRadarTest(unittest.TestCase):
             research_id,
         )
 
+    def test_focused_watch_scan_does_not_replace_dashboard_universe_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "radar.sqlite")
+            store.init_db()
+            full_watch_id = store.start_funding_scan(
+                {"scan_mode": "watch", "horizon_mode": "next_settlement"}
+            )
+            store.finish_funding_scan(full_watch_id, "success")
+            focused_watch_id = store.start_funding_scan(
+                {
+                    "scan_mode": "watch",
+                    "horizon_mode": "next_settlement",
+                    "focused_route_key": "route-one",
+                    "focused_route_mode": "direct_symbol_recheck_v1",
+                }
+            )
+            store.finish_funding_scan(focused_watch_id, "success")
+
+            dashboard = store.funding_dashboard(
+                horizon_mode="next_settlement",
+                include_watch_scans=True,
+            )
+
+        self.assertEqual(
+            dashboard["latest_scan"]["funding_scan_id"],
+            full_watch_id,
+        )
+
     def test_latest_funding_scan_config_ignores_research_snapshots(self) -> None:
         with TemporaryDirectory() as directory:
             store = SQLiteStore(Path(directory) / "radar.sqlite")
@@ -862,12 +991,12 @@ class FundingRadarTest(unittest.TestCase):
             ("fixed", 24.0),
         )
 
-    def test_dashboard_candidates_include_positive_live_nowcast_net(self) -> None:
+    def test_dashboard_candidates_include_actionable_live_nowcast_net(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
         now = datetime.fromisoformat(observed_at)
         route = evaluate_perp_route(
             market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at),
-            market("hyperliquid", "BTC", "BTC", 0.005, 1, observed_at),
+            market("hyperliquid", "BTC", "BTC", 0.006, 1, observed_at),
             book("binance", "BTCUSDT", observed_at),
             book("hyperliquid", "BTC", observed_at),
             history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
@@ -890,7 +1019,7 @@ class FundingRadarTest(unittest.TestCase):
             dashboard = store.funding_dashboard()
 
         self.assertEqual(route["status"], "paper_candidate")
-        self.assertGreater(route["evidence"]["current_nowcast_net"], 0)
+        self.assertGreaterEqual(route["evidence"]["current_nowcast_net"], 1.0)
         self.assertEqual(len(dashboard["routes"]), 1)
         self.assertEqual(dashboard["watch_routes"], [])
 
@@ -899,7 +1028,7 @@ class FundingRadarTest(unittest.TestCase):
         now = datetime.fromisoformat(observed_at)
         route = evaluate_perp_route(
             market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at),
-            market("hyperliquid", "BTC", "BTC", 0.005, 1, observed_at),
+            market("hyperliquid", "BTC", "BTC", 0.006, 1, observed_at),
             book("binance", "BTCUSDT", observed_at),
             book("hyperliquid", "BTC", observed_at),
             history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
@@ -1143,7 +1272,7 @@ class FundingRadarTest(unittest.TestCase):
         now = datetime.fromisoformat(observed_at)
         weak_live = evaluate_perp_route(
             market("binance", "AAAUSDT", "AAA", 0.0, 8, observed_at),
-            market("hyperliquid", "AAA", "AAA", 0.0035, 1, observed_at),
+            market("hyperliquid", "AAA", "AAA", 0.006, 1, observed_at),
             book("binance", "AAAUSDT", observed_at),
             book("hyperliquid", "AAA", observed_at),
             history_rows("binance", "AAAUSDT", now, 8, 0.0, 90),
@@ -1157,7 +1286,7 @@ class FundingRadarTest(unittest.TestCase):
         )
         strong_live = evaluate_perp_route(
             market("binance", "BBBUSDT", "BBB", 0.0, 8, observed_at),
-            market("hyperliquid", "BBB", "BBB", 0.0045, 1, observed_at),
+            market("hyperliquid", "BBB", "BBB", 0.007, 1, observed_at),
             book("binance", "BBBUSDT", observed_at),
             book("hyperliquid", "BBB", observed_at),
             history_rows("binance", "BBBUSDT", now, 8, 0.0, 90),
@@ -1185,6 +1314,45 @@ class FundingRadarTest(unittest.TestCase):
             dashboard["routes"][1]["evidence"]["current_nowcast_net"],
         )
         self.assertEqual(dashboard["routes"][0]["canonical_asset"], "BBB")
+
+    def test_dashboard_hides_candidates_below_visible_profit_floor(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+        route = evaluate_perp_route(
+            market("binance", "AAAUSDT", "AAA", 0.0, 8, observed_at),
+            market("hyperliquid", "AAA", "AAA", 0.0035, 1, observed_at),
+            book("binance", "AAAUSDT", observed_at),
+            book("hyperliquid", "AAA", observed_at),
+            history_rows("binance", "AAAUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "AAA", now, 1, -0.0001, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+        route["status"] = "paper_candidate"
+        route["evidence"]["decision_mode"] = "settlement_capture"
+        route["evidence"]["current_nowcast_net"] = 0.99
+
+        with TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "radar.sqlite")
+            store.init_db()
+            scan_id = store.start_funding_scan(
+                {
+                    "scan_mode": "manual",
+                    "horizon_mode": "next_settlement",
+                    "minimum_net_profit": 1.0,
+                }
+            )
+            store.insert_funding_routes(scan_id, [route])
+            store.finish_funding_scan(scan_id, "success", route_count=1)
+            dashboard = store.funding_dashboard()
+
+        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(dashboard["minimum_visible_profit"], 1.0)
+        self.assertEqual(dashboard["routes"], [])
 
     def test_live_settlement_profit_is_not_vetoed_by_negative_history(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -2626,6 +2794,28 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(result["repriced_net_profit"], 20)
         self.assertEqual(result["latency_ms"], 60_000)
 
+    def test_paper_revalidation_uses_current_route_id_when_available(self) -> None:
+        previous = {
+            "funding_route_id": 7,
+            "route_key": "route",
+            "target_notional": 500,
+            "expected_net_profit": 5,
+            "observed_at": "2026-07-14T12:00:00+00:00",
+        }
+        current = {
+            "funding_route_id": 99,
+            "route_key": "route",
+            "target_notional": 500,
+            "expected_net_profit": 6,
+            "status": "paper_candidate",
+            "observed_at": "2026-07-14T12:00:10+00:00",
+        }
+
+        result = simulate_paper_revalidations([previous], [current], 1_000)[0]
+
+        self.assertEqual(result["funding_route_id"], 99)
+        self.assertEqual(result["status"], "revalidated_profitable")
+
     def test_paper_route_is_reauthorized_after_a_crossed_settlement(self) -> None:
         previous = {
             "funding_route_id": 8,
@@ -3009,6 +3199,131 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(len(history), 2)
         self.assertEqual(history[-1]["funding_interval_hours"], 1)
         self.assertAlmostEqual(history[-1]["hourly_funding_rate"], 0.000012)
+
+    def test_woox_adapter_uses_batch_funding_depth_and_history(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = WOOXFundingClient(http=FakeWOOXHttp(), base_url="https://woox.test")
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("PERP_BTC_USDT", observed_at, limit=2)
+        history = client.funding_history("PERP_BTC_USDT", 1, 4, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "woox")
+        self.assertEqual(markets[0]["funding_interval_hours"], 4)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.0004)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001)
+        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[-1]["funding_interval_hours"], 4)
+
+    def test_coinex_adapter_derives_dynamic_interval_and_reads_depth(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = CoinExFundingClient(http=FakeCoinExHttp(), base_url="https://coinex.test")
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTCUSDT", observed_at, limit=2)
+        history = client.funding_history("BTCUSDT", 1, 8, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "coinex")
+        self.assertEqual(markets[0]["funding_interval_hours"], 4)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0004 / 4)
+        self.assertEqual(markets[0]["taker_fee_rate"], 0.0005)
+        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
+        self.assertEqual(len(history), 2)
+
+    def test_bitunix_adapter_converts_percent_funding_rate(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = BitunixFundingClient(http=FakeBitunixHttp(), base_url="https://bitunix.test")
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTCUSDT", observed_at, limit=2)
+        snapshot = client.market_snapshot("BTCUSDT", "BTC", observed_at, markets[0])
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "bitunix")
+        self.assertEqual(markets[0]["funding_interval_hours"], 8)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.007459 / 100)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.007459 / 100 / 8)
+        self.assertAlmostEqual(markets[0]["funding_rate_cap"], 0.3 / 100)
+        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
+        self.assertAlmostEqual(snapshot["funding_rate"], 0.007459 / 100)
+
+    def test_bitmart_adapter_converts_contract_depth(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = BitMartFundingClient(http=FakeBitMartHttp(), base_url="https://bitmart.test")
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTCUSDT", observed_at, limit=2)
+        history = client.funding_history("BTCUSDT", 1, 8, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(instruments[0]["contract_multiplier"], 0.001)
+        self.assertEqual(markets[0]["venue"], "bitmart")
+        self.assertEqual(markets[0]["funding_interval_hours"], 8)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0008 / 8)
+        self.assertEqual(book_row["bids"][0], [99.9, 0.002])
+        self.assertEqual(len(history), 2)
+
+    def test_blofin_adapter_filters_inverse_and_converts_contract_depth(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = BloFinFundingClient(http=FakeBloFinHttp(), base_url="https://blofin.test")
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC-USDT", observed_at, limit=2)
+        history = client.funding_history("BTC-USDT", 1, 8, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(instruments[0]["contract_multiplier"], 0.001)
+        self.assertEqual(markets[0]["venue"], "blofin")
+        self.assertEqual(markets[0]["funding_interval_hours"], 8)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0008 / 8)
+        self.assertEqual(book_row["bids"][0], [99.9, 0.002])
+        self.assertEqual(len(history), 2)
+
+    def test_phemex_adapter_computes_next_boundary_and_reads_depth(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = PhemexFundingClient(http=FakePhemexHttp(), base_url="https://phemex.test")
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTCUSDT", observed_at, limit=2)
+        snapshot = client.market_snapshot("BTCUSDT", "BTC", observed_at, markets[0])
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "phemex")
+        self.assertEqual(markets[0]["funding_interval_hours"], 8)
+        self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T16:00:00+00:00")
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0008 / 8)
+        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
+        self.assertEqual(snapshot["next_funding_at"], "2026-07-14T16:00:00+00:00")
+
+    def test_aevo_adapter_uses_hourly_funding_and_nanosecond_timestamp(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = AevoFundingClient(
+            http=FakeAevoHttp(),
+            base_url="https://aevo.test",
+            max_funding_workers=2,
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC-PERP", observed_at, limit=2)
+        history = client.funding_history("BTC-PERP", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "aevo")
+        self.assertEqual(markets[0]["funding_interval_hours"], 1)
+        self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001)
+        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
+        self.assertEqual(len(history), 2)
 
     def test_account_fee_override_replaces_public_tier(self) -> None:
         row = {"venue": "binance", "taker_fee_rate": 0.0005}
@@ -3418,8 +3733,8 @@ class FundingRadarTest(unittest.TestCase):
                     "SELECT COUNT(*) FROM funding_rate_history"
                 ).fetchone()[0]
 
-        self.assertEqual(removed, 1)
-        self.assertEqual(len(scans), 3)
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(scans), 2)
         self.assertEqual(scans[-1]["funding_scan_id"], manual["funding_scan_id"])
         self.assertGreater(history_count, 0)
         self.assertEqual(dashboard["latest_scan"]["scan_mode"], "manual")
@@ -4845,6 +5160,476 @@ class FakeVertexHttp:
                     ]
                 }
         raise AssertionError((url, payload))
+
+
+class FakeWOOXHttp:
+    def get_json(self, url: str) -> Any:
+        if "/v3/public/futures" in url:
+            return {
+                "success": True,
+                "data": {
+                    "rows": [
+                        {
+                            "symbol": "PERP_BTC_USDT",
+                            "indexPrice": "100",
+                            "markPrice": "100",
+                            "estFundingRate": "0.0004",
+                            "openInterest": "10",
+                            "24hAmount": "1000000",
+                            "nextFundingTime": 1784044800000,
+                        }
+                    ]
+                },
+            }
+        if "/v1/public/funding_rates" in url:
+            return {
+                "success": True,
+                "rows": [
+                    {
+                        "symbol": "PERP_BTC_USDT",
+                        "est_funding_rate": 0.0004,
+                        "next_funding_time": 1784044800000,
+                        "est_funding_rate_interval": 4,
+                    }
+                ],
+            }
+        if "/v1/public/funding_rate/PERP_BTC_USDT" in url:
+            return {
+                "success": True,
+                "symbol": "PERP_BTC_USDT",
+                "est_funding_rate": 0.0004,
+                "next_funding_time": 1784044800000,
+                "est_funding_rate_interval": 4,
+            }
+        if "/v3/public/orderbook?" in url:
+            return {
+                "success": True,
+                "data": {
+                    "bids": [{"price": "99.9", "quantity": "2"}],
+                    "asks": [{"price": "100.1", "quantity": "3"}],
+                },
+            }
+        if "/v1/public/funding_rate_history?" in url:
+            return {
+                "success": True,
+                "rows": [
+                    {
+                        "symbol": "PERP_BTC_USDT",
+                        "funding_rate": 0.0002,
+                        "funding_rate_timestamp": 1784016000000,
+                        "mark_price": 100,
+                    },
+                    {
+                        "symbol": "PERP_BTC_USDT",
+                        "funding_rate": 0.0004,
+                        "funding_rate_timestamp": 1784030400000,
+                        "mark_price": 100,
+                    },
+                ],
+            }
+        raise AssertionError(url)
+
+
+class FakeCoinExHttp:
+    def get_json(self, url: str) -> Any:
+        if url.endswith("/v2/futures/market"):
+            return {
+                "code": 0,
+                "message": "OK",
+                "data": [
+                    {
+                        "market": "BTCUSDT",
+                        "base_ccy": "BTC",
+                        "quote_ccy": "USDT",
+                        "contract_type": "linear",
+                        "status": "online",
+                        "is_market_available": True,
+                        "is_api_trading_available": True,
+                        "maker_fee_rate": "0.0003",
+                        "taker_fee_rate": "0.0005",
+                    },
+                    {
+                        "market": "BTCUSD",
+                        "base_ccy": "BTC",
+                        "quote_ccy": "USD",
+                        "contract_type": "inverse",
+                        "status": "online",
+                        "is_market_available": True,
+                        "is_api_trading_available": True,
+                    },
+                ],
+            }
+        if "/v2/futures/funding-rate-history?" in url:
+            return {
+                "code": 0,
+                "message": "OK",
+                "data": [
+                    {
+                        "market": "BTCUSDT",
+                        "actual_funding_rate": "0.0002",
+                        "funding_time": 1784016000000,
+                    },
+                    {
+                        "market": "BTCUSDT",
+                        "actual_funding_rate": "0.0004",
+                        "funding_time": 1784030400000,
+                    },
+                ],
+            }
+        if "/v2/futures/funding-rate" in url:
+            return {
+                "code": 0,
+                "message": "OK",
+                "data": [
+                    {
+                        "market": "BTCUSDT",
+                        "next_funding_rate": "0.0004",
+                        "latest_funding_time": 1784030400000,
+                        "next_funding_time": 1784044800000,
+                        "mark_price": "100",
+                        "max_funding_rate": "0.003",
+                        "min_funding_rate": "-0.003",
+                    }
+                ],
+            }
+        if "/v2/futures/ticker" in url:
+            return {
+                "code": 0,
+                "message": "OK",
+                "data": [
+                    {
+                        "market": "BTCUSDT",
+                        "mark_price": "100",
+                        "index_price": "100",
+                        "open_interest_volume": "10",
+                        "value": "1000000",
+                    }
+                ],
+            }
+        if "/v2/futures/depth?" in url:
+            return {
+                "code": 0,
+                "message": "OK",
+                "data": {
+                    "depth": {
+                        "bids": [["99.9", "2"]],
+                        "asks": [["100.1", "3"]],
+                    }
+                },
+            }
+        raise AssertionError(url)
+
+
+class FakeBitunixHttp:
+    def get_json(self, url: str) -> Any:
+        if url.endswith("/api/v1/futures/market/trading_pairs"):
+            return {
+                "code": 0,
+                "msg": "Success",
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "base": "BTC",
+                        "quote": "USDT",
+                        "symbolStatus": "OPEN",
+                        "isApiSupported": True,
+                        "maxFundingRate": "0.3",
+                        "minFundingRate": "-0.3",
+                    }
+                ],
+            }
+        if url.endswith("/api/v1/futures/market/tickers"):
+            return {
+                "code": 0,
+                "msg": "Success",
+                "data": [{"symbol": "BTCUSDT", "markPrice": "100", "quoteVol": "1000000"}],
+            }
+        if "/api/v1/futures/market/funding_rate/batch" in url:
+            return {
+                "code": 0,
+                "msg": "Success",
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "markPrice": "100",
+                        "indexPrice": "100",
+                        "fundingRate": "0.007459",
+                        "fundingInterval": 8,
+                        "nextFundingTime": "1784044800000",
+                        "maxFundingRate": "0.3",
+                        "minFundingRate": "-0.3",
+                    }
+                ],
+            }
+        if "/api/v1/futures/market/funding_rate?" in url:
+            return {
+                "code": 0,
+                "msg": "Success",
+                "data": {
+                    "symbol": "BTCUSDT",
+                    "markPrice": "100",
+                    "indexPrice": "100",
+                    "fundingRate": "0.007459",
+                    "fundingInterval": 8,
+                    "nextFundingTime": "1784044800000",
+                    "maxFundingRate": "0.3",
+                    "minFundingRate": "-0.3",
+                },
+            }
+        if "/api/v1/futures/market/depth?" in url:
+            return {
+                "code": 0,
+                "msg": "Success",
+                "data": {"bids": [["99.9", "2"]], "asks": [["100.1", "3"]]},
+            }
+        raise AssertionError(url)
+
+
+class FakeBitMartHttp:
+    def get_json(self, url: str) -> Any:
+        if "/contract/public/details" in url:
+            return {
+                "code": 1000,
+                "message": "Ok",
+                "data": {
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "product_type": 1,
+                            "expire_timestamp": 0,
+                            "delist_time": 0,
+                            "base_currency": "BTC",
+                            "quote_currency": "USDT",
+                            "contract_size": "0.001",
+                            "last_price": "100",
+                            "index_price": "100",
+                            "expected_funding_rate": "0.0008",
+                            "funding_time": 1784044800000,
+                            "funding_interval_hours": 8,
+                            "open_interest_value": "1000000",
+                            "turnover_24h": "2000000",
+                            "status": "Trading",
+                            "tradfi_info": None,
+                        }
+                    ]
+                },
+            }
+        if "/contract/public/funding-rate-v2" in url:
+            return {
+                "code": 1000,
+                "message": "Ok",
+                "data": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "expected_rate": "0.0008",
+                            "rate_value": "0.0007",
+                            "funding_time": 1784044800000,
+                        }
+                    ]
+                },
+            }
+        if "/contract/public/funding-rate?" in url:
+            return {
+                "code": 1000,
+                "message": "Ok",
+                "data": {
+                    "symbol": "BTCUSDT",
+                    "expected_rate": "0.0008",
+                    "funding_time": 1784044800000,
+                },
+            }
+        if "/contract/public/depth?" in url:
+            return {
+                "code": 1000,
+                "message": "Ok",
+                "data": {"bids": [["99.9", "2"]], "asks": [["100.1", "3"]]},
+            }
+        if "/contract/public/funding-rate-history?" in url:
+            return {
+                "code": 1000,
+                "message": "Ok",
+                "data": {
+                    "list": [
+                        {"symbol": "BTCUSDT", "funding_rate": "0.0007", "funding_time": "1784016000000"},
+                        {"symbol": "BTCUSDT", "funding_rate": "0.0008", "funding_time": "1784044800000"},
+                    ]
+                },
+            }
+        raise AssertionError(url)
+
+
+class FakeBloFinHttp:
+    def get_json(self, url: str) -> Any:
+        if "/api/v1/market/instruments?" in url:
+            return {
+                "code": "0",
+                "msg": "success",
+                "data": [
+                    {
+                        "instId": "BTC-USDT",
+                        "baseCurrency": "BTC",
+                        "quoteCurrency": "USDT",
+                        "settleCurrency": "USDT",
+                        "contractValue": "0.001",
+                        "instType": "SWAP",
+                        "contractType": "linear",
+                        "state": "live",
+                    },
+                    {
+                        "instId": "BTC-USD",
+                        "baseCurrency": "BTC",
+                        "quoteCurrency": "USD",
+                        "settleCurrency": "BTC",
+                        "contractValue": "1",
+                        "instType": "SWAP",
+                        "contractType": "inverse",
+                        "state": "live",
+                    },
+                ],
+            }
+        if "/api/v1/market/funding-rate-history?" in url:
+            return {
+                "code": "0",
+                "msg": "success",
+                "data": [
+                    {"instId": "BTC-USDT", "fundingRate": "0.0007", "fundingTime": "1784016000000"},
+                    {"instId": "BTC-USDT", "fundingRate": "0.0008", "fundingTime": "1784044800000"},
+                ],
+            }
+        if "/api/v1/market/funding-rate" in url:
+            return {
+                "code": "0",
+                "msg": "success",
+                "data": [
+                    {
+                        "instId": "BTC-USDT",
+                        "fundingRate": "0.0008",
+                        "fundingTime": "1784044800000",
+                    }
+                ],
+            }
+        if "/api/v1/market/mark-price" in url:
+            return {
+                "code": "0",
+                "msg": "success",
+                "data": [{"instId": "BTC-USDT", "markPrice": "100", "indexPrice": "100"}],
+            }
+        if "/api/v1/market/tickers?" in url:
+            return {
+                "code": "0",
+                "msg": "success",
+                "data": [{"instId": "BTC-USDT", "last": "100", "volCurrency24h": "1000000"}],
+            }
+        if "/api/v1/market/books?" in url:
+            return {
+                "code": "0",
+                "msg": "success",
+                "data": [{"bids": [["99.9", "2"]], "asks": [["100.1", "3"]]}],
+            }
+        raise AssertionError(url)
+
+
+class FakePhemexHttp:
+    def get_json(self, url: str) -> Any:
+        if url.endswith("/public/products"):
+            return {
+                "code": 0,
+                "msg": "OK",
+                "data": {
+                    "perpProductsV2": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "type": "PerpetualV2",
+                            "status": "Listed",
+                            "baseCurrency": "BTC",
+                            "contractUnderlyingAssets": "BTC",
+                            "quoteCurrency": "USDT",
+                            "settleCurrency": "USDT",
+                            "fundingInterval": 28800,
+                        }
+                    ]
+                },
+            }
+        if url.endswith("/md/v2/ticker/24hr/all"):
+            return {
+                "error": None,
+                "id": 0,
+                "result": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "predFundingRateRr": "0.0008",
+                        "fundingRateRr": "0.0007",
+                        "markPriceRp": "100",
+                        "indexPriceRp": "100",
+                        "openInterestRv": "10",
+                        "turnoverRv": "1000000",
+                    }
+                ],
+            }
+        if "/md/v2/ticker/24hr?" in url:
+            return {
+                "error": None,
+                "id": 0,
+                "result": {
+                    "symbol": "BTCUSDT",
+                    "predFundingRateRr": "0.0008",
+                    "fundingRateRr": "0.0007",
+                    "markPriceRp": "100",
+                    "indexPriceRp": "100",
+                    "openInterestRv": "10",
+                    "turnoverRv": "1000000",
+                },
+            }
+        if "/md/v2/orderbook?" in url:
+            return {
+                "error": None,
+                "id": 0,
+                "result": {
+                    "orderbook_p": {
+                        "bids": [["99.9", "2"]],
+                        "asks": [["100.1", "3"]],
+                    }
+                },
+            }
+        raise AssertionError(url)
+
+
+class FakeAevoHttp:
+    def get_json(self, url: str) -> Any:
+        if "/markets?" in url:
+            return [
+                {
+                    "instrument_id": "1",
+                    "instrument_name": "BTC-PERP",
+                    "instrument_type": "PERPETUAL",
+                    "underlying_asset": "BTC",
+                    "quote_asset": "USDC",
+                    "mark_price": "100",
+                    "index_price": "100",
+                    "is_active": True,
+                    "is_rwa": False,
+                    "market_type": "crypto",
+                }
+            ]
+        if "/funding-history?" in url:
+            return {
+                "funding_history": [
+                    ["BTC-PERP", "1784030400000000000", "0.00008", "100"],
+                    ["BTC-PERP", "1784034000000000000", "0.0001", "100"],
+                ]
+            }
+        if "/funding?" in url:
+            return {
+                "next_epoch": "1784034000000000000",
+                "funding_rate": "0.0001",
+            }
+        if "/orderbook?" in url:
+            return {
+                "bids": [["99.9", "2"]],
+                "asks": [["100.1", "3"]],
+            }
+        raise AssertionError(url)
 
 
 class FailingClient:

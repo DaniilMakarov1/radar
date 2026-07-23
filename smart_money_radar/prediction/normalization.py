@@ -10,6 +10,7 @@ from smart_money_radar.prediction.clients import as_float
 
 KALSHI_TAKER_FEE_RATE = 0.07
 KALSHI_CONSERVATIVE_MAKER_FEE_RATE = 0.0175
+HYPERLIQUID_HIP4_TAKER_FEE_RATE = 0.0006
 
 
 def normalize_polymarket_catalog(
@@ -118,6 +119,11 @@ def normalize_polymarket_market(
         "maker_fee_rate": 0.0,
         "fees_enabled": fees_enabled,
         "fee_verified": fee_verified,
+        "fee_source": (
+            "polymarket_gamma_fee_schedule"
+            if fee_verified
+            else "polymarket_fee_schedule_missing"
+        ),
         "min_order_size": max(0.0, as_float(raw.get("orderMinSize"), 1.0)),
         "tick_size": max(0.0001, as_float(raw.get("orderPriceMinTickSize"), 0.01)),
         "volume": as_float(raw.get("volumeNum") or raw.get("volume")),
@@ -152,6 +158,7 @@ def enrich_polymarket_market_info(
             market["fee_exponent"] = as_float(fee_details.get("e"), 1.0)
             market["fee_taker_only"] = as_bool(fee_details.get("to"))
             market["fee_verified"] = True
+            market["fee_source"] = "polymarket_clob_market_info"
         if info.get("mos") not in (None, ""):
             market["min_order_size"] = max(0.0, as_float(info.get("mos"), 1.0))
         if info.get("mts") not in (None, ""):
@@ -181,6 +188,98 @@ def normalize_kalshi_catalog(
             normalize_kalshi_market(event, raw_market, observed_at)
             for raw_market in selected
         ]
+        events.append(event)
+        markets.extend(normalized_markets)
+    return events, markets
+
+
+def normalize_hyperliquid_catalog(
+    raw_meta: dict[str, Any],
+    all_mids: dict[str, Any],
+    observed_at: str,
+    max_markets: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    outcomes = [
+        row
+        for row in raw_meta.get("outcomes", [])
+        if isinstance(row, dict) and row.get("outcome") is not None
+    ]
+    questions = [
+        row
+        for row in raw_meta.get("questions", [])
+        if isinstance(row, dict) and row.get("question") is not None
+    ]
+    outcome_by_id = {str(row["outcome"]): row for row in outcomes}
+    question_events: list[dict[str, Any]] = []
+    assigned_outcomes: set[str] = set()
+    for question in questions:
+        outcome_ids = [
+            str(value)
+            for value in [
+                *(question.get("namedOutcomes") or []),
+                question.get("fallbackOutcome"),
+            ]
+            if value is not None
+        ]
+        raw_outcomes = [
+            outcome_by_id[outcome_id]
+            for outcome_id in outcome_ids
+            if outcome_id in outcome_by_id
+        ]
+        if not raw_outcomes:
+            continue
+        assigned_outcomes.update(str(row["outcome"]) for row in raw_outcomes)
+        question_events.append(
+            {
+                **question,
+                "event_id": f"question:{question['question']}",
+                "event_kind": "question",
+                "markets": raw_outcomes,
+            }
+        )
+    standalone_events = [
+        {
+            "event_id": f"outcome:{row['outcome']}",
+            "event_kind": "outcome",
+            "name": hyperliquid_outcome_title(row),
+            "description": row.get("description"),
+            "markets": [row],
+        }
+        for row in outcomes
+        if str(row["outcome"]) not in assigned_outcomes
+    ]
+    events: list[dict[str, Any]] = []
+    markets: list[dict[str, Any]] = []
+    selections = fair_market_selection(
+        [*question_events, *standalone_events],
+        max_markets,
+    )
+    for raw_event, selected, total_count in selections:
+        event = normalize_hyperliquid_event(raw_event, selected, total_count, observed_at)
+        normalized_markets = [
+            market
+            for raw_market in selected
+            for market in [
+                normalize_hyperliquid_market(
+                    event,
+                    raw_event,
+                    raw_market,
+                    all_mids,
+                    observed_at,
+                )
+            ]
+            if market
+        ]
+        if not normalized_markets:
+            continue
+        event["active"] = any(row["accepting_orders"] for row in normalized_markets)
+        event["catalog_complete"] = len(selected) == total_count
+        event["outcome_count"] = total_count
+        event["exhaustive"] = bool(
+            event["mutually_exclusive"]
+            and event["catalog_complete"]
+            and raw_event.get("event_kind") == "question"
+        )
         events.append(event)
         markets.extend(normalized_markets)
     return events, markets
@@ -323,7 +422,8 @@ def normalize_kalshi_market(
         "fee_taker_only": True,
         "maker_fee_rate": KALSHI_CONSERVATIVE_MAKER_FEE_RATE,
         "fees_enabled": True,
-        "fee_verified": False,
+        "fee_verified": True,
+        "fee_source": "kalshi_public_conservative_formula",
         "min_order_size": 1.0,
         "tick_size": kalshi_tick_size(raw),
         "volume": as_float(raw.get("volume_fp")),
@@ -340,6 +440,121 @@ def normalize_kalshi_market(
         "raw": {
             **raw,
             "fee_policy": "kalshi_2026_general_conservative",
+        },
+    }
+
+
+def normalize_hyperliquid_event(
+    raw: dict[str, Any],
+    raw_markets: list[dict[str, Any]],
+    total_count: int,
+    observed_at: str,
+) -> dict[str, Any]:
+    description = str(raw.get("description") or "").strip()
+    metadata = hyperliquid_description_fields(description)
+    market_metadata = hyperliquid_description_fields(
+        str((raw_markets[0] if raw_markets else {}).get("description") or "")
+    )
+    category = hyperliquid_category(metadata, market_metadata)
+    expected_resolution_at = (
+        hyperliquid_expiry_iso(metadata.get("expiry"))
+        or hyperliquid_expiry_iso(market_metadata.get("expiry"))
+    )
+    return {
+        "venue": "hyperliquid_hip4",
+        "event_id": str(raw["event_id"]),
+        "title": hyperliquid_event_title(raw, market_metadata),
+        "slug": str(raw["event_id"]).replace(":", "-"),
+        "category": category,
+        "description": description,
+        "starts_at": None,
+        "closes_at": expected_resolution_at,
+        "expected_resolution_at": expected_resolution_at,
+        "resolution_source": "Hyperliquid HIP-4 outcome market",
+        "resolution_rules": description,
+        "cancellation_rules": None,
+        "mutually_exclusive": raw.get("event_kind") == "question" and total_count > 1,
+        "exhaustive": False,
+        "neg_risk": False,
+        "augmented_neg_risk": False,
+        "active": False,
+        "source_url": hyperliquid_source_url(raw_markets[0]) if raw_markets else None,
+        "observed_at": observed_at,
+        "raw": raw,
+        "outcome_count": total_count,
+    }
+
+
+def normalize_hyperliquid_market(
+    event: dict[str, Any],
+    raw_event: dict[str, Any],
+    raw: dict[str, Any],
+    all_mids: dict[str, Any],
+    observed_at: str,
+) -> dict[str, Any] | None:
+    outcome_id = str(raw.get("outcome") or "")
+    if not outcome_id:
+        return None
+    side_specs = raw.get("sideSpecs")
+    side_specs = side_specs if isinstance(side_specs, list) else []
+    if len(side_specs) < 2:
+        return None
+    yes_index = hyperliquid_side_index(side_specs, "yes", 0)
+    no_index = hyperliquid_side_index(side_specs, "no", 1)
+    yes_token = hyperliquid_side_token(outcome_id, yes_index)
+    no_token = hyperliquid_side_token(outcome_id, no_index)
+    active = yes_token in all_mids or no_token in all_mids
+    description = str(raw.get("description") or "").strip()
+    metadata = hyperliquid_description_fields(description)
+    expected_resolution_at = (
+        hyperliquid_expiry_iso(metadata.get("expiry"))
+        or event.get("expected_resolution_at")
+    )
+    return {
+        "venue": "hyperliquid_hip4",
+        "market_id": outcome_id,
+        "event_id": event["event_id"],
+        "event_title": event["title"],
+        "event_slug": event.get("slug"),
+        "condition_id": f"hip4:{outcome_id}",
+        "question": hyperliquid_market_title(raw_event, raw),
+        "outcome_label": str(raw.get("name") or "Yes").strip() or "Yes",
+        "status": "open" if active else "inactive",
+        "result": None,
+        "yes_token_id": yes_token,
+        "no_token_id": no_token,
+        "opens_at": None,
+        "closes_at": expected_resolution_at,
+        "expected_resolution_at": expected_resolution_at,
+        "resolution_source": event.get("resolution_source"),
+        "resolution_rules": description or event.get("resolution_rules"),
+        "cancellation_rules": event.get("cancellation_rules"),
+        "fee_rate": HYPERLIQUID_HIP4_TAKER_FEE_RATE,
+        "fee_exponent": 1.0,
+        "fee_taker_only": True,
+        "maker_fee_rate": 0.0,
+        "fees_enabled": True,
+        "fee_verified": True,
+        "fee_source": "hyperliquid_public_conservative_fee_assumption",
+        "min_order_size": 1.0,
+        "tick_size": 0.0001,
+        "volume": 0.0,
+        "volume_24h": 0.0,
+        "liquidity": 0.0,
+        "accepting_orders": active,
+        "is_other_outcome": hyperliquid_is_fallback(raw_event, raw),
+        "event_mutually_exclusive": bool(event.get("mutually_exclusive")),
+        "event_exhaustive": bool(event.get("exhaustive")),
+        "event_neg_risk": False,
+        "event_augmented_neg_risk": False,
+        "event_source_url": hyperliquid_source_url(raw),
+        "observed_at": observed_at,
+        "raw": {
+            **raw,
+            "question": raw_event,
+            "fee_policy": "hyperliquid_public_conservative_fee_assumption",
+            "yes_token": yes_token,
+            "no_token": no_token,
         },
     }
 
@@ -396,6 +611,28 @@ def normalize_kalshi_orderbook(
     )
 
 
+def normalize_hyperliquid_orderbook(
+    market: dict[str, Any],
+    raw_books: dict[str, dict[str, Any]],
+    observed_at: str,
+) -> dict[str, Any] | None:
+    yes_raw = raw_books.get(str(market.get("yes_token_id") or ""))
+    no_raw = raw_books.get(str(market.get("no_token_id") or ""))
+    if not yes_raw and not no_raw:
+        return None
+    yes_bids, yes_asks = hyperliquid_book_sides(yes_raw)
+    no_bids, no_asks = hyperliquid_book_sides(no_raw)
+    return normalized_book(
+        market,
+        observed_at,
+        yes_bids,
+        yes_asks,
+        no_bids,
+        no_asks,
+        raw={"yes": yes_raw or {}, "no": no_raw or {}},
+    )
+
+
 def normalized_book(
     market: dict[str, Any],
     observed_at: str,
@@ -441,6 +678,25 @@ def pair_levels(value: Any, reverse: bool) -> list[list[float]]:
         [as_float(row[0]), as_float(row[1])]
         for row in rows
         if isinstance(row, list) and len(row) >= 2
+    ]
+    return valid_levels(levels, reverse)
+
+
+def hyperliquid_book_sides(raw: dict[str, Any] | None) -> tuple[list[list[float]], list[list[float]]]:
+    payload = raw if isinstance(raw, dict) else {}
+    levels = payload.get("levels")
+    levels = levels if isinstance(levels, list) else []
+    bids = levels[0] if len(levels) >= 1 else []
+    asks = levels[1] if len(levels) >= 2 else []
+    return hyperliquid_levels(bids, reverse=True), hyperliquid_levels(asks, reverse=False)
+
+
+def hyperliquid_levels(value: Any, reverse: bool) -> list[list[float]]:
+    rows = value if isinstance(value, list) else []
+    levels = [
+        [as_float(row.get("px")), as_float(row.get("sz"))]
+        for row in rows
+        if isinstance(row, dict)
     ]
     return valid_levels(levels, reverse)
 
@@ -502,6 +758,158 @@ def extract_resolution_source(text: str) -> str | None:
         re.I,
     )
     return match.group(1).strip() if match else None
+
+
+def hyperliquid_description_fields(value: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for part in str(value or "").split("|"):
+        if ":" not in part:
+            continue
+        key, raw_value = part.split(":", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if key and raw_value:
+            fields[key] = raw_value
+    return fields
+
+
+def hyperliquid_event_title(
+    raw: dict[str, Any],
+    metadata: dict[str, str],
+) -> str:
+    name = str(raw.get("name") or "").strip()
+    if metadata.get("class") == "priceBucket" and metadata.get("underlying"):
+        return (
+            f"{metadata['underlying']} price bucket by "
+            f"{hyperliquid_expiry_label(metadata.get('expiry'))}"
+        )
+    return name or str(raw.get("event_id") or "Hyperliquid outcome")
+
+
+def hyperliquid_market_title(
+    raw_event: dict[str, Any],
+    raw: dict[str, Any],
+) -> str:
+    description = str(raw.get("description") or "").strip()
+    metadata = hyperliquid_description_fields(description)
+    if metadata.get("class") == "priceBinary" and metadata.get("underlying"):
+        target = hyperliquid_money_label(metadata.get("targetPrice"))
+        return (
+            f"{metadata['underlying']} above {target} by "
+            f"{hyperliquid_expiry_label(metadata.get('expiry'))}?"
+        )
+    event_metadata = hyperliquid_description_fields(
+        str(raw_event.get("description") or "")
+    )
+    if event_metadata.get("class") == "priceBucket":
+        return hyperliquid_price_bucket_title(raw_event, raw, event_metadata)
+    event_name = str(raw_event.get("name") or "").strip()
+    outcome_name = str(raw.get("name") or "").strip()
+    if event_name and outcome_name and outcome_name.lower() not in {"yes", "no"}:
+        return f"{event_name}: {outcome_name}"
+    return outcome_name or event_name or f"Hyperliquid outcome {raw.get('outcome')}"
+
+
+def hyperliquid_outcome_title(raw: dict[str, Any]) -> str:
+    return hyperliquid_market_title({}, raw)
+
+
+def hyperliquid_price_bucket_title(
+    raw_event: dict[str, Any],
+    raw: dict[str, Any],
+    metadata: dict[str, str],
+) -> str:
+    underlying = metadata.get("underlying") or "Asset"
+    expiry = hyperliquid_expiry_label(metadata.get("expiry"))
+    thresholds = [
+        as_float(value)
+        for value in str(metadata.get("priceThresholds") or "").split(",")
+        if str(value).strip()
+    ]
+    description = str(raw.get("description") or "")
+    index_match = re.search(r"\bindex:(\d+)\b", description)
+    if index_match and len(thresholds) >= 2:
+        index = int(index_match.group(1))
+        lower = hyperliquid_money_label(thresholds[0])
+        upper = hyperliquid_money_label(thresholds[1])
+        if index == 0:
+            return f"{underlying} below {lower} by {expiry}?"
+        if index == 1:
+            return f"{underlying} between {lower} and {upper} by {expiry}?"
+        if index == 2:
+            return f"{underlying} above {upper} by {expiry}?"
+    if hyperliquid_is_fallback(raw_event, raw):
+        return f"{underlying} outside named price buckets by {expiry}?"
+    return f"{underlying} price bucket by {expiry}: {raw.get('name') or raw.get('outcome')}"
+
+
+def hyperliquid_category(
+    event_metadata: dict[str, str],
+    market_metadata: dict[str, str],
+) -> str | None:
+    metadata = {**event_metadata, **market_metadata}
+    raw_category = metadata.get("category")
+    if raw_category and raw_category.lower() != "n/a":
+        return raw_category
+    if metadata.get("underlying"):
+        return "crypto"
+    return None
+
+
+def hyperliquid_expiry_iso(value: Any) -> str | None:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})", text)
+    if not match:
+        return None
+    year, month, day, hour, minute = (int(part) for part in match.groups())
+    return datetime(year, month, day, hour, minute, tzinfo=UTC).isoformat()
+
+
+def hyperliquid_expiry_label(value: Any) -> str:
+    iso = hyperliquid_expiry_iso(value)
+    if not iso:
+        return str(value or "resolution")
+    parsed = datetime.fromisoformat(iso)
+    return parsed.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def hyperliquid_money_label(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value or "?")
+    if number >= 1_000:
+        return f"${number:,.0f}"
+    return f"${number:g}"
+
+
+def hyperliquid_side_index(
+    side_specs: list[Any],
+    side_name: str,
+    fallback: int,
+) -> int:
+    for index, row in enumerate(side_specs):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("name") or "").strip().lower() == side_name:
+            return index
+    return fallback
+
+
+def hyperliquid_side_token(outcome_id: str, side_index: int) -> str:
+    return f"#{outcome_id}{side_index}"
+
+
+def hyperliquid_source_url(raw: dict[str, Any]) -> str:
+    outcome_id = str(raw.get("outcome") or "")
+    return f"https://app.hyperliquid.xyz/trade/%23{outcome_id}0"
+
+
+def hyperliquid_is_fallback(
+    raw_event: dict[str, Any],
+    raw: dict[str, Any],
+) -> bool:
+    return str(raw.get("outcome") or "") == str(raw_event.get("fallbackOutcome") or "")
 
 
 def extract_cancellation_rules(text: str) -> str | None:

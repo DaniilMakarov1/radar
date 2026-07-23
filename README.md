@@ -35,6 +35,7 @@ incomplete entity, funding, route, or owner coverage cannot vote as independent.
 - [Architecture](docs/architecture.md)
 - [Backtest Methodology](docs/backtest_methodology.md)
 - [Data Sources](docs/data_sources.md)
+- [Local Radar Analytics](docs/local_analytics.md)
 - [Roadmap](docs/roadmap.md)
 - [How It Works](docs/how_it_works.md)
 - [Dune Backfill Runbook V4](docs/dune_backfill_runbook.md)
@@ -101,6 +102,29 @@ Write a local Markdown/HTML report:
 
 ```bash
 python3 -m smart_money_radar.cli report
+```
+
+Initialize and inspect the local Dune-like analytics layer:
+
+```bash
+python3 -m smart_money_radar.cli analytics-init
+python3 -m smart_money_radar.cli analytics-list
+```
+
+Run a saved local analytics query without calling Dune:
+
+```bash
+python3 -m smart_money_radar.cli analytics-run \
+  --slug pre-listing-wallet-leaders \
+  --limit 20
+```
+
+Run a custom read-only SQL query over local Radar datasets:
+
+```bash
+python3 -m smart_money_radar.cli analytics-query \
+  --sql "SELECT * FROM analytics_live_signals ORDER BY confidence_score DESC" \
+  --limit 20
 ```
 
 Generate Dune SQL for Base pre-listing buyers:
@@ -225,6 +249,23 @@ tokens with DexScreener market data and GoPlus contract risk:
 python3 -m smart_money_radar.cli live-scan
 python3 -m smart_money_radar.cli live-report --limit 20
 ```
+
+Run the local Base scan without Dune. It uses wallet `Transfer` events to find
+candidate tokens, scans the top liquid DexScreener pairs for V2/V3 `Swap`
+events, writes compact `local_dex_trades`/rollups, and keeps only the latest
+local snapshot. Raw HyperSync logs are not stored:
+
+```bash
+python3 -m smart_money_radar.cli local-live-scan \
+  --window-hours 24 \
+  --max-wallets 200 \
+  --max-tokens 100 \
+  --max-pairs-per-token 5
+python3 -m smart_money_radar.cli live-report --limit 20
+```
+
+Use `--no-transfer-fallback` to write only swap-backed observations, and
+`--use-cursor` to start pool-swap ingestion after the stored local block cursor.
 
 Run the local dashboard:
 

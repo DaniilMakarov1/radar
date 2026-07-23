@@ -11,17 +11,51 @@ CANONICAL_ASSET_ALIASES = {
     "XBT": "BTC",
     "1000BONK": "BONK",
     "KBONK": "BONK",
+    "1000000BONK": "BONK",
+    "MBONK": "BONK",
+    "1000BTT": "BTT",
+    "KBTT": "BTT",
+    "1000000BTT": "BTT",
+    "MBTT": "BTT",
+    "1000CATS": "CATS",
+    "KCATS": "CATS",
     "1000FLOKI": "FLOKI",
     "KFLOKI": "FLOKI",
+    "10000FLOKI": "FLOKI",
+    "1000000FLOKI": "FLOKI",
+    "MFLOKI": "FLOKI",
     "1000LUNC": "LUNC",
+    "KLUNC": "LUNC",
+    "10000LUNC": "LUNC",
     "1000000MOG": "MOG",
+    "1000MOG": "MOG",
+    "KMOG": "MOG",
+    "MMOG": "MOG",
     "1000PEPE": "PEPE",
     "KPEPE": "PEPE",
+    "10000PEPE": "PEPE",
+    "1000000PEPE": "PEPE",
+    "MPEPE": "PEPE",
     "1000RATS": "RATS",
+    "KRATS": "RATS",
+    "1000000RATS": "RATS",
+    "MRATS": "RATS",
     "1000SATS": "SATS",
+    "KSATS": "SATS",
+    "1000000SATS": "SATS",
+    "MSATS": "SATS",
     "1000SHIB": "SHIB",
     "KSHIB": "SHIB",
+    "10000SHIB": "SHIB",
+    "1000000SHIB": "SHIB",
+    "MSHIB": "SHIB",
+    "1000WHY": "WHY",
+    "KWHY": "WHY",
+    "10000WHY": "WHY",
+    "1000000WHY": "WHY",
+    "MWHY": "WHY",
     "1000XEC": "XEC",
+    "KXEC": "XEC",
 }
 
 
@@ -32,17 +66,84 @@ CANONICAL_ASSET_ALIASES = {
 CANONICAL_ASSET_UNIT_MULTIPLIERS = {
     "1000BONK": 1_000.0,
     "KBONK": 1_000.0,
+    "1000000BONK": 1_000_000.0,
+    "MBONK": 1_000_000.0,
+    "1000BTT": 1_000.0,
+    "KBTT": 1_000.0,
+    "1000000BTT": 1_000_000.0,
+    "MBTT": 1_000_000.0,
+    "1000CATS": 1_000.0,
+    "KCATS": 1_000.0,
     "1000FLOKI": 1_000.0,
     "KFLOKI": 1_000.0,
+    "10000FLOKI": 10_000.0,
+    "1000000FLOKI": 1_000_000.0,
+    "MFLOKI": 1_000_000.0,
     "1000LUNC": 1_000.0,
+    "KLUNC": 1_000.0,
+    "10000LUNC": 10_000.0,
     "1000000MOG": 1_000_000.0,
+    "1000MOG": 1_000.0,
+    "KMOG": 1_000.0,
+    "MMOG": 1_000_000.0,
     "1000PEPE": 1_000.0,
     "KPEPE": 1_000.0,
+    "10000PEPE": 10_000.0,
+    "1000000PEPE": 1_000_000.0,
+    "MPEPE": 1_000_000.0,
     "1000RATS": 1_000.0,
+    "KRATS": 1_000.0,
+    "1000000RATS": 1_000_000.0,
+    "MRATS": 1_000_000.0,
     "1000SATS": 1_000.0,
+    "KSATS": 1_000.0,
+    "1000000SATS": 1_000_000.0,
+    "MSATS": 1_000_000.0,
     "1000SHIB": 1_000.0,
     "KSHIB": 1_000.0,
+    "10000SHIB": 10_000.0,
+    "1000000SHIB": 1_000_000.0,
+    "MSHIB": 1_000_000.0,
+    "1000WHY": 1_000.0,
+    "KWHY": 1_000.0,
+    "10000WHY": 10_000.0,
+    "1000000WHY": 1_000_000.0,
+    "MWHY": 1_000_000.0,
     "1000XEC": 1_000.0,
+    "KXEC": 1_000.0,
+}
+
+
+STABLE_QUOTE_ASSET_ALIASES = {
+    "BUSD": "USD",
+    "DAI": "USD",
+    "FDUSD": "USD",
+    "TUSD": "USD",
+    "USD": "USD",
+    "USDC": "USD",
+    "USDE": "USD",
+    "USDT": "USD",
+}
+
+
+LINEAR_CONTRACT_TYPES = {
+    "LINEAR",
+    "LINEARPERPETUAL",
+    "LINEAR_PERPETUAL",
+    "PERP",
+    "PERPETUAL",
+    "SWAP",
+    "USDCM",
+    "USDTM",
+}
+
+
+INVERSE_CONTRACT_TYPES = {
+    "COINM",
+    "COIN_MARGINED",
+    "INVERSE",
+    "INVERSEPERPETUAL",
+    "INVERSE_PERPETUAL",
 }
 
 
@@ -60,6 +161,25 @@ def canonical_asset_symbol(value: Any) -> str:
 
 def canonical_asset_unit_multiplier(value: Any) -> float:
     return CANONICAL_ASSET_UNIT_MULTIPLIERS.get(clean_asset_symbol(value), 1.0)
+
+
+def canonical_quote_asset_symbol(value: Any) -> str:
+    cleaned = clean_asset_symbol(value)
+    return STABLE_QUOTE_ASSET_ALIASES.get(cleaned, cleaned)
+
+
+def normalized_contract_type(value: Any) -> str:
+    cleaned = re.sub(r"[^A-Z0-9_]", "", str(value or "").strip().upper())
+    compact = cleaned.replace("_", "")
+    if cleaned in INVERSE_CONTRACT_TYPES or compact in INVERSE_CONTRACT_TYPES:
+        return "inverse_perpetual"
+    if cleaned in LINEAR_CONTRACT_TYPES or compact in LINEAR_CONTRACT_TYPES:
+        return "linear_perpetual"
+    return cleaned.lower()
+
+
+def is_linear_contract_type(value: Any) -> bool:
+    return normalized_contract_type(value) == "linear_perpetual"
 
 
 def symbol_unit_alias(value: Any) -> str:

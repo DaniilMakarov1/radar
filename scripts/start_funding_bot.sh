@@ -9,16 +9,41 @@ PATTERN="smart_money_radar.cli funding-paper-trader"
 LABEL="com.smartmoneyradar.funding-paper-trader"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_VALUE="$(id -u)"
+SCREEN_NAME="${FUNDING_PAPER_SCREEN_NAME:-radar-funding-bot}"
+FUNDING_BOT_PROCESS_PATTERN='(^|/)(Python|python[0-9.]*)[[:space:]]+-m smart_money_radar[.]cli funding-paper-trader'
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+funding_telegram_enabled="${FUNDING_PAPER_TELEGRAM_ENABLED:-}"
+if [[ -z "$funding_telegram_enabled" ]] \
+  && [[ -n "${FUNDING_TELEGRAM_BOT_TOKEN:-}" ]] \
+  && [[ -n "${FUNDING_TELEGRAM_CHAT_ID:-}" ]]; then
+  funding_telegram_enabled=1
+fi
+funding_telegram_arg=()
+if [[ "$funding_telegram_enabled" != "1" ]]; then
+  funding_telegram_arg=(--no-telegram)
+fi
 
 mkdir -p "$LOG_DIR"
 
+funding_bot_pid() {
+  ps ax -o pid=,comm=,command= \
+    | awk -v pattern="$FUNDING_BOT_PROCESS_PATTERN" '$0 ~ pattern && !found {print $1; found=1}'
+}
+
 if [[ -f "$PLIST" ]]; then
   launchctl bootstrap "gui/$UID_VALUE" "$PLIST" >/dev/null 2>&1 || true
-  pid="$(ps ax -o pid=,command= | awk '/[p]ython.*-m smart_money_radar[.]cli funding-paper-trader/{print $1; exit}')"
+  pid="$(funding_bot_pid)"
   if [[ -z "$pid" ]]; then
     launchctl kickstart "gui/$UID_VALUE/$LABEL"
     sleep 1
-    pid="$(ps ax -o pid=,command= | awk '/[p]ython.*-m smart_money_radar[.]cli funding-paper-trader/{print $1; exit}')"
+    pid="$(funding_bot_pid)"
   fi
   if [[ -n "$pid" ]]; then
     echo "$pid" > "$PID_FILE"
@@ -35,14 +60,15 @@ fi
 
 if [[ -f "$PID_FILE" ]]; then
   existing_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+  running_pid="$(funding_bot_pid)"
+  if [[ -n "$existing_pid" ]] && [[ "$existing_pid" == "$running_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
     echo "Funding paper trader is already running: PID $existing_pid"
     echo "Log: $LOG_FILE"
     exit 0
   fi
 fi
 
-existing_pid="$(ps ax -o pid=,command= | awk '/[p]ython.*-m smart_money_radar[.]cli funding-paper-trader/{print $1; exit}')"
+existing_pid="$(funding_bot_pid)"
 if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
   echo "$existing_pid" > "$PID_FILE"
   echo "Funding paper trader is already running: PID $existing_pid"
@@ -52,18 +78,77 @@ if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
 fi
 
 cd "$ROOT_DIR"
+if command -v screen >/dev/null 2>&1; then
+  screen_listing="$(screen -ls 2>/dev/null || true)"
+  if [[ "$screen_listing" == *".${SCREEN_NAME}"* ]]; then
+    echo "Funding paper trader screen already exists: $SCREEN_NAME"
+    echo "No python process is visible yet; check with: screen -r $SCREEN_NAME"
+    echo "Log: $LOG_FILE"
+    exit 0
+  fi
+  screen -dmS "$SCREEN_NAME" /bin/zsh -lc '
+    cd "$1"
+    telegram_arg=""
+    funding_telegram_enabled="${FUNDING_PAPER_TELEGRAM_ENABLED:-}"
+    if [[ -z "$funding_telegram_enabled" ]] \
+      && [[ -n "${FUNDING_TELEGRAM_BOT_TOKEN:-}" ]] \
+      && [[ -n "${FUNDING_TELEGRAM_CHAT_ID:-}" ]]; then
+      funding_telegram_enabled=1
+    fi
+    if [[ "$funding_telegram_enabled" != "1" ]]; then
+      telegram_arg="--no-telegram"
+    fi
+    exec python3 -m smart_money_radar.cli funding-paper-trader \
+      --target-notional "${FUNDING_PAPER_TARGET_NOTIONAL:-500}" \
+      --entry-window-seconds "${FUNDING_PAPER_ENTRY_WINDOW_SECONDS:-180}" \
+      --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-0}" \
+      --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-15}" \
+      --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-900}" \
+      --final-recheck-freeze-seconds "${FUNDING_PAPER_FINAL_RECHECK_FREEZE_SECONDS:-15}" \
+      --max-entry-snapshot-age-seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-30}" \
+      --max-settlement-publication-lag-seconds "${FUNDING_PAPER_MAX_SETTLEMENT_PUBLICATION_LAG_SECONDS:-300}" \
+      --min-live-net-profit "${FUNDING_PAPER_MIN_LIVE_NET_PROFIT:-0}" \
+      --scan-interval-seconds "${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-300}" \
+      --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-120}" \
+      --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}" \
+      --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
+      --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-3600}" \
+      --status-report-max-routes "${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}" \
+      ${telegram_arg} \
+      >> "$2" 2>&1
+  ' _ "$ROOT_DIR" "$LOG_FILE"
+  sleep 1
+  pid="$(funding_bot_pid)"
+  if [[ -n "$pid" ]]; then
+    echo "$pid" > "$PID_FILE"
+    echo "Funding paper trader started in screen: $SCREEN_NAME"
+    echo "PID: $pid"
+  else
+    echo "Funding paper trader screen started: $SCREEN_NAME"
+    echo "PID is not visible yet; check status again in a few seconds."
+  fi
+  echo "PID file: $PID_FILE"
+  echo "Log: $LOG_FILE"
+  exit 0
+fi
+
 nohup python3 -m smart_money_radar.cli funding-paper-trader \
   --target-notional "${FUNDING_PAPER_TARGET_NOTIONAL:-500}" \
   --entry-window-seconds "${FUNDING_PAPER_ENTRY_WINDOW_SECONDS:-180}" \
-  --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-30}" \
-  --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-60}" \
+  --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-0}" \
+  --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-15}" \
   --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-900}" \
+  --final-recheck-freeze-seconds "${FUNDING_PAPER_FINAL_RECHECK_FREEZE_SECONDS:-15}" \
+  --max-entry-snapshot-age-seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-30}" \
   --max-settlement-publication-lag-seconds "${FUNDING_PAPER_MAX_SETTLEMENT_PUBLICATION_LAG_SECONDS:-300}" \
   --min-live-net-profit "${FUNDING_PAPER_MIN_LIVE_NET_PROFIT:-0}" \
-  --scan-interval-seconds "${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-60}" \
+  --scan-interval-seconds "${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-300}" \
+  --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-120}" \
   --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}" \
-  --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-1800}" \
+  --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
+  --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-3600}" \
   --status-report-max-routes "${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}" \
+  "${funding_telegram_arg[@]}" \
   >> "$LOG_FILE" 2>&1 < /dev/null &
 
 pid="$!"

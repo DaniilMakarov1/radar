@@ -9,6 +9,7 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 .funding-paper-trader.pid
+.prediction-radar-bot.pid
 
 # Local runtime data
 data/*.sqlite

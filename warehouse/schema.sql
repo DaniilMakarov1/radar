@@ -130,6 +130,34 @@ CREATE TABLE IF NOT EXISTS dune_executions (
 CREATE INDEX IF NOT EXISTS idx_dune_executions_submitted_at
     ON dune_executions (submitted_at);
 
+CREATE TABLE IF NOT EXISTS analytics_queries (
+    query_slug TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    query_text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'user',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analytics_executions (
+    analytics_execution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_slug TEXT,
+    query_hash TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    elapsed_ms INTEGER,
+    row_count INTEGER,
+    limit_rows INTEGER NOT NULL,
+    error TEXT,
+    FOREIGN KEY (query_slug) REFERENCES analytics_queries(query_slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_executions_started
+    ON analytics_executions (started_at DESC);
+
 CREATE TABLE IF NOT EXISTS pre_listing_wallet_buys (
     pre_listing_wallet_buy_id INTEGER PRIMARY KEY AUTOINCREMENT,
     chain_id TEXT NOT NULL,
@@ -496,6 +524,91 @@ CREATE TABLE IF NOT EXISTS token_market_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_token_market_snapshots_token
     ON token_market_snapshots (chain_id, token_address, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS local_ingestion_cursors (
+    local_ingestion_cursor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    chain_id TEXT NOT NULL,
+    cursor_key TEXT NOT NULL,
+    block_number INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (source, chain_id, cursor_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_ingestion_cursors_source
+    ON local_ingestion_cursors (source, chain_id, cursor_key);
+
+CREATE TABLE IF NOT EXISTS local_dex_trades (
+    local_dex_trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id TEXT NOT NULL,
+    project TEXT,
+    dex_id TEXT,
+    pair_address TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT,
+    wallet_address TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    log_index INTEGER NOT NULL,
+    block_number INTEGER,
+    block_time TEXT,
+    side TEXT NOT NULL,
+    amount_raw TEXT NOT NULL,
+    amount_token REAL,
+    amount_usd REAL,
+    price_usd REAL,
+    observed_at TEXT NOT NULL,
+    window_hours INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (chain_id) REFERENCES chains(chain_id),
+    UNIQUE (
+        chain_id,
+        tx_hash,
+        log_index,
+        token_address,
+        wallet_address,
+        source
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_dex_trades_snapshot
+    ON local_dex_trades (source, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_local_dex_trades_token
+    ON local_dex_trades (chain_id, token_address, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS local_dex_rollups (
+    local_dex_rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT,
+    observed_at TEXT NOT NULL,
+    window_hours INTEGER NOT NULL,
+    tracked_wallet_count INTEGER NOT NULL DEFAULT 0,
+    strong_wallet_count INTEGER NOT NULL DEFAULT 0,
+    watch_wallet_count INTEGER NOT NULL DEFAULT 0,
+    gross_buy_usd REAL NOT NULL DEFAULT 0,
+    gross_sell_usd REAL NOT NULL DEFAULT 0,
+    net_buy_usd REAL NOT NULL DEFAULT 0,
+    buy_trade_count INTEGER NOT NULL DEFAULT 0,
+    sell_trade_count INTEGER NOT NULL DEFAULT 0,
+    first_trade_at TEXT,
+    last_trade_at TEXT,
+    weighted_wallet_score REAL,
+    source TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (chain_id) REFERENCES chains(chain_id),
+    UNIQUE (chain_id, token_address, observed_at, window_hours, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_dex_rollups_snapshot
+    ON local_dex_rollups (source, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_local_dex_rollups_token
+    ON local_dex_rollups (chain_id, token_address, observed_at DESC);
 
 CREATE TABLE IF NOT EXISTS token_risk_snapshots (
     token_risk_snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -994,6 +1107,9 @@ CREATE TABLE IF NOT EXISTS prediction_scans (
     finished_at TEXT,
     polymarket_event_count INTEGER NOT NULL DEFAULT 0,
     kalshi_event_count INTEGER NOT NULL DEFAULT 0,
+    hyperliquid_event_count INTEGER NOT NULL DEFAULT 0,
+    hyperliquid_market_count INTEGER NOT NULL DEFAULT 0,
+    hyperliquid_orderbook_count INTEGER NOT NULL DEFAULT 0,
     market_count INTEGER NOT NULL DEFAULT 0,
     orderbook_count INTEGER NOT NULL DEFAULT 0,
     route_count INTEGER NOT NULL DEFAULT 0,
@@ -1145,6 +1261,27 @@ CREATE TABLE IF NOT EXISTS prediction_contract_matches (
     )
 );
 
+CREATE TABLE IF NOT EXISTS prediction_verified_contract_mappings (
+    prediction_verified_contract_mapping_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    venue_a TEXT NOT NULL,
+    market_id_a TEXT NOT NULL,
+    venue_b TEXT NOT NULL,
+    market_id_b TEXT NOT NULL,
+    relation_type TEXT NOT NULL DEFAULT 'equivalent',
+    status TEXT NOT NULL DEFAULT 'active',
+    confidence_score REAL NOT NULL DEFAULT 1,
+    verified_by TEXT,
+    verified_at TEXT,
+    notes TEXT,
+    rationale_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (venue_a, market_id_a, venue_b, market_id_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_verified_contract_mappings_active
+    ON prediction_verified_contract_mappings (status, venue_a, venue_b);
+
 CREATE TABLE IF NOT EXISTS prediction_routes (
     prediction_route_id INTEGER PRIMARY KEY AUTOINCREMENT,
     prediction_scan_id INTEGER NOT NULL,
@@ -1186,6 +1323,92 @@ CREATE INDEX IF NOT EXISTS idx_prediction_routes_executable
         status,
         expected_net_profit DESC
     );
+
+CREATE TABLE IF NOT EXISTS prediction_route_candidates (
+    prediction_route_candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_scan_id INTEGER NOT NULL,
+    route_key TEXT NOT NULL,
+    route_type TEXT NOT NULL,
+    venue_scope TEXT NOT NULL,
+    event_id TEXT,
+    title TEXT NOT NULL,
+    candidate_status TEXT NOT NULL,
+    route_status TEXT NOT NULL,
+    candidate_score REAL NOT NULL DEFAULT 0,
+    expected_net_profit REAL,
+    net_edge_per_share REAL,
+    optimal_size REAL NOT NULL DEFAULT 0,
+    max_executable_size REAL NOT NULL DEFAULT 0,
+    blocking_reason TEXT,
+    screen_reason TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    risk_flags_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (prediction_scan_id)
+        REFERENCES prediction_scans(prediction_scan_id),
+    UNIQUE (prediction_scan_id, route_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_route_candidates_scan
+    ON prediction_route_candidates (
+        prediction_scan_id,
+        candidate_score DESC
+    );
+
+CREATE TABLE IF NOT EXISTS prediction_candidate_backlog (
+    prediction_candidate_backlog_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_key TEXT NOT NULL UNIQUE,
+    route_type TEXT NOT NULL,
+    strategy_bucket TEXT,
+    venue_scope TEXT NOT NULL,
+    event_id TEXT,
+    title TEXT NOT NULL,
+    candidate_status TEXT NOT NULL,
+    route_status TEXT NOT NULL,
+    first_prediction_scan_id INTEGER NOT NULL,
+    last_prediction_scan_id INTEGER NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1,
+    candidate_score REAL NOT NULL DEFAULT 0,
+    expected_net_profit REAL,
+    best_expected_net_profit REAL,
+    net_edge_per_share REAL,
+    best_net_edge_per_share REAL,
+    optimal_size REAL NOT NULL DEFAULT 0,
+    max_executable_size REAL NOT NULL DEFAULT 0,
+    source_url TEXT,
+    risk_flags_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    legs_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_candidate_backlog_recent
+    ON prediction_candidate_backlog (last_seen_at DESC, active, best_expected_net_profit DESC);
+
+CREATE TABLE IF NOT EXISTS prediction_trade_backlog (
+    prediction_trade_backlog_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_key TEXT NOT NULL UNIQUE,
+    source_type TEXT NOT NULL,
+    prediction_scan_id INTEGER NOT NULL,
+    route_key TEXT NOT NULL,
+    route_type TEXT NOT NULL,
+    venue_scope TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    model_version TEXT,
+    created_at TEXT NOT NULL,
+    expected_net_profit REAL,
+    simulated_net_profit REAL,
+    filled_size REAL,
+    fill_ratio REAL,
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_trade_backlog_recent
+    ON prediction_trade_backlog (created_at DESC, simulated_net_profit DESC);
 
 CREATE TABLE IF NOT EXISTS prediction_paper_executions (
     prediction_paper_execution_id INTEGER PRIMARY KEY AUTOINCREMENT,

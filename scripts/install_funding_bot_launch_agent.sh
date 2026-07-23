@@ -8,8 +8,10 @@ PID_FILE="$ROOT_DIR/.funding-paper-trader.pid"
 PYTHON_BIN="${FUNDING_PAPER_PYTHON:-$(command -v python3)}"
 LOG_DIR="$ROOT_DIR/logs"
 UID_VALUE="$(id -u)"
+RUNNER="$ROOT_DIR/scripts/run_funding_bot_launchd.sh"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+chmod +x "$RUNNER"
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,32 +24,8 @@ cat > "$PLIST" <<PLIST
   <string>$ROOT_DIR</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$PYTHON_BIN</string>
-    <string>-m</string>
-    <string>smart_money_radar.cli</string>
-    <string>funding-paper-trader</string>
-    <string>--target-notional</string>
-    <string>${FUNDING_PAPER_TARGET_NOTIONAL:-500}</string>
-    <string>--entry-window-seconds</string>
-    <string>${FUNDING_PAPER_ENTRY_WINDOW_SECONDS:-180}</string>
-    <string>--entry-min-lead-seconds</string>
-    <string>${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-30}</string>
-    <string>--entry-max-lead-seconds</string>
-    <string>${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-60}</string>
-    <string>--arm-window-seconds</string>
-    <string>${FUNDING_PAPER_ARM_WINDOW_SECONDS:-900}</string>
-    <string>--max-settlement-publication-lag-seconds</string>
-    <string>${FUNDING_PAPER_MAX_SETTLEMENT_PUBLICATION_LAG_SECONDS:-300}</string>
-    <string>--min-live-net-profit</string>
-    <string>${FUNDING_PAPER_MIN_LIVE_NET_PROFIT:-0}</string>
-    <string>--scan-interval-seconds</string>
-    <string>${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-60}</string>
-    <string>--hot-interval-seconds</string>
-    <string>${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}</string>
-    <string>--status-report-interval-seconds</string>
-    <string>${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-1800}</string>
-    <string>--status-report-max-routes</string>
-    <string>${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}</string>
+    <string>/bin/zsh</string>
+    <string>$RUNNER</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

@@ -82,6 +82,8 @@ class DexScreenerClient:
         chain_id: str,
         token_addresses: list[str],
         observed_at: str | None = None,
+        max_pairs_per_token: int = 5,
+        minimum_pair_liquidity_usd: float = 1_000.0,
     ) -> list[dict[str, Any]]:
         timestamp = observed_at or utc_now_iso()
         addresses = list(dict.fromkeys(address.lower() for address in token_addresses))
@@ -102,10 +104,21 @@ class DexScreenerClient:
 
         snapshots = []
         for address in addresses:
-            pairs = pairs_by_token.get(address, [])
+            pairs = [
+                pair
+                for pair in pairs_by_token.get(address, [])
+                if is_evm_address(pair.get("pairAddress"))
+            ]
             if not pairs:
                 continue
-            pair = max(pairs, key=pair_liquidity_usd)
+            sorted_pairs = sorted(pairs, key=pair_liquidity_usd, reverse=True)
+            pair = sorted_pairs[0]
+            candidate_pairs = compact_pair_candidates(
+                sorted_pairs,
+                token_address=address,
+                max_pairs=max_pairs_per_token,
+                minimum_liquidity_usd=minimum_pair_liquidity_usd,
+            )
             token = token_side(pair, address)
             info = pair.get("info") if isinstance(pair.get("info"), dict) else {}
             websites = info.get("websites") if isinstance(info.get("websites"), list) else []
@@ -147,6 +160,10 @@ class DexScreenerClient:
                     "raw": pair,
                 }
             )
+            snapshots[-1]["raw"] = {
+                **pair,
+                "candidatePairs": candidate_pairs,
+            }
         return snapshots
 
     def token_promotion_snapshot(
@@ -315,6 +332,64 @@ def token_side(pair: dict[str, Any], address: str) -> dict[str, Any]:
 
 def pair_liquidity_usd(pair: dict[str, Any]) -> float:
     return nested_float(pair, "liquidity", "usd") or 0.0
+
+
+def compact_pair_candidates(
+    pairs: list[dict[str, Any]],
+    token_address: str,
+    max_pairs: int = 5,
+    minimum_liquidity_usd: float = 1_000.0,
+) -> list[dict[str, Any]]:
+    candidates = []
+    seen = set()
+    limit = max(1, int(max_pairs))
+    minimum_liquidity = max(0.0, float(minimum_liquidity_usd))
+    for pair in pairs:
+        pair_address = str(pair.get("pairAddress") or "").lower()
+        if not is_evm_address(pair_address) or pair_address in seen:
+            continue
+        liquidity_usd = pair_liquidity_usd(pair)
+        if liquidity_usd < minimum_liquidity and candidates:
+            continue
+        token = token_side(pair, token_address)
+        candidates.append(
+            {
+                "rank": len(candidates) + 1,
+                "pairAddress": pair_address,
+                "dexId": pair.get("dexId"),
+                "priceUsd": pair.get("priceUsd"),
+                "liquidity_usd": liquidity_usd,
+                "volume_24h_usd": nested_float(pair, "volume", "h24"),
+                "pairCreatedAt": pair.get("pairCreatedAt"),
+                "baseToken": compact_token_side(pair.get("baseToken")),
+                "quoteToken": compact_token_side(pair.get("quoteToken")),
+                "matchedToken": compact_token_side(token),
+            }
+        )
+        seen.add(pair_address)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def compact_token_side(value: Any) -> dict[str, Any]:
+    token = value if isinstance(value, dict) else {}
+    return {
+        "address": str(token.get("address") or "").lower() or None,
+        "symbol": token.get("symbol"),
+        "name": token.get("name"),
+    }
+
+
+def is_evm_address(value: Any) -> bool:
+    text = str(value or "")
+    if len(text) != 42 or not text.startswith("0x"):
+        return False
+    try:
+        int(text[2:], 16)
+        return True
+    except ValueError:
+        return False
 
 
 def nested_float(value: dict[str, Any], key: str, child: str) -> float | None:

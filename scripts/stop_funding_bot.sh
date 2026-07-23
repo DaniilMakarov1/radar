@@ -7,29 +7,40 @@ PATTERN="smart_money_radar.cli funding-paper-trader"
 LABEL="com.smartmoneyradar.funding-paper-trader"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_VALUE="$(id -u)"
+SCREEN_NAME="${FUNDING_PAPER_SCREEN_NAME:-radar-funding-bot}"
+FUNDING_BOT_PROCESS_PATTERN='(^|/)(Python|python[0-9.]*)[[:space:]]+-m smart_money_radar[.]cli funding-paper-trader'
+
+funding_bot_pids() {
+  ps ax -o pid=,comm=,command= \
+    | awk -v pattern="$FUNDING_BOT_PROCESS_PATTERN" '$0 ~ pattern {print $1}'
+}
+
+stop_funding_screen() {
+  command -v screen >/dev/null 2>&1 || return 0
+  screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+  while IFS= read -r session; do
+    [[ -n "$session" ]] && screen -S "$session" -X quit >/dev/null 2>&1 || true
+  done < <(
+    screen -ls 2>/dev/null \
+      | awk -v suffix=".$SCREEN_NAME" '$1 ~ suffix {print $1}'
+  )
+}
 
 if [[ -f "$PLIST" ]]; then
   launchctl bootout "gui/$UID_VALUE" "$PLIST" >/dev/null 2>&1 || true
+  stop_funding_screen
   rm -f "$PID_FILE"
   echo "Funding paper trader LaunchAgent stopped."
   exit 0
 fi
 
 pids=()
-if [[ -f "$PID_FILE" ]]; then
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    pids+=("$pid")
-  fi
-fi
+while IFS= read -r pid; do
+  [[ -n "$pid" ]] && pids+=("$pid")
+done < <(funding_bot_pids)
 
 if [[ "${#pids[@]}" -eq 0 ]]; then
-  while IFS= read -r pid; do
-    [[ -n "$pid" ]] && pids+=("$pid")
-  done < <(ps ax -o pid=,command= | awk '/[p]ython.*-m smart_money_radar[.]cli funding-paper-trader/{print $1}')
-fi
-
-if [[ "${#pids[@]}" -eq 0 ]]; then
+  stop_funding_screen
   rm -f "$PID_FILE"
   echo "Funding paper trader is not running."
   exit 0
@@ -67,4 +78,5 @@ if [[ "${#still_alive[@]}" -gt 0 ]]; then
 fi
 
 rm -f "$PID_FILE"
+stop_funding_screen
 echo "Funding paper trader stopped."

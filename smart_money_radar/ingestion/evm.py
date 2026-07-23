@@ -15,6 +15,9 @@ EVM_RPC_URLS = {
 }
 ERC20_SYMBOL_SELECTOR = "0x95d89b41"
 ERC20_NAME_SELECTOR = "0x06fdde03"
+ERC20_DECIMALS_SELECTOR = "0x313ce567"
+PAIR_TOKEN0_SELECTOR = "0x0dfe1681"
+PAIR_TOKEN1_SELECTOR = "0xd21220a7"
 
 
 class EvmRpcError(RuntimeError):
@@ -62,6 +65,30 @@ class EvmRpcClient:
         if not name:
             raise EvmRpcError(f"Empty ERC-20 name for {contract_address}")
         return name
+
+    def erc20_decimals(self, contract_address: str) -> int:
+        result = self.call(
+            "eth_call",
+            [{"to": contract_address, "data": ERC20_DECIMALS_SELECTOR}, "latest"],
+        )
+        decimals = decode_abi_uint(result)
+        if decimals is None or decimals < 0 or decimals > 255:
+            raise EvmRpcError(f"Invalid ERC-20 decimals for {contract_address}")
+        return decimals
+
+    def pair_tokens(self, pair_address: str) -> tuple[str, str]:
+        token0 = self.contract_address(pair_address, PAIR_TOKEN0_SELECTOR)
+        token1 = self.contract_address(pair_address, PAIR_TOKEN1_SELECTOR)
+        if not token0 or not token1:
+            raise EvmRpcError(f"Invalid pair tokens for {pair_address}")
+        return token0, token1
+
+    def contract_address(self, contract_address: str, selector: str) -> str | None:
+        result = self.call(
+            "eth_call",
+            [{"to": contract_address, "data": selector}, "latest"],
+        )
+        return decode_abi_address(result)
 
     def call(self, method: str, params: list[Any]) -> Any:
         payload = None
@@ -139,6 +166,33 @@ def decode_abi_string(value: Any) -> str:
             if 0 <= length and end <= len(data):
                 payload = data[start:end]
     return payload.rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+
+
+def decode_abi_uint(value: Any) -> int | None:
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return None
+    try:
+        data = bytes.fromhex(value[2:])
+    except ValueError:
+        return None
+    if not data:
+        return None
+    return int.from_bytes(data[-32:], "big")
+
+
+def decode_abi_address(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return None
+    try:
+        data = bytes.fromhex(value[2:])
+    except ValueError:
+        return None
+    if len(data) < 32:
+        return None
+    address = "0x" + data[-20:].hex()
+    if address == "0x" + "0" * 40:
+        return None
+    return address
 
 
 def normalize_token_symbol(value: str) -> str:

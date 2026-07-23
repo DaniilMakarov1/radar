@@ -457,6 +457,14 @@ def evaluate_perp_route(
             "live_net_pnl_not_positive",
             f"Текущий live net PnL ${current_nowcast_net:,.2f} не положительный.",
         )
+    elif (
+        decision_mode == "settlement_capture"
+        and current_nowcast_net < actionable_profit_threshold
+    ):
+        block(
+            "live_net_pnl_below_actionable_threshold",
+            f"Текущий live net PnL ${current_nowcast_net:,.2f} ниже минимально значимой прибыли ${actionable_profit_threshold:,.2f}.",
+        )
     if expected_net_profit <= 0:
         assess_history(
             "forecast_median_net_negative",

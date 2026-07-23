@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from typing import Any
 
+from smart_money_radar.prediction.strategies import prediction_strategy_bucket
+
 
 @dataclass(frozen=True)
 class ScannerConfig:
@@ -26,12 +28,17 @@ def scan_prediction_routes(
     books: list[dict[str, Any]],
     observed_at: str,
     config: ScannerConfig | None = None,
+    trusted_contract_mappings: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     settings = config or ScannerConfig()
     book_map = {(book["venue"], book["market_id"]): book for book in books}
     event_map = {(event["venue"], event["event_id"]): event for event in events}
     constraints = infer_implication_constraints(markets, observed_at)
-    matches = match_cross_venue_contracts(markets, observed_at)
+    matches = match_cross_venue_contracts(
+        markets,
+        observed_at,
+        trusted_contract_mappings=trusted_contract_mappings,
+    )
 
     routes: list[dict[str, Any]] = []
     routes.extend(scan_binary_complements(markets, book_map, observed_at, settings))
@@ -40,6 +47,15 @@ def scan_prediction_routes(
     )
     routes.extend(
         scan_negative_risk(event_map, markets, book_map, observed_at, settings)
+    )
+    routes.extend(
+        scan_threshold_ladders(
+            constraints,
+            markets,
+            book_map,
+            observed_at,
+            settings,
+        )
     )
     routes.extend(
         scan_implications(
@@ -67,6 +83,181 @@ def scan_prediction_routes(
         reverse=True,
     )
     return constraints, matches, routes
+
+
+def build_prediction_route_candidates(
+    routes: list[dict[str, Any]],
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    candidates = []
+    for route in routes:
+        candidate_status = prediction_candidate_status(route)
+        if not candidate_status:
+            continue
+        evidence = route.get("evidence") or {}
+        blocking_reasons = list(evidence.get("blocking_reasons") or [])
+        advisory_reasons = list(evidence.get("advisory_reasons") or [])
+        blocking_reason = blocking_reasons[0] if blocking_reasons else None
+        screen_reason = prediction_candidate_screen_reason(
+            candidate_status,
+            blocking_reason,
+        )
+        risk_flags = list(
+            dict.fromkeys(
+                [
+                    *(route.get("risk_flags") or []),
+                    *(evidence.get("blocking_risk_flags") or []),
+                    *(evidence.get("advisory_risk_flags") or []),
+                ]
+            )
+        )
+        candidates.append(
+            {
+                "route_key": route["route_key"],
+                "route_type": route["route_type"],
+                "strategy_bucket": prediction_strategy_bucket(route["route_type"]),
+                "venue_scope": route["venue_scope"],
+                "event_id": route.get("event_id"),
+                "title": route["title"],
+                "candidate_status": candidate_status,
+                "route_status": route["status"],
+                "candidate_score": prediction_candidate_score(
+                    route,
+                    candidate_status,
+                    len(risk_flags),
+                ),
+                "expected_net_profit": route.get("expected_net_profit"),
+                "net_edge_per_share": route.get("net_edge_per_share"),
+                "optimal_size": route.get("optimal_size") or 0.0,
+                "max_executable_size": route.get("max_executable_size") or 0.0,
+                "blocking_reason": blocking_reason,
+                "screen_reason": screen_reason,
+                "observed_at": route["observed_at"],
+                "risk_flags": risk_flags,
+                "evidence": {
+                    "route_key": route["route_key"],
+                    "route_status": route["status"],
+                    "gross_edge_per_share": route.get("gross_edge_per_share"),
+                    "expected_gross_profit": route.get("expected_gross_profit"),
+                    "capital_required": route.get("capital_required"),
+                    "total_fees": route.get("total_fees"),
+                    "slippage_cost": route.get("slippage_cost"),
+                    "operations_buffer": route.get("operations_buffer"),
+                    "confidence_score": route.get("confidence_score"),
+                    "semantic_match_score": route.get("semantic_match_score"),
+                    "minimum_net_edge": evidence.get("minimum_net_edge"),
+                    "minimum_expected_profit": evidence.get("minimum_expected_profit"),
+                    "needed_net_edge_improvement": needed_improvement(
+                        route.get("net_edge_per_share"),
+                        evidence.get("minimum_net_edge"),
+                    ),
+                    "needed_expected_profit_improvement": needed_improvement(
+                        route.get("expected_net_profit"),
+                        evidence.get("minimum_expected_profit"),
+                    ),
+                    "blocking_reasons": blocking_reasons,
+                    "advisory_reasons": advisory_reasons,
+                    "rationale": route.get("rationale") or [],
+                },
+            }
+        )
+    candidates.sort(
+        key=lambda row: (
+            row["candidate_score"],
+            row.get("expected_net_profit") or -math.inf,
+            row.get("net_edge_per_share") or -math.inf,
+        ),
+        reverse=True,
+    )
+    if limit is None:
+        return candidates
+    return candidates[: max(0, int(limit))]
+
+
+def prediction_candidate_status(route: dict[str, Any]) -> str | None:
+    status = route.get("status")
+    expected_net_profit = numeric(route.get("expected_net_profit"))
+    net_edge = numeric(route.get("net_edge_per_share"))
+    gross_edge = numeric(route.get("gross_edge_per_share"))
+    has_positive_shape = any(
+        value is not None and value > 0
+        for value in (expected_net_profit, net_edge, gross_edge)
+    )
+    if status in {"executable", "paper_candidate"}:
+        return "paper_candidate"
+    if status == "contract_review" and has_positive_shape:
+        return "contract_review"
+    if status == "not_profitable" and net_edge is not None and net_edge >= -0.01:
+        return "near_miss"
+    if status == "incomplete_book":
+        return "incomplete_book"
+    return None
+
+
+def prediction_candidate_screen_reason(
+    candidate_status: str,
+    blocking_reason: str | None,
+) -> str:
+    if blocking_reason:
+        return blocking_reason
+    return {
+        "paper_candidate": "passed_paper_filters",
+        "contract_review": "manual_contract_review_required",
+        "near_miss": "below_profit_or_edge_gate",
+        "incomplete_book": "incomplete_orderbook_depth",
+    }.get(candidate_status, "not_selected")
+
+
+def prediction_candidate_score(
+    route: dict[str, Any],
+    candidate_status: str,
+    risk_flag_count: int,
+) -> float:
+    status_component = {
+        "paper_candidate": 1.0,
+        "contract_review": 0.75,
+        "near_miss": 0.45,
+        "incomplete_book": 0.25,
+    }.get(candidate_status, 0.0)
+    expected_net_profit = max(0.0, numeric(route.get("expected_net_profit")) or 0.0)
+    net_edge = numeric(route.get("net_edge_per_share"))
+    profit_component = math.tanh(expected_net_profit / 100.0)
+    edge_component = 0.0
+    if net_edge is not None:
+        edge_component = max(0.0, min(1.0, (net_edge + 0.01) / 0.05))
+    confidence_component = max(
+        0.0,
+        min(1.0, (numeric(route.get("confidence_score")) or 0.0) / 100.0),
+    )
+    risk_penalty = 0.04 * min(max(0, risk_flag_count), 6)
+    score = (
+        0.45 * status_component
+        + 0.30 * profit_component
+        + 0.15 * edge_component
+        + 0.10 * confidence_component
+        - risk_penalty
+    )
+    return round(max(0.0, min(100.0, score * 100.0)), 2)
+
+
+def numeric(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def needed_improvement(current: Any, required: Any) -> float | None:
+    current_number = numeric(current)
+    required_number = numeric(required)
+    if current_number is None or required_number is None:
+        return None
+    return max(0.0, required_number - current_number)
 
 
 def scan_binary_complements(
@@ -130,39 +321,72 @@ def scan_complete_sets(
         unresolved = event_markets
         if len(unresolved) < 2:
             continue
-        legs = []
-        incomplete = False
+        yes_legs = []
+        no_legs = []
+        yes_incomplete = False
+        no_incomplete = False
         for market in unresolved:
             book = books.get((market["venue"], market["market_id"]))
             if not book or not book.get("yes_asks"):
-                incomplete = True
-                break
-            legs.append(market_leg(market, book, "buy", "yes"))
-        if incomplete:
-            continue
-        routes.append(
-            evaluate_route(
-                route_type="complete_set",
-                title=event["title"],
-                venue_scope=event["venue"],
-                event_id=event["event_id"],
-                legs=legs,
-                observed_at=observed_at,
-                config=config,
-                payout_per_share=1.0,
-                locked_until=event.get("expected_resolution_at")
-                or event.get("closes_at"),
-                confidence_score=98.0,
-                rationale=[
-                    "The normalized event is mutually exclusive and exhaustive.",
-                    f"The route buys all {len(legs)} unresolved YES outcomes.",
-                ],
-                risk_flags=["multi_leg_execution_unvalidated"],
-                critical_review=False,
-                execution_atomic=False,
-                source_url=event.get("source_url"),
+                yes_incomplete = True
+            else:
+                yes_legs.append(market_leg(market, book, "buy", "yes"))
+            if not book or not book.get("no_asks"):
+                no_incomplete = True
+            else:
+                no_legs.append(market_leg(market, book, "buy", "no"))
+        if not yes_incomplete:
+            routes.append(
+                evaluate_route(
+                    route_type="complete_set",
+                    title=event["title"],
+                    venue_scope=event["venue"],
+                    event_id=event["event_id"],
+                    legs=yes_legs,
+                    observed_at=observed_at,
+                    config=config,
+                    payout_per_share=1.0,
+                    locked_until=event.get("expected_resolution_at")
+                    or event.get("closes_at"),
+                    confidence_score=98.0,
+                    rationale=[
+                        "The normalized event is mutually exclusive and exhaustive.",
+                        f"The route buys all {len(yes_legs)} unresolved YES outcomes.",
+                    ],
+                    risk_flags=["multi_leg_execution_unvalidated"],
+                    critical_review=False,
+                    execution_atomic=False,
+                    source_url=event.get("source_url"),
+                )
             )
-        )
+        if not no_incomplete:
+            payout = max(0.0, float(len(no_legs) - 1))
+            routes.append(
+                evaluate_route(
+                    route_type="complete_set_no",
+                    title=f"{event['title']}: all NO basket",
+                    venue_scope=event["venue"],
+                    event_id=event["event_id"],
+                    legs=no_legs,
+                    observed_at=observed_at,
+                    config=config,
+                    payout_per_share=payout,
+                    locked_until=event.get("expected_resolution_at")
+                    or event.get("closes_at"),
+                    confidence_score=98.0,
+                    rationale=[
+                        "The normalized event is mutually exclusive and exhaustive.",
+                        (
+                            f"The route buys all {len(no_legs)} unresolved NO outcomes; "
+                            f"exactly {len(no_legs) - 1} NO legs pay if one outcome resolves YES."
+                        ),
+                    ],
+                    risk_flags=["multi_leg_execution_unvalidated"],
+                    critical_review=False,
+                    execution_atomic=False,
+                    source_url=event.get("source_url"),
+                )
+            )
     return routes
 
 
@@ -180,6 +404,7 @@ def scan_negative_risk(
         if (
             not event
             or not event.get("neg_risk")
+            or not event.get("mutually_exclusive")
             or not event.get("exhaustive")
             or event.get("augmented_neg_risk")
         ):
@@ -228,6 +453,23 @@ def scan_negative_risk(
                     critical_review=False,
                     execution_atomic=False,
                     source_url=event.get("source_url"),
+                    extra_evidence={
+                        "negative_risk_conversion": {
+                            "source_market_id": source_market["market_id"],
+                            "source_outcome": (
+                                source_market.get("outcome_label")
+                                or source_market["question"]
+                            ),
+                            "converted_yes_count": len(legs) - 1,
+                            "event_exhaustive": bool(event.get("exhaustive")),
+                            "event_mutually_exclusive": bool(
+                                event.get("mutually_exclusive")
+                            ),
+                            "augmented_neg_risk": bool(
+                                event.get("augmented_neg_risk")
+                            ),
+                        }
+                    },
                 )
             )
     return routes
@@ -243,6 +485,8 @@ def scan_implications(
     market_map = {(market["venue"], market["market_id"]): market for market in markets}
     routes = []
     for constraint in constraints:
+        if constraint.get("relation_type") == "threshold_implication":
+            continue
         key_a = (constraint["venue"], constraint["antecedent_market_id"])
         key_b = (constraint["venue"], constraint["consequent_market_id"])
         antecedent = market_map.get(key_a)
@@ -278,6 +522,82 @@ def scan_implications(
                 critical_review=True,
                 execution_atomic=False,
                 source_url=antecedent.get("event_source_url"),
+                blocking_reasons=[
+                    "Automatically parsed implication constraints require manual contract review before paper eligibility."
+                ],
+                blocking_risk_flags=["auto_parsed_contract_semantics"],
+            )
+        )
+    return routes
+
+
+def scan_threshold_ladders(
+    constraints: list[dict[str, Any]],
+    markets: list[dict[str, Any]],
+    books: dict[tuple[str, str], dict[str, Any]],
+    observed_at: str,
+    config: ScannerConfig,
+) -> list[dict[str, Any]]:
+    market_map = {(market["venue"], market["market_id"]): market for market in markets}
+    routes = []
+    for constraint in constraints:
+        if constraint.get("relation_type") != "threshold_implication":
+            continue
+        evidence = constraint.get("evidence") or {}
+        if not evidence.get("deterministic_threshold_ladder"):
+            continue
+        key_high = (constraint["venue"], constraint["antecedent_market_id"])
+        key_low = (constraint["venue"], constraint["consequent_market_id"])
+        higher = market_map.get(key_high)
+        lower = market_map.get(key_low)
+        higher_book = books.get(key_high)
+        lower_book = books.get(key_low)
+        if not higher or not lower or not higher_book or not lower_book:
+            continue
+        if (
+            higher.get("status") != "open"
+            or lower.get("status") != "open"
+            or not higher.get("accepting_orders")
+            or not lower.get("accepting_orders")
+        ):
+            continue
+        legs = [
+            market_leg(lower, lower_book, "buy", "yes"),
+            market_leg(higher, higher_book, "buy", "no"),
+        ]
+        routes.append(
+            evaluate_route(
+                route_type="threshold_ladder",
+                title=f"{higher['question']} implies {lower['question']}",
+                venue_scope=constraint["venue"],
+                event_id=f"{lower['event_id']}|{higher['event_id']}",
+                legs=legs,
+                observed_at=observed_at,
+                config=config,
+                payout_per_share=1.0,
+                locked_until=max_timestamp(
+                    higher.get("expected_resolution_at"),
+                    lower.get("expected_resolution_at"),
+                ),
+                confidence_score=96.0,
+                rationale=[
+                    *list(constraint.get("rationale") or []),
+                    (
+                        "Buying YES on the lower threshold and NO on the higher "
+                        "threshold has a conservative minimum payout of 1.00."
+                    ),
+                ],
+                risk_flags=["multi_leg_execution_unvalidated"],
+                critical_review=False,
+                execution_atomic=False,
+                source_url=lower.get("event_source_url"),
+                advisory_reasons=[
+                    (
+                        "Deterministic parser matched the same venue, asset, date, "
+                        "direction, and threshold family; review contract text before real execution."
+                    )
+                ],
+                advisory_risk_flags=["auto_parsed_contract_semantics"],
             )
         )
     return routes
@@ -301,10 +621,12 @@ def scan_cross_venue(
             continue
         critical = (
             match["match_score"] < config.minimum_semantic_match
-            or not match["cancellation_match"]
             or not bool(
                 (match.get("evidence") or {}).get("contract_terms_verified")
             )
+        )
+        venue_scope = "+".join(
+            sorted({str(match["venue_a"]), str(match["venue_b"])})
         )
         risks = list(match["risk_flags"])
         for yes_market, yes_book, no_market, no_book in (
@@ -315,7 +637,7 @@ def scan_cross_venue(
                 evaluate_route(
                     route_type="cross_venue_complement",
                     title=f"{yes_market['question']} / {no_market['question']}",
-                    venue_scope="polymarket+kalshi",
+                    venue_scope=venue_scope,
                     event_id=f"{market_a['event_id']}|{market_b['event_id']}",
                     legs=[
                         market_leg(yes_market, yes_book, "buy", "yes"),
@@ -335,6 +657,39 @@ def scan_cross_venue(
                     critical_review=critical,
                     execution_atomic=False,
                     source_url=yes_market.get("event_source_url"),
+                    blocking_reasons=(match.get("evidence") or {}).get(
+                        "blocking_reasons",
+                        [],
+                    ),
+                    blocking_risk_flags=(match.get("evidence") or {}).get(
+                        "blocking_risk_flags",
+                        [],
+                    ),
+                    advisory_reasons=(match.get("evidence") or {}).get(
+                        "advisory_reasons",
+                        [],
+                    ),
+                    advisory_risk_flags=(match.get("evidence") or {}).get(
+                        "advisory_risk_flags",
+                        [],
+                    ),
+                    extra_evidence={
+                        "cross_venue_match": {
+                            "status": match.get("status"),
+                            "match_score": match.get("match_score"),
+                            "trusted_mapping": bool(
+                                (match.get("evidence") or {}).get("trusted_mapping")
+                            ),
+                            "mapping_id": (match.get("evidence") or {}).get(
+                                "mapping_id"
+                            ),
+                            "contract_terms_verified": bool(
+                                (match.get("evidence") or {}).get(
+                                    "contract_terms_verified"
+                                )
+                            ),
+                        }
+                    },
                 )
             )
     return routes
@@ -358,11 +713,36 @@ def evaluate_route(
     execution_atomic: bool,
     source_url: str | None,
     semantic_match_score: float | None = None,
+    blocking_reasons: list[str] | None = None,
+    blocking_risk_flags: list[str] | None = None,
+    advisory_reasons: list[str] | None = None,
+    advisory_risk_flags: list[str] | None = None,
+    extra_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    blocking_reasons = list(blocking_reasons or [])
+    blocking_risk_flags = list(blocking_risk_flags or [])
+    advisory_reasons = list(advisory_reasons or [])
+    advisory_risk_flags = list(advisory_risk_flags or [])
     fee_model_verified = all(bool(leg.get("fee_verified")) for leg in legs)
     if not fee_model_verified:
         critical_review = True
         risk_flags = [*risk_flags, "fee_schedule_unverified"]
+        blocking_risk_flags.append("fee_schedule_unverified")
+        blocking_reasons.append(
+            "At least one leg has no verified or conservative public fee schedule."
+        )
+    if any(public_fee_source(leg.get("fee_source")) for leg in legs):
+        risk_flags = [*risk_flags, "public_fee_assumptions"]
+        advisory_risk_flags.append("public_fee_assumptions")
+        advisory_reasons.append(
+            "One or more legs use public conservative fee assumptions; account fees must be checked before any real execution."
+        )
+    if critical_review and not blocking_reasons:
+        risk_flags = [*risk_flags, "manual_contract_review_required"]
+        blocking_risk_flags.append("manual_contract_review_required")
+        blocking_reasons.append(
+            "The route requires manual contract review before paper eligibility."
+        )
     common_capacity = min((leg_capacity(leg) for leg in legs), default=0.0)
     common_capacity = min(common_capacity, config.max_route_size)
     minimum_size = max((leg.get("min_order_size", 1.0) for leg in legs), default=1.0)
@@ -433,6 +813,11 @@ def evaluate_route(
             "full_depth_vwap": True,
             "fee_model_verified": fee_model_verified,
             "execution_atomic": execution_atomic,
+            "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+            "blocking_risk_flags": list(dict.fromkeys(blocking_risk_flags)),
+            "advisory_reasons": list(dict.fromkeys(advisory_reasons)),
+            "advisory_risk_flags": list(dict.fromkeys(advisory_risk_flags)),
+            **(extra_evidence or {}),
         },
     }
 
@@ -480,8 +865,9 @@ def evaluate_size(
         )
     gross_profit = payout_per_share * size + sell_notional - buy_notional
     capital = buy_notional
+    guaranteed_payout = max(0.0, payout_per_share) * size
     operations_buffer = (
-        config.operations_buffer_rate * max(capital, size)
+        config.operations_buffer_rate * max(capital, guaranteed_payout, size)
         + config.fixed_operations_cost
     )
     net_profit = gross_profit - fees - operations_buffer
@@ -520,47 +906,72 @@ def market_leg(
         "fee_exponent": market.get("fee_exponent", 1.0),
         "fee_taker_only": market.get("fee_taker_only", True),
         "fee_verified": bool(market.get("fee_verified")),
+        "fee_source": market.get("fee_source") or (market.get("raw") or {}).get("fee_policy"),
         "tick_size": market.get("tick_size", 0.01),
         "min_order_size": market.get("min_order_size", 1.0),
     }
+
+
+def public_fee_source(value: Any) -> bool:
+    text = str(value or "").lower()
+    return "public" in text or "conservative" in text
 
 
 def infer_implication_constraints(
     markets: list[dict[str, Any]],
     observed_at: str,
 ) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, str], list[tuple[dict[str, Any], float]]] = {}
+    grouped: dict[
+        tuple[str, str, str, str, str],
+        list[tuple[dict[str, Any], float, dict[str, Any]]],
+    ] = {}
     for market in markets:
-        if market.get("status") != "open":
+        if market.get("status") != "open" or not market.get("accepting_orders"):
             continue
-        descriptor = threshold_descriptor(market)
-        if not descriptor:
+        terms = threshold_terms(market)
+        if not terms or terms.get("direction") != "above":
             continue
-        asset, date_key, threshold = descriptor
-        grouped.setdefault((market["venue"], asset, date_key), []).append(
-            (market, threshold)
+        grouped.setdefault(
+            (
+                market["venue"],
+                terms["asset"],
+                terms["date_key"],
+                terms["direction"],
+                terms["condition_family"],
+            ),
+            [],
+        ).append(
+            (market, float(terms["threshold"]), terms)
         )
     constraints = []
-    for (venue, asset, date_key), rows in grouped.items():
+    for (venue, asset, date_key, direction, condition_family), rows in grouped.items():
         ordered = sorted(rows, key=lambda row: row[1])
-        for index, (lower_market, lower_value) in enumerate(ordered[:-1]):
-            for higher_market, higher_value in ordered[index + 1 :]:
+        for index, (lower_market, lower_value, lower_terms) in enumerate(ordered[:-1]):
+            for higher_market, higher_value, higher_terms in ordered[index + 1 :]:
                 constraints.append(
                     {
                         "venue": venue,
                         "antecedent_market_id": higher_market["market_id"],
                         "consequent_market_id": lower_market["market_id"],
                         "relation_type": "threshold_implication",
-                        "confidence_score": 0.75,
-                        "source": "deterministic_threshold_parser",
+                        "confidence_score": 0.96,
+                        "source": "deterministic_threshold_ladder_v1",
                         "rationale": [
-                            f"{asset} above {higher_value:g} implies {asset} above {lower_value:g} on {date_key}."
+                            (
+                                f"{asset} {direction} {higher_value:g} implies "
+                                f"{asset} {direction} {lower_value:g} on {date_key}."
+                            )
                         ],
                         "evidence": {
                             "asset": asset,
                             "date_key": date_key,
+                            "direction": direction,
+                            "condition_family": condition_family,
                             "higher_threshold": higher_value,
                             "lower_threshold": lower_value,
+                            "higher_terms": higher_terms,
+                            "lower_terms": lower_terms,
+                            "deterministic_threshold_ladder": True,
                         },
                         "created_at": observed_at,
                     }
@@ -571,12 +982,31 @@ def infer_implication_constraints(
 def match_cross_venue_contracts(
     markets: list[dict[str, Any]],
     observed_at: str,
+    trusted_contract_mappings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    market_map = {(row["venue"], row["market_id"]): row for row in markets}
+    trusted_candidates = trusted_cross_venue_contract_matches(
+        market_map,
+        trusted_contract_mappings or [],
+        observed_at,
+    )
+    trusted_pair_keys = {
+        contract_pair_key(candidate)
+        for candidate in trusted_candidates
+    }
     polymarket = [row for row in markets if row["venue"] == "polymarket" and row["status"] == "open"]
     kalshi = [row for row in markets if row["venue"] == "kalshi" and row["status"] == "open"]
     candidates = []
     for market_a in polymarket:
         for market_b in kalshi:
+            pair_key = frozenset(
+                {
+                    market_ref("polymarket", market_a["market_id"]),
+                    market_ref("kalshi", market_b["market_id"]),
+                }
+            )
+            if pair_key in trusted_pair_keys:
+                continue
             event_score = text_similarity(
                 canonical_event_text(market_a),
                 canonical_event_text(market_b),
@@ -610,31 +1040,16 @@ def match_cross_venue_contracts(
                 market_a.get("resolution_source") or "",
                 market_b.get("resolution_source") or "",
             )
-            rules_present = bool(
-                str(market_a.get("resolution_rules") or "").strip()
-                and str(market_b.get("resolution_rules") or "").strip()
+            review = cross_venue_contract_review(
+                market_a,
+                market_b,
+                deadline_delta,
+                cancellation_match,
+                rules_score,
+                source_score,
             )
-            sources_present = bool(
-                str(market_a.get("resolution_source") or "").strip()
-                and str(market_b.get("resolution_source") or "").strip()
-            )
-            if not cancellation_match:
-                risk_flags.append("cancellation_rules_differ")
-            if deadline_delta is None or deadline_delta > 72:
-                risk_flags.append("resolution_deadline_differs")
-            if not rules_present or rules_score < 0.75:
-                risk_flags.append("resolution_rules_unverified")
-            if not sources_present or source_score < 0.75:
-                risk_flags.append("resolution_source_unverified")
-            contract_terms_verified = bool(
-                cancellation_match
-                and rules_present
-                and rules_score >= 0.75
-                and sources_present
-                and source_score >= 0.75
-                and deadline_delta is not None
-                and deadline_delta <= 24
-            )
+            risk_flags = review["risk_flags"]
+            contract_terms_verified = bool(review["contract_terms_verified"])
             candidates.append(
                 {
                     "venue_a": "polymarket",
@@ -663,26 +1078,285 @@ def match_cross_venue_contracts(
                         "rules_score": rules_score,
                         "source_score": source_score,
                         "contract_terms_verified": contract_terms_verified,
+                        "blocking_reasons": review["blocking_reasons"],
+                        "blocking_risk_flags": review["blocking_risk_flags"],
+                        "advisory_reasons": review["advisory_reasons"],
+                        "advisory_risk_flags": review["advisory_risk_flags"],
+                        "contract_terms": review["contract_terms"],
                     },
                     "created_at": observed_at,
                 }
             )
     candidates.sort(key=lambda row: row["match_score"], reverse=True)
+    used_refs: set[str] = set()
     selected = []
-    used_a: set[str] = set()
-    used_b: set[str] = set()
+    for candidate in trusted_candidates:
+        refs = contract_match_refs(candidate)
+        if any(ref in used_refs for ref in refs):
+            continue
+        used_refs.update(refs)
+        selected.append(candidate)
     for candidate in candidates:
         if candidate["match_score"] < 0.76:
             break
-        if candidate["market_id_a"] in used_a or candidate["market_id_b"] in used_b:
+        refs = contract_match_refs(candidate)
+        if any(ref in used_refs for ref in refs):
             continue
-        used_a.add(candidate["market_id_a"])
-        used_b.add(candidate["market_id_b"])
+        used_refs.update(refs)
         selected.append(candidate)
     return selected
 
 
+def trusted_cross_venue_contract_matches(
+    market_map: dict[tuple[str, str], dict[str, Any]],
+    mappings: list[dict[str, Any]],
+    observed_at: str,
+) -> list[dict[str, Any]]:
+    matches = []
+    for mapping in mappings:
+        if str(mapping.get("status") or "active") != "active":
+            continue
+        if str(mapping.get("relation_type") or "equivalent") != "equivalent":
+            continue
+        venue_a = str(mapping.get("venue_a") or "")
+        venue_b = str(mapping.get("venue_b") or "")
+        market_id_a = str(mapping.get("market_id_a") or "")
+        market_id_b = str(mapping.get("market_id_b") or "")
+        if not venue_a or not venue_b or not market_id_a or not market_id_b:
+            continue
+        if venue_a == venue_b:
+            continue
+        market_a = market_map.get((venue_a, market_id_a))
+        market_b = market_map.get((venue_b, market_id_b))
+        if not market_a or not market_b:
+            continue
+        if market_a.get("status") != "open" or market_b.get("status") != "open":
+            continue
+        confidence_value = numeric(mapping.get("confidence_score"))
+        if confidence_value is None:
+            confidence_value = 1.0
+        confidence_score = max(0.0, min(1.0, confidence_value))
+        deadline_delta = timestamp_delta_hours(
+            market_a.get("expected_resolution_at") or market_a.get("closes_at"),
+            market_b.get("expected_resolution_at") or market_b.get("closes_at"),
+        )
+        rationale = list(mapping.get("rationale") or [])
+        if not rationale:
+            rationale = [
+                (
+                    f"Trusted manual mapping: {venue_a}:{market_id_a} is equivalent "
+                    f"to {venue_b}:{market_id_b}."
+                )
+            ]
+        matches.append(
+            {
+                "venue_a": venue_a,
+                "market_id_a": market_id_a,
+                "venue_b": venue_b,
+                "market_id_b": market_id_b,
+                "match_score": confidence_score,
+                "status": "matched",
+                "deadline_delta_hours": deadline_delta,
+                "cancellation_match": True,
+                "rationale": rationale,
+                "risk_flags": [],
+                "evidence": {
+                    "trusted_mapping": True,
+                    "mapping_id": mapping.get("prediction_verified_contract_mapping_id")
+                    or mapping.get("mapping_id"),
+                    "relation_type": mapping.get("relation_type", "equivalent"),
+                    "verified_by": mapping.get("verified_by"),
+                    "verified_at": mapping.get("verified_at"),
+                    "notes": mapping.get("notes"),
+                    "contract_terms_verified": True,
+                    "blocking_reasons": [],
+                    "blocking_risk_flags": [],
+                    "advisory_reasons": [],
+                    "advisory_risk_flags": [],
+                },
+                "created_at": observed_at,
+            }
+        )
+    matches.sort(key=lambda row: row["match_score"], reverse=True)
+    return matches
+
+
+def market_ref(venue: str, market_id: str) -> str:
+    return f"{venue}:{market_id}"
+
+
+def contract_match_refs(match: dict[str, Any]) -> set[str]:
+    return {
+        market_ref(str(match.get("venue_a") or ""), str(match.get("market_id_a") or "")),
+        market_ref(str(match.get("venue_b") or ""), str(match.get("market_id_b") or "")),
+    }
+
+
+def contract_pair_key(match: dict[str, Any]) -> frozenset[str]:
+    return frozenset(contract_match_refs(match))
+
+
+def cross_venue_contract_review(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    deadline_delta_hours: float | None,
+    cancellation_match: bool,
+    rules_score: float,
+    source_score: float,
+) -> dict[str, Any]:
+    terms_left = contract_terms(left)
+    terms_right = contract_terms(right)
+    blocking_reasons: list[str] = []
+    advisory_reasons: list[str] = []
+    blocking_risk_flags: list[str] = []
+    advisory_risk_flags: list[str] = []
+
+    def block(flag: str, reason: str) -> None:
+        blocking_risk_flags.append(flag)
+        blocking_reasons.append(reason)
+
+    def advise(flag: str, reason: str) -> None:
+        advisory_risk_flags.append(flag)
+        advisory_reasons.append(reason)
+
+    rules_present = bool(
+        str(left.get("resolution_rules") or "").strip()
+        and str(right.get("resolution_rules") or "").strip()
+    )
+    sources_present = bool(
+        str(left.get("resolution_source") or "").strip()
+        and str(right.get("resolution_source") or "").strip()
+    )
+    if not cancellation_match:
+        block(
+            "cancellation_rules_differ",
+            "Cancellation, void, refund, or Other-bucket rules are missing or materially different.",
+        )
+    if deadline_delta_hours is None:
+        block(
+            "resolution_deadline_unverified",
+            "Both contracts must expose comparable resolution deadlines.",
+        )
+    elif deadline_delta_hours > 72:
+        block(
+            "resolution_deadline_differs",
+            f"Resolution deadlines differ by {deadline_delta_hours:.1f} hours.",
+        )
+    elif deadline_delta_hours > 24:
+        advise(
+            "resolution_deadline_offset",
+            f"Resolution deadlines differ by {deadline_delta_hours:.1f} hours.",
+        )
+    if not rules_present or rules_score < 0.75:
+        block(
+            "resolution_rules_unverified",
+            "Resolution rules are missing or too different for deterministic equivalence.",
+        )
+    if not sources_present or source_score < 0.75:
+        block(
+            "resolution_source_unverified",
+            "Resolution sources are missing or too different for deterministic equivalence.",
+        )
+
+    if terms_left["market_kind"] != terms_right["market_kind"]:
+        block(
+            "contract_kind_differs",
+            f"Contract kinds differ: {terms_left['market_kind']} vs {terms_right['market_kind']}.",
+        )
+    if (
+        terms_left["date_scope"] != terms_right["date_scope"]
+        and "single_calendar_date" in {terms_left["date_scope"], terms_right["date_scope"]}
+    ):
+        block(
+            "event_date_semantics_differ",
+            "One contract is tied to a specific calendar date while the other is not.",
+        )
+    years_left = set(terms_left["years"])
+    years_right = set(terms_right["years"])
+    if years_left and years_right and years_left.isdisjoint(years_right):
+        block(
+            "contract_year_differs",
+            f"Contract years differ: {', '.join(sorted(years_left))} vs {', '.join(sorted(years_right))}.",
+        )
+    threshold_left = terms_left.get("threshold")
+    threshold_right = terms_right.get("threshold")
+    if threshold_left and threshold_right and threshold_left != threshold_right:
+        block(
+            "threshold_terms_differ",
+            "Threshold contracts have different assets, dates, or threshold values.",
+        )
+    elif bool(threshold_left) != bool(threshold_right):
+        block(
+            "threshold_terms_unpaired",
+            "Only one side parsed as a threshold contract.",
+        )
+
+    return {
+        "contract_terms_verified": not blocking_risk_flags,
+        "risk_flags": list(dict.fromkeys([*blocking_risk_flags, *advisory_risk_flags])),
+        "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+        "blocking_risk_flags": list(dict.fromkeys(blocking_risk_flags)),
+        "advisory_reasons": list(dict.fromkeys(advisory_reasons)),
+        "advisory_risk_flags": list(dict.fromkeys(advisory_risk_flags)),
+        "contract_terms": {
+            "left": terms_left,
+            "right": terms_right,
+        },
+    }
+
+
+def contract_terms(market: dict[str, Any]) -> dict[str, Any]:
+    text = " ".join(
+        str(market.get(key) or "")
+        for key in (
+            "event_title",
+            "question",
+            "outcome_label",
+            "resolution_rules",
+        )
+    )
+    lowered = text.lower()
+    threshold = threshold_descriptor(market)
+    explicit_iso_dates = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", lowered)
+    month_dates = re.findall(
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}\b",
+        lowered,
+    )
+    single_calendar_date = bool(
+        explicit_iso_dates
+        or re.search(r"\bon\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b", lowered)
+    )
+    tournament = bool(
+        re.search(r"\b(world cup|championship|champion|tournament winner|overall winner)\b", lowered)
+    )
+    single_match = bool(re.search(r"\b(match|game|round of|qualification round)\b", lowered))
+    if threshold:
+        market_kind = "threshold"
+    elif tournament and not single_match and not single_calendar_date:
+        market_kind = "tournament_winner"
+    elif single_match:
+        market_kind = "single_match"
+    elif single_calendar_date:
+        market_kind = "date_binary"
+    else:
+        market_kind = "binary"
+    return {
+        "market_kind": market_kind,
+        "date_scope": "single_calendar_date" if single_calendar_date else "event_resolution",
+        "explicit_dates": sorted(set([*explicit_iso_dates, *month_dates])),
+        "years": sorted(set(re.findall(r"\b20\d{2}\b", lowered))),
+        "threshold": threshold,
+    }
+
+
 def threshold_descriptor(market: dict[str, Any]) -> tuple[str, str, float] | None:
+    terms = threshold_terms(market)
+    if not terms:
+        return None
+    return terms["asset"], terms["date_key"], float(terms["threshold"])
+
+
+def threshold_terms(market: dict[str, Any]) -> dict[str, Any] | None:
     text = f"{market.get('event_title', '')} {market.get('question', '')}".lower()
     aliases = {
         "bitcoin": ("bitcoin", "btc"),
@@ -693,18 +1367,44 @@ def threshold_descriptor(market: dict[str, Any]) -> tuple[str, str, float] | Non
         (name for name, words in aliases.items() if any(re.search(rf"\b{word}\b", text) for word in words)),
         None,
     )
-    if not asset or not re.search(r"\b(above|over|exceed|higher than|at least)\b", text):
+    if not asset:
         return None
-    amounts = re.findall(r"\$([0-9]+(?:[,.][0-9]+)?)\s*([km]?)\b", text)
+    if re.search(
+        (
+            r"\b(below|under|less than|lower than|at most|"
+            r"dip|dips|dipped|drop|drops|dropped|fall|falls|fell|"
+            r"crash|crashes|low|lower)\b"
+        ),
+        text,
+    ):
+        return None
+    if not re.search(
+        r"\b(above|over|exceed|exceeds|exceeding|higher than|at least|hit|hits|reach|reaches|touch|touches|breach|breaches)\b",
+        text,
+    ):
+        return None
+    amounts = re.findall(r"\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*([km]?)\b", text)
     if not amounts:
-        amounts = re.findall(r"\b([0-9]+(?:[,.][0-9]+)?)\s*([km])\b", text)
+        amounts = re.findall(r"\b([0-9][0-9,]*(?:\.[0-9]+)?)\s*([km])\b", text)
     if not amounts:
         return None
     raw_number, suffix = amounts[-1]
     value = float(raw_number.replace(",", ""))
     value *= {"k": 1_000, "m": 1_000_000}.get(suffix, 1)
     close = str(market.get("closes_at") or market.get("expected_resolution_at") or "unknown")
-    return asset, close[:10], value
+    if close == "unknown" or len(close) < 10:
+        return None
+    if re.search(r"\b(hit|hits|reach|reaches|touch|touches|breach|breaches)\b", text):
+        condition_family = "hit_by"
+    else:
+        condition_family = "above_at_resolution"
+    return {
+        "asset": asset,
+        "date_key": close[:10],
+        "threshold": value,
+        "direction": "above",
+        "condition_family": condition_family,
+    }
 
 
 def route_candidate_sizes(
@@ -751,6 +1451,11 @@ def walk_levels(levels: list[list[float]], size: float) -> dict[str, Any] | None
 
 
 def venue_fee(venue: str, fills: list[list[float]], fee_rate: float) -> float:
+    if venue == "hyperliquid_hip4":
+        return round(
+            max(0.0, sum(size * price * fee_rate for price, size in fills)),
+            5,
+        )
     fee = sum(size * fee_rate * price * (1.0 - price) for price, size in fills)
     if venue == "kalshi":
         trade_fee = math.ceil(max(0.0, fee) * 10_000 - 1e-12) / 10_000
@@ -824,6 +1529,8 @@ def canonical_tokens(value: str) -> set[str]:
 
 
 def text_similarity(left: str, right: str) -> float:
+    if normalized_text(left) and normalized_text(left) == normalized_text(right):
+        return 1.0
     left_tokens = canonical_tokens(left)
     right_tokens = canonical_tokens(right)
     if not left_tokens or not right_tokens:
@@ -835,6 +1542,10 @@ def text_similarity(left: str, right: str) -> float:
         " ".join(sorted(right_tokens)),
     ).ratio()
     return max(jaccard, sequence * 0.9)
+
+
+def normalized_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
 
 
 def outcome_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:

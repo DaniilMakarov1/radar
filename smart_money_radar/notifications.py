@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from smart_money_radar.config import load_env_file
 
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
+TELEGRAM_HTML_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|s|code|pre|a|blockquote)(?:\s[^>]*)?>"
+)
 
 
 @dataclass(frozen=True)
@@ -26,10 +30,18 @@ class TelegramNotifier:
         token: str | None = None,
         chat_id: str | None = None,
         timeout_seconds: int = 10,
+        token_env_var: str = "TELEGRAM_BOT_TOKEN",
+        chat_id_env_var: str = "TELEGRAM_CHAT_ID",
     ) -> None:
         load_env_file()
-        self.token = token or os.environ.get("TELEGRAM_BOT_TOKEN")
-        self.chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+        self.token_env_var = token_env_var
+        self.chat_id_env_var = chat_id_env_var
+        self.token = token or os.environ.get(token_env_var)
+        self.chat_id = chat_id or os.environ.get(chat_id_env_var)
+        if not self.token and token_env_var != "TELEGRAM_BOT_TOKEN":
+            self.token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not self.chat_id and chat_id_env_var != "TELEGRAM_CHAT_ID":
+            self.chat_id = os.environ.get("TELEGRAM_CHAT_ID")
         self.timeout_seconds = max(1, int(timeout_seconds))
 
     @property
@@ -38,16 +50,17 @@ class TelegramNotifier:
 
     def send(self, text: str) -> NotificationResult:
         if not self.token:
-            return NotificationResult("not_configured", "TELEGRAM_BOT_TOKEN missing")
+            return NotificationResult("not_configured", f"{self.token_env_var} missing")
         if not self.chat_id:
-            return NotificationResult("not_configured", "TELEGRAM_CHAT_ID missing")
-        data = urllib.parse.urlencode(
-            {
-                "chat_id": self.chat_id,
-                "text": text,
-                "disable_web_page_preview": "true",
-            }
-        ).encode("utf-8")
+            return NotificationResult("not_configured", f"{self.chat_id_env_var} missing")
+        message_payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "disable_web_page_preview": "true",
+        }
+        if TELEGRAM_HTML_TAG_RE.search(text):
+            message_payload["parse_mode"] = "HTML"
+        data = urllib.parse.urlencode(message_payload).encode("utf-8")
         request = urllib.request.Request(
             f"{TELEGRAM_API_BASE}/bot{self.token}/sendMessage",
             data=data,

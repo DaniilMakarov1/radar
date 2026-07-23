@@ -10,6 +10,7 @@ from smart_money_radar.prediction.clients import as_float
 
 
 PREDICTION_WALLET_MODEL_VERSION = "prediction_wallet_v1_3_event_level"
+PREDICTION_EVENT_TOKEN_LINK_SOURCE = "deterministic_direct_mention_v2"
 
 
 def normalize_closed_positions(
@@ -265,7 +266,7 @@ def build_event_token_links(
                     "token_symbol": symbol,
                     "relation_type": "direct_mention",
                     "confidence_score": confidence,
-                    "source": "deterministic_direct_mention_v2",
+                    "source": PREDICTION_EVENT_TOKEN_LINK_SOURCE,
                     "rationale": [reason],
                     "created_at": observed_at,
                 }

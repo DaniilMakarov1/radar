@@ -1,0 +1,21 @@
+{
+  "mappings": [
+    {
+      "venue_a": "polymarket",
+      "market_id_a": "polymarket-market-id",
+      "venue_b": "kalshi",
+      "market_id_b": "kalshi-market-id",
+      "relation_type": "equivalent",
+      "status": "active",
+      "confidence_score": 1.0,
+      "verified_by": "manual-review",
+      "verified_at": "2026-07-22T00:00:00+00:00",
+      "notes": "Resolution rules, resolution source, deadline, cancellation/void semantics, and payout contract were checked manually.",
+      "rationale": [
+        "Both contracts resolve on the same event and outcome.",
+        "Resolution deadlines and cancellation rules are equivalent.",
+        "No Other bucket or venue-specific void rule changes the payout."
+      ]
+    }
+  ]
+}

@@ -5,9 +5,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="com.smartmoneyradar.funding-paper-trader"
 PID_FILE="$ROOT_DIR/.funding-paper-trader.pid"
 UID_VALUE="$(id -u)"
+FUNDING_BOT_PROCESS_PATTERN='(^|/)(Python|python[0-9.]*)[[:space:]]+-m smart_money_radar[.]cli funding-paper-trader'
 
 echo "Processes:"
-ps ax -o pid=,ppid=,etime=,command= | awk '/[p]ython.*-m smart_money_radar[.]cli funding-paper-trader/{print}'
+ps ax -o pid=,ppid=,etime=,comm=,command= \
+  | awk -v pattern="$FUNDING_BOT_PROCESS_PATTERN" '$0 ~ pattern {print}'
+
+echo
+echo "screen:"
+screen_listing="$(screen -ls 2>/dev/null || true)"
+if [[ -n "$screen_listing" ]]; then
+  printf "%s\n" "$screen_listing" | sed -n '1,80p'
+else
+  echo "screen unavailable"
+fi
 
 if [[ -f "$PID_FILE" ]]; then
   echo

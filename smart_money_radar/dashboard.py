@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import threading
 from http import HTTPStatus
@@ -7,6 +9,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from smart_money_radar.analytics import (
+    AnalyticsError,
+    prune_analytics_executions,
+    run_saved_query,
+    run_sql,
+)
 from smart_money_radar.backtest import run_wallet_walk_forward
 from smart_money_radar.config import (
     DEFAULT_DB_PATH,
@@ -14,8 +22,21 @@ from smart_money_radar.config import (
     x_social_gate_enabled,
 )
 from smart_money_radar.decision import build_capital_readiness
+from smart_money_radar.dashboard_dune import (
+    DUNE_ANALYTICS_EXECUTION_RETENTION,
+    build_dune_overview,
+    dashboard_int,
+    dune_local_scan_config,
+    run_dune_local_scan_job,
+)
 from smart_money_radar.funding.models import FundingScanConfig
-from smart_money_radar.funding.service import run_funding_scan
+from smart_money_radar.funding.presentation import (
+    filter_deactivated_funding_paper_export_rows,
+    filter_deactivated_funding_paper_payload,
+)
+from smart_money_radar.funding.service import (
+    run_funding_scan,
+)
 from smart_money_radar.live_radar import recompute_live_signals, run_base_live_scan
 from smart_money_radar.prediction.service import (
     PredictionScanConfig,
@@ -41,6 +62,7 @@ def run_dashboard(
 ) -> None:
     store = SQLiteStore(db_path)
     store.init_db()
+    recover_interrupted_dashboard_work(store)
     handler = build_handler(store)
     server = ThreadingHTTPServer((host, port), handler)
     print(f"Smart Money Radar: http://{host}:{port}")
@@ -50,6 +72,19 @@ def run_dashboard(
         print("\nStopping dashboard")
     finally:
         server.server_close()
+
+
+def recover_interrupted_dashboard_work(
+    store: SQLiteStore,
+    event_writer=print,
+) -> None:
+    error = "Dashboard restarted before the background job completed"
+    failed_jobs = store.fail_running_app_jobs(error)
+    if failed_jobs:
+        event_writer(
+            "Recovered interrupted dashboard work: "
+            f"{failed_jobs} app jobs"
+        )
 
 
 def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
@@ -126,6 +161,25 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
             if path == "/api/jobs/latest":
                 self.send_json(store.latest_app_job() or {})
                 return
+            if path.startswith("/api/jobs/"):
+                raw_job_id = path.rsplit("/", 1)[-1]
+                try:
+                    job_id = int(raw_job_id)
+                except ValueError:
+                    self.send_json(
+                        {"status": "invalid_request", "error": "Invalid job id"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                job = store.app_job(job_id)
+                if not job:
+                    self.send_json(
+                        {"status": "not_found", "error": "Job not found"},
+                        status=HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                self.send_json(job)
+                return
             if path == "/api/summary":
                 self.send_json(store.dashboard_summary())
                 return
@@ -140,6 +194,7 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                 payload = store.funding_dashboard(
                     horizon_mode=horizon_mode,
                     horizon_hours=horizon_hours,
+                    include_watch_scans=True,
                 )
                 payload["selected_horizon"] = {
                     "horizon_mode": horizon_mode,
@@ -151,7 +206,8 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                     "auto_refresh_enabled": FUNDING_AUTO_REFRESH_ENABLED,
                     "auto_refresh_seconds": FUNDING_AUTO_REFRESH_SECONDS,
                     "non_overlapping": True,
-                    "auto_snapshot_retention": 360,
+                    "scan_snapshot_retention": 1,
+                    "funding_history_retention_per_market": 24,
                 }
                 self.send_json(payload)
                 return
@@ -160,8 +216,29 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                     payload = dict(funding_state)
                 self.send_json(payload)
                 return
+            if path == "/api/funding-paper/export.csv":
+                self.send_csv(
+                    "funding-paper-trades.csv",
+                    filter_deactivated_funding_paper_export_rows(
+                        store.funding_paper_trade_report_rows(
+                            refresh_estimates=False
+                        )
+                    ),
+                )
+                return
             if path == "/api/funding-paper":
-                self.send_json(store.funding_paper_dashboard())
+                self.send_json(filter_deactivated_funding_paper_payload(
+                    store.funding_paper_dashboard(refresh_estimates=False)
+                ))
+                return
+            if path == "/api/dune":
+                try:
+                    self.send_json(build_dune_overview(store))
+                except Exception as exc:
+                    self.send_json(
+                        {"status": "failed", "error": str(exc)},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 return
             if path == "/health":
                 self.send_json({"status": "ok", "time": utc_now_iso()})
@@ -236,6 +313,80 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                     {"status": "queued", "job_id": job_id},
                     status=HTTPStatus.ACCEPTED,
                 )
+                return
+
+            if path == "/api/dune/saved-query":
+                try:
+                    payload = self.read_json_body()
+                    slug = str(payload.get("slug") or "").strip()
+                    if not slug:
+                        raise ValueError("slug is required")
+                    result = run_saved_query(
+                        store,
+                        slug,
+                        limit=dashboard_int(payload, "limit", 100, 1, 5_000),
+                    )
+                    pruned = prune_analytics_executions(
+                        store,
+                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
+                    )
+                    self.send_json(
+                        {
+                            "status": "success",
+                            "result": result,
+                            "pruned_execution_count": pruned,
+                        }
+                    )
+                except (AnalyticsError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    prune_analytics_executions(
+                        store,
+                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
+                    )
+                    self.send_json(
+                        {"status": "invalid_request", "error": str(exc)},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                except Exception as exc:
+                    self.send_json(
+                        {"status": "failed", "error": str(exc)},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                return
+
+            if path == "/api/dune/query":
+                try:
+                    payload = self.read_json_body()
+                    sql = str(payload.get("sql") or "")
+                    result = run_sql(
+                        store,
+                        sql,
+                        limit=dashboard_int(payload, "limit", 100, 1, 5_000),
+                    )
+                    pruned = prune_analytics_executions(
+                        store,
+                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
+                    )
+                    self.send_json(
+                        {
+                            "status": "success",
+                            "result": result,
+                            "pruned_execution_count": pruned,
+                        }
+                    )
+                except (AnalyticsError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    prune_analytics_executions(
+                        store,
+                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
+                    )
+                    self.send_json(
+                        {"status": "invalid_request", "error": str(exc)},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                except Exception as exc:
+                    self.send_json(
+                        {"status": "failed", "error": str(exc)},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 return
 
             if path == "/api/actions/funding-scan":
@@ -336,6 +487,44 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                 )
                 return
 
+            if path == "/api/actions/dune-local-scan":
+                try:
+                    payload = self.read_json_body()
+                    config = dune_local_scan_config(payload)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    self.send_json(
+                        {"status": "invalid_request", "error": str(exc)},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                with job_lock:
+                    if active_job["job_id"] is not None or funding_state["running"]:
+                        self.send_json(
+                            {
+                                "status": "already_running",
+                                "job_id": active_job["job_id"],
+                                "funding_running": bool(funding_state["running"]),
+                            },
+                            status=HTTPStatus.CONFLICT,
+                        )
+                        return
+                    job_id = store.create_app_job(
+                        "dune_local_base_scan",
+                        "Preparing local Base analytics ingestion",
+                    )
+                    active_job["job_id"] = job_id
+                    thread = threading.Thread(
+                        target=run_dune_local_scan_job,
+                        args=(store, job_id, active_job, job_lock, config),
+                        daemon=True,
+                    )
+                    thread.start()
+                self.send_json(
+                    {"status": "queued", "job_id": job_id},
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
         def send_html(self, html_body: str) -> None:
@@ -345,7 +534,7 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.write_response_body(body)
 
         def send_json(
             self,
@@ -358,13 +547,41 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.write_response_body(body)
+
+        def send_csv(
+            self,
+            filename: str,
+            rows: list[dict[str, object]],
+        ) -> None:
+            fieldnames = list(rows[0].keys()) if rows else funding_paper_csv_fields()
+            buffer = io.StringIO(newline="")
+            writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+            body = ("\ufeff" + buffer.getvalue()).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{filename}"',
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.write_response_body(body)
+
+        def write_response_body(self, body: bytes) -> None:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def read_json_body(self) -> dict[str, object]:
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0:
                 return {}
-            if length > 10_000:
+            if length > 250_000:
                 raise ValueError("Request body is too large")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
@@ -375,6 +592,32 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
             return
 
     return DashboardHandler
+
+
+def funding_paper_csv_fields() -> list[str]:
+    return [
+        "ID",
+        "Статус",
+        "Открыто",
+        "Закрыто",
+        "Актив",
+        "Маршрут",
+        "Long",
+        "Short",
+        "Объем $",
+        "Long notional $",
+        "Short notional $",
+        "Base qty",
+        "Expected net $",
+        "Funding PnL $",
+        "Costs $",
+        "Net PnL $",
+        "Причина закрытия",
+        "Состояние окна при закрытии",
+        "Качество PnL",
+    ]
+
+
 
 
 def funding_request_config(
@@ -610,7 +853,7 @@ def run_prediction_scan_job(
         )
         result = run_prediction_scan(
             store,
-            PredictionScanConfig(),
+            PredictionScanConfig(collect_wallets=False),
         )
         store.update_app_job(
             job_id,

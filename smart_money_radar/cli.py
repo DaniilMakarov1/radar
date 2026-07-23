@@ -5,6 +5,13 @@ import json
 import sys
 from pathlib import Path
 
+from smart_money_radar.analytics import (
+    AnalyticsError,
+    initialize_analytics,
+    prune_analytics_executions,
+    run_saved_query,
+    run_sql,
+)
 from smart_money_radar.attention import enrich_attention_snapshots
 from smart_money_radar.backtest import run_wallet_walk_forward
 from smart_money_radar.backfill_plan import prepare_dune_backfill
@@ -15,6 +22,10 @@ from smart_money_radar.contract_validation import (
 )
 from smart_money_radar.funding.adapters import FundingDataError
 from smart_money_radar.funding.models import FundingScanConfig
+from smart_money_radar.funding.retention import (
+    apply_funding_retention_plan,
+    build_funding_retention_plan,
+)
 from smart_money_radar.funding.service import (
     backfill_funding_history,
     run_funding_scan,
@@ -53,9 +64,18 @@ from smart_money_radar.live_radar import (
     recompute_live_signals,
     run_base_live_scan,
 )
+from smart_money_radar.local_radar import run_base_local_live_scan
 from smart_money_radar.identity_graph import run_identity_graph_backfill
 from smart_money_radar.ml import train_model_suite
 from smart_money_radar.prediction.clients import PredictionDataError
+from smart_money_radar.prediction.bot import (
+    PredictionBotConfig,
+    PredictionRadarBot,
+)
+from smart_money_radar.prediction.mappings import (
+    PredictionMappingError,
+    load_prediction_verified_mapping_file,
+)
 from smart_money_radar.prediction.service import (
     PredictionScanConfig,
     run_prediction_scan,
@@ -82,6 +102,9 @@ from smart_money_radar.wallet_research import (
     rescore_wallet_opportunities,
     run_wallet_opportunity_backfill,
 )
+
+
+ANALYTICS_EXECUTION_RETENTION = 5
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -242,6 +265,53 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Wrote report: {markdown_path}")
             print(f"Wrote HTML report: {html_path}")
+            return 0
+
+        if args.command == "analytics-init":
+            catalog = initialize_analytics(store)
+            print("Initialized local Radar Analytics")
+            print(f"  engine: {catalog['engine']}")
+            print(f"  views: {len(catalog['views'])}")
+            print(f"  saved queries: {len(catalog['queries'])}")
+            return 0
+
+        if args.command == "analytics-list":
+            catalog = initialize_analytics(store)
+            print("Radar Analytics views")
+            for view in catalog["views"]:
+                print(f"  {view['name']}")
+            print("\nSaved queries")
+            for query in catalog["queries"]:
+                print(
+                    f"  {query['query_slug']} | {query['title']} | "
+                    f"{query['source']}"
+                )
+            return 0
+
+        if args.command == "analytics-run":
+            try:
+                result = run_saved_query(store, args.slug, limit=args.limit)
+            finally:
+                prune_analytics_executions(
+                    store,
+                    keep_latest=ANALYTICS_EXECUTION_RETENTION,
+                )
+            print_analytics_result(result, as_json=args.json)
+            return 0
+
+        if args.command == "analytics-query":
+            if args.sql_file:
+                sql = Path(args.sql_file).read_text(encoding="utf-8")
+            else:
+                sql = args.sql
+            try:
+                result = run_sql(store, sql, limit=args.limit)
+            finally:
+                prune_analytics_executions(
+                    store,
+                    keep_latest=ANALYTICS_EXECUTION_RETENTION,
+                )
+            print_analytics_result(result, as_json=args.json)
             return 0
 
         if args.command == "render-dune-base-buyers":
@@ -913,6 +983,51 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  enrichment warning: {error}")
             return 0
 
+        if args.command == "local-live-scan":
+            store.init_db()
+            result = run_base_local_live_scan(
+                store=store,
+                window_hours=args.window_hours,
+                max_wallets=args.max_wallets,
+                max_tokens=args.max_tokens,
+                min_wallets=args.minimum_wallets,
+                max_hypersync_pages=args.max_hypersync_pages,
+                max_pairs_per_token=args.max_pairs_per_token,
+                min_pair_liquidity_usd=args.min_pair_liquidity_usd,
+                use_cursor=args.use_cursor,
+                generate_signals=not args.no_signals,
+                allow_transfer_fallback=not args.no_transfer_fallback,
+            )
+            print(f"Local Live Radar status: {result['status']}")
+            print(f"  tracked wallets: {result['tracked_wallet_count']}")
+            print(f"  transfer events: {result['transfer_event_count']}")
+            print(f"  swap events: {result.get('swap_event_count', 0)}")
+            print(f"  local dex trades: {result.get('dex_trade_count', 0)}")
+            print(f"  local dex rollups: {result.get('dex_rollup_count', 0)}")
+            print(f"  pair candidates: {result.get('pair_candidate_count', 0)}")
+            print(f"  pair token maps: {result.get('pair_token_count', 0)}")
+            print(f"  token candidates: {result.get('token_candidate_count', 0)}")
+            print(f"  observations: {result['observation_count']}")
+            print(
+                "  observations by source: "
+                f"dex={result.get('dex_observation_count', 0)}, "
+                f"transfer_proxy={result.get('fallback_observation_count', 0)}"
+            )
+            print(f"  market snapshots: {result.get('market_snapshot_count', 0)}")
+            print(f"  priced tokens: {result.get('priced_token_count', 0)}")
+            print(f"  signals: {result.get('signal_count', 0)}")
+            print(f"  qualified signals: {result.get('qualified_signal_count', 0)}")
+            print(f"  cursor block: {result.get('cursor_block') or '-'}")
+            print(f"  raw logs stored: {result['raw_logs_stored']}")
+            print(f"  pruned observations: {result['pruned_observation_count']}")
+            print(f"  pruned market snapshots: {result['pruned_market_snapshot_count']}")
+            print(f"  pruned local dex trades: {result.get('pruned_dex_trade_count', 0)}")
+            print(f"  pruned local dex rollups: {result.get('pruned_dex_rollup_count', 0)}")
+            print(f"  pruned local signals: {result.get('pruned_signal_count', 0)}")
+            for warning in result.get("warnings", []):
+                print(f"  warning: {warning}")
+            return 0
+
         if args.command == "live-report":
             store.init_db()
             observations = store.latest_radar_observations(limit=args.limit)
@@ -945,7 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "  events: "
                 f"Polymarket={result['polymarket_event_count']} "
-                f"Kalshi={result['kalshi_event_count']}"
+                f"Kalshi={result['kalshi_event_count']} "
+                f"Hyperliquid={result.get('hyperliquid_event_count', 0)}"
             )
             print(f"  markets: {result['market_count']}")
             print(f"  orderbooks: {result['orderbook_count']}")
@@ -968,6 +1084,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "prediction-bot":
+            store.init_db()
+            bot = PredictionRadarBot(
+                store,
+                config=prediction_bot_config(args),
+                notifier=TelegramNotifier(
+                    token_env_var="PREDICTION_TELEGRAM_BOT_TOKEN",
+                    chat_id_env_var="PREDICTION_TELEGRAM_CHAT_ID",
+                ),
+            )
+            bot.run_loop()
+            return 0
+
         if args.command == "prediction-report":
             store.init_db()
             report = store.prediction_dashboard(route_limit=args.limit)
@@ -975,18 +1104,124 @@ def main(argv: list[str] | None = None) -> int:
             print("Prediction Radar report")
             print(f"  latest scan: {scan.get('prediction_scan_id', '-')}")
             print(f"  status: {scan.get('status', 'not_started')}")
+            print(f"  freshness: {scan.get('freshness_status', 'unknown')}")
+            print(
+                "  venue events: "
+                f"Polymarket={int(scan.get('polymarket_event_count') or 0)} "
+                f"Kalshi={int(scan.get('kalshi_event_count') or 0)} "
+                f"Hyperliquid={int(scan.get('hyperliquid_event_count') or 0)}"
+            )
             print(f"  markets: {scan.get('market_count', 0)}")
-            print(f"  executable routes: {len(report['routes'])}")
+            print(f"  paper/executable routes: {len(report['routes'])}")
+            candidate_summary = report.get("candidate_summary") or {}
+            candidate_count = int(candidate_summary.get("candidate_count") or 0)
+            print(
+                "  route candidates: "
+                f"{candidate_count if candidate_count else 'нет кандидатов'}"
+            )
+            print(f"  executable routes: {scan.get('executable_route_count', 0)}")
+            wallet_summary = report.get("wallet_summary") or {}
+            print(
+                "  wallet cache: "
+                f"{wallet_summary.get('cache_status', 'unknown')}"
+            )
             print(
                 "  paper PnL: "
                 f"${float(report['paper_summary'].get('simulated_net_profit') or 0):.2f}"
             )
+            alerts = (report.get("opportunity_dashboard") or {}).get("alerts") or []
+            for alert in alerts[:5]:
+                print(
+                    f"  alert: {alert['alert_type']} | "
+                    f"{alert.get('strategy_name') or alert.get('strategy_bucket')} | "
+                    f"score={float(alert.get('candidate_score') or 0):.2f} | "
+                    f"{alert.get('title')}"
+                )
             for route in report["routes"]:
                 print(
                     f"  {route['route_type']} | {route['venue_scope']} | "
                     f"net=${float(route.get('expected_net_profit') or 0):.2f} | "
                     f"size={float(route.get('optimal_size') or 0):.2f} | "
                     f"{route['title']}"
+                )
+            near_zero = report.get("near_zero_routes") or []
+            if near_zero:
+                print("  near-zero watch, not candidates:")
+                for route in near_zero[: args.limit]:
+                    print(
+                        f"    {route['route_type']} | {route['venue_scope']} | "
+                        f"net=${float(route.get('expected_net_profit') or 0):.4f} | "
+                        f"missing_edge={float(route.get('missing_net_edge_per_share') or 0) * 100:.3f}% | "
+                        f"size={float(route.get('optimal_size') or 0):.2f} | "
+                        f"{route['title']}"
+                    )
+            return 0
+
+        if args.command == "prediction-backlog-report":
+            store.init_db()
+            report = store.prediction_dashboard(route_limit=args.limit)
+            summary = report.get("backlog_summary") or {}
+            print("Prediction Radar backlog")
+            print(
+                "  candidates: "
+                f"{int(summary.get('candidate_backlog_count') or 0)} "
+                f"(active={int(summary.get('active_candidate_count') or 0)})"
+            )
+            print(f"  trades: {int(summary.get('trade_backlog_count') or 0)}")
+            print(f"  policy: {summary.get('storage_policy')}")
+            candidates = report.get("candidate_backlog") or []
+            if candidates:
+                print("\nCandidates:")
+                for row in candidates[: args.limit]:
+                    status = "active" if row.get("active") else "inactive"
+                    print(
+                        f"  {status} | seen={row.get('seen_count')} | "
+                        f"{row.get('route_type')} | {row.get('venue_scope')} | "
+                        f"best=${float(row.get('best_expected_net_profit') or 0):.2f} | "
+                        f"last=${float(row.get('expected_net_profit') or 0):.2f} | "
+                        f"{row.get('title')}"
+                    )
+            trades = report.get("trade_backlog") or []
+            if trades:
+                print("\nTrades:")
+                for row in trades[: args.limit]:
+                    print(
+                        f"  {row.get('source_type')} | {row.get('status')} | "
+                        f"{row.get('route_type')} | "
+                        f"sim=${float(row.get('simulated_net_profit') or 0):.2f} | "
+                        f"{row.get('title')}"
+                    )
+            return 0
+
+        if args.command == "prediction-mappings-import":
+            store.init_db()
+            try:
+                mappings = load_prediction_verified_mapping_file(Path(args.input))
+            except PredictionMappingError as exc:
+                print(f"Prediction mapping import failed: {exc}", file=sys.stderr)
+                return 2
+            if args.dry_run:
+                print("Prediction trusted mapping import dry run")
+                print(f"  valid mappings: {len(mappings)}")
+                return 0
+            inserted = store.upsert_prediction_verified_contract_mappings(mappings)
+            print("Prediction trusted mappings imported")
+            print(f"  mappings: {inserted}")
+            return 0
+
+        if args.command == "prediction-mappings-report":
+            store.init_db()
+            mappings = store.prediction_verified_contract_mappings()
+            print("Prediction trusted mappings")
+            if not mappings:
+                print("  нет trusted mappings")
+                return 0
+            for row in mappings[: max(0, int(args.limit))]:
+                print(
+                    f"  {row['venue_a']}:{row['market_id_a']} <=> "
+                    f"{row['venue_b']}:{row['market_id_b']} | "
+                    f"confidence={float(row.get('confidence_score') or 0):.3f} | "
+                    f"status={row.get('status')}"
                 )
             return 0
 
@@ -1068,12 +1303,48 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  warning: {warning}")
             return 0
 
+        if args.command == "funding-prune":
+            store.init_db()
+            if args.apply:
+                result = apply_funding_retention_plan(
+                    store,
+                    keep_latest_scans=args.keep_latest_scans,
+                    keep_latest_history_per_market=(
+                        args.keep_latest_history_per_market
+                    ),
+                )
+                print("Funding retention applied")
+                rows = result["deleted_rows"]
+            else:
+                result = build_funding_retention_plan(
+                    store,
+                    keep_latest_scans=args.keep_latest_scans,
+                    keep_latest_history_per_market=(
+                        args.keep_latest_history_per_market
+                    ),
+                ).as_dict()
+                print("Funding retention dry run")
+                rows = result["rows_by_table"]
+            print(f"  total scans: {result['total_scan_count']}")
+            print(f"  protected scans: {result['protected_scan_count']}")
+            print(f"  delete scans: {result['delete_scan_count']}")
+            for table, count in rows.items():
+                print(f"  {table}: {count}")
+            if not args.apply:
+                print("  apply: rerun with --apply to delete these rows")
+            else:
+                print("  note: run sqlite VACUUM separately to return disk space to the OS")
+            return 0
+
         if args.command == "funding-paper-trader":
             store.init_db()
             trader = FundingPaperTrader(
                 store,
                 config=funding_paper_trader_config(args),
-                notifier=TelegramNotifier(),
+                notifier=TelegramNotifier(
+                    token_env_var="FUNDING_TELEGRAM_BOT_TOKEN",
+                    chat_id_env_var="FUNDING_TELEGRAM_CHAT_ID",
+                ),
             )
             trader.run_loop()
             return 0
@@ -1145,6 +1416,24 @@ def main(argv: list[str] | None = None) -> int:
             if result.error:
                 print(f"  error: {result.error}")
             return 0 if result.status == "sent" else 1
+
+        if args.command == "sqlite-maintenance":
+            store.init_db()
+            result = store.sqlite_maintenance(
+                vacuum=args.vacuum,
+                analyze=not args.no_analyze,
+                optimize=not args.no_optimize,
+                wal_checkpoint=not args.no_wal_checkpoint,
+            )
+            print("SQLite maintenance")
+            print(f"  database: {result['database_path']}")
+            print(f"  operations: {', '.join(result['operations']) or '-'}")
+            print(f"  before: {int(result['before_bytes'])} bytes")
+            print(f"  after: {int(result['after_bytes'])} bytes")
+            print(f"  saved: {int(result['saved_bytes'])} bytes")
+            if not args.vacuum:
+                print("  note: add --vacuum to return free pages to the OS")
+            return 0
 
         if args.command == "wallet-report":
             store.init_db()
@@ -1228,6 +1517,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except DuneAPIError as exc:
         print(f"Dune error: {exc}", file=sys.stderr)
+        return 1
+    except AnalyticsError as exc:
+        print(f"Analytics error: {exc}", file=sys.stderr)
         return 1
     except PredictionDataError as exc:
         print(f"Prediction market data error: {exc}", file=sys.stderr)
@@ -1341,6 +1633,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--output", default="reports/latest.md")
     report.add_argument("--html-output", default="reports/latest.html")
+
+    subparsers.add_parser(
+        "analytics-init",
+        help="Initialize local Radar Analytics views and built-in queries.",
+    )
+
+    subparsers.add_parser(
+        "analytics-list",
+        help="List local Radar Analytics datasets and saved queries.",
+    )
+
+    analytics_run = subparsers.add_parser(
+        "analytics-run",
+        help="Run a saved local analytics query without Dune.",
+    )
+    analytics_run.add_argument("--slug", required=True)
+    analytics_run.add_argument("--limit", type=int, default=100)
+    analytics_run.add_argument("--json", action="store_true")
+
+    analytics_query = subparsers.add_parser(
+        "analytics-query",
+        help="Run a read-only local SQL analytics query without Dune.",
+    )
+    sql_source = analytics_query.add_mutually_exclusive_group(required=True)
+    sql_source.add_argument("--sql")
+    sql_source.add_argument("--sql-file")
+    analytics_query.add_argument("--limit", type=int, default=100)
+    analytics_query.add_argument("--json", action="store_true")
 
     render_dune = subparsers.add_parser(
         "render-dune-base-buyers",
@@ -1653,6 +1973,33 @@ def build_parser() -> argparse.ArgumentParser:
     live_scan.add_argument("--timeout-seconds", type=int, default=600)
     live_scan.add_argument("--dry-run", action="store_true")
 
+    local_live_scan = subparsers.add_parser(
+        "local-live-scan",
+        help="Run local Base wallet-transfer radar through HyperSync without Dune.",
+    )
+    local_live_scan.add_argument("--window-hours", type=int, default=24)
+    local_live_scan.add_argument("--max-wallets", type=int, default=200)
+    local_live_scan.add_argument("--max-tokens", type=int, default=100)
+    local_live_scan.add_argument("--minimum-wallets", type=int, default=1)
+    local_live_scan.add_argument("--max-hypersync-pages", type=int, default=3)
+    local_live_scan.add_argument("--max-pairs-per-token", type=int, default=5)
+    local_live_scan.add_argument("--min-pair-liquidity-usd", type=float, default=1_000.0)
+    local_live_scan.add_argument(
+        "--use-cursor",
+        action="store_true",
+        help="Start pool-swap ingestion after the stored local cursor.",
+    )
+    local_live_scan.add_argument(
+        "--no-signals",
+        action="store_true",
+        help="Skip local signal generation for this scan.",
+    )
+    local_live_scan.add_argument(
+        "--no-transfer-fallback",
+        action="store_true",
+        help="Only write observations backed by local swap events.",
+    )
+
     live_report = subparsers.add_parser(
         "live-report",
         help="Print the latest Live Radar observations and qualified signals.",
@@ -1670,14 +2017,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Continuously refresh the Prediction Radar paper pipeline.",
     )
     add_prediction_scan_arguments(prediction_watch)
-    prediction_watch.add_argument("--interval-seconds", type=int, default=60)
+    prediction_watch.add_argument("--interval-seconds", type=int, default=300)
     prediction_watch.add_argument("--iterations", type=int)
+
+    prediction_bot = subparsers.add_parser(
+        "prediction-bot",
+        help="Run Prediction Radar every 5 minutes and send Telegram status reports.",
+    )
+    prediction_bot.add_argument("--scan-interval-seconds", type=int, default=300)
+    prediction_bot.add_argument(
+        "--status-report-interval-seconds",
+        type=int,
+        default=3_600,
+        help="Telegram status report interval; use 0 to disable.",
+    )
+    prediction_bot.add_argument(
+        "--status-report-max-routes",
+        type=int,
+        default=5,
+        help="Maximum prediction routes included in each status report.",
+    )
+    prediction_bot.add_argument("--events-per-venue", type=int, default=75)
+    prediction_bot.add_argument("--max-markets-per-venue", type=int, default=1_500)
+    prediction_bot.add_argument("--kalshi-market-pages", type=int, default=10)
+    prediction_bot.add_argument("--http-timeout-seconds", type=int, default=8)
+    prediction_bot.add_argument("--http-max-retries", type=int, default=1)
+    prediction_bot.add_argument("--paper-size", type=float, default=100.0)
+    prediction_bot.add_argument("--paper-latency-ms", type=int, default=750)
+    prediction_bot.add_argument("--paper-depth-haircut", type=float, default=0.8)
+    prediction_bot.add_argument("--skip-hyperliquid", action="store_true")
+    prediction_bot.add_argument("--iterations", type=int)
+    prediction_bot.add_argument("--no-telegram", action="store_true")
+    prediction_bot.add_argument(
+        "--lifecycle-telegram",
+        action="store_true",
+        help="Also send normal Prediction Radar start/stop Telegram notifications.",
+    )
 
     prediction_report = subparsers.add_parser(
         "prediction-report",
         help="Print the latest research-only prediction-market paper candidates.",
     )
     prediction_report.add_argument("--limit", type=int, default=20)
+
+    prediction_backlog_report = subparsers.add_parser(
+        "prediction-backlog-report",
+        help="Print bounded Prediction Radar candidate/trade backlog.",
+    )
+    prediction_backlog_report.add_argument("--limit", type=int, default=20)
+
+    prediction_mappings_import = subparsers.add_parser(
+        "prediction-mappings-import",
+        help="Import manually verified Polymarket/Kalshi equivalent contracts.",
+    )
+    prediction_mappings_import.add_argument("--input", required=True)
+    prediction_mappings_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print the number of mappings without writing to SQLite.",
+    )
+
+    prediction_mappings_report = subparsers.add_parser(
+        "prediction-mappings-report",
+        help="Print trusted prediction cross-venue contract mappings.",
+    )
+    prediction_mappings_report.add_argument("--limit", type=int, default=50)
 
     funding_scan = subparsers.add_parser(
         "funding-scan",
@@ -1722,6 +2126,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Backfill only this venue; repeat the option for multiple venues.",
     )
 
+    funding_prune = subparsers.add_parser(
+        "funding-prune",
+        help="Prune old Funding Radar scan diagnostics while preserving paper ledger rows.",
+    )
+    funding_prune.add_argument(
+        "--keep-latest-scans",
+        type=int,
+        default=20,
+        help="Always keep this many latest funding scans plus paper-linked scans.",
+    )
+    funding_prune.add_argument(
+        "--keep-latest-history-per-market",
+        type=int,
+        default=24,
+        help="Keep only this many latest funding-rate rows per venue/symbol.",
+    )
+    funding_prune.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete rows. Omit for a dry-run plan.",
+    )
+
     funding_paper_trader = subparsers.add_parser(
         "funding-paper-trader",
         help="Run deterministic local funding paper trader loop.",
@@ -1733,9 +2159,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     funding_paper_trader.add_argument("--target-notional", type=float, default=500.0)
     funding_paper_trader.add_argument("--entry-window-seconds", type=int, default=180)
-    funding_paper_trader.add_argument("--entry-min-lead-seconds", type=int, default=30)
-    funding_paper_trader.add_argument("--entry-max-lead-seconds", type=int, default=60)
+    funding_paper_trader.add_argument("--entry-min-lead-seconds", type=int, default=0)
+    funding_paper_trader.add_argument("--entry-max-lead-seconds", type=int, default=15)
     funding_paper_trader.add_argument("--arm-window-seconds", type=int, default=900)
+    funding_paper_trader.add_argument(
+        "--final-recheck-freeze-seconds",
+        type=int,
+        default=15,
+        help="Skip fresh API rechecks inside this final pre-settlement window.",
+    )
+    funding_paper_trader.add_argument(
+        "--max-entry-snapshot-age-seconds",
+        type=int,
+        default=30,
+        help="Maximum age of the last successful focused snapshot usable for paper entry.",
+    )
     funding_paper_trader.add_argument(
         "--settlement-grace-seconds",
         type=int,
@@ -1751,19 +2189,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
     )
-    funding_paper_trader.add_argument("--scan-interval-seconds", type=int, default=60)
+    funding_paper_trader.add_argument("--scan-interval-seconds", type=int, default=300)
+    funding_paper_trader.add_argument(
+        "--monitor-interval-seconds",
+        type=int,
+        default=120,
+    )
     funding_paper_trader.add_argument("--hot-interval-seconds", type=int, default=10)
+    funding_paper_trader.add_argument(
+        "--hot-route-recheck-workers",
+        type=int,
+        default=6,
+        help="Maximum focused route rechecks to run in parallel during hot monitoring.",
+    )
     funding_paper_trader.add_argument(
         "--status-report-interval-seconds",
         type=int,
-        default=1_800,
+        default=3_600,
         help="Telegram status report interval; use 0 to disable.",
     )
     funding_paper_trader.add_argument(
         "--status-report-max-routes",
         type=int,
         default=5,
-        help="Maximum candidate/watch routes included in each status report.",
+        help="Maximum candidate routes included in each status report.",
     )
     funding_paper_trader.add_argument("--iterations", type=int)
     funding_paper_trader.add_argument("--export-dir", default="exports/funding_paper")
@@ -1795,6 +2244,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send a small Telegram test message using .env settings.",
     )
 
+    sqlite_maintenance = subparsers.add_parser(
+        "sqlite-maintenance",
+        help="Run SQLite checkpoint/analyze/optimize and optional VACUUM.",
+    )
+    sqlite_maintenance.add_argument("--vacuum", action="store_true")
+    sqlite_maintenance.add_argument("--no-analyze", action="store_true")
+    sqlite_maintenance.add_argument("--no-optimize", action="store_true")
+    sqlite_maintenance.add_argument("--no-wal-checkpoint", action="store_true")
+
     wallet_report = subparsers.add_parser(
         "wallet-report",
         help="Print wallet score diagnostics.",
@@ -1820,16 +2278,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_prediction_scan_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--events-per-venue", type=int, default=24)
-    parser.add_argument("--max-markets-per-venue", type=int, default=500)
-    parser.add_argument("--kalshi-market-pages", type=int, default=5)
+    parser.add_argument("--events-per-venue", type=int, default=75)
+    parser.add_argument("--max-markets-per-venue", type=int, default=1_500)
+    parser.add_argument("--kalshi-market-pages", type=int, default=10)
+    parser.add_argument("--http-timeout-seconds", type=int, default=8)
+    parser.add_argument("--http-max-retries", type=int, default=1)
     parser.add_argument("--wallet-limit", type=int, default=10)
     parser.add_argument("--wallet-position-limit", type=int, default=60)
     parser.add_argument("--wallet-refresh-hours", type=float, default=24.0)
     parser.add_argument("--paper-size", type=float, default=100.0)
     parser.add_argument("--paper-latency-ms", type=int, default=750)
     parser.add_argument("--paper-depth-haircut", type=float, default=0.8)
+    parser.add_argument("--retention-scans", type=int, default=1)
+    parser.add_argument("--dashboard-freshness-minutes", type=float, default=15.0)
     parser.add_argument("--skip-wallets", action="store_true")
+    parser.add_argument("--skip-hyperliquid", action="store_true")
 
 
 def prediction_scan_config(args: argparse.Namespace) -> PredictionScanConfig:
@@ -1837,14 +2300,39 @@ def prediction_scan_config(args: argparse.Namespace) -> PredictionScanConfig:
         events_per_venue=args.events_per_venue,
         max_markets_per_venue=args.max_markets_per_venue,
         kalshi_market_pages=args.kalshi_market_pages,
+        http_timeout_seconds=args.http_timeout_seconds,
+        http_max_retries=args.http_max_retries,
         wallet_limit=args.wallet_limit,
         wallet_position_limit=args.wallet_position_limit,
         wallet_refresh_hours=args.wallet_refresh_hours,
         paper_size=args.paper_size,
         paper_latency_ms=args.paper_latency_ms,
         paper_depth_haircut=args.paper_depth_haircut,
+        retention_scans=args.retention_scans,
+        dashboard_freshness_minutes=args.dashboard_freshness_minutes,
         collect_wallets=not args.skip_wallets,
+        collect_hyperliquid=not args.skip_hyperliquid,
     )
+
+
+def prediction_bot_config(args: argparse.Namespace) -> PredictionBotConfig:
+    return PredictionBotConfig(
+        scan_interval_seconds=args.scan_interval_seconds,
+        status_report_interval_seconds=args.status_report_interval_seconds,
+        status_report_max_routes=args.status_report_max_routes,
+        events_per_venue=args.events_per_venue,
+        max_markets_per_venue=args.max_markets_per_venue,
+        kalshi_market_pages=args.kalshi_market_pages,
+        http_timeout_seconds=args.http_timeout_seconds,
+        http_max_retries=args.http_max_retries,
+        paper_size=args.paper_size,
+        paper_latency_ms=args.paper_latency_ms,
+        paper_depth_haircut=args.paper_depth_haircut,
+        collect_hyperliquid=not args.skip_hyperliquid,
+        iterations=args.iterations,
+        telegram_enabled=not args.no_telegram,
+        lifecycle_telegram_enabled=args.lifecycle_telegram,
+    ).validated()
 
 
 def add_funding_scan_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1983,12 +2471,16 @@ def funding_paper_trader_config(args: argparse.Namespace) -> FundingPaperTraderC
         entry_min_lead_seconds=args.entry_min_lead_seconds,
         entry_max_lead_seconds=args.entry_max_lead_seconds,
         arm_window_seconds=args.arm_window_seconds,
+        final_recheck_freeze_seconds=args.final_recheck_freeze_seconds,
+        max_entry_snapshot_age_seconds=args.max_entry_snapshot_age_seconds,
         settlement_grace_seconds=args.settlement_grace_seconds,
         max_settlement_publication_lag_seconds=(
             args.max_settlement_publication_lag_seconds
         ),
         scan_interval_seconds=args.scan_interval_seconds,
+        monitor_interval_seconds=args.monitor_interval_seconds,
         hot_interval_seconds=args.hot_interval_seconds,
+        hot_route_recheck_workers=args.hot_route_recheck_workers,
         status_report_interval_seconds=args.status_report_interval_seconds,
         status_report_max_routes=args.status_report_max_routes,
         min_live_net_profit=args.min_live_net_profit,
@@ -1997,6 +2489,68 @@ def funding_paper_trader_config(args: argparse.Namespace) -> FundingPaperTraderC
         telegram_enabled=not args.no_telegram,
         focused_recheck_enabled=not args.no_focused_recheck,
     ).validated()
+
+
+def print_analytics_result(result: dict[str, object], as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    rows = result["rows"]
+    columns = result["columns"]
+    assert isinstance(rows, list)
+    assert isinstance(columns, list)
+    print(
+        "Analytics execution "
+        f"{result['analytics_execution_id']} | "
+        f"engine={result['engine']} | rows={result['row_count']} | "
+        f"limit={result['limit']}"
+    )
+    if not rows:
+        print("No rows.")
+        return
+
+    visible_columns = [str(column) for column in columns[:8]]
+    widths = {
+        column: min(
+            36,
+            max(
+                len(column),
+                *[
+                    len(format_analytics_cell(row.get(column)))
+                    for row in rows[:20]
+                    if isinstance(row, dict)
+                ],
+            ),
+        )
+        for column in visible_columns
+    }
+    header = " | ".join(column.ljust(widths[column]) for column in visible_columns)
+    print(header)
+    print("-+-".join("-" * widths[column] for column in visible_columns))
+    for row in rows:
+        assert isinstance(row, dict)
+        print(
+            " | ".join(
+                format_analytics_cell(row.get(column))[: widths[column]].ljust(
+                    widths[column]
+                )
+                for column in visible_columns
+            )
+        )
+    if len(columns) > len(visible_columns):
+        hidden = ", ".join(str(column) for column in columns[len(visible_columns) :])
+        print(f"... hidden columns: {hidden}")
+
+
+def format_analytics_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
 
 
 def print_status(store: SQLiteStore) -> None:
