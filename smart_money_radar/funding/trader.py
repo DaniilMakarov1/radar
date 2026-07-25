@@ -65,10 +65,73 @@ from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.notifications import TelegramNotifier
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
 
+from smart_money_radar.paper_bot.helpers import (
+    csv_value,
+    format_datetime_utc,
+    format_interval_hours,
+    format_money,
+    format_rate,
+    format_seconds,
+    format_signed_money,
+    is_retention_skip_error,
+    leg_by_side,
+    optional_float,
+    parse_iso,
+    ranked_status_routes,
+    route_data_age_seconds,
+    route_entry_key,
+    route_settlement_leads,
+    should_record_routine_scan,
+    status_route_sort_key,
+    tg,
+)
+from smart_money_radar.paper_bot.position import (
+    build_close_payload,
+    build_position_from_route,
+    build_settlement_accrual_payload,
+    close_decision,
+    close_reason_from_hold_reasons,
+    compute_spread_snapshot,
+    current_position_leg,
+    entry_cross_spread,
+    final_recheck_fallback_route,
+    final_recheck_freeze_window_active,
+    funding_leg_pnl,
+    leg_vwap,
+    position_hold_decision,
+    required_live_net_profit,
+    route_entry_decision,
+    route_monitor_decision,
+    settlement_rate_or_entry,
+    settlement_rates_for_position,
+    settlement_payload,
+    spread_stop_loss_triggered,
+    status_publishable_candidate,
+)
+from smart_money_radar.paper_bot.telegram import (
+    armed_message,
+    close_decision_details_message,
+    close_message,
+    close_reason_message,
+    close_window_message,
+    disarmed_message,
+    funding_leg_compact_line,
+    funding_rate_lines,
+    funding_settlement_mismatch_line,
+    hold_message,
+    hold_reason_labels,
+    lead_seconds,
+    open_message,
+    pending_message,
+    position_summary,
+    reprice_message,
+    skipped_open_message,
+    status_report_message,
+    status_route_line,
+)
 
 FUNDING_HISTORY_RETENTION_PER_MARKET = 24
 FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
-
 
 @dataclass(frozen=True)
 class PaperBotConfig:
@@ -187,7 +250,6 @@ class PaperBotConfig:
                 "entry_max_lead_seconds": maximum,
             }
         )
-
 
 class PaperBot:
     """Paper trading bot for funding carry arbitrage.
@@ -1335,744 +1397,9 @@ class PaperBot:
             )
         return event_id
 
-
-def should_record_routine_scan(result: dict[str, Any]) -> bool:
-    return any(
-        int(result.get(key) or 0) > 0
-        for key in (
-            "candidate_count",
-            "watch_count",
-            "opened_count",
-            "closed_count",
-            "pending_count",
-            "hot_route_count",
-            "urgent_route_count",
-        )
-    )
-
-
-def is_retention_skip_error(exc: sqlite3.DatabaseError) -> bool:
-    message = str(exc).lower()
-    if isinstance(exc, sqlite3.OperationalError):
-        return "database is locked" in message or "database is busy" in message
-    if isinstance(exc, sqlite3.IntegrityError):
-        return "foreign key" in message
-    return False
-
-
-def route_entry_decision(
-    route: dict[str, Any],
-    accounts: dict[str, dict[str, Any]],
-    now: datetime,
-    config: PaperBotConfig,
-) -> dict[str, Any]:
-    legs = route.get("legs") or []
-    long_leg = leg_by_side(legs, "long")
-    short_leg = leg_by_side(legs, "short")
-    reasons: list[str] = []
-    leads: dict[str, float | None] = {"long": None, "short": None}
-    if route.get("status") != "paper_candidate":
-        reasons.append("route_not_candidate")
-    evidence = route.get("evidence") or {}
-    live_net = float(evidence.get("current_nowcast_net") or 0.0)
-    if not long_leg or not short_leg:
-        reasons.append("missing_route_legs")
-    else:
-        for side, leg in (("long", long_leg), ("short", short_leg)):
-            settlement_at = parse_iso(leg.get("next_funding_at"))
-            if settlement_at is None:
-                reasons.append(f"{side}_settlement_missing")
-                continue
-            lead = (settlement_at - now).total_seconds()
-            leads[side] = lead
-            if lead < 0:
-                reasons.append(f"{side}_settlement_already_passed")
-            elif lead < config.entry_min_lead_seconds:
-                reasons.append(f"{side}_settlement_inside_final_deadline")
-            elif lead > config.entry_max_lead_seconds:
-                reasons.append(f"{side}_settlement_outside_final_entry_window")
-        if long_leg and short_leg:
-            for leg in (long_leg, short_leg):
-                venue = str(leg.get("venue") or "")
-                notional = float(leg.get("notional") or route.get("target_notional") or 0.0)
-                required = notional * (1.0 + config.collateral_reserve_fraction)
-                available = float(
-                    (accounts.get(venue) or {}).get("available_balance") or 0.0
-                )
-                if available < required:
-                    reasons.append(f"{venue}_insufficient_paper_balance")
-    entry_window_ready = all(
-        lead is not None and 0 <= lead <= config.entry_max_lead_seconds
-        for lead in leads.values()
-    )
-    snapshot_age = route_data_age_seconds(route, now)
-    if entry_window_ready and (
-        snapshot_age is None or snapshot_age > config.max_entry_snapshot_age_seconds
-    ):
-        reasons.append("entry_snapshot_stale")
-    required_live_net = required_live_net_profit(route, config)
-    armed = bool(
-        long_leg
-        and short_leg
-        and all(
-            lead is not None and 0 <= lead <= config.arm_window_seconds
-            for lead in leads.values()
-        )
-        and live_net >= required_live_net
-    )
-    if live_net <= 0:
-        if "live_net_not_positive" not in reasons:
-            reasons.append("live_net_not_positive")
-    elif live_net < required_live_net:
-        reasons.append("live_net_below_required_profit")
-    return {
-        "eligible": not reasons,
-        "armed": armed,
-        "reasons": reasons,
-        "lead_seconds": leads,
-        "entry_window_seconds": config.entry_window_seconds,
-        "entry_min_lead_seconds": config.entry_min_lead_seconds,
-        "entry_max_lead_seconds": config.entry_max_lead_seconds,
-        "arm_window_seconds": config.arm_window_seconds,
-        "live_net": live_net,
-        "required_live_net": required_live_net,
-        "snapshot_age_seconds": snapshot_age,
-        "max_entry_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
-    }
-
-
-def required_live_net_profit(
-    route: dict[str, Any],
-    config: PaperBotConfig,
-) -> float:
-    evidence = route.get("evidence") or {}
-    threshold = optional_float(evidence.get("actionable_profit_threshold"))
-    return max(float(config.min_live_net_profit), threshold or 0.0)
-
-
-def route_monitor_decision(
-    route: dict[str, Any],
-    now: datetime,
-    config: PaperBotConfig,
-) -> dict[str, Any]:
-    legs = route.get("legs") or []
-    leads: dict[str, float | None] = {"long": None, "short": None}
-    reasons: list[str] = []
-    for side in ("long", "short"):
-        leg = leg_by_side(legs, side)
-        settlement = parse_iso((leg or {}).get("next_funding_at"))
-        if settlement is None:
-            reasons.append(f"{side}_settlement_missing")
-            continue
-        lead = (settlement - now).total_seconds()
-        leads[side] = lead
-        if lead < 0:
-            reasons.append(f"{side}_settlement_already_passed")
-        elif lead > config.arm_window_seconds:
-            reasons.append(f"{side}_settlement_outside_arm_window")
-    live_net = float((route.get("evidence") or {}).get("current_nowcast_net") or 0.0)
-    required_live_net = required_live_net_profit(route, config)
-    if live_net <= 0:
-        reasons.append("live_net_not_positive")
-    elif live_net < required_live_net:
-        reasons.append("live_net_below_required_profit")
-    hot = bool(
-        not reasons
-        and route.get("status") in {"paper_candidate", "watch"}
-        and all(
-            lead is not None and 0 <= lead <= config.arm_window_seconds
-            for lead in leads.values()
-        )
-    )
-    urgent = bool(
-        hot
-        and all(
-            lead is not None and 0 <= lead <= config.entry_window_seconds
-            for lead in leads.values()
-        )
-    )
-    return {
-        "hot": hot,
-        "urgent": urgent,
-        "reasons": reasons,
-        "lead_seconds": leads,
-        "live_net": live_net,
-        "required_live_net": required_live_net,
-    }
-
-
-def build_position_from_route(
-    route: dict[str, Any],
-    decision: dict[str, Any],
-    config: PaperBotConfig,
-) -> dict[str, Any]:
-    legs = route.get("legs") or []
-    long_leg = leg_by_side(legs, "long") or {}
-    short_leg = leg_by_side(legs, "short") or {}
-    evidence = route.get("evidence") or {}
-    long_notional = float(long_leg.get("notional") or route.get("target_notional") or 0.0)
-    short_notional = float(short_leg.get("notional") or route.get("target_notional") or 0.0)
-    long_settlement = str(long_leg.get("next_funding_at") or "")
-    short_settlement = str(short_leg.get("next_funding_at") or "")
-    max_settlement = max(
-        parse_iso(long_settlement) or datetime.min.replace(tzinfo=UTC),
-        parse_iso(short_settlement) or datetime.min.replace(tzinfo=UTC),
-    ).isoformat()
-    return {
-        "entry_key": route_entry_key(route),
-        "route_key": route["route_key"],
-        "open_funding_scan_id": route.get("funding_scan_id"),
-        "open_funding_route_id": route.get("funding_route_id"),
-        "canonical_asset": route["canonical_asset"],
-        "long_venue": route["long_venue"],
-        "long_symbol": route["long_symbol"],
-        "short_venue": route["short_venue"],
-        "short_symbol": route["short_symbol"],
-        "base_quantity": min(
-            float(long_leg.get("base_quantity") or 0.0),
-            float(short_leg.get("base_quantity") or 0.0),
-        ),
-        "target_notional": float(route.get("target_notional") or 0.0),
-        "long_notional": long_notional,
-        "short_notional": short_notional,
-        "long_reserved_margin": long_notional * (1.0 + config.collateral_reserve_fraction),
-        "short_reserved_margin": short_notional * (1.0 + config.collateral_reserve_fraction),
-        "long_settlement_at": long_settlement,
-        "short_settlement_at": short_settlement,
-        "max_settlement_at": max_settlement,
-        "expected_live_gross": float(evidence.get("current_nowcast_gross") or 0.0),
-        "expected_live_net": float(evidence.get("current_nowcast_net") or 0.0),
-        "expected_execution_cost": float(evidence.get("execution_cost") or 0.0),
-        "entry_legs": legs,
-        "entry_evidence": evidence,
-        "entry_cross_spread": entry_cross_spread(long_leg, short_leg),
-        "entry_basis_bps": float(evidence.get("signed_entry_basis") or 0.0) * 10_000.0,
-        "notes": {"decision": decision, "paper_model": "funding_paper_trader_v2"},
-    }
-
-
-def close_decision(
-    position: dict[str, Any],
-    now: datetime,
-    store: SQLiteStore,
-    config: PaperBotConfig,
-) -> dict[str, Any]:
-    max_settlement = parse_iso(position.get("max_settlement_at"))
-    if max_settlement is None:
-        opened = parse_iso(position.get("opened_at"))
-        lag = config.max_settlement_publication_lag_seconds
-        if opened is not None and (now - opened).total_seconds() > max(60, lag):
-            return {
-                "status": "close",
-                "close": build_close_payload(
-                    position, {}, None,
-                    use_entry_estimate_for_missing=True,
-                    close_reason="settlement_publication_timeout",
-                    hold_decision={"hold": False, "close_reason": "settlement_publication_timeout", "reasons": ["max_settlement_at_missing_timeout"]},
-                ),
-            }
-        return {"status": "settlement_pending", "reason": "missing_max_settlement_at"}
-    if now < max_settlement + timedelta(seconds=config.settlement_grace_seconds):
-        return {"status": "wait", "reason": "settlement_not_reached"}
-
-    settlement = settlement_rates_for_position(position, store)
-    missing = [side for side, row in settlement.items() if row is None]
-    close_route = store.latest_funding_route_by_key(str(position["route_key"]))
-    hold = position_hold_decision(position, close_route, now, config)
-    if hold["hold"]:
-        accrual = build_settlement_accrual_payload(
-            position,
-            settlement,
-            close_route or {},
-            use_entry_estimate_for_missing=bool(missing),
-            hold_decision=hold,
-        )
-        return {"status": "hold", "accrual": accrual}
-    close = build_close_payload(
-        position,
-        settlement,
-        close_route,
-        use_entry_estimate_for_missing=bool(missing),
-        close_reason=str(hold["close_reason"]),
-        hold_decision=hold,
-    )
-    return {"status": "close", "close": close}
-
-
-def position_hold_decision(
-    position: dict[str, Any],
-    route: dict[str, Any] | None,
-    now: datetime,
-    config: PaperBotConfig,
-) -> dict[str, Any]:
-    if not route:
-        return {
-            "hold": False,
-            "close_reason": "arbitrage_window_unverifiable_route_missing",
-            "reasons": ["latest_route_missing"],
-        }
-    legs = route.get("legs") or []
-    long_leg = leg_by_side(legs, "long")
-    short_leg = leg_by_side(legs, "short")
-    reasons: list[str] = []
-    route_age = route_data_age_seconds(route, now)
-    if route_age is None:
-        reasons.append("route_snapshot_age_missing")
-    elif route_age > config.max_entry_snapshot_age_seconds:
-        reasons.append("route_snapshot_stale")
-    if not long_leg or not short_leg:
-        reasons.append("missing_route_legs")
-    data_quality_flags = {
-        "unit_identity_mismatch",
-        "basis_divergence",
-    }
-    route_flags = set(str(flag) for flag in route.get("risk_flags") or [])
-    evidence = route.get("evidence") or {}
-    route_flags.update(
-        str(flag) for flag in evidence.get("blocking_risk_flags") or []
-    )
-    if route_flags.intersection(data_quality_flags):
-        reasons.append("data_quality_issue")
-    next_settlements: dict[str, str] = {}
-    for side, leg in (("long", long_leg), ("short", short_leg)):
-        if not leg:
-            continue
-        settlement = parse_iso(leg.get("next_funding_at"))
-        if settlement is None:
-            reasons.append(f"{side}_next_settlement_missing")
-            continue
-        if settlement <= now:
-            reasons.append(f"{side}_next_settlement_not_future")
-            continue
-        next_settlements[side] = settlement.isoformat()
-    live_net = optional_float(evidence.get("current_nowcast_net"))
-    if live_net is None:
-        reasons.append("live_net_missing")
-    elif live_net <= max(0.0, float(config.min_live_net_profit)):
-        reasons.append("live_net_not_positive")
-    if long_leg and short_leg:
-        long_hourly = optional_float(long_leg.get("hourly_funding_rate"))
-        short_hourly = optional_float(short_leg.get("hourly_funding_rate"))
-        if (
-            long_hourly is not None
-            and short_hourly is not None
-            and short_hourly < long_hourly
-        ):
-            reasons.append("funding_rate_inverted")
-    close_reason = close_reason_from_hold_reasons(reasons)
-    return {
-        "hold": not reasons,
-        "close_reason": close_reason,
-        "reasons": reasons,
-        "live_net": live_net,
-        "route_snapshot_age_seconds": route_age,
-        "max_route_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
-        "next_settlements": next_settlements,
-        "route_status": route.get("status"),
-    }
-
-
-def close_reason_from_hold_reasons(reasons: list[str]) -> str:
-    if "live_net_not_positive" in reasons:
-        return "arbitrage_window_closed_live_net_non_positive"
-    if "data_quality_issue" in reasons:
-        return "arbitrage_window_data_quality_issue"
-    if (
-        "route_snapshot_stale" in reasons
-        or "route_snapshot_age_missing" in reasons
-    ):
-        return "arbitrage_window_unverifiable_route_stale"
-    if "latest_route_missing" in reasons:
-        return "arbitrage_window_unverifiable_route_missing"
-    if any("settlement" in reason for reason in reasons):
-        return "arbitrage_window_unverifiable_next_settlement_missing"
-    if "live_net_missing" in reasons:
-        return "arbitrage_window_unverifiable_live_net_missing"
-    if "funding_rate_inverted" in reasons:
-        return "arbitrage_window_funding_rate_inverted"
-    return "arbitrage_window_unverifiable"
-
-
-def build_settlement_accrual_payload(
-    position: dict[str, Any],
-    settlement: dict[str, dict[str, Any] | None],
-    continuation_route: dict[str, Any],
-    *,
-    use_entry_estimate_for_missing: bool,
-    hold_decision: dict[str, Any],
-) -> dict[str, Any]:
-    current_long = current_position_leg(position, "long")
-    current_short = current_position_leg(position, "short")
-    long_rate = settlement_rate_or_entry(settlement.get("long"), current_long)
-    short_rate = settlement_rate_or_entry(settlement.get("short"), current_short)
-    long_notional = float(position.get("long_notional") or 0.0)
-    short_notional = float(position.get("short_notional") or 0.0)
-    long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
-    short_funding_pnl = funding_leg_pnl("short", short_notional, short_rate)
-    next_legs = continuation_route.get("legs") or []
-    next_long = leg_by_side(next_legs, "long") or {}
-    next_short = leg_by_side(next_legs, "short") or {}
-    next_long_settlement = str(next_long.get("next_funding_at") or "")
-    next_short_settlement = str(next_short.get("next_funding_at") or "")
-    next_max_settlement = max(
-        parse_iso(next_long_settlement) or datetime.min.replace(tzinfo=UTC),
-        parse_iso(next_short_settlement) or datetime.min.replace(tzinfo=UTC),
-    ).isoformat()
-    funding_pnl_delta = long_funding_pnl + short_funding_pnl
-    evidence = continuation_route.get("evidence") or {}
-    settlement_payload_value = {
-        "long": settlement_payload(settlement.get("long"), current_long, long_rate),
-        "short": settlement_payload(settlement.get("short"), current_short, short_rate),
-        "funding_pnl_delta": funding_pnl_delta,
-        "history_missing_fallback": use_entry_estimate_for_missing,
-        "continued_live_net": evidence.get("current_nowcast_net"),
-    }
-    return {
-        "settlement_key": ":".join(
-            [
-                str(position.get("funding_paper_position_id") or ""),
-                str(position.get("max_settlement_at") or ""),
-            ]
-        ),
-        "long_cash_delta": long_funding_pnl,
-        "short_cash_delta": short_funding_pnl,
-        "funding_pnl_delta": funding_pnl_delta,
-        "history_missing_fallback": use_entry_estimate_for_missing,
-        "settlement": settlement_payload_value,
-        "hold_decision": hold_decision,
-        "next_funding_scan_id": continuation_route.get("funding_scan_id"),
-        "next_funding_route_id": continuation_route.get("funding_route_id"),
-        "next_long_settlement_at": next_long_settlement,
-        "next_short_settlement_at": next_short_settlement,
-        "next_max_settlement_at": next_max_settlement,
-        "next_entry_legs": next_legs,
-        "next_entry_evidence": evidence,
-        "next_expected_live_gross": evidence.get("current_nowcast_gross"),
-        "next_expected_live_net": evidence.get("current_nowcast_net"),
-    }
-
-
-def settlement_rates_for_position(
-    position: dict[str, Any],
-    store: SQLiteStore,
-) -> dict[str, dict[str, Any] | None]:
-    return {
-        "long": store.funding_history_rate_near(
-            str(position["long_venue"]),
-            str(position["long_symbol"]),
-            str(position.get("long_settlement_at") or ""),
-        ),
-        "short": store.funding_history_rate_near(
-            str(position["short_venue"]),
-            str(position["short_symbol"]),
-            str(position.get("short_settlement_at") or ""),
-        ),
-    }
-
-
-def build_close_payload(
-    position: dict[str, Any],
-    settlement: dict[str, dict[str, Any] | None],
-    close_route: dict[str, Any] | None,
-    *,
-    use_entry_estimate_for_missing: bool,
-    close_reason: str,
-    hold_decision: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    entry_long = current_position_leg(position, "long")
-    entry_short = current_position_leg(position, "short")
-    long_rate = settlement_rate_or_entry(settlement.get("long"), entry_long)
-    short_rate = settlement_rate_or_entry(settlement.get("short"), entry_short)
-    long_notional = float(position.get("long_notional") or 0.0)
-    short_notional = float(position.get("short_notional") or 0.0)
-    long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
-    short_funding_pnl = funding_leg_pnl("short", short_notional, short_rate)
-    accrued_funding_pnl = float(
-        (position.get("notes") or {}).get("accrued_funding_pnl") or 0.0
-    )
-    current_funding_pnl = long_funding_pnl + short_funding_pnl
-    actual_funding_pnl = accrued_funding_pnl + current_funding_pnl
-    actual_execution_cost = float(position.get("expected_execution_cost") or 0.0)
-    spread_snap = compute_spread_snapshot(position, close_route)
-    basis_pnl = float(spread_snap.get("unrealized_basis_pnl") or 0.0)
-    actual_net_pnl = actual_funding_pnl + basis_pnl - actual_execution_cost
-    long_cash_delta = long_funding_pnl - actual_execution_cost / 2.0
-    short_cash_delta = short_funding_pnl - actual_execution_cost / 2.0
-    close_evidence = (close_route or {}).get("evidence") or {}
-    return {
-        "close_funding_scan_id": (close_route or {}).get("funding_scan_id"),
-        "close_funding_route_id": (close_route or {}).get("funding_route_id"),
-        "actual_funding_pnl": actual_funding_pnl,
-        "actual_basis_pnl": basis_pnl,
-        "actual_execution_cost": actual_execution_cost,
-        "actual_net_pnl": actual_net_pnl,
-        "long_cash_delta": long_cash_delta,
-        "short_cash_delta": short_cash_delta,
-        "close_reason": close_reason,
-        "hold_decision": hold_decision or {},
-        "close_legs": (close_route or {}).get("legs") or [],
-        "close_evidence": close_evidence,
-        "spread_snapshot": spread_snap,
-        "settlement": {
-            "long": settlement_payload(settlement.get("long"), entry_long, long_rate),
-            "short": settlement_payload(settlement.get("short"), entry_short, short_rate),
-            "current_funding_pnl": current_funding_pnl,
-            "accrued_funding_pnl": accrued_funding_pnl,
-            "entry_expected_live_net": position.get("expected_live_net"),
-            "entry_expected_live_gross": position.get("expected_live_gross"),
-            "history_missing_fallback": use_entry_estimate_for_missing,
-        },
-        "notes": {
-            "paper_model": "funding_paper_trader_v2",
-            "execution_cost_source": "entry_route_expected_execution_cost",
-            "basis_pnl_included": spread_snap.get("spread_tracking", False),
-        },
-    }
-
-
-def current_position_leg(position: dict[str, Any], side: str) -> dict[str, Any]:
-    leg = dict(leg_by_side(position.get("entry_legs") or [], side) or {})
-    leg.setdefault("side", side)
-    leg.setdefault("venue", position.get(f"{side}_venue"))
-    leg.setdefault("symbol", position.get(f"{side}_symbol"))
-    leg.setdefault("notional", position.get(f"{side}_notional"))
-    leg.setdefault("base_quantity", position.get("base_quantity"))
-    leg["next_funding_at"] = position.get(f"{side}_settlement_at") or leg.get(
-        "next_funding_at"
-    )
-    return leg
-
-
-def funding_leg_pnl(side: str, notional: float, funding_rate: float) -> float:
-    if str(side).lower() == "long":
-        return -float(notional) * float(funding_rate)
-    return float(notional) * float(funding_rate)
-
-
-def settlement_rate_or_entry(
-    settlement_row: dict[str, Any] | None,
-    entry_leg: dict[str, Any],
-) -> float:
-    if settlement_row is not None:
-        return float(settlement_row.get("funding_rate") or 0.0)
-    hourly = float(entry_leg.get("funding_rate") or 0.0)
-    interval = max(1.0, float(entry_leg.get("funding_interval_hours") or 1.0))
-    return hourly * interval
-
-
-def settlement_payload(
-    settlement_row: dict[str, Any] | None,
-    entry_leg: dict[str, Any],
-    funding_rate: float,
-) -> dict[str, Any]:
-    return {
-        "venue": (settlement_row or {}).get("venue") or entry_leg.get("venue"),
-        "symbol": (settlement_row or {}).get("symbol") or entry_leg.get("symbol"),
-        "settlement_at": (settlement_row or {}).get("funding_at")
-        or entry_leg.get("next_funding_at"),
-        "funding_rate": funding_rate,
-        "source": "history" if settlement_row is not None else "entry_estimate_fallback",
-        "history_row": settlement_row,
-    }
-
-
-def leg_by_side(legs: list[dict[str, Any]], side: str) -> dict[str, Any] | None:
-    return next((leg for leg in legs if str(leg.get("side")) == side), None)
-
-
-def route_entry_key(route: dict[str, Any]) -> str:
-    legs = route.get("legs") or []
-    long_leg = leg_by_side(legs, "long") or {}
-    short_leg = leg_by_side(legs, "short") or {}
-    return ":".join(
-        [
-            str(route.get("route_key") or ""),
-            str(long_leg.get("next_funding_at") or ""),
-            str(short_leg.get("next_funding_at") or ""),
-        ]
-    )
-
-
-def parse_iso(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
-
-
-def optional_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def route_settlement_leads(
-    route: dict[str, Any],
-    now: datetime,
-) -> dict[str, float | None]:
-    leads: dict[str, float | None] = {"long": None, "short": None}
-    for side in ("long", "short"):
-        leg = leg_by_side(route.get("legs") or [], side)
-        settlement = parse_iso((leg or {}).get("next_funding_at"))
-        if settlement is not None:
-            leads[side] = (settlement - now).total_seconds()
-    return leads
-
-
-def route_data_age_seconds(route: dict[str, Any], now: datetime) -> float | None:
-    evidence = route.get("evidence") or {}
-    focused = evidence.get("focused_recheck") or {}
-    observed = parse_iso(focused.get("observed_at")) or parse_iso(route.get("observed_at"))
-    if observed is None:
-        return None
-    return max(0.0, (now - observed).total_seconds())
-
-
 # ---------------------------------------------------------------------------
 # Spread / basis risk tracking
 # ---------------------------------------------------------------------------
-
-
-def entry_cross_spread(
-    long_leg: dict[str, Any],
-    short_leg: dict[str, Any],
-) -> float | None:
-    long_price = leg_vwap(long_leg)
-    short_price = leg_vwap(short_leg)
-    if long_price is None or short_price is None:
-        return None
-    return long_price - short_price
-
-
-def leg_vwap(leg: dict[str, Any]) -> float | None:
-    evidence = leg.get("evidence") or leg
-    for key in ("vwap", "mark_price", "mid_price", "price"):
-        value = optional_float(evidence.get(key))
-        if value is not None and value > 0:
-            return value
-    return None
-
-
-def compute_spread_snapshot(
-    position: dict[str, Any],
-    route: dict[str, Any] | None,
-) -> dict[str, Any]:
-    entry_spread = optional_float(position.get("entry_cross_spread"))
-    if route is None or entry_spread is None:
-        return {
-            "spread_tracking": False,
-            "reason": "missing_route_or_entry_spread",
-        }
-    legs = route.get("legs") or []
-    long_leg = leg_by_side(legs, "long") or {}
-    short_leg = leg_by_side(legs, "short") or {}
-    current_long = leg_vwap(long_leg)
-    current_short = leg_vwap(short_leg)
-    if current_long is None or current_short is None:
-        return {
-            "spread_tracking": False,
-            "reason": "missing_current_prices",
-        }
-    current_spread = current_long - current_short
-    quantity = float(position.get("base_quantity") or 0.0)
-    unrealized_basis_pnl = (current_spread - entry_spread) * quantity
-    notional = float(position.get("target_notional") or 0.0)
-    reference = (current_long + current_short) / 2.0
-    current_basis_bps = (
-        (current_short - current_long) / reference * 10_000.0
-        if reference > 0
-        else 0.0
-    )
-    entry_basis_bps = float(position.get("entry_basis_bps") or 0.0)
-    accrued_funding = float(
-        (position.get("notes") or {}).get("accrued_funding_pnl") or 0.0
-    )
-    expected_exec_cost = float(position.get("expected_execution_cost") or 0.0)
-    total_unrealized = accrued_funding + unrealized_basis_pnl - expected_exec_cost
-    return {
-        "spread_tracking": True,
-        "entry_cross_spread": entry_spread,
-        "current_cross_spread": current_spread,
-        "current_long_price": current_long,
-        "current_short_price": current_short,
-        "unrealized_basis_pnl": unrealized_basis_pnl,
-        "current_basis_bps": current_basis_bps,
-        "entry_basis_bps": entry_basis_bps,
-        "accrued_funding_pnl": accrued_funding,
-        "total_unrealized_pnl": total_unrealized,
-        "notional": notional,
-    }
-
-
-def spread_stop_loss_triggered(
-    snapshot: dict[str, Any],
-    config: PaperBotConfig,
-) -> tuple[bool, str]:
-    if not snapshot.get("spread_tracking"):
-        return False, ""
-    notional = float(snapshot.get("notional") or 0.0)
-    if notional <= 0:
-        return False, ""
-    unrealized = float(snapshot.get("unrealized_basis_pnl") or 0.0)
-    basis_loss_bps = abs(min(0.0, unrealized)) / notional * 10_000.0
-    if basis_loss_bps >= config.basis_stop_loss_bps:
-        return True, (
-            f"basis_stop_loss: unrealized_basis_pnl={unrealized:.2f} "
-            f"({basis_loss_bps:.0f} bps >= {config.basis_stop_loss_bps:.0f} bps)"
-        )
-    return False, ""
-
-
-def final_recheck_freeze_window_active(
-    route: dict[str, Any],
-    now: datetime,
-    config: PaperBotConfig,
-) -> bool:
-    if config.final_recheck_freeze_seconds <= 0:
-        return False
-    leads = route_settlement_leads(route, now)
-    return all(
-        lead is not None and 0 <= lead < config.final_recheck_freeze_seconds
-        for lead in leads.values()
-    )
-
-
-def final_recheck_fallback_route(
-    route: dict[str, Any],
-    now: datetime,
-    config: PaperBotConfig,
-    reason: str,
-) -> dict[str, Any] | None:
-    if not final_recheck_freeze_window_active(route, now, config):
-        return None
-    leads = route_settlement_leads(route, now)
-    age = route_data_age_seconds(route, now)
-    if age is None or age > config.max_entry_snapshot_age_seconds:
-        return None
-    fallback = dict(route)
-    evidence = dict(fallback.get("evidence") or {})
-    previous_recheck = dict(evidence.get("focused_recheck") or {})
-    evidence["focused_recheck"] = {
-        **previous_recheck,
-        "mode": "final_freeze_last_success_v1",
-        "reason": reason,
-        "snapshot_age_seconds": age,
-        "max_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
-        "freeze_seconds": config.final_recheck_freeze_seconds,
-        "lead_seconds": leads,
-        "used_at": now.isoformat(),
-    }
-    evidence["entry_snapshot_source"] = "last_successful_focused_recheck"
-    evidence["entry_snapshot_frozen"] = True
-    fallback["evidence"] = evidence
-    return fallback
-
 
 def venues_from_routes(routes: list[dict[str, Any]]) -> list[str]:
     venues: set[str] = set()
@@ -2083,7 +1410,6 @@ def venues_from_routes(routes: list[dict[str, Any]]) -> list[str]:
                 venues.add(str(value))
     return sorted(venues)
 
-
 def venues_from_funding_payload(funding: dict[str, Any]) -> list[str]:
     return sorted(
         {
@@ -2092,7 +1418,6 @@ def venues_from_funding_payload(funding: dict[str, Any]) -> list[str]:
             if row.get("venue")
         }
     )
-
 
 def funding_clients_for_route(
     route: dict[str, Any],
@@ -2109,7 +1434,6 @@ def funding_clients_for_route(
         if client is not None:
             clients.append(client)
     return clients
-
 
 def funding_client_for_venue(
     venue: str,
@@ -2169,7 +1493,6 @@ def funding_client_for_venue(
     except TypeError:
         return factory()
 
-
 def count_hot_routes(
     routes: list[dict[str, Any]],
     config: PaperBotConfig,
@@ -2179,7 +1502,6 @@ def count_hot_routes(
         1 for route in routes if route_monitor_decision(route, now, config)["hot"]
     )
 
-
 def count_urgent_routes(
     routes: list[dict[str, Any]],
     config: PaperBotConfig,
@@ -2188,7 +1510,6 @@ def count_urgent_routes(
     return sum(
         1 for route in routes if route_monitor_decision(route, now, config)["urgent"]
     )
-
 
 def route_summary(route: dict[str, Any]) -> dict[str, Any]:
     evidence = route.get("evidence") or {}
@@ -2208,554 +1529,10 @@ def route_summary(route: dict[str, Any]) -> dict[str, Any]:
         "risk_flags": route.get("risk_flags") or [],
     }
 
-
-def ranked_status_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(routes, key=status_route_sort_key, reverse=True)
-
-
-def status_route_sort_key(route: dict[str, Any]) -> tuple[float, float]:
-    evidence = route.get("evidence") or {}
-    live_net = optional_float(evidence.get("current_nowcast_net")) or 0.0
-    threshold = optional_float(evidence.get("actionable_profit_threshold")) or 0.0
-    return live_net, live_net - threshold
-
-
-def status_publishable_candidate(
-    route: dict[str, Any],
-    config: PaperBotConfig,
-) -> bool:
-    if route.get("status") != "paper_candidate":
-        return False
-    evidence = route.get("evidence") or {}
-    live_net = optional_float(evidence.get("current_nowcast_net"))
-    if live_net is None or live_net <= 0:
-        return False
-    return live_net >= required_live_net_profit(route, config)
-
-
-def status_report_message(
-    result: dict[str, Any],
-    routes: list[dict[str, Any]],
-    watch_routes: list[dict[str, Any]],
-    summary: dict[str, Any],
-    config: PaperBotConfig,
-) -> str:
-    candidates = ranked_status_routes(
-        [
-            route
-            for route in routes
-            if status_publishable_candidate(route, config)
-        ]
-    )
-    watched = ranked_status_routes(watch_routes)
-    max_routes = int(config.status_report_max_routes)
-    universe_count = int(result.get("universe_route_count") or 0)
-    route_count = int(result.get("route_count") or 0)
-    full_depth_count = int(result.get("execution_shortlist_count") or route_count)
-    lines = [
-        "<b>Paper Bot STATUS</b>",
-        "",
-        (
-            f"<b>Mode:</b> <code>{tg(result.get('mode'))}</code> | "
-            f"<b>Scan:</b> <code>{tg(result.get('funding_scan_id') or '-')}</code>"
-        ),
-        (
-            f"<b>Candidates: {len(candidates)}</b> | "
-            f"Watch/internal: {len(watch_routes)} | Monitor: {result.get('hot_route_count') or 0} | "
-            f"Urgent: {result.get('urgent_route_count') or 0}"
-        ),
-        (
-            f"<b>Open:</b> {int(summary.get('open_position_count') or 0)} | "
-            f"Closed: {int(summary.get('closed_trade_count') or 0)} | "
-            f"Realized PnL: <b>${float(summary.get('realized_pnl') or 0):.2f}</b>"
-        ),
-    ]
-    if universe_count or full_depth_count:
-        lines.extend(
-            [
-                "",
-                (
-                    f"<b>Market scan</b>\n"
-                    f"Universe screened: <b>{universe_count:,}</b>\n"
-                    f"Full-depth modeled: <b>{full_depth_count:,}</b>"
-                ),
-            ]
-        )
-    if candidates:
-        lines.extend(["", "<b>Candidates</b>"])
-        lines.extend(
-            status_route_line(route, index)
-            for index, route in enumerate(candidates[:max_routes], start=1)
-        )
-        hidden = len(candidates) - max_routes
-        if hidden > 0:
-            lines.append(f"<i>...and {hidden} more</i>")
-    else:
-        lines.extend(["", "<b>Candidates:</b> нет"])
-        if watched:
-            lines.append(
-                "<i>Watch routes are hidden from status: they are monitored "
-                "internally but are not trade candidates.</i>"
-            )
-    return "\n".join(lines)
-
-
-def status_route_line(route: dict[str, Any], index: int) -> str:
-    evidence = route.get("evidence") or {}
-    legs = route.get("legs") or []
-    long_leg = leg_by_side(legs, "long") or {}
-    short_leg = leg_by_side(legs, "short") or {}
-    now = datetime.now(UTC)
-    long_lead = lead_seconds(long_leg.get("next_funding_at"), now)
-    short_lead = lead_seconds(short_leg.get("next_funding_at"), now)
-    live_net = float(evidence.get("current_nowcast_net") or 0.0)
-    threshold = float(evidence.get("actionable_profit_threshold") or 0.0)
-    long_interval = format_interval_hours(long_leg.get("funding_interval_hours"))
-    short_interval = format_interval_hours(short_leg.get("funding_interval_hours"))
-    long_hourly = optional_float(long_leg.get("hourly_funding_rate"))
-    short_hourly = optional_float(short_leg.get("hourly_funding_rate"))
-    long_hourly_label = f"{long_hourly * 100:.4f}%/h" if long_hourly is not None else ""
-    short_hourly_label = f"{short_hourly * 100:.4f}%/h" if short_hourly is not None else ""
-    long_interval_rate = optional_float(long_leg.get("funding_rate"))
-    short_interval_rate = optional_float(short_leg.get("funding_rate"))
-    long_iv = max(1.0, float(long_leg.get("funding_interval_hours") or 1.0))
-    short_iv = max(1.0, float(short_leg.get("funding_interval_hours") or 1.0))
-    long_rate_display = format_rate(long_interval_rate * long_iv if long_interval_rate is not None else None)
-    short_rate_display = format_rate(short_interval_rate * short_iv if short_interval_rate is not None else None)
-    return (
-        f"\n<b>{index}. {tg(route.get('canonical_asset'))}</b>\n"
-        f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
-        f"{long_rate_display}/{long_interval}"
-        f"{f' ({long_hourly_label})' if long_hourly_label else ''}\n"
-        f"SHORT <code>{tg(route.get('short_venue'))} {tg(route.get('short_symbol'))}</code> "
-        f"{short_rate_display}/{short_interval}"
-        f"{f' ({short_hourly_label})' if short_hourly_label else ''}\n"
-        f"Next net PnL after costs: <b>{format_signed_money(live_net)}</b> | "
-        f"Min: ${threshold:.2f}\n"
-        f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"
-    )
-
-
-def lead_seconds(value: Any, now: datetime) -> float | None:
-    settlement = parse_iso(value)
-    if settlement is None:
-        return None
-    return (settlement - now).total_seconds()
-
-
-def position_summary(position: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "funding_paper_position_id": position.get("funding_paper_position_id"),
-        "entry_key": position.get("entry_key"),
-        "route_key": position.get("route_key"),
-        "canonical_asset": position.get("canonical_asset"),
-        "long": f"{position.get('long_venue')} {position.get('long_symbol')}",
-        "short": f"{position.get('short_venue')} {position.get('short_symbol')}",
-        "expected_live_net": position.get("expected_live_net"),
-        "max_settlement_at": position.get("max_settlement_at"),
-    }
-
-
-def funding_rate_lines(route: dict[str, Any]) -> str:
-    legs = route.get("legs") or []
-    lines: list[str] = []
-    for side in ("long", "short"):
-        leg = leg_by_side(legs, side) or {}
-        venue = leg.get("venue") or route.get(f"{side}_venue") or ""
-        rate = optional_float(leg.get("funding_rate"))
-        interval = optional_float(leg.get("funding_interval_hours"))
-        hourly = optional_float(leg.get("hourly_funding_rate"))
-        if rate is None:
-            continue
-        interval_label = format_interval_hours(interval) if interval else "?"
-        interval_rate = rate * max(1.0, interval or 1.0)
-        hourly_label = f"{hourly * 100:.4f}%/h" if hourly is not None else "?"
-        lines.append(
-            f"{side.upper()} <code>{tg(venue)}</code>: "
-            f"{format_rate(interval_rate)}/{interval_label} ({hourly_label})"
-        )
-    return "\n".join(lines)
-
-
-def armed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
-    leads = decision.get("lead_seconds") or {}
-    rates = funding_rate_lines(route)
-    return (
-        "<b>Paper Bot ARMED</b>\n\n"
-        f"<b>{tg(route['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(route['long_venue'])}</code> / "
-        f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
-        f"{rates}\n"
-        f"Live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
-        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
-        f"До funding: long {format_seconds(leads.get('long'))}, "
-        f"short {format_seconds(leads.get('short'))}"
-    )
-
-
-def open_message(
-    route: dict[str, Any],
-    decision: dict[str, Any],
-    position: dict[str, Any],
-) -> str:
-    leads = decision.get("lead_seconds") or {}
-    rates = funding_rate_lines(route)
-    return (
-        "<b>Paper Bot OPEN</b>\n\n"
-        f"<b>{tg(route['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(route['long_venue'])}</code> / "
-        f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
-        f"{rates}\n"
-        f"Size: <b>${float(position.get('target_notional') or 0):.0f}</b> per leg\n"
-        f"Expected live net: <b>${float(position.get('expected_live_net') or 0):.2f}</b>\n"
-        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
-        f"До funding: long {format_seconds(leads.get('long'))}, "
-        f"short {format_seconds(leads.get('short'))}"
-    )
-
-
-def skipped_open_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
-    return (
-        "<b>Paper Bot SKIP OPEN</b>\n\n"
-        f"<b>{tg(route['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(route['long_venue'])}</code> / "
-        f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
-        f"Fresh live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
-        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
-        f"Reasons: {tg(', '.join(decision.get('reasons') or []) or 'recheck failed')}"
-    )
-
-
-def disarmed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
-    return (
-        "<b>Paper Bot DISARMED</b>\n\n"
-        f"<b>{tg(route.get('canonical_asset'))}</b>\n"
-        f"LONG <code>{tg(route.get('long_venue'))}</code> / "
-        f"SHORT <code>{tg(route.get('short_venue'))}</code>\n\n"
-        f"Fresh live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
-        f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
-        f"Reasons: {tg(', '.join(decision.get('reasons') or []) or 'not hot')}"
-    )
-
-
-def pending_message(position: dict[str, Any], result: dict[str, Any]) -> str:
-    return (
-        "<b>Paper Bot SETTLEMENT PENDING</b>\n\n"
-        f"<b>{tg(position['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(position['long_venue'])}</code> / "
-        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
-        f"Причина: {tg(result.get('reason'))}\n"
-        "Жду публикацию funding history."
-    )
-
-
-def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
-    settlement = accrual.get("settlement") or {}
-    quality = (
-        "Начисление предварительное: одна или обе funding history еще не "
-        "опубликованы, использована ставка на входе."
-        if accrual.get("history_missing_fallback")
-        else "Начисление финальное: использована опубликованная funding history."
-    )
-    hold_decision = accrual.get("hold_decision") or {}
-    return (
-        "<b>Paper Bot HOLD</b>\n\n"
-        f"<b>{tg(position['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(position['long_venue'])}</code> / "
-        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
-        "Funding settlement начислен, позиция остается открытой: "
-        "арбитражное окно все еще положительное.\n"
-        f"Settlement PnL: <b>{format_money(accrual.get('funding_pnl_delta'))}</b>\n"
-        f"Current live net: {format_money(hold_decision.get('live_net'))}\n"
-        f"Next settlement: {tg(accrual.get('next_max_settlement_at'))}\n"
-        f"{tg(quality)}\n"
-        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
-        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
-    )
-
-
-def close_message(position: dict[str, Any], close: dict[str, Any]) -> str:
-    settlement = close.get("settlement") or {}
-    quality = (
-        "Качество PnL: предварительный расчет. Одна или обе биржи еще не "
-        "опубликовали funding history, поэтому пока использованы ставки на входе. "
-        "После публикации бот пересчитает PnL."
-        if settlement.get("history_missing_fallback")
-        else "Качество PnL: финальный расчет по опубликованной funding history."
-    )
-    window = close_window_message(close)
-    details = close_decision_details_message(position, close)
-    return (
-        "<b>Paper Bot CLOSE</b>\n\n"
-        f"<b>{tg(position['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(position['long_venue'])}</code> / "
-        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
-        f"Причина закрытия: {tg(close_reason_message(close.get('close_reason')))}\n"
-        f"{tg(window)}\n"
-        f"{details}\n\n"
-        f"Funding PnL: <b>${float(close.get('actual_funding_pnl') or 0):.2f}</b>\n"
-        f"Basis PnL: <b>${float(close.get('actual_basis_pnl') or 0):.2f}</b>\n"
-        f"Execution cost: ${float(close.get('actual_execution_cost') or 0):.2f}\n"
-        f"Net PnL: <b>${float(close.get('actual_net_pnl') or 0):.2f}</b>\n"
-        f"{tg(quality)}\n"
-        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
-        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
-    )
-
-
-def close_decision_details_message(
-    position: dict[str, Any],
-    close: dict[str, Any],
-) -> str:
-    entry_legs = position.get("entry_legs") or []
-    close_legs = close.get("close_legs") or []
-    hold_decision = close.get("hold_decision") or {}
-    close_evidence = close.get("close_evidence") or {}
-    live_net = optional_float(hold_decision.get("live_net"))
-    if live_net is None:
-        live_net = optional_float(close_evidence.get("current_nowcast_net"))
-    required = optional_float(close_evidence.get("actionable_profit_threshold"))
-    route_age = optional_float(hold_decision.get("route_snapshot_age_seconds"))
-    reasons = hold_reason_labels(hold_decision.get("reasons") or [])
-    lines = ["", "<b>Детали решения</b>"]
-    if live_net is not None:
-        need_text = (
-            f"; нужно >= {format_money(required)}"
-            if required is not None
-            else ""
-        )
-        lines.append(f"Fresh live net: <b>{format_signed_money(live_net)}</b>{need_text}.")
-    if reasons:
-        lines.append(f"Триггеры: {tg('; '.join(reasons))}.")
-    if route_age is not None:
-        lines.append(f"Возраст fresh snapshot: {route_age:.0f}s.")
-    if entry_legs:
-        lines.append(
-            "На входе: "
-            + " | ".join(
-                funding_leg_compact_line(leg)
-                for leg in sorted(entry_legs, key=leg_side_sort)
-            )
-            + "."
-        )
-    if close_legs:
-        lines.append(
-            "После settlement: "
-            + " | ".join(
-                funding_leg_compact_line(leg)
-                for leg in sorted(close_legs, key=leg_side_sort)
-            )
-            + "."
-        )
-        mismatch = funding_settlement_mismatch_line(close_legs)
-        if mismatch:
-            lines.append(mismatch)
-    return "\n".join(lines)
-
-
-def leg_side_sort(leg: dict[str, Any]) -> int:
-    return 0 if str(leg.get("side") or "").lower() == "long" else 1
-
-
-def funding_leg_compact_line(leg: dict[str, Any]) -> str:
-    side = str(leg.get("side") or "").upper()
-    venue = leg.get("venue")
-    symbol = leg.get("symbol")
-    interval = format_interval_hours(leg.get("funding_interval_hours"))
-    hourly = optional_float(leg.get("funding_rate"))
-    iv = max(1.0, float(leg.get("funding_interval_hours") or 1.0))
-    interval_rate = hourly * iv if hourly is not None else None
-    return (
-        f"{tg(side)} <code>{tg(venue)} {tg(symbol)}</code> "
-        f"{format_rate(interval_rate)}/{interval}, "
-        f"next {tg(format_datetime_utc(leg.get('next_funding_at')))}"
-    )
-
-
-def funding_settlement_mismatch_line(legs: list[dict[str, Any]]) -> str:
-    long_leg = leg_by_side(legs, "long") or {}
-    short_leg = leg_by_side(legs, "short") or {}
-    long_next = parse_iso(long_leg.get("next_funding_at"))
-    short_next = parse_iso(short_leg.get("next_funding_at"))
-    long_interval = optional_float(long_leg.get("funding_interval_hours"))
-    short_interval = optional_float(short_leg.get("funding_interval_hours"))
-    notes: list[str] = []
-    if long_next and short_next and abs((long_next - short_next).total_seconds()) > 60:
-        notes.append(
-            "следующие funding settlement не совпадают: "
-            f"long {tg(format_datetime_utc(long_next.isoformat()))}, "
-            f"short {tg(format_datetime_utc(short_next.isoformat()))}"
-        )
-    if (
-        long_interval is not None
-        and short_interval is not None
-        and abs(long_interval - short_interval) > 1e-9
-    ):
-        notes.append(
-            "интервалы funding разные: "
-            f"long {format_interval_hours(long_interval)}, "
-            f"short {format_interval_hours(short_interval)}"
-        )
-    if not notes:
-        return ""
-    return (
-        "Важно: "
-        + "; ".join(notes)
-        + ". Следующее удержание уже считается новой проверкой окна, "
-        "а не автоматическим продолжением старой сделки."
-    )
-
-
-def hold_reason_labels(reasons: list[Any]) -> list[str]:
-    labels = {
-        "live_net_not_positive": "fresh live net стал <= 0",
-        "live_net_missing": "не удалось проверить fresh live net",
-        "data_quality_issue": "свежие данные маршрута несовместимы",
-        "latest_route_missing": "нет свежего route snapshot",
-        "route_snapshot_stale": "fresh snapshot устарел",
-        "route_snapshot_age_missing": "непонятен возраст fresh snapshot",
-        "missing_route_legs": "не хватает одной из ног маршрута",
-        "long_next_settlement_missing": "не найден следующий settlement long-ноги",
-        "short_next_settlement_missing": "не найден следующий settlement short-ноги",
-        "long_next_settlement_not_future": "следующий settlement long-ноги уже прошел",
-        "short_next_settlement_not_future": "следующий settlement short-ноги уже прошел",
-        "funding_rate_inverted": "funding rate инвертировался: short-нога стала дешевле long-ноги",
-    }
-    return [labels.get(str(reason), str(reason)) for reason in reasons]
-
-
-def reprice_message(position: dict[str, Any], payload: dict[str, Any]) -> str:
-    settlement = position.get("settlement") or {}
-    quality = (
-        "Качество PnL: частичный пересчет. Одна из бирж все еще не "
-        "опубликовала funding history, поэтому оставшаяся нога рассчитана по "
-        "ставке на входе."
-        if payload.get("history_missing_fallback")
-        else "Качество PnL: финальный пересчет по опубликованной funding history."
-    )
-    return (
-        "<b>Paper Bot PnL REPRICED</b>\n\n"
-        f"<b>{tg(position.get('canonical_asset'))}</b>\n"
-        f"LONG <code>{tg(position.get('long_venue'))}</code> / "
-        f"SHORT <code>{tg(position.get('short_venue'))}</code>\n\n"
-        "Биржи опубликовали funding history, бот пересчитал результат.\n"
-        f"Funding PnL: <b>{format_signed_money(position.get('actual_funding_pnl'))}</b>\n"
-        f"Basis PnL: <b>{format_signed_money(position.get('actual_basis_pnl'))}</b>\n"
-        f"Execution cost: {format_money(position.get('actual_execution_cost'))}\n"
-        f"Net PnL: <b>{format_signed_money(position.get('actual_net_pnl'))}</b>\n"
-        f"{tg(quality)}\n"
-        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
-        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
-    )
-
-
-def close_reason_message(value: Any) -> str:
-    return {
-        "arbitrage_window_closed_live_net_non_positive": (
-            "арбитражное окно закрылось, live net стал неположительным"
-        ),
-        "arbitrage_window_data_quality_issue": (
-            "свежие данные маршрута выглядят несовместимыми"
-        ),
-        "arbitrage_window_unverifiable_route_missing": (
-            "не удалось получить свежий route snapshot"
-        ),
-        "arbitrage_window_unverifiable_route_stale": (
-            "route snapshot устарел, продолжение окна не подтверждено"
-        ),
-        "arbitrage_window_unverifiable_next_settlement_missing": (
-            "не удалось определить следующий funding settlement"
-        ),
-        "arbitrage_window_unverifiable_live_net_missing": (
-            "не удалось проверить live net"
-        ),
-        "arbitrage_window_funding_rate_inverted": (
-            "funding rate инвертировался: арбитражное окно закрылось"
-        ),
-        "arbitrage_window_unverifiable": (
-            "продолжение окна не подтверждено"
-        ),
-    }.get(str(value or ""), str(value or "продолжение окна не подтверждено"))
-
-
-def close_window_message(close: dict[str, Any]) -> str:
-    evidence = close.get("close_evidence") or {}
-    live_net = optional_float(evidence.get("current_nowcast_net"))
-    if live_net is None:
-        if close.get("close_funding_route_id"):
-            return "Состояние окна при закрытии: close-scan был, но live net не рассчитан."
-        return "Состояние окна при закрытии: свежий route snapshot не найден."
-    if live_net > 0:
-        return (
-            "Состояние окна при закрытии: окно еще выглядело положительным, "
-            f"live net {format_money(live_net)}."
-        )
-    if live_net < 0:
-        return (
-            "Состояние окна при закрытии: окно уже не выглядело положительным, "
-            f"live net {format_money(live_net)}."
-        )
-    return "Состояние окна при закрытии: live net около $0.00."
-
-
-def format_money(value: Any) -> str:
-    try:
-        return f"${float(value):.2f}"
-    except (TypeError, ValueError):
-        return "-"
-
-
-def format_signed_money(value: Any) -> str:
-    try:
-        amount = float(value)
-    except (TypeError, ValueError):
-        return "-"
-    sign = "+" if amount > 0 else ""
-    return f"{sign}${amount:.2f}" if amount >= 0 else f"-${abs(amount):.2f}"
-
-
-def tg(value: Any) -> str:
-    if value is None:
-        return "-"
-    return html_escape(str(value), quote=False)
-
-
-def format_seconds(value: Any) -> str:
-    if value is None:
-        return "-"
-    seconds = max(0, int(float(value)))
-    minutes, rest = divmod(seconds, 60)
-    return f"{minutes}m {rest}s"
-
-
-def format_datetime_utc(value: Any) -> str:
-    timestamp = parse_iso(value)
-    if timestamp is None:
-        return "-"
-    return timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def format_interval_hours(value: Any) -> str:
-    hours = optional_float(value)
-    if hours is None:
-        return "-"
-    if abs(hours - round(hours)) < 1e-9:
-        return f"{int(round(hours))}h"
-    return f"{hours:.2f}h"
-
-
-def format_rate(value: Any) -> str:
-    try:
-        return f"{float(value) * 100:.4f}%"
-    except (TypeError, ValueError):
-        return "-"
-
-
 def serializable_config(config: PaperBotConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload["export_dir"] = str(config.export_dir)
     return payload
-
 
 def export_funding_paper_csv(
     store: SQLiteStore,
@@ -2779,7 +1556,6 @@ def export_funding_paper_csv(
     write_csv(outputs["equity"], dashboard["equity"])
     return outputs
 
-
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -2796,7 +1572,6 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     for key in fieldnames
                 }
             )
-
 
 def flatten_positions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     flattened = []
@@ -2829,7 +1604,6 @@ def flatten_positions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     return flattened
 
-
 def flatten_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -2845,13 +1619,6 @@ def flatten_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for row in rows
     ]
-
-
-def csv_value(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return str(value)
-    return value
-
 
 # Backward-compatible aliases
 FundingPaperTrader = PaperBot
