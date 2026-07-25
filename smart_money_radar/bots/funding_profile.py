@@ -43,7 +43,7 @@ class FundingBotProfile:
 
     # Spread arb
     spread_arb_max_hold_hours: float = 4.0
-    spread_arb_convergence_threshold: float = 0.3
+    spread_arb_convergence_threshold: float = 0.5
     spread_arb_inversion_threshold: float = 0.5
 
     # Entry timing (funding carry)
