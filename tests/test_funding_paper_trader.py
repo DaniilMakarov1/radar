@@ -152,7 +152,6 @@ def ensure_btc_instruments(store: SQLiteStore, observed_at: str) -> None:
 def test_entry_requires_both_legs_inside_final_entry_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
-        entry_window_seconds=180,
         entry_min_lead_seconds=30,
         entry_max_lead_seconds=60,
     ).validated()
@@ -186,7 +185,7 @@ def test_entry_requires_both_legs_inside_final_entry_window() -> None:
 
 def test_default_entry_window_targets_final_fifteen_seconds() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
-    config = PaperBotConfig(entry_window_seconds=180).validated()
+    config = PaperBotConfig().validated()
 
     too_early = route_entry_decision(
         paper_route(now, long_lead=17, short_lead=12),
@@ -253,7 +252,6 @@ def test_final_recheck_freeze_does_not_start_before_fifteen_second_boundary() ->
 def test_entry_rejects_stale_snapshot_inside_final_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
-        entry_window_seconds=180,
         entry_min_lead_seconds=0,
         entry_max_lead_seconds=15,
         max_entry_snapshot_age_seconds=30,
@@ -273,7 +271,6 @@ def test_entry_rejects_stale_snapshot_inside_final_window() -> None:
 def test_entry_requires_route_actionable_profit_threshold() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
-        entry_window_seconds=180,
         entry_min_lead_seconds=30,
         entry_max_lead_seconds=60,
     ).validated()
@@ -1145,7 +1142,6 @@ def test_next_sleep_uses_three_speed_monitoring(tmp_path) -> None:
         config=PaperBotConfig(
             scan_interval_seconds=300,
             monitor_interval_seconds=120,
-            hot_interval_seconds=10,
         ),
     )
 
@@ -1153,21 +1149,21 @@ def test_next_sleep_uses_three_speed_monitoring(tmp_path) -> None:
     assert trader.next_sleep_seconds({"hot_route_count": 1}) == 120
     assert (
         trader.next_sleep_seconds({"hot_route_count": 1, "urgent_route_count": 1})
-        == 10
+        == 6
     )
-    assert trader.next_sleep_seconds({"pending_count": 1}) == 10
-    assert trader.next_sleep_seconds({"open_position_count": 1}) == 10
+    assert trader.next_sleep_seconds({"pending_count": 1}) == 6
+    assert trader.next_sleep_seconds({"open_position_count": 1}) == 6
 
 
 def test_monitor_route_is_urgent_only_inside_entry_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
-        entry_window_seconds=180,
         arm_window_seconds=900,
+        entry_max_lead_seconds=15,
     ).validated()
 
     monitored = route_monitor_decision(paper_route(now, 600, 540), now, config)
-    urgent = route_monitor_decision(paper_route(now, 120, 100), now, config)
+    urgent = route_monitor_decision(paper_route(now, 12, 10), now, config)
 
     assert monitored["hot"]
     assert not monitored["urgent"]
@@ -1182,11 +1178,10 @@ def test_urgent_route_keeps_focused_loop_after_base_interval(tmp_path) -> None:
     trader = PaperBot(
         store,
         config=PaperBotConfig(
-            entry_window_seconds=180,
             scan_interval_seconds=300,
         ),
     )
-    trader.hot_routes["route-1"] = paper_route(now, 120, 110)
+    trader.hot_routes["route-1"] = paper_route(now, 12, 10)
     trader.last_full_scan_monotonic = time.monotonic() - 300
 
     assert trader.should_run_hot_iteration()

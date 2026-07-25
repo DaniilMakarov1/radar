@@ -136,7 +136,6 @@ FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 class PaperBotConfig:
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
-    entry_window_seconds: int = 180
     entry_min_lead_seconds: int = 0
     entry_max_lead_seconds: int = 15
     arm_window_seconds: int = 900
@@ -148,7 +147,7 @@ class PaperBotConfig:
     min_live_net_profit: float = 0.0
     scan_interval_seconds: int = 300
     monitor_interval_seconds: int = 120
-    hot_interval_seconds: int = 10
+    hot_interval_seconds: int = 6
     hot_route_recheck_workers: int = 6
     status_report_interval_seconds: int = 1_800
     status_report_max_routes: int = 5
@@ -166,7 +165,6 @@ class PaperBotConfig:
         return PaperBotConfig(
             venue_starting_balance=max(100.0, float(self.venue_starting_balance)),
             target_notional_per_leg=max(50.0, float(self.target_notional_per_leg)),
-            entry_window_seconds=max(15, min(int(self.entry_window_seconds), 900)),
             entry_min_lead_seconds=max(
                 0,
                 min(int(self.entry_min_lead_seconds), 300),
@@ -176,7 +174,7 @@ class PaperBotConfig:
                 min(int(self.entry_max_lead_seconds), 900),
             ),
             arm_window_seconds=max(
-                int(self.entry_window_seconds),
+                60,
                 min(int(self.arm_window_seconds), 7_200),
             ),
             final_recheck_freeze_seconds=max(
@@ -240,7 +238,6 @@ class PaperBotConfig:
     def normalized_entry_leads(self) -> "PaperBotConfig":
         minimum = max(0, int(self.entry_min_lead_seconds))
         maximum = max(minimum, int(self.entry_max_lead_seconds))
-        maximum = min(maximum, int(self.entry_window_seconds))
         minimum = min(minimum, maximum)
         return PaperBotConfig(
             **{

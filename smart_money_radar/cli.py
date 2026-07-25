@@ -609,7 +609,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=1_000.0,
     )
     funding_paper_trader.add_argument("--target-notional", type=float, default=500.0)
-    funding_paper_trader.add_argument("--entry-window-seconds", type=int, default=180)
     funding_paper_trader.add_argument("--entry-min-lead-seconds", type=int, default=0)
     funding_paper_trader.add_argument("--entry-max-lead-seconds", type=int, default=15)
     funding_paper_trader.add_argument("--arm-window-seconds", type=int, default=900)
@@ -858,7 +857,6 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
     return PaperBotConfig(
         venue_starting_balance=args.venue_starting_balance,
         target_notional_per_leg=args.target_notional,
-        entry_window_seconds=args.entry_window_seconds,
         entry_min_lead_seconds=args.entry_min_lead_seconds,
         entry_max_lead_seconds=args.entry_max_lead_seconds,
         arm_window_seconds=args.arm_window_seconds,

@@ -85,7 +85,6 @@ def route_entry_decision(
         "armed": armed,
         "reasons": reasons,
         "lead_seconds": leads,
-        "entry_window_seconds": config.entry_window_seconds,
         "entry_min_lead_seconds": config.entry_min_lead_seconds,
         "entry_max_lead_seconds": config.entry_max_lead_seconds,
         "arm_window_seconds": config.arm_window_seconds,
@@ -142,7 +141,7 @@ def route_monitor_decision(
     urgent = bool(
         hot
         and all(
-            lead is not None and 0 <= lead <= config.entry_window_seconds
+            lead is not None and 0 <= lead <= config.entry_max_lead_seconds
             for lead in leads.values()
         )
     )
