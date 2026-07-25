@@ -2,6 +2,21 @@
   "tools": {
     "approvalMode": "yolo"
   },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(write_file|edit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$QWEN_PROJECT_DIR/.qwen/hooks/auto-commit.sh",
+            "name": "auto-commit",
+            "timeout": 15000
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "allow": [
       "Bash(python3 *)",
