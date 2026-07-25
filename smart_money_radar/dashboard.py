@@ -15,19 +15,15 @@ from smart_money_radar.analytics import (
     run_saved_query,
     run_sql,
 )
-from smart_money_radar.backtest import run_wallet_walk_forward
 from smart_money_radar.config import (
     DEFAULT_DB_PATH,
     api_key_status,
     x_social_gate_enabled,
 )
-from smart_money_radar.decision import build_capital_readiness
 from smart_money_radar.dashboard_dune import (
     DUNE_ANALYTICS_EXECUTION_RETENTION,
     build_dune_overview,
     dashboard_int,
-    dune_local_scan_config,
-    run_dune_local_scan_job,
 )
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.presentation import (
@@ -37,15 +33,11 @@ from smart_money_radar.funding.presentation import (
 from smart_money_radar.funding.service import (
     run_funding_scan,
 )
-from smart_money_radar.live_radar import recompute_live_signals, run_base_live_scan
 from smart_money_radar.prediction.service import (
     PredictionScanConfig,
     run_prediction_scan,
 )
-from smart_money_radar.ingestion.dune import DuneAPIError, DuneClient
-from smart_money_radar.scoring.wallets import MODEL_VERSION, score_wallet_rows
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
-from smart_money_radar.wallet_intelligence import rebuild_wallet_clusters
 
 
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
@@ -112,36 +104,6 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/overview":
                 self.send_json(build_app_overview(store))
-                return
-            if path == "/api/wallets":
-                self.send_json(
-                    store.wallet_score_rows(
-                        model_version=MODEL_VERSION,
-                        limit=query_limit(query, 300, 2000),
-                    )
-                )
-                return
-            if path == "/api/clusters":
-                self.send_json(
-                    store.dashboard_clusters(
-                        model_version=MODEL_VERSION,
-                        limit=query_limit(query, 100, 200),
-                    )
-                )
-                return
-            if path == "/api/backtest":
-                self.send_json(
-                    {
-                        "wallet": store.latest_backtest("wallet_walk_forward") or {},
-                        "negative": store.latest_backtest(
-                            "token_candidate_negative_control"
-                        )
-                        or {},
-                        "negative_candidates": store.latest_negative_control_candidates(
-                            limit=100
-                        ),
-                    }
-                )
                 return
             if path == "/api/coverage":
                 self.send_json(store.dashboard_coverage())
@@ -247,46 +209,6 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            if path == "/api/actions/recompute":
-                try:
-                    result = recompute_research(store)
-                except Exception as exc:
-                    self.send_json(
-                        {"status": "failed", "error": str(exc)},
-                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                    return
-                self.send_json({"status": "success", **result})
-                return
-
-            if path == "/api/actions/live-scan":
-                with job_lock:
-                    if active_job["job_id"] is not None or funding_state["running"]:
-                        self.send_json(
-                            {
-                                "status": "already_running",
-                                "job_id": active_job["job_id"],
-                            },
-                            status=HTTPStatus.CONFLICT,
-                        )
-                        return
-                    job_id = store.create_app_job(
-                        "base_live_scan",
-                        "Preparing qualified wallet scan",
-                    )
-                    active_job["job_id"] = job_id
-                    thread = threading.Thread(
-                        target=run_live_scan_job,
-                        args=(store, job_id, active_job, job_lock),
-                        daemon=True,
-                    )
-                    thread.start()
-                self.send_json(
-                    {"status": "queued", "job_id": job_id},
-                    status=HTTPStatus.ACCEPTED,
-                )
-                return
-
             if path == "/api/actions/prediction-scan":
                 with job_lock:
                     if active_job["job_id"] is not None or funding_state["running"]:
@@ -487,44 +409,6 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                 )
                 return
 
-            if path == "/api/actions/dune-local-scan":
-                try:
-                    payload = self.read_json_body()
-                    config = dune_local_scan_config(payload)
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    self.send_json(
-                        {"status": "invalid_request", "error": str(exc)},
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-                    return
-                with job_lock:
-                    if active_job["job_id"] is not None or funding_state["running"]:
-                        self.send_json(
-                            {
-                                "status": "already_running",
-                                "job_id": active_job["job_id"],
-                                "funding_running": bool(funding_state["running"]),
-                            },
-                            status=HTTPStatus.CONFLICT,
-                        )
-                        return
-                    job_id = store.create_app_job(
-                        "dune_local_base_scan",
-                        "Preparing local Base analytics ingestion",
-                    )
-                    active_job["job_id"] = job_id
-                    thread = threading.Thread(
-                        target=run_dune_local_scan_job,
-                        args=(store, job_id, active_job, job_lock, config),
-                        daemon=True,
-                    )
-                    thread.start()
-                self.send_json(
-                    {"status": "queued", "job_id": job_id},
-                    status=HTTPStatus.ACCEPTED,
-                )
-                return
-
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
         def send_html(self, html_body: str) -> None:
@@ -610,6 +494,7 @@ def funding_paper_csv_fields() -> list[str]:
         "Base qty",
         "Expected net $",
         "Funding PnL $",
+        "Basis PnL $",
         "Costs $",
         "Net PnL $",
         "Причина закрытия",
@@ -709,38 +594,19 @@ def funding_query_horizon(
 def build_app_overview(store: SQLiteStore) -> dict[str, object]:
     summary = store.dashboard_summary()
     registry = store.registry_summary()
-    wallet_summary = store.wallet_score_summary(
-        model_version=MODEL_VERSION,
-        limit=10,
-    )
-    latest_backtest = store.latest_backtest("wallet_walk_forward")
-    latest_negative_backtest = store.latest_backtest(
-        "token_candidate_negative_control"
-    )
     latest_job = store.latest_app_job()
     api_status = api_key_status()
-    research = store.research_dashboard()
-    capital_readiness = build_capital_readiness(
-        research,
-        identity=store.identity_coverage_summary(),
-        shadow=store.signal_shadow_summary(),
-    )
     return {
         **summary,
-        "model_version": MODEL_VERSION,
         "spot_backtest_target_count": registry["backtest_targets"],
         "token_contract_count": registry["token_contracts"],
-        "wallet_labels": wallet_summary["by_label"],
         "wallet_entities": store.wallet_entity_summary("base"),
-        "latest_backtest": latest_backtest,
-        "latest_negative_backtest": latest_negative_backtest,
         "latest_job": latest_job,
         "dune_ready": api_status["DUNE_API_KEY"],
         "moralis_ready": api_status["MORALIS_API_KEY"],
         "hypersync_ready": api_status["HYPERSYNC_API_TOKEN"],
         "blockscout_mode": "public_base_instance",
         "x_social_gate_enabled": x_social_gate_enabled(),
-        "capital_readiness": capital_readiness,
     }
 
 
@@ -749,93 +615,7 @@ def build_research_overview(store: SQLiteStore) -> dict[str, object]:
     result["dune_executions"] = store.dashboard_dune_executions(limit=5)
     result["identity"] = store.identity_coverage_summary()
     result["shadow"] = store.signal_shadow_summary()
-    result["capital_readiness"] = build_capital_readiness(
-        result,
-        identity=result["identity"],
-        shadow=result["shadow"],
-    )
-    try:
-        usage = DuneClient(timeout_seconds=8).usage()
-        periods = usage.get("billing_periods") or []
-        current = periods[-1] if periods else {}
-        credits_used = float(current.get("credits_used") or 0)
-        credits_included = float(current.get("credits_included") or 0)
-        credits_remaining = max(0.0, credits_included - credits_used)
-        result["dune_usage"] = {
-            "available": True,
-            "credits_used": credits_used,
-            "credits_included": credits_included,
-            "credits_remaining": credits_remaining,
-            "included_credits_exhausted": bool(
-                credits_included > 0 and credits_used >= credits_included
-            ),
-            "execution_blocked": credits_remaining < 25,
-            "minimum_execution_reserve": 25,
-            "period_start": current.get("start_date"),
-            "period_end": current.get("end_date"),
-        }
-    except DuneAPIError as exc:
-        result["dune_usage"] = {
-            "available": False,
-            "error": str(exc),
-        }
     return result
-
-
-def recompute_research(store: SQLiteStore) -> dict[str, object]:
-    rows = store.pre_listing_wallet_buy_rows()
-    holding_rows = store.wallet_holding_metric_rows()
-    scores = score_wallet_rows(
-        rows,
-        holding_rows=holding_rows,
-        dataset_target_count=store.observed_target_count(),
-    )
-    wallet_count = store.upsert_wallet_scores(scores)
-    cluster_summary = rebuild_wallet_clusters(store)
-    backtest = run_wallet_walk_forward(store)
-    signal_count = 0
-    if store.latest_radar_observations(limit=1):
-        signal_count = len(recompute_live_signals(store))
-    return {
-        "wallet_count": wallet_count,
-        "backtest_run_id": backtest["backtest_run_id"],
-        "signal_count": signal_count,
-        "cluster_summary": cluster_summary,
-    }
-
-
-def run_live_scan_job(
-    store: SQLiteStore,
-    job_id: int,
-    active_job: dict[str, int | None],
-    job_lock: threading.Lock,
-) -> None:
-    try:
-        store.update_app_job(
-            job_id,
-            status="running",
-            progress=0.1,
-            message="Scanning recent Base DEX activity",
-        )
-        result = run_base_live_scan(store)
-        store.update_app_job(
-            job_id,
-            status="success",
-            progress=1.0,
-            message="Live Radar scan completed",
-            result=result,
-        )
-    except Exception as exc:
-        store.update_app_job(
-            job_id,
-            status="failed",
-            progress=1.0,
-            message="Live Radar scan failed",
-            error=str(exc),
-        )
-    finally:
-        with job_lock:
-            active_job["job_id"] = None
 
 
 def run_prediction_scan_job(

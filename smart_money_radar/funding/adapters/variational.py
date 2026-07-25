@@ -68,7 +68,7 @@ class VariationalFundingClient:
             if mark_price <= 0:
                 continue
 
-            funding_rate = as_float(raw.get("funding_rate"))
+            funding_rate = as_float(raw.get("funding_rate")) / 100.0
             funding_interval_s = int(as_float(raw.get("funding_interval_s")) or 28800)
             interval_hours = max(funding_interval_s / 3600.0, 1.0)
             hourly_funding_rate = funding_rate / interval_hours

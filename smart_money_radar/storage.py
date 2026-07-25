@@ -125,6 +125,7 @@ class SQLiteStore:
             connection.execute("PRAGMA synchronous = NORMAL")
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             self._ensure_prediction_scan_columns(connection)
+            self._ensure_funding_paper_position_columns(connection)
             self.upsert_chains(connection, CHAINS)
 
     def _ensure_prediction_scan_columns(self, connection: sqlite3.Connection) -> None:
@@ -141,6 +142,21 @@ class SQLiteStore:
                 connection.execute(
                     f"ALTER TABLE prediction_scans ADD COLUMN {name} "
                     "INTEGER NOT NULL DEFAULT 0"
+                )
+
+    def _ensure_funding_paper_position_columns(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(funding_paper_positions)"
+            )
+        }
+        for name in ("entry_cross_spread", "entry_basis_bps", "actual_basis_pnl"):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE funding_paper_positions ADD COLUMN {name} REAL"
                 )
 
     def sqlite_maintenance(
@@ -8865,10 +8881,11 @@ class SQLiteStore:
                     short_reserved_margin, long_settlement_at,
                     short_settlement_at, max_settlement_at,
                     expected_live_gross, expected_live_net,
-                    expected_execution_cost, entry_legs_json,
+                    expected_execution_cost, entry_cross_spread,
+                    entry_basis_bps, entry_legs_json,
                     entry_evidence_json, notes_json
                 )
-                VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position["entry_key"],
@@ -8893,6 +8910,8 @@ class SQLiteStore:
                     float(position.get("expected_live_gross") or 0.0),
                     float(position.get("expected_live_net") or 0.0),
                     float(position.get("expected_execution_cost") or 0.0),
+                    position.get("entry_cross_spread"),
+                    position.get("entry_basis_bps"),
                     json.dumps(position.get("entry_legs") or []),
                     json.dumps(position.get("entry_evidence") or {}, sort_keys=True),
                     json.dumps(position.get("notes") or {}, sort_keys=True),
@@ -8973,6 +8992,7 @@ class SQLiteStore:
                     close_funding_scan_id = ?,
                     close_funding_route_id = ?,
                     actual_funding_pnl = ?,
+                    actual_basis_pnl = ?,
                     actual_execution_cost = ?,
                     actual_net_pnl = ?,
                     close_reason = ?,
@@ -8987,6 +9007,7 @@ class SQLiteStore:
                     close.get("close_funding_scan_id"),
                     close.get("close_funding_route_id"),
                     float(close.get("actual_funding_pnl") or 0.0),
+                    float(close.get("actual_basis_pnl") or 0.0),
                     actual_execution_cost,
                     actual_net_pnl,
                     str(close.get("close_reason") or "settlement_capture_complete"),
@@ -9961,6 +9982,7 @@ def funding_paper_trade_report_row(row: dict[str, Any]) -> dict[str, Any]:
         "Base qty": report_quantity(row.get("base_quantity")),
         "Expected net $": report_money(row.get("expected_live_net")),
         "Funding PnL $": report_money(row.get("actual_funding_pnl")),
+        "Basis PnL $": report_money(row.get("actual_basis_pnl")),
         "Costs $": report_money(row.get("actual_execution_cost")),
         "Net PnL $": report_money(row.get("actual_net_pnl")),
         "Причина закрытия": funding_paper_close_reason_label(

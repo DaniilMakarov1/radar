@@ -190,7 +190,7 @@ class FundingRadarTest(unittest.TestCase):
     def test_http_client_wraps_remote_disconnect_as_venue_error(self) -> None:
         client = FundingHttpClient(max_retries=0)
         with patch(
-            "smart_money_radar.funding.adapters.base.urllib.request.urlopen",
+            "smart_money_radar.http.urllib.request.urlopen",
             side_effect=http.client.RemoteDisconnected("closed"),
         ):
             with self.assertRaises(FundingDataError):
