@@ -8,13 +8,21 @@ from datetime import UTC, datetime, timedelta
 from smart_money_radar.funding.trader import (
     FundingPaperTrader,
     FundingPaperTraderConfig,
+    build_close_payload,
+    build_position_from_route,
     close_decision,
     close_message,
+    compute_spread_snapshot,
+    entry_cross_spread,
     final_recheck_fallback_route,
     funding_client_for_venue,
     funding_leg_pnl,
+    leg_vwap,
+    position_hold_decision,
     route_entry_decision,
     route_monitor_decision,
+    settlement_rate_or_entry,
+    spread_stop_loss_triggered,
 )
 from smart_money_radar.notifications import NotificationResult
 from smart_money_radar.storage import SQLiteStore
@@ -306,6 +314,18 @@ def test_funding_leg_pnl_signs_match_perp_cashflow() -> None:
     assert funding_leg_pnl("long", 500.0, -0.01) == 5.0
     assert funding_leg_pnl("short", 500.0, 0.01) == 5.0
     assert funding_leg_pnl("short", 500.0, -0.01) == -5.0
+
+
+def test_settlement_rate_or_entry_history_vs_fallback() -> None:
+    history_row = {"funding_rate": 0.0004, "funding_interval_hours": 8.0}
+    entry_leg = {"funding_rate": 0.00005, "funding_interval_hours": 8.0}
+    assert settlement_rate_or_entry(history_row, entry_leg) == 0.0004
+    assert settlement_rate_or_entry(None, entry_leg) == 0.00005 * 8.0
+
+
+def test_settlement_rate_or_entry_variational_4h_interval() -> None:
+    entry_leg = {"funding_rate": 0.0001, "funding_interval_hours": 4.0}
+    assert settlement_rate_or_entry(None, entry_leg) == 0.0001 * 4.0
 
 
 def test_open_close_updates_virtual_balances(tmp_path) -> None:
@@ -1336,3 +1356,288 @@ def test_filtered_summary_empty_positions_keeps_original() -> None:
     assert summary["realized_pnl"] == 46.26
     assert summary["closed_trade_count"] == 13
     assert summary["open_position_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Spread / basis risk tracking
+# ---------------------------------------------------------------------------
+
+
+def test_leg_vwap_prefers_evidence_vwap() -> None:
+    leg = {"evidence": {"vwap": 100.0, "mark_price": 99.0}, "mid_price": 98.0}
+    assert leg_vwap(leg) == 100.0
+
+
+def test_leg_vwap_falls_back_to_leg_price() -> None:
+    leg = {"mid_price": 42.0}
+    assert leg_vwap(leg) == 42.0
+
+
+def test_leg_vwap_returns_none_when_no_price() -> None:
+    assert leg_vwap({}) is None
+    assert leg_vwap({"evidence": {"vwap": 0}}) is None
+
+
+def test_entry_cross_spread_computes_long_minus_short() -> None:
+    long_leg = {"evidence": {"vwap": 100.5}}
+    short_leg = {"evidence": {"vwap": 100.2}}
+    assert entry_cross_spread(long_leg, short_leg) == 100.5 - 100.2
+
+
+def test_entry_cross_spread_returns_none_when_price_missing() -> None:
+    assert entry_cross_spread({}, {"evidence": {"vwap": 100.0}}) is None
+
+
+def test_compute_spread_snapshot_tracks_basis_pnl() -> None:
+    position = {
+        "entry_cross_spread": 0.3,
+        "base_quantity": 2.0,
+        "target_notional": 500.0,
+        "entry_basis_bps": -5.0,
+        "expected_execution_cost": 1.0,
+        "notes": {"accrued_funding_pnl": 0.5},
+    }
+    route = {
+        "legs": [
+            {"side": "long", "evidence": {"vwap": 101.0}},
+            {"side": "short", "evidence": {"vwap": 100.5}},
+        ],
+    }
+    snap = compute_spread_snapshot(position, route)
+    assert snap["spread_tracking"] is True
+    assert snap["current_cross_spread"] == 101.0 - 100.5
+    assert abs(snap["unrealized_basis_pnl"] - (0.5 - 0.3) * 2.0) < 1e-9
+    assert snap["entry_basis_bps"] == -5.0
+    assert abs(snap["total_unrealized_pnl"] - (0.5 + 0.4 - 1.0)) < 1e-9
+
+
+def test_compute_spread_snapshot_returns_false_without_route() -> None:
+    position = {"entry_cross_spread": 0.3}
+    snap = compute_spread_snapshot(position, None)
+    assert snap["spread_tracking"] is False
+
+
+def test_compute_spread_snapshot_returns_false_without_entry_spread() -> None:
+    route = {"legs": [{"side": "long", "evidence": {"vwap": 100.0}}]}
+    snap = compute_spread_snapshot({"entry_cross_spread": None}, route)
+    assert snap["spread_tracking"] is False
+
+
+def test_spread_stop_loss_triggers_above_threshold() -> None:
+    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    snapshot = {
+        "spread_tracking": True,
+        "notional": 500.0,
+        "unrealized_basis_pnl": -15.0,
+    }
+    triggered, reason = spread_stop_loss_triggered(snapshot, config)
+    assert triggered
+    assert "basis_stop_loss" in reason
+    assert "300 bps" in reason
+
+
+def test_spread_stop_loss_does_not_trigger_below_threshold() -> None:
+    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    snapshot = {
+        "spread_tracking": True,
+        "notional": 500.0,
+        "unrealized_basis_pnl": -5.0,
+    }
+    triggered, _ = spread_stop_loss_triggered(snapshot, config)
+    assert not triggered
+
+
+def test_spread_stop_loss_ignores_positive_pnl() -> None:
+    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    snapshot = {
+        "spread_tracking": True,
+        "notional": 500.0,
+        "unrealized_basis_pnl": 10.0,
+    }
+    triggered, _ = spread_stop_loss_triggered(snapshot, config)
+    assert not triggered
+
+
+def test_spread_stop_loss_ignores_untracked_snapshot() -> None:
+    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    triggered, _ = spread_stop_loss_triggered({"spread_tracking": False}, config)
+    assert not triggered
+
+
+def test_hold_decision_detects_funding_rate_inversion() -> None:
+    now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
+    config = FundingPaperTraderConfig(
+        max_entry_snapshot_age_seconds=300,
+    ).validated()
+    position = {
+        "route_key": "route-1",
+        "max_settlement_at": "2026-07-19T12:00:00+00:00",
+        "expected_execution_cost": 0.5,
+        "notes": {},
+    }
+    route = paper_route(now, 3_600, 3_600, live_net=1.0)
+    route["legs"][0]["hourly_funding_rate"] = 0.001
+    route["legs"][1]["hourly_funding_rate"] = 0.0005
+
+    decision = position_hold_decision(position, route, now, config)
+    assert not decision["hold"]
+    assert "funding_rate_inverted" in decision["reasons"]
+    assert decision["close_reason"] == "arbitrage_window_funding_rate_inverted"
+
+
+def test_hold_decision_allows_normal_rate_order() -> None:
+    now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
+    config = FundingPaperTraderConfig(
+        max_entry_snapshot_age_seconds=300,
+    ).validated()
+    position = {
+        "route_key": "route-1",
+        "max_settlement_at": "2026-07-19T12:00:00+00:00",
+        "expected_execution_cost": 0.5,
+        "notes": {},
+    }
+    route = paper_route(now, 3_600, 3_600, live_net=1.0)
+    route["legs"][0]["hourly_funding_rate"] = -0.001
+    route["legs"][1]["hourly_funding_rate"] = 0.001
+
+    decision = position_hold_decision(position, route, now, config)
+    assert decision["hold"]
+    assert "funding_rate_inverted" not in decision["reasons"]
+
+
+def test_build_position_includes_spread_fields() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = paper_route(now, 60, 45, live_net=1.0)
+    route["legs"][0]["evidence"] = {"vwap": 100.5}
+    route["legs"][1]["evidence"] = {"vwap": 100.2}
+    route["evidence"]["signed_entry_basis"] = -0.003
+    config = FundingPaperTraderConfig().validated()
+    decision = route_entry_decision(route, accounts(), now, config)
+
+    position = build_position_from_route(route, decision, config)
+    assert abs(position["entry_cross_spread"] - 0.3) < 1e-9
+    assert abs(position["entry_basis_bps"] - (-30.0)) < 1e-9
+    assert position["notes"]["paper_model"] == "funding_paper_trader_v2"
+
+
+def test_build_close_payload_includes_basis_pnl() -> None:
+    position = {
+        "entry_cross_spread": 0.3,
+        "entry_basis_bps": -30.0,
+        "base_quantity": 2.0,
+        "target_notional": 500.0,
+        "long_notional": 500.0,
+        "short_notional": 500.0,
+        "expected_execution_cost": 1.0,
+        "long_venue": "aster",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "binance",
+        "short_symbol": "BTCUSDT",
+        "long_settlement_at": "2026-07-19T12:00:00+00:00",
+        "short_settlement_at": "2026-07-19T12:00:00+00:00",
+        "entry_legs": [
+            {"side": "long", "venue": "aster", "symbol": "BTCUSDT",
+             "funding_rate": -0.001, "notional": 500.0, "base_quantity": 2.0,
+             "next_funding_at": "2026-07-19T12:00:00+00:00"},
+            {"side": "short", "venue": "binance", "symbol": "BTCUSDT",
+             "funding_rate": 0.001, "notional": 500.0, "base_quantity": 2.0,
+             "next_funding_at": "2026-07-19T12:00:00+00:00"},
+        ],
+        "notes": {"accrued_funding_pnl": 0.0},
+    }
+    close_route = {
+        "funding_scan_id": 10,
+        "funding_route_id": 20,
+        "legs": [
+            {"side": "long", "evidence": {"vwap": 101.0}},
+            {"side": "short", "evidence": {"vwap": 100.5}},
+        ],
+        "evidence": {},
+    }
+    close = build_close_payload(
+        position,
+        {"long": None, "short": None},
+        close_route,
+        use_entry_estimate_for_missing=True,
+        close_reason="test",
+    )
+    assert "actual_basis_pnl" in close
+    assert close["spread_snapshot"]["spread_tracking"] is True
+    assert close["notes"]["paper_model"] == "funding_paper_trader_v2"
+    assert close["notes"]["basis_pnl_included"] is True
+
+
+def test_funding_client_for_venue_covers_all_active_venues() -> None:
+    active_venues = [
+        "aevo", "apex", "aster", "backpack", "binance", "bitmart",
+        "bitget", "bybit", "coinex", "deribit", "drift", "dydx",
+        "edgex", "ethereal", "extended", "gate", "grvt", "htx",
+        "hyperliquid", "kraken", "kucoin", "lighter", "mexc", "okx",
+        "pacifica", "paradex", "reya", "risex", "variational",
+        "vertex_base", "woox",
+    ]
+    for venue in active_venues:
+        client = funding_client_for_venue(venue)
+        assert client is not None, f"Missing client for {venue}"
+        assert client.venue == venue
+
+
+def test_funding_client_for_venue_rejects_deactivated() -> None:
+    for venue in ("bingx", "bitunix", "blofin", "phemex"):
+        assert funding_client_for_venue(venue) is None
+
+
+def test_position_spread_fields_round_trip_through_db(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["aster", "binance"], 1_000.0)
+    position_id = store.open_funding_paper_position(
+        {
+            "entry_key": "spread-rt",
+            "route_key": "spread-rt",
+            "canonical_asset": "BTC",
+            "long_venue": "aster",
+            "long_symbol": "BTCUSDT",
+            "short_venue": "binance",
+            "short_symbol": "BTCUSDT",
+            "base_quantity": 0.01,
+            "target_notional": 500.0,
+            "long_notional": 500.0,
+            "short_notional": 500.0,
+            "long_reserved_margin": 550.0,
+            "short_reserved_margin": 550.0,
+            "long_settlement_at": "2026-07-19T12:00:00+00:00",
+            "short_settlement_at": "2026-07-19T12:00:00+00:00",
+            "max_settlement_at": "2026-07-19T12:00:00+00:00",
+            "expected_live_gross": 2.0,
+            "expected_live_net": 1.0,
+            "expected_execution_cost": 0.5,
+            "entry_cross_spread": 0.42,
+            "entry_basis_bps": -35.0,
+            "entry_legs": [],
+            "entry_evidence": {},
+        }
+    )
+    positions = store.funding_paper_open_positions()
+    assert len(positions) == 1
+    assert positions[0]["entry_cross_spread"] == 0.42
+    assert positions[0]["entry_basis_bps"] == -35.0
+
+    store.close_funding_paper_position(
+        position_id,
+        {
+            "actual_funding_pnl": 3.0,
+            "actual_basis_pnl": -1.5,
+            "actual_execution_cost": 0.5,
+            "actual_net_pnl": 1.0,
+            "long_cash_delta": 0.5,
+            "short_cash_delta": 0.5,
+            "close_reason": "test",
+            "settlement": {},
+        },
+    )
+    dashboard = store.funding_paper_dashboard(refresh_estimates=False)
+    closed = dashboard["closed_positions"][0]
+    assert closed["entry_cross_spread"] == 0.42
+    assert closed["entry_basis_bps"] == -35.0
+    assert closed["actual_basis_pnl"] == -1.5

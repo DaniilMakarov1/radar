@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import signal
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,12 +8,13 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
-from types import FrameType
 from typing import Any
 
+from smart_money_radar.bots.base import BaseBot
 from smart_money_radar.config import PROJECT_ROOT
 from smart_money_radar.funding.adapters import (
     AevoFundingClient,
+    ApexFundingClient,
     AsterFundingClient,
     BackpackFundingClient,
     BinanceFundingClient,
@@ -26,10 +26,12 @@ from smart_money_radar.funding.adapters import (
     DeribitFundingClient,
     DriftFundingClient,
     DydxFundingClient,
+    EdgexFundingClient,
     EtherealFundingClient,
     ExtendedFundingClient,
     FundingVenueClient,
     GateFundingClient,
+    GrvtFundingClient,
     HTXFundingClient,
     HyperliquidFundingClient,
     KrakenFundingClient,
@@ -37,8 +39,12 @@ from smart_money_radar.funding.adapters import (
     LighterFundingClient,
     MEXCFundingClient,
     OKXFundingClient,
+    PacificaFundingClient,
     ParadexFundingClient,
     PhemexFundingClient,
+    ReyaFundingClient,
+    RiseXFundingClient,
+    VariationalFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
 )
@@ -81,13 +87,17 @@ class FundingPaperTraderConfig:
     monitor_interval_seconds: int = 120
     hot_interval_seconds: int = 10
     hot_route_recheck_workers: int = 6
-    status_report_interval_seconds: int = 3_600
+    status_report_interval_seconds: int = 1_800
     status_report_max_routes: int = 5
     retention_interval_seconds: int = 300
     iterations: int | None = None
     export_dir: Path = PROJECT_ROOT / "exports" / "funding_paper"
     telegram_enabled: bool = True
     focused_recheck_enabled: bool = True
+    venue_set: tuple[str, ...] | None = None
+    spread_arb_enabled: bool = False
+    basis_stop_loss_bps: float = 200.0
+    spread_monitoring_enabled: bool = True
 
     def validated(self) -> "FundingPaperTraderConfig":
         return FundingPaperTraderConfig(
@@ -154,6 +164,14 @@ class FundingPaperTraderConfig:
             export_dir=Path(self.export_dir),
             telegram_enabled=bool(self.telegram_enabled),
             focused_recheck_enabled=bool(self.focused_recheck_enabled),
+            venue_set=(
+                tuple(str(v) for v in self.venue_set)
+                if self.venue_set
+                else None
+            ),
+            spread_arb_enabled=bool(self.spread_arb_enabled),
+            basis_stop_loss_bps=max(0.0, float(self.basis_stop_loss_bps)),
+            spread_monitoring_enabled=bool(self.spread_monitoring_enabled),
         ).normalized_entry_leads()
 
     def normalized_entry_leads(self) -> "FundingPaperTraderConfig":
@@ -170,26 +188,27 @@ class FundingPaperTraderConfig:
         )
 
 
-class FundingPaperTrader:
+class FundingPaperTrader(BaseBot):
     def __init__(
         self,
         store: SQLiteStore,
         config: FundingPaperTraderConfig | None = None,
         notifier: TelegramNotifier | None = None,
     ) -> None:
+        cfg = (config or FundingPaperTraderConfig()).validated()
+        super().__init__(
+            iterations=cfg.iterations,
+            telegram_enabled=cfg.telegram_enabled,
+            notifier=notifier or TelegramNotifier(),
+        )
         self.store = store
-        self.config = (config or FundingPaperTraderConfig()).validated()
-        self.notifier = notifier or TelegramNotifier()
+        self.config = cfg
         self.armed_routes: set[str] = set()
         self.hot_routes: dict[str, dict[str, Any]] = {}
         self.last_full_scan_monotonic = 0.0
         self.last_status_report_monotonic = 0.0
         self.last_retention_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
-        self.stop_requested = False
-        self.stop_reason: str | None = None
-        self.shutdown_notified = False
-        self.last_iteration_result: dict[str, Any] | None = None
 
     def run_loop(self) -> None:
         completed = 0
@@ -263,45 +282,6 @@ class FundingPaperTrader:
         finally:
             self.restore_signal_handlers(previous_signal_handlers)
 
-    def request_stop(self, reason: str) -> None:
-        self.stop_requested = True
-        self.stop_reason = self.stop_reason or reason
-
-    def install_signal_handlers(self) -> dict[int, Any]:
-        handlers: dict[int, Any] = {}
-        for stop_signal in (signal.SIGINT, signal.SIGTERM):
-            try:
-                handlers[int(stop_signal)] = signal.getsignal(stop_signal)
-                signal.signal(stop_signal, self.handle_stop_signal)
-            except (ValueError, OSError):
-                continue
-        return handlers
-
-    def restore_signal_handlers(self, handlers: dict[int, Any]) -> None:
-        for signum, handler in handlers.items():
-            try:
-                signal.signal(signum, handler)
-            except (ValueError, OSError):
-                continue
-
-    def handle_stop_signal(
-        self,
-        signum: int,
-        frame: FrameType | None,
-    ) -> None:
-        reason = signal.Signals(signum).name
-        if self.stop_requested:
-            raise KeyboardInterrupt
-        self.request_stop(reason)
-
-    def sleep_interruptibly(self, seconds: int) -> None:
-        deadline = time.monotonic() + max(0, int(seconds))
-        while not self.stop_requested:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(1.0, remaining))
-
     def notify_shutdown(
         self,
         event_type: str,
@@ -345,6 +325,7 @@ class FundingPaperTrader:
         scan_result = run_funding_scan(
             self.store,
             config=self.scan_config(),
+            venue_clients=self.build_venue_clients(),
             scan_mode="watch",
         )
         self.last_full_scan_monotonic = time.monotonic()
@@ -566,6 +547,18 @@ class FundingPaperTrader:
             orderbook_cache_ttl_seconds=0,
             market_snapshot_cache_ttl_seconds=0,
         ).validated()
+
+    def build_venue_clients(self) -> list[FundingVenueClient] | None:
+        if not self.config.venue_set:
+            return None
+        from smart_money_radar.funding.service import active_default_funding_clients
+
+        allowed = set(self.config.venue_set)
+        return [
+            client
+            for client in active_default_funding_clients()
+            if client.venue in allowed
+        ]
 
     def focused_scan_config(self) -> FundingScanConfig:
         return FundingScanConfig(
@@ -1087,10 +1080,59 @@ class FundingPaperTrader:
         for position in self.store.funding_paper_open_positions():
             self.refresh_open_position_route(position)
             now = datetime.now(UTC)
+            position_id = int(position["funding_paper_position_id"])
+            if self.config.spread_monitoring_enabled:
+                route_key = str(position.get("route_key") or "")
+                live_route = self.hot_routes.get(route_key) or (
+                    self.store.latest_funding_route_by_key(route_key)
+                    if route_key
+                    else None
+                )
+                spread_snap = compute_spread_snapshot(position, live_route)
+                triggered, reason = spread_stop_loss_triggered(
+                    spread_snap, self.config
+                )
+                if triggered:
+                    close_payload = build_close_payload(
+                        position,
+                        settlement_rates_for_position(position, self.store),
+                        live_route,
+                        use_entry_estimate_for_missing=True,
+                        close_reason=f"spread_stop_loss:{reason}",
+                        hold_decision={
+                            "hold": False,
+                            "close_reason": "spread_stop_loss",
+                            "reasons": [reason],
+                        },
+                    )
+                    close_payload["spread_snapshot"] = spread_snap
+                    self.store.close_funding_paper_position(
+                        position_id, close_payload
+                    )
+                    self.record_event(
+                        "close",
+                        (
+                            f"SPREAD STOP-LOSS {position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            f"Reason: {reason}\n"
+                            f"Basis PnL: ${spread_snap.get('unrealized_basis_pnl', 0):.2f}\n"
+                            f"Total PnL: ${spread_snap.get('total_unrealized_pnl', 0):.2f}"
+                        ),
+                        {
+                            "position": position_summary(position),
+                            "close": close_payload,
+                            "spread_snapshot": spread_snap,
+                        },
+                        funding_paper_position_id=position_id,
+                        route_key=position.get("route_key"),
+                        notify=True,
+                        severity="warning",
+                    )
+                    outcomes.append("closed")
+                    continue
             result = close_decision(position, now, self.store, self.config)
             if result["status"] == "wait":
                 continue
-            position_id = int(position["funding_paper_position_id"])
             if result["status"] == "settlement_pending":
                 self.store.set_funding_paper_position_status(
                     position_id,
@@ -1443,7 +1485,9 @@ def build_position_from_route(
         "expected_execution_cost": float(evidence.get("execution_cost") or 0.0),
         "entry_legs": legs,
         "entry_evidence": evidence,
-        "notes": {"decision": decision, "paper_model": "funding_paper_trader_v1"},
+        "entry_cross_spread": entry_cross_spread(long_leg, short_leg),
+        "entry_basis_bps": float(evidence.get("signed_entry_basis") or 0.0) * 10_000.0,
+        "notes": {"decision": decision, "paper_model": "funding_paper_trader_v2"},
     }
 
 
@@ -1546,6 +1590,15 @@ def position_hold_decision(
         reasons.append("live_net_missing")
     elif live_net <= max(0.0, float(config.min_live_net_profit)):
         reasons.append("live_net_not_positive")
+    if long_leg and short_leg:
+        long_hourly = optional_float(long_leg.get("hourly_funding_rate"))
+        short_hourly = optional_float(short_leg.get("hourly_funding_rate"))
+        if (
+            long_hourly is not None
+            and short_hourly is not None
+            and short_hourly < long_hourly
+        ):
+            reasons.append("funding_rate_inverted")
     close_reason = close_reason_from_hold_reasons(reasons)
     return {
         "hold": not reasons,
@@ -1575,6 +1628,8 @@ def close_reason_from_hold_reasons(reasons: list[str]) -> str:
         return "arbitrage_window_unverifiable_next_settlement_missing"
     if "live_net_missing" in reasons:
         return "arbitrage_window_unverifiable_live_net_missing"
+    if "funding_rate_inverted" in reasons:
+        return "arbitrage_window_funding_rate_inverted"
     return "arbitrage_window_unverifiable"
 
 
@@ -1678,7 +1733,9 @@ def build_close_payload(
     current_funding_pnl = long_funding_pnl + short_funding_pnl
     actual_funding_pnl = accrued_funding_pnl + current_funding_pnl
     actual_execution_cost = float(position.get("expected_execution_cost") or 0.0)
-    actual_net_pnl = actual_funding_pnl - actual_execution_cost
+    spread_snap = compute_spread_snapshot(position, close_route)
+    basis_pnl = float(spread_snap.get("unrealized_basis_pnl") or 0.0)
+    actual_net_pnl = actual_funding_pnl + basis_pnl - actual_execution_cost
     long_cash_delta = long_funding_pnl - actual_execution_cost / 2.0
     short_cash_delta = short_funding_pnl - actual_execution_cost / 2.0
     close_evidence = (close_route or {}).get("evidence") or {}
@@ -1686,6 +1743,7 @@ def build_close_payload(
         "close_funding_scan_id": (close_route or {}).get("funding_scan_id"),
         "close_funding_route_id": (close_route or {}).get("funding_route_id"),
         "actual_funding_pnl": actual_funding_pnl,
+        "actual_basis_pnl": basis_pnl,
         "actual_execution_cost": actual_execution_cost,
         "actual_net_pnl": actual_net_pnl,
         "long_cash_delta": long_cash_delta,
@@ -1694,6 +1752,7 @@ def build_close_payload(
         "hold_decision": hold_decision or {},
         "close_legs": (close_route or {}).get("legs") or [],
         "close_evidence": close_evidence,
+        "spread_snapshot": spread_snap,
         "settlement": {
             "long": settlement_payload(settlement.get("long"), entry_long, long_rate),
             "short": settlement_payload(settlement.get("short"), entry_short, short_rate),
@@ -1704,8 +1763,9 @@ def build_close_payload(
             "history_missing_fallback": use_entry_estimate_for_missing,
         },
         "notes": {
-            "paper_model": "funding_paper_trader_v1",
+            "paper_model": "funding_paper_trader_v2",
             "execution_cost_source": "entry_route_expected_execution_cost",
+            "basis_pnl_included": spread_snap.get("spread_tracking", False),
         },
     }
 
@@ -1735,7 +1795,9 @@ def settlement_rate_or_entry(
 ) -> float:
     if settlement_row is not None:
         return float(settlement_row.get("funding_rate") or 0.0)
-    return float(entry_leg.get("funding_rate") or 0.0)
+    hourly = float(entry_leg.get("funding_rate") or 0.0)
+    interval = max(1.0, float(entry_leg.get("funding_interval_hours") or 1.0))
+    return hourly * interval
 
 
 def settlement_payload(
@@ -1810,6 +1872,101 @@ def route_data_age_seconds(route: dict[str, Any], now: datetime) -> float | None
     if observed is None:
         return None
     return max(0.0, (now - observed).total_seconds())
+
+
+# ---------------------------------------------------------------------------
+# Spread / basis risk tracking
+# ---------------------------------------------------------------------------
+
+
+def entry_cross_spread(
+    long_leg: dict[str, Any],
+    short_leg: dict[str, Any],
+) -> float | None:
+    long_price = leg_vwap(long_leg)
+    short_price = leg_vwap(short_leg)
+    if long_price is None or short_price is None:
+        return None
+    return long_price - short_price
+
+
+def leg_vwap(leg: dict[str, Any]) -> float | None:
+    evidence = leg.get("evidence") or leg
+    for key in ("vwap", "mark_price", "mid_price", "price"):
+        value = optional_float(evidence.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def compute_spread_snapshot(
+    position: dict[str, Any],
+    route: dict[str, Any] | None,
+) -> dict[str, Any]:
+    entry_spread = optional_float(position.get("entry_cross_spread"))
+    if route is None or entry_spread is None:
+        return {
+            "spread_tracking": False,
+            "reason": "missing_route_or_entry_spread",
+        }
+    legs = route.get("legs") or []
+    long_leg = leg_by_side(legs, "long") or {}
+    short_leg = leg_by_side(legs, "short") or {}
+    current_long = leg_vwap(long_leg)
+    current_short = leg_vwap(short_leg)
+    if current_long is None or current_short is None:
+        return {
+            "spread_tracking": False,
+            "reason": "missing_current_prices",
+        }
+    current_spread = current_long - current_short
+    quantity = float(position.get("base_quantity") or 0.0)
+    unrealized_basis_pnl = (current_spread - entry_spread) * quantity
+    notional = float(position.get("target_notional") or 0.0)
+    reference = (current_long + current_short) / 2.0
+    current_basis_bps = (
+        (current_short - current_long) / reference * 10_000.0
+        if reference > 0
+        else 0.0
+    )
+    entry_basis_bps = float(position.get("entry_basis_bps") or 0.0)
+    accrued_funding = float(
+        (position.get("notes") or {}).get("accrued_funding_pnl") or 0.0
+    )
+    expected_exec_cost = float(position.get("expected_execution_cost") or 0.0)
+    total_unrealized = accrued_funding + unrealized_basis_pnl - expected_exec_cost
+    return {
+        "spread_tracking": True,
+        "entry_cross_spread": entry_spread,
+        "current_cross_spread": current_spread,
+        "current_long_price": current_long,
+        "current_short_price": current_short,
+        "unrealized_basis_pnl": unrealized_basis_pnl,
+        "current_basis_bps": current_basis_bps,
+        "entry_basis_bps": entry_basis_bps,
+        "accrued_funding_pnl": accrued_funding,
+        "total_unrealized_pnl": total_unrealized,
+        "notional": notional,
+    }
+
+
+def spread_stop_loss_triggered(
+    snapshot: dict[str, Any],
+    config: FundingPaperTraderConfig,
+) -> tuple[bool, str]:
+    if not snapshot.get("spread_tracking"):
+        return False, ""
+    notional = float(snapshot.get("notional") or 0.0)
+    if notional <= 0:
+        return False, ""
+    unrealized = float(snapshot.get("unrealized_basis_pnl") or 0.0)
+    basis_loss_bps = abs(min(0.0, unrealized)) / notional * 10_000.0
+    if basis_loss_bps >= config.basis_stop_loss_bps:
+        return True, (
+            f"basis_stop_loss: unrealized_basis_pnl={unrealized:.2f} "
+            f"({basis_loss_bps:.0f} bps >= {config.basis_stop_loss_bps:.0f} bps)"
+        )
+    return False, ""
 
 
 def final_recheck_freeze_window_active(
@@ -1903,6 +2060,7 @@ def funding_client_for_venue(
         return None
     factories: dict[str, type[FundingVenueClient]] = {
         "aevo": AevoFundingClient,
+        "apex": ApexFundingClient,
         "aster": AsterFundingClient,
         "backpack": BackpackFundingClient,
         "binance": BinanceFundingClient,
@@ -1914,9 +2072,11 @@ def funding_client_for_venue(
         "deribit": DeribitFundingClient,
         "drift": DriftFundingClient,
         "dydx": DydxFundingClient,
+        "edgex": EdgexFundingClient,
         "ethereal": EtherealFundingClient,
         "extended": ExtendedFundingClient,
         "gate": GateFundingClient,
+        "grvt": GrvtFundingClient,
         "htx": HTXFundingClient,
         "hyperliquid": HyperliquidFundingClient,
         "kraken": KrakenFundingClient,
@@ -1924,8 +2084,12 @@ def funding_client_for_venue(
         "lighter": LighterFundingClient,
         "mexc": MEXCFundingClient,
         "okx": OKXFundingClient,
+        "pacifica": PacificaFundingClient,
         "paradex": ParadexFundingClient,
         "phemex": PhemexFundingClient,
+        "reya": ReyaFundingClient,
+        "risex": RiseXFundingClient,
+        "variational": VariationalFundingClient,
         "vertex_base": VertexFundingClient,
         "woox": WOOXFundingClient,
     }
@@ -2086,12 +2250,26 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     short_lead = lead_seconds(short_leg.get("next_funding_at"), now)
     live_net = float(evidence.get("current_nowcast_net") or 0.0)
     threshold = float(evidence.get("actionable_profit_threshold") or 0.0)
+    long_interval = format_interval_hours(long_leg.get("funding_interval_hours"))
+    short_interval = format_interval_hours(short_leg.get("funding_interval_hours"))
+    long_hourly = optional_float(long_leg.get("hourly_funding_rate"))
+    short_hourly = optional_float(short_leg.get("hourly_funding_rate"))
+    long_hourly_label = f"{long_hourly * 100:.4f}%/h" if long_hourly is not None else ""
+    short_hourly_label = f"{short_hourly * 100:.4f}%/h" if short_hourly is not None else ""
+    long_interval_rate = optional_float(long_leg.get("funding_rate"))
+    short_interval_rate = optional_float(short_leg.get("funding_rate"))
+    long_iv = max(1.0, float(long_leg.get("funding_interval_hours") or 1.0))
+    short_iv = max(1.0, float(short_leg.get("funding_interval_hours") or 1.0))
+    long_rate_display = format_rate(long_interval_rate * long_iv if long_interval_rate is not None else None)
+    short_rate_display = format_rate(short_interval_rate * short_iv if short_interval_rate is not None else None)
     return (
         f"\n<b>{index}. {tg(route.get('canonical_asset'))}</b>\n"
         f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
-        f"{format_rate(long_leg.get('funding_rate'))}\n"
+        f"{long_rate_display}/{long_interval}"
+        f"{f' ({long_hourly_label})' if long_hourly_label else ''}\n"
         f"SHORT <code>{tg(route.get('short_venue'))} {tg(route.get('short_symbol'))}</code> "
-        f"{format_rate(short_leg.get('funding_rate'))}\n"
+        f"{short_rate_display}/{short_interval}"
+        f"{f' ({short_hourly_label})' if short_hourly_label else ''}\n"
         f"Next net PnL after costs: <b>{format_signed_money(live_net)}</b> | "
         f"Min: ${threshold:.2f}\n"
         f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"
@@ -2118,13 +2296,36 @@ def position_summary(position: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def funding_rate_lines(route: dict[str, Any]) -> str:
+    legs = route.get("legs") or []
+    lines: list[str] = []
+    for side in ("long", "short"):
+        leg = leg_by_side(legs, side) or {}
+        venue = leg.get("venue") or route.get(f"{side}_venue") or ""
+        rate = optional_float(leg.get("funding_rate"))
+        interval = optional_float(leg.get("funding_interval_hours"))
+        hourly = optional_float(leg.get("hourly_funding_rate"))
+        if rate is None:
+            continue
+        interval_label = format_interval_hours(interval) if interval else "?"
+        interval_rate = rate * max(1.0, interval or 1.0)
+        hourly_label = f"{hourly * 100:.4f}%/h" if hourly is not None else "?"
+        lines.append(
+            f"{side.upper()} <code>{tg(venue)}</code>: "
+            f"{format_rate(interval_rate)}/{interval_label} ({hourly_label})"
+        )
+    return "\n".join(lines)
+
+
 def armed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     leads = decision.get("lead_seconds") or {}
+    rates = funding_rate_lines(route)
     return (
         "<b>Funding Paper Trader ARMED</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"{rates}\n"
         f"Live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
         f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"До funding: long {format_seconds(leads.get('long'))}, "
@@ -2138,11 +2339,13 @@ def open_message(
     position: dict[str, Any],
 ) -> str:
     leads = decision.get("lead_seconds") or {}
+    rates = funding_rate_lines(route)
     return (
         "<b>Funding Paper Trader OPEN</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"{rates}\n"
         f"Size: <b>${float(position.get('target_notional') or 0):.0f}</b> per leg\n"
         f"Expected live net: <b>${float(position.get('expected_live_net') or 0):.2f}</b>\n"
         f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
@@ -2231,6 +2434,7 @@ def close_message(position: dict[str, Any], close: dict[str, Any]) -> str:
         f"{tg(window)}\n"
         f"{details}\n\n"
         f"Funding PnL: <b>${float(close.get('actual_funding_pnl') or 0):.2f}</b>\n"
+        f"Basis PnL: <b>${float(close.get('actual_basis_pnl') or 0):.2f}</b>\n"
         f"Execution cost: ${float(close.get('actual_execution_cost') or 0):.2f}\n"
         f"Net PnL: <b>${float(close.get('actual_net_pnl') or 0):.2f}</b>\n"
         f"{tg(quality)}\n"
@@ -2298,9 +2502,12 @@ def funding_leg_compact_line(leg: dict[str, Any]) -> str:
     venue = leg.get("venue")
     symbol = leg.get("symbol")
     interval = format_interval_hours(leg.get("funding_interval_hours"))
+    hourly = optional_float(leg.get("funding_rate"))
+    iv = max(1.0, float(leg.get("funding_interval_hours") or 1.0))
+    interval_rate = hourly * iv if hourly is not None else None
     return (
         f"{tg(side)} <code>{tg(venue)} {tg(symbol)}</code> "
-        f"{format_rate(leg.get('funding_rate'))}/{interval}, "
+        f"{format_rate(interval_rate)}/{interval}, "
         f"next {tg(format_datetime_utc(leg.get('next_funding_at')))}"
     )
 
@@ -2352,6 +2559,7 @@ def hold_reason_labels(reasons: list[Any]) -> list[str]:
         "short_next_settlement_missing": "не найден следующий settlement short-ноги",
         "long_next_settlement_not_future": "следующий settlement long-ноги уже прошел",
         "short_next_settlement_not_future": "следующий settlement short-ноги уже прошел",
+        "funding_rate_inverted": "funding rate инвертировался: short-нога стала дешевле long-ноги",
     }
     return [labels.get(str(reason), str(reason)) for reason in reasons]
 
@@ -2372,6 +2580,7 @@ def reprice_message(position: dict[str, Any], payload: dict[str, Any]) -> str:
         f"SHORT <code>{tg(position.get('short_venue'))}</code>\n\n"
         "Биржи опубликовали funding history, бот пересчитал результат.\n"
         f"Funding PnL: <b>{format_signed_money(position.get('actual_funding_pnl'))}</b>\n"
+        f"Basis PnL: <b>{format_signed_money(position.get('actual_basis_pnl'))}</b>\n"
         f"Execution cost: {format_money(position.get('actual_execution_cost'))}\n"
         f"Net PnL: <b>{format_signed_money(position.get('actual_net_pnl'))}</b>\n"
         f"{tg(quality)}\n"
@@ -2399,6 +2608,9 @@ def close_reason_message(value: Any) -> str:
         ),
         "arbitrage_window_unverifiable_live_net_missing": (
             "не удалось проверить live net"
+        ),
+        "arbitrage_window_funding_rate_inverted": (
+            "funding rate инвертировался: арбитражное окно закрылось"
         ),
         "arbitrage_window_unverifiable": (
             "продолжение окна не подтверждено"
@@ -2545,8 +2757,11 @@ def flatten_positions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "target_notional": row.get("target_notional"),
                 "expected_live_net": row.get("expected_live_net"),
                 "actual_funding_pnl": row.get("actual_funding_pnl"),
+                "actual_basis_pnl": row.get("actual_basis_pnl"),
                 "actual_execution_cost": row.get("actual_execution_cost"),
                 "actual_net_pnl": row.get("actual_net_pnl"),
+                "entry_cross_spread": row.get("entry_cross_spread"),
+                "entry_basis_bps": row.get("entry_basis_bps"),
                 "long_settlement_at": row.get("long_settlement_at"),
                 "short_settlement_at": row.get("short_settlement_at"),
                 "close_reason": row.get("close_reason"),
