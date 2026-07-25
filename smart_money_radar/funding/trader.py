@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import signal
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,9 +9,9 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
-from smart_money_radar.bots.base import BaseBot
 from smart_money_radar.config import PROJECT_ROOT
 from smart_money_radar.funding.adapters import (
     AevoFundingClient,
@@ -70,7 +71,7 @@ FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 
 
 @dataclass(frozen=True)
-class FundingPaperTraderConfig:
+class PaperBotConfig:
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
     entry_window_seconds: int = 180
@@ -99,8 +100,8 @@ class FundingPaperTraderConfig:
     basis_stop_loss_bps: float = 200.0
     spread_monitoring_enabled: bool = True
 
-    def validated(self) -> "FundingPaperTraderConfig":
-        return FundingPaperTraderConfig(
+    def validated(self) -> "PaperBotConfig":
+        return PaperBotConfig(
             venue_starting_balance=max(100.0, float(self.venue_starting_balance)),
             target_notional_per_leg=max(50.0, float(self.target_notional_per_leg)),
             entry_window_seconds=max(15, min(int(self.entry_window_seconds), 900)),
@@ -174,12 +175,12 @@ class FundingPaperTraderConfig:
             spread_monitoring_enabled=bool(self.spread_monitoring_enabled),
         ).normalized_entry_leads()
 
-    def normalized_entry_leads(self) -> "FundingPaperTraderConfig":
+    def normalized_entry_leads(self) -> "PaperBotConfig":
         minimum = max(0, int(self.entry_min_lead_seconds))
         maximum = max(minimum, int(self.entry_max_lead_seconds))
         maximum = min(maximum, int(self.entry_window_seconds))
         minimum = min(minimum, maximum)
-        return FundingPaperTraderConfig(
+        return PaperBotConfig(
             **{
                 **asdict(self),
                 "entry_min_lead_seconds": minimum,
@@ -188,19 +189,27 @@ class FundingPaperTraderConfig:
         )
 
 
-class FundingPaperTrader(BaseBot):
+class PaperBot:
+    """Paper trading bot for funding carry arbitrage.
+
+    Lifecycle: run_loop → scan → evaluate → entry → monitor → settlement → exit.
+    Supports inheritance for venue-specific bots (e.g. RiseXBot).
+    """
+
     def __init__(
         self,
         store: SQLiteStore,
-        config: FundingPaperTraderConfig | None = None,
+        config: PaperBotConfig | None = None,
         notifier: TelegramNotifier | None = None,
     ) -> None:
-        cfg = (config or FundingPaperTraderConfig()).validated()
-        super().__init__(
-            iterations=cfg.iterations,
-            telegram_enabled=cfg.telegram_enabled,
-            notifier=notifier or TelegramNotifier(),
-        )
+        cfg = (config or PaperBotConfig()).validated()
+        self.iterations = cfg.iterations
+        self.telegram_enabled = cfg.telegram_enabled
+        self.notifier = notifier or TelegramNotifier()
+        self.stop_requested = False
+        self.stop_reason: str | None = None
+        self.shutdown_notified = False
+        self.last_iteration_result: dict[str, Any] | None = None
         self.store = store
         self.config = cfg
         self.armed_routes: set[str] = set()
@@ -210,13 +219,64 @@ class FundingPaperTrader(BaseBot):
         self.last_retention_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
 
+    # ------------------------------------------------------------------
+    # Lifecycle: signal handling, sleep, notifications (folded from BaseBot)
+    # ------------------------------------------------------------------
+
+    def request_stop(self, reason: str) -> None:
+        self.stop_requested = True
+        self.stop_reason = self.stop_reason or reason
+
+    def install_signal_handlers(self) -> dict[int, Any]:
+        handlers: dict[int, Any] = {}
+        for stop_signal in (signal.SIGINT, signal.SIGTERM):
+            try:
+                handlers[int(stop_signal)] = signal.getsignal(stop_signal)
+                signal.signal(stop_signal, self._handle_stop_signal)
+            except (ValueError, OSError):
+                continue
+        return handlers
+
+    def restore_signal_handlers(self, handlers: dict[int, Any]) -> None:
+        for signum, handler in handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                continue
+
+    def _handle_stop_signal(self, signum: int, frame: FrameType | None) -> None:
+        reason = signal.Signals(signum).name
+        if self.stop_requested:
+            raise KeyboardInterrupt
+        self.request_stop(reason)
+
+    def sleep_interruptibly(self, seconds: int) -> None:
+        deadline = time.monotonic() + max(0, int(seconds))
+        while not self.stop_requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(1.0, remaining))
+
+    def notify(self, text: str) -> None:
+        print(text, flush=True)
+        if not self.telegram_enabled:
+            return
+        result = self.notifier.send(text)
+        if result.status != "sent":
+            print(f"[telegram {result.status}] {result.error or ''}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
     def run_loop(self) -> None:
         completed = 0
         previous_signal_handlers = self.install_signal_handlers()
         try:
             self.record_event(
                 "trader_started",
-                "Funding Paper Trader started",
+                "Paper Bot started",
                 {"config": serializable_config(self.config)},
                 notify=True,
             )
@@ -230,7 +290,7 @@ class FundingPaperTrader(BaseBot):
                     self.notify_shutdown(
                         "trader_crashed",
                         (
-                            "Funding Paper Trader CRASHED\n"
+                            "Paper Bot CRASHED\n"
                             f"Error: {type(exc).__name__}: {exc}\n"
                             "Paper trading loop is not running."
                         ),
@@ -251,7 +311,7 @@ class FundingPaperTrader(BaseBot):
                 self.notify_shutdown(
                     "trader_stopped",
                     (
-                        "Funding Paper Trader STOPPED\n"
+                        "Paper Bot STOPPED\n"
                         f"Reason: {self.stop_reason or 'stop requested'}\n"
                         "Paper trading loop is not running."
                     ),
@@ -267,7 +327,7 @@ class FundingPaperTrader(BaseBot):
             self.notify_shutdown(
                 "trader_interrupted",
                 (
-                    "Funding Paper Trader INTERRUPTED\n"
+                    "Paper Bot INTERRUPTED\n"
                     "Reason: KeyboardInterrupt\n"
                     "Paper trading loop is not running."
                 ),
@@ -478,7 +538,7 @@ class FundingPaperTrader(BaseBot):
                 self.record_event(
                     "retention_skipped",
                     (
-                        "Funding Paper Trader retention skipped\n"
+                        "Paper Bot retention skipped\n"
                         f"Reason: {type(exc).__name__}: {exc}; "
                         "trading loop continues."
                     ),
@@ -642,7 +702,7 @@ class FundingPaperTrader(BaseBot):
                     self.record_event(
                         "focused_recheck_failed",
                         (
-                            "Funding Paper Trader focused recheck failed\n"
+                            "Paper Bot focused recheck failed\n"
                             f"{route.get('canonical_asset')}: "
                             f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
                             f"Error: {type(exc).__name__}: {exc}"
@@ -676,7 +736,7 @@ class FundingPaperTrader(BaseBot):
             self.record_event(
                 "focused_recheck_skipped",
                 (
-                    "Funding Paper Trader skipped final recheck\n"
+                    "Paper Bot skipped final recheck\n"
                     f"{route.get('canonical_asset')}: "
                     f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
                     "Reason: no fresh snapshot available inside final freeze window."
@@ -709,7 +769,7 @@ class FundingPaperTrader(BaseBot):
                 self.record_event(
                     "focused_recheck_fallback",
                     (
-                        "Funding Paper Trader used last successful focused snapshot\n"
+                        "Paper Bot used last successful focused snapshot\n"
                         f"{route.get('canonical_asset')}: "
                         f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
                         f"Reason: {type(exc).__name__}: {exc}"
@@ -729,7 +789,7 @@ class FundingPaperTrader(BaseBot):
             self.record_event(
                 "focused_recheck_failed",
                 (
-                    "Funding Paper Trader focused recheck failed\n"
+                    "Paper Bot focused recheck failed\n"
                     f"{route.get('canonical_asset')}: "
                     f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
                     f"Error: {type(exc).__name__}: {exc}"
@@ -755,7 +815,7 @@ class FundingPaperTrader(BaseBot):
             self.record_event(
                 "focused_recheck_failed",
                 (
-                    "Funding Paper Trader focused recheck failed\n"
+                    "Paper Bot focused recheck failed\n"
                     f"{route.get('canonical_asset')}: "
                     f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
                     f"Error: {type(exc).__name__}: {exc}"
@@ -1020,7 +1080,7 @@ class FundingPaperTrader(BaseBot):
                     self.record_event(
                         "open_skipped",
                         (
-                            "<b>Funding Paper Trader SKIP OPEN</b>\n\n"
+                            "<b>Paper Bot SKIP OPEN</b>\n\n"
                             f"<b>{tg(route.get('canonical_asset'))}</b>\n"
                             "Focused recheck did not return the route."
                         ),
@@ -1304,7 +1364,7 @@ def route_entry_decision(
     route: dict[str, Any],
     accounts: dict[str, dict[str, Any]],
     now: datetime,
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> dict[str, Any]:
     legs = route.get("legs") or []
     long_leg = leg_by_side(legs, "long")
@@ -1383,7 +1443,7 @@ def route_entry_decision(
 
 def required_live_net_profit(
     route: dict[str, Any],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> float:
     evidence = route.get("evidence") or {}
     threshold = optional_float(evidence.get("actionable_profit_threshold"))
@@ -1393,7 +1453,7 @@ def required_live_net_profit(
 def route_monitor_decision(
     route: dict[str, Any],
     now: datetime,
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> dict[str, Any]:
     legs = route.get("legs") or []
     leads: dict[str, float | None] = {"long": None, "short": None}
@@ -1444,7 +1504,7 @@ def route_monitor_decision(
 def build_position_from_route(
     route: dict[str, Any],
     decision: dict[str, Any],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> dict[str, Any]:
     legs = route.get("legs") or []
     long_leg = leg_by_side(legs, "long") or {}
@@ -1495,7 +1555,7 @@ def close_decision(
     position: dict[str, Any],
     now: datetime,
     store: SQLiteStore,
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> dict[str, Any]:
     max_settlement = parse_iso(position.get("max_settlement_at"))
     if max_settlement is None:
@@ -1543,7 +1603,7 @@ def position_hold_decision(
     position: dict[str, Any],
     route: dict[str, Any] | None,
     now: datetime,
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> dict[str, Any]:
     if not route:
         return {
@@ -1952,7 +2012,7 @@ def compute_spread_snapshot(
 
 def spread_stop_loss_triggered(
     snapshot: dict[str, Any],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> tuple[bool, str]:
     if not snapshot.get("spread_tracking"):
         return False, ""
@@ -1972,7 +2032,7 @@ def spread_stop_loss_triggered(
 def final_recheck_freeze_window_active(
     route: dict[str, Any],
     now: datetime,
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> bool:
     if config.final_recheck_freeze_seconds <= 0:
         return False
@@ -1986,7 +2046,7 @@ def final_recheck_freeze_window_active(
 def final_recheck_fallback_route(
     route: dict[str, Any],
     now: datetime,
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
     reason: str,
 ) -> dict[str, Any] | None:
     if not final_recheck_freeze_window_active(route, now, config):
@@ -2112,7 +2172,7 @@ def funding_client_for_venue(
 
 def count_hot_routes(
     routes: list[dict[str, Any]],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> int:
     now = datetime.now(UTC)
     return sum(
@@ -2122,7 +2182,7 @@ def count_hot_routes(
 
 def count_urgent_routes(
     routes: list[dict[str, Any]],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> int:
     now = datetime.now(UTC)
     return sum(
@@ -2162,7 +2222,7 @@ def status_route_sort_key(route: dict[str, Any]) -> tuple[float, float]:
 
 def status_publishable_candidate(
     route: dict[str, Any],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> bool:
     if route.get("status") != "paper_candidate":
         return False
@@ -2178,7 +2238,7 @@ def status_report_message(
     routes: list[dict[str, Any]],
     watch_routes: list[dict[str, Any]],
     summary: dict[str, Any],
-    config: FundingPaperTraderConfig,
+    config: PaperBotConfig,
 ) -> str:
     candidates = ranked_status_routes(
         [
@@ -2193,7 +2253,7 @@ def status_report_message(
     route_count = int(result.get("route_count") or 0)
     full_depth_count = int(result.get("execution_shortlist_count") or route_count)
     lines = [
-        "<b>Funding Paper Trader STATUS</b>",
+        "<b>Paper Bot STATUS</b>",
         "",
         (
             f"<b>Mode:</b> <code>{tg(result.get('mode'))}</code> | "
@@ -2321,7 +2381,7 @@ def armed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     leads = decision.get("lead_seconds") or {}
     rates = funding_rate_lines(route)
     return (
-        "<b>Funding Paper Trader ARMED</b>\n\n"
+        "<b>Paper Bot ARMED</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
@@ -2341,7 +2401,7 @@ def open_message(
     leads = decision.get("lead_seconds") or {}
     rates = funding_rate_lines(route)
     return (
-        "<b>Funding Paper Trader OPEN</b>\n\n"
+        "<b>Paper Bot OPEN</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
@@ -2356,7 +2416,7 @@ def open_message(
 
 def skipped_open_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     return (
-        "<b>Funding Paper Trader SKIP OPEN</b>\n\n"
+        "<b>Paper Bot SKIP OPEN</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
@@ -2368,7 +2428,7 @@ def skipped_open_message(route: dict[str, Any], decision: dict[str, Any]) -> str
 
 def disarmed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     return (
-        "<b>Funding Paper Trader DISARMED</b>\n\n"
+        "<b>Paper Bot DISARMED</b>\n\n"
         f"<b>{tg(route.get('canonical_asset'))}</b>\n"
         f"LONG <code>{tg(route.get('long_venue'))}</code> / "
         f"SHORT <code>{tg(route.get('short_venue'))}</code>\n\n"
@@ -2380,7 +2440,7 @@ def disarmed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
 
 def pending_message(position: dict[str, Any], result: dict[str, Any]) -> str:
     return (
-        "<b>Funding Paper Trader SETTLEMENT PENDING</b>\n\n"
+        "<b>Paper Bot SETTLEMENT PENDING</b>\n\n"
         f"<b>{tg(position['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(position['long_venue'])}</code> / "
         f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
@@ -2399,7 +2459,7 @@ def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
     )
     hold_decision = accrual.get("hold_decision") or {}
     return (
-        "<b>Funding Paper Trader HOLD</b>\n\n"
+        "<b>Paper Bot HOLD</b>\n\n"
         f"<b>{tg(position['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(position['long_venue'])}</code> / "
         f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
@@ -2426,7 +2486,7 @@ def close_message(position: dict[str, Any], close: dict[str, Any]) -> str:
     window = close_window_message(close)
     details = close_decision_details_message(position, close)
     return (
-        "<b>Funding Paper Trader CLOSE</b>\n\n"
+        "<b>Paper Bot CLOSE</b>\n\n"
         f"<b>{tg(position['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(position['long_venue'])}</code> / "
         f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
@@ -2574,7 +2634,7 @@ def reprice_message(position: dict[str, Any], payload: dict[str, Any]) -> str:
         else "Качество PnL: финальный пересчет по опубликованной funding history."
     )
     return (
-        "<b>Funding Paper Trader PnL REPRICED</b>\n\n"
+        "<b>Paper Bot PnL REPRICED</b>\n\n"
         f"<b>{tg(position.get('canonical_asset'))}</b>\n"
         f"LONG <code>{tg(position.get('long_venue'))}</code> / "
         f"SHORT <code>{tg(position.get('short_venue'))}</code>\n\n"
@@ -2691,7 +2751,7 @@ def format_rate(value: Any) -> str:
         return "-"
 
 
-def serializable_config(config: FundingPaperTraderConfig) -> dict[str, Any]:
+def serializable_config(config: PaperBotConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload["export_dir"] = str(config.export_dir)
     return payload
@@ -2791,3 +2851,8 @@ def csv_value(value: Any) -> Any:
     if isinstance(value, (dict, list)):
         return str(value)
     return value
+
+
+# Backward-compatible aliases
+FundingPaperTrader = PaperBot
+FundingPaperTraderConfig = PaperBotConfig

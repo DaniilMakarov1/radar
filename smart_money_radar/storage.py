@@ -19,12 +19,24 @@ from smart_money_radar.config import (
     ChainConfig,
 )
 from smart_money_radar.funding.normalization import CANONICAL_ASSET_UNIT_MULTIPLIERS
-from smart_money_radar.prediction.strategies import (
-    build_prediction_opportunity_dashboard,
-    build_prediction_strategy_counts,
-    prediction_strategy_bucket,
-    prediction_strategy_name,
-)
+
+
+def prediction_strategy_bucket(route_type: str | None) -> str:
+    return str(route_type or "unknown")
+
+
+def prediction_strategy_name(bucket: str | None) -> str:
+    return str(bucket or "unknown")
+
+
+def build_prediction_strategy_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {}
+
+
+def build_prediction_opportunity_dashboard(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {}
 
 
 FUNDING_UNIT_MULTIPLIERS = CANONICAL_ASSET_UNIT_MULTIPLIERS

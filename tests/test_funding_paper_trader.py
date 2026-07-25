@@ -6,8 +6,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from smart_money_radar.funding.trader import (
-    FundingPaperTrader,
-    FundingPaperTraderConfig,
+    PaperBot,
+    PaperBotConfig,
     build_close_payload,
     build_position_from_route,
     close_decision,
@@ -151,7 +151,7 @@ def ensure_btc_instruments(store: SQLiteStore, observed_at: str) -> None:
 
 def test_entry_requires_both_legs_inside_final_entry_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         entry_window_seconds=180,
         entry_min_lead_seconds=30,
         entry_max_lead_seconds=60,
@@ -186,7 +186,7 @@ def test_entry_requires_both_legs_inside_final_entry_window() -> None:
 
 def test_default_entry_window_targets_final_fifteen_seconds() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
-    config = FundingPaperTraderConfig(entry_window_seconds=180).validated()
+    config = PaperBotConfig(entry_window_seconds=180).validated()
 
     too_early = route_entry_decision(
         paper_route(now, long_lead=17, short_lead=12),
@@ -209,7 +209,7 @@ def test_default_entry_window_targets_final_fifteen_seconds() -> None:
 def test_final_recheck_freeze_uses_recent_successful_snapshot() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     route = paper_route(now - timedelta(seconds=20), long_lead=28, short_lead=26)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         final_recheck_freeze_seconds=15,
         max_entry_snapshot_age_seconds=30,
     ).validated()
@@ -231,7 +231,7 @@ def test_final_recheck_freeze_uses_recent_successful_snapshot() -> None:
 def test_final_recheck_freeze_rejects_stale_snapshot() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     route = paper_route(now - timedelta(seconds=90), long_lead=98, short_lead=96)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         final_recheck_freeze_seconds=15,
         max_entry_snapshot_age_seconds=30,
     ).validated()
@@ -242,7 +242,7 @@ def test_final_recheck_freeze_rejects_stale_snapshot() -> None:
 def test_final_recheck_freeze_does_not_start_before_fifteen_second_boundary() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     route = paper_route(now - timedelta(seconds=20), long_lead=36, short_lead=35)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         final_recheck_freeze_seconds=15,
         max_entry_snapshot_age_seconds=30,
     ).validated()
@@ -252,7 +252,7 @@ def test_final_recheck_freeze_does_not_start_before_fifteen_second_boundary() ->
 
 def test_entry_rejects_stale_snapshot_inside_final_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         entry_window_seconds=180,
         entry_min_lead_seconds=0,
         entry_max_lead_seconds=15,
@@ -272,7 +272,7 @@ def test_entry_rejects_stale_snapshot_inside_final_window() -> None:
 
 def test_entry_requires_route_actionable_profit_threshold() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         entry_window_seconds=180,
         entry_min_lead_seconds=30,
         entry_max_lead_seconds=60,
@@ -525,15 +525,15 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
     ]
     assert dashboard["summary"]["realized_pnl"] == -0.5
     notifier = FakeNotifier()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(),
+        config=PaperBotConfig(),
         notifier=notifier,
     )
 
     assert trader.publish_repriced_pnl_events() == 1
     assert len(notifier.messages) == 1
-    assert "Funding Paper Trader PnL REPRICED" in notifier.messages[0]
+    assert "Paper Bot PnL REPRICED" in notifier.messages[0]
     assert "Net PnL: <b>-$0.50</b>" in notifier.messages[0]
     events = store.funding_paper_dashboard()["events"]
     reprice_event = next(
@@ -618,7 +618,7 @@ def test_settlement_hold_accrues_funding_and_rolls_position(tmp_path) -> None:
         position,
         now,
         store,
-        FundingPaperTraderConfig(settlement_grace_seconds=0).validated(),
+        PaperBotConfig(settlement_grace_seconds=0).validated(),
     )
 
     assert decision["status"] == "hold"
@@ -705,7 +705,7 @@ def test_settlement_closes_when_window_is_not_positive(tmp_path) -> None:
         position,
         now,
         store,
-        FundingPaperTraderConfig(settlement_grace_seconds=0).validated(),
+        PaperBotConfig(settlement_grace_seconds=0).validated(),
     )
 
     assert decision["status"] == "close"
@@ -848,7 +848,7 @@ def test_close_message_explains_interval_and_settlement_mismatch(tmp_path) -> No
         position,
         now,
         store,
-        FundingPaperTraderConfig(settlement_grace_seconds=0).validated(),
+        PaperBotConfig(settlement_grace_seconds=0).validated(),
     )
     message = close_message(position, decision["close"])
 
@@ -930,7 +930,7 @@ def test_settlement_closes_when_continuation_route_is_stale(tmp_path) -> None:
         position,
         now,
         store,
-        FundingPaperTraderConfig(
+        PaperBotConfig(
             settlement_grace_seconds=0,
             max_entry_snapshot_age_seconds=30,
         ).validated(),
@@ -949,9 +949,9 @@ def test_retention_database_lock_does_not_crash_trading_loop(
 ) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(retention_interval_seconds=30),
+        config=PaperBotConfig(retention_interval_seconds=30),
     )
 
     def locked_retention(*args, **kwargs):
@@ -975,9 +975,9 @@ def test_retention_foreign_key_error_does_not_crash_trading_loop(
 ) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(retention_interval_seconds=30),
+        config=PaperBotConfig(retention_interval_seconds=30),
     )
 
     def broken_retention(*args, **kwargs):
@@ -1000,9 +1000,9 @@ def test_trader_notifies_on_graceful_stop(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     notifier = FakeNotifier()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(),
+        config=PaperBotConfig(),
         notifier=notifier,
     )
 
@@ -1020,7 +1020,7 @@ def test_trader_notifies_on_crash(tmp_path) -> None:
     notifier = FakeNotifier()
     trader = ExplodingTrader(
         store,
-        config=FundingPaperTraderConfig(),
+        config=PaperBotConfig(),
         notifier=notifier,
     )
 
@@ -1040,9 +1040,9 @@ def test_status_report_sends_once_per_interval(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     notifier = FakeNotifier()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(
+        config=PaperBotConfig(
             status_report_interval_seconds=1_800,
             status_report_max_routes=3,
         ),
@@ -1065,7 +1065,7 @@ def test_status_report_sends_once_per_interval(tmp_path) -> None:
     trader.maybe_record_status_report(result, [paper_route(now, 60, 45)], [])
 
     assert len(notifier.messages) == 1
-    assert "Funding Paper Trader STATUS" in notifier.messages[0]
+    assert "Paper Bot STATUS" in notifier.messages[0]
     assert "Candidates: 1" in notifier.messages[0]
     event_types = [row["event_type"] for row in store.funding_paper_dashboard()["events"]]
     assert event_types.count("status_report") == 1
@@ -1075,9 +1075,9 @@ def test_status_report_does_not_publish_watch_routes(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     notifier = FakeNotifier()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(status_report_interval_seconds=1_800),
+        config=PaperBotConfig(status_report_interval_seconds=1_800),
         notifier=notifier,
     )
     now = datetime.now(UTC)
@@ -1110,9 +1110,9 @@ def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) ->
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     notifier = FakeNotifier()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(status_report_interval_seconds=1_800),
+        config=PaperBotConfig(status_report_interval_seconds=1_800),
         notifier=notifier,
     )
     now = datetime.now(UTC)
@@ -1140,9 +1140,9 @@ def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) ->
 
 
 def test_next_sleep_uses_three_speed_monitoring(tmp_path) -> None:
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         SQLiteStore(tmp_path / "radar.sqlite"),
-        config=FundingPaperTraderConfig(
+        config=PaperBotConfig(
             scan_interval_seconds=300,
             monitor_interval_seconds=120,
             hot_interval_seconds=10,
@@ -1161,7 +1161,7 @@ def test_next_sleep_uses_three_speed_monitoring(tmp_path) -> None:
 
 def test_monitor_route_is_urgent_only_inside_entry_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         entry_window_seconds=180,
         arm_window_seconds=900,
     ).validated()
@@ -1179,9 +1179,9 @@ def test_urgent_route_keeps_focused_loop_after_base_interval(tmp_path) -> None:
     now = datetime.now(UTC)
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(
+        config=PaperBotConfig(
             entry_window_seconds=180,
             scan_interval_seconds=300,
         ),
@@ -1198,7 +1198,7 @@ def test_hot_route_rechecks_are_parallelized(tmp_path) -> None:
     store.init_db()
     trader = CountingRecheckTrader(
         store,
-        config=FundingPaperTraderConfig(hot_route_recheck_workers=2),
+        config=PaperBotConfig(hot_route_recheck_workers=2),
     )
     for index in range(4):
         route = paper_route(now, 600, 540)
@@ -1241,9 +1241,9 @@ def test_open_position_keeps_focused_loop_without_hot_route(tmp_path) -> None:
             "entry_evidence": {},
         }
     )
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(scan_interval_seconds=300),
+        config=PaperBotConfig(scan_interval_seconds=300),
     )
 
     assert trader.should_run_hot_iteration()
@@ -1253,9 +1253,9 @@ def test_status_report_can_be_disabled(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     notifier = FakeNotifier()
-    trader = FundingPaperTrader(
+    trader = PaperBot(
         store,
-        config=FundingPaperTraderConfig(status_report_interval_seconds=0),
+        config=PaperBotConfig(status_report_interval_seconds=0),
         notifier=notifier,
     )
 
@@ -1279,12 +1279,12 @@ class FakeNotifier:
         return NotificationResult("sent")
 
 
-class ExplodingTrader(FundingPaperTrader):
+class ExplodingTrader(PaperBot):
     def run_iteration(self) -> dict:
         raise RuntimeError("boom")
 
 
-class CountingRecheckTrader(FundingPaperTrader):
+class CountingRecheckTrader(PaperBot):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.active_rechecks = 0
@@ -1424,7 +1424,7 @@ def test_compute_spread_snapshot_returns_false_without_entry_spread() -> None:
 
 
 def test_spread_stop_loss_triggers_above_threshold() -> None:
-    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    config = PaperBotConfig(basis_stop_loss_bps=200.0).validated()
     snapshot = {
         "spread_tracking": True,
         "notional": 500.0,
@@ -1437,7 +1437,7 @@ def test_spread_stop_loss_triggers_above_threshold() -> None:
 
 
 def test_spread_stop_loss_does_not_trigger_below_threshold() -> None:
-    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    config = PaperBotConfig(basis_stop_loss_bps=200.0).validated()
     snapshot = {
         "spread_tracking": True,
         "notional": 500.0,
@@ -1448,7 +1448,7 @@ def test_spread_stop_loss_does_not_trigger_below_threshold() -> None:
 
 
 def test_spread_stop_loss_ignores_positive_pnl() -> None:
-    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    config = PaperBotConfig(basis_stop_loss_bps=200.0).validated()
     snapshot = {
         "spread_tracking": True,
         "notional": 500.0,
@@ -1459,14 +1459,14 @@ def test_spread_stop_loss_ignores_positive_pnl() -> None:
 
 
 def test_spread_stop_loss_ignores_untracked_snapshot() -> None:
-    config = FundingPaperTraderConfig(basis_stop_loss_bps=200.0).validated()
+    config = PaperBotConfig(basis_stop_loss_bps=200.0).validated()
     triggered, _ = spread_stop_loss_triggered({"spread_tracking": False}, config)
     assert not triggered
 
 
 def test_hold_decision_detects_funding_rate_inversion() -> None:
     now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         max_entry_snapshot_age_seconds=300,
     ).validated()
     position = {
@@ -1487,7 +1487,7 @@ def test_hold_decision_detects_funding_rate_inversion() -> None:
 
 def test_hold_decision_allows_normal_rate_order() -> None:
     now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
-    config = FundingPaperTraderConfig(
+    config = PaperBotConfig(
         max_entry_snapshot_age_seconds=300,
     ).validated()
     position = {
@@ -1511,7 +1511,7 @@ def test_build_position_includes_spread_fields() -> None:
     route["legs"][0]["evidence"] = {"vwap": 100.5}
     route["legs"][1]["evidence"] = {"vwap": 100.2}
     route["evidence"]["signed_entry_basis"] = -0.003
-    config = FundingPaperTraderConfig().validated()
+    config = PaperBotConfig().validated()
     decision = route_entry_decision(route, accounts(), now, config)
 
     position = build_position_from_route(route, decision, config)

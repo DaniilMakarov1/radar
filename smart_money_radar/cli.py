@@ -5,13 +5,6 @@ import json
 import sys
 from pathlib import Path
 
-from smart_money_radar.analytics import (
-    AnalyticsError,
-    initialize_analytics,
-    prune_analytics_executions,
-    run_saved_query,
-    run_sql,
-)
 from smart_money_radar.config import DEFAULT_DB_PATH, api_key_status
 from smart_money_radar.funding.adapters import FundingDataError
 from smart_money_radar.funding.models import FundingScanConfig
@@ -25,8 +18,8 @@ from smart_money_radar.funding.service import (
     watch_funding_markets,
 )
 from smart_money_radar.funding.trader import (
-    FundingPaperTrader,
-    FundingPaperTraderConfig,
+    PaperBot,
+    PaperBotConfig,
     export_funding_paper_csv,
 )
 from smart_money_radar.dashboard import (
@@ -38,24 +31,7 @@ from smart_money_radar.notifications import (
     TelegramNotifier,
     telegram_update_chat_ids,
 )
-from smart_money_radar.prediction.clients import PredictionDataError
-from smart_money_radar.prediction.bot import (
-    PredictionBotConfig,
-    PredictionRadarBot,
-)
-from smart_money_radar.prediction.mappings import (
-    PredictionMappingError,
-    load_prediction_verified_mapping_file,
-)
-from smart_money_radar.prediction.service import (
-    PredictionScanConfig,
-    run_prediction_scan,
-    watch_prediction_markets,
-)
 from smart_money_radar.storage import SQLiteStore
-
-
-ANALYTICS_EXECUTION_RETENTION = 5
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,61 +110,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             store.init_db()
             print_status(store)
-            return 0
-
-        if args.command == "analytics-init":
-            catalog = initialize_analytics(store)
-            print("Initialized local Radar Analytics")
-            print(f"  engine: {catalog['engine']}")
-            print(f"  views: {len(catalog['views'])}")
-            print(f"  saved queries: {len(catalog['queries'])}")
-            return 0
-
-        if args.command == "analytics-list":
-            catalog = initialize_analytics(store)
-            print("Radar Analytics views")
-            for view in catalog["views"]:
-                print(f"  {view['name']}")
-            print("\nSaved queries")
-            for query in catalog["queries"]:
-                print(
-                    f"  {query['query_slug']} | {query['title']} | "
-                    f"{query['source']}"
-                )
-            return 0
-
-        if args.command == "analytics-run":
-            try:
-                result = run_saved_query(store, args.slug, limit=args.limit)
-            finally:
-                prune_analytics_executions(
-                    store,
-                    keep_latest=ANALYTICS_EXECUTION_RETENTION,
-                )
-            print_analytics_result(result, as_json=args.json)
-            return 0
-
-        if args.command == "analytics-query":
-            if args.sql_file:
-                sql = Path(args.sql_file).read_text(encoding="utf-8")
-            else:
-                sql = args.sql
-            try:
-                result = run_sql(store, sql, limit=args.limit)
-            finally:
-                prune_analytics_executions(
-                    store,
-                    keep_latest=ANALYTICS_EXECUTION_RETENTION,
-                )
-            print_analytics_result(result, as_json=args.json)
-            return 0
-
-        if args.command == "dune-health":
-            statuses = api_key_status()
-            print("Dune/API health:")
-            print(f"  DUNE_API_KEY: {'present' if statuses['DUNE_API_KEY'] else 'missing'}")
-            if not statuses["DUNE_API_KEY"]:
-                print("  Next: add DUNE_API_KEY to .env before executing Dune SQL.")
             return 0
 
         if args.command == "buyers-report":
@@ -313,333 +234,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
 
-        if args.command == "prediction-scan":
-            store.init_db()
-            result = run_prediction_scan(
-                store,
-                config=prediction_scan_config(args),
-            )
-            print("Prediction Radar scan")
-            print(f"  scan: {result['prediction_scan_id']}")
-            print(
-                "  events: "
-                f"Polymarket={result['polymarket_event_count']} "
-                f"Kalshi={result['kalshi_event_count']} "
-                f"Hyperliquid={result.get('hyperliquid_event_count', 0)}"
-            )
-            print(f"  markets: {result['market_count']}")
-            print(f"  orderbooks: {result['orderbook_count']}")
-            print(f"  routes evaluated: {result['route_count']}")
-            print(f"  executable routes: {result['executable_route_count']}")
-            print(f"  paper executions: {result['paper_execution_count']}")
-            print(f"  wallet scores: {result['wallet_score_count']}")
-            print(f"  event-token links: {result['token_link_count']}")
-            for warning in result.get("warnings", []):
-                print(f"  warning: {warning}")
-            return 0
-
-        if args.command == "prediction-watch":
-            store.init_db()
-            watch_prediction_markets(
-                store,
-                interval_seconds=args.interval_seconds,
-                iterations=args.iterations,
-                config=prediction_scan_config(args),
-            )
-            return 0
-
-        if args.command == "prediction-bot":
-            store.init_db()
-            bot = PredictionRadarBot(
-                store,
-                config=prediction_bot_config(args),
-                notifier=TelegramNotifier(
-                    token_env_var="PREDICTION_TELEGRAM_BOT_TOKEN",
-                    chat_id_env_var="PREDICTION_TELEGRAM_CHAT_ID",
-                ),
-            )
-            bot.run_loop()
-            return 0
-
-        if args.command == "prediction-report":
-            store.init_db()
-            report = store.prediction_dashboard(route_limit=args.limit)
-            scan = report["latest_scan"]
-            print("Prediction Radar report")
-            print(f"  latest scan: {scan.get('prediction_scan_id', '-')}")
-            print(f"  status: {scan.get('status', 'not_started')}")
-            print(f"  freshness: {scan.get('freshness_status', 'unknown')}")
-            print(
-                "  venue events: "
-                f"Polymarket={int(scan.get('polymarket_event_count') or 0)} "
-                f"Kalshi={int(scan.get('kalshi_event_count') or 0)} "
-                f"Hyperliquid={int(scan.get('hyperliquid_event_count') or 0)}"
-            )
-            print(f"  markets: {scan.get('market_count', 0)}")
-            print(f"  paper/executable routes: {len(report['routes'])}")
-            candidate_summary = report.get("candidate_summary") or {}
-            candidate_count = int(candidate_summary.get("candidate_count") or 0)
-            print(
-                "  route candidates: "
-                f"{candidate_count if candidate_count else 'нет кандидатов'}"
-            )
-            print(f"  executable routes: {scan.get('executable_route_count', 0)}")
-            wallet_summary = report.get("wallet_summary") or {}
-            print(
-                "  wallet cache: "
-                f"{wallet_summary.get('cache_status', 'unknown')}"
-            )
-            print(
-                "  paper PnL: "
-                f"${float(report['paper_summary'].get('simulated_net_profit') or 0):.2f}"
-            )
-            alerts = (report.get("opportunity_dashboard") or {}).get("alerts") or []
-            for alert in alerts[:5]:
-                print(
-                    f"  alert: {alert['alert_type']} | "
-                    f"{alert.get('strategy_name') or alert.get('strategy_bucket')} | "
-                    f"score={float(alert.get('candidate_score') or 0):.2f} | "
-                    f"{alert.get('title')}"
-                )
-            for route in report["routes"]:
-                print(
-                    f"  {route['route_type']} | {route['venue_scope']} | "
-                    f"net=${float(route.get('expected_net_profit') or 0):.2f} | "
-                    f"size={float(route.get('optimal_size') or 0):.2f} | "
-                    f"{route['title']}"
-                )
-            near_zero = report.get("near_zero_routes") or []
-            if near_zero:
-                print("  near-zero watch, not candidates:")
-                for route in near_zero[: args.limit]:
-                    print(
-                        f"    {route['route_type']} | {route['venue_scope']} | "
-                        f"net=${float(route.get('expected_net_profit') or 0):.4f} | "
-                        f"missing_edge={float(route.get('missing_net_edge_per_share') or 0) * 100:.3f}% | "
-                        f"size={float(route.get('optimal_size') or 0):.2f} | "
-                        f"{route['title']}"
-                    )
-            return 0
-
-        if args.command == "prediction-backlog-report":
-            store.init_db()
-            report = store.prediction_dashboard(route_limit=args.limit)
-            summary = report.get("backlog_summary") or {}
-            print("Prediction Radar backlog")
-            print(
-                "  candidates: "
-                f"{int(summary.get('candidate_backlog_count') or 0)} "
-                f"(active={int(summary.get('active_candidate_count') or 0)})"
-            )
-            print(f"  trades: {int(summary.get('trade_backlog_count') or 0)}")
-            print(f"  policy: {summary.get('storage_policy')}")
-            candidates = report.get("candidate_backlog") or []
-            if candidates:
-                print("\nCandidates:")
-                for row in candidates[: args.limit]:
-                    status = "active" if row.get("active") else "inactive"
-                    print(
-                        f"  {status} | seen={row.get('seen_count')} | "
-                        f"{row.get('route_type')} | {row.get('venue_scope')} | "
-                        f"best=${float(row.get('best_expected_net_profit') or 0):.2f} | "
-                        f"last=${float(row.get('expected_net_profit') or 0):.2f} | "
-                        f"{row.get('title')}"
-                    )
-            trades = report.get("trade_backlog") or []
-            if trades:
-                print("\nTrades:")
-                for row in trades[: args.limit]:
-                    print(
-                        f"  {row.get('source_type')} | {row.get('status')} | "
-                        f"{row.get('route_type')} | "
-                        f"sim=${float(row.get('simulated_net_profit') or 0):.2f} | "
-                        f"{row.get('title')}"
-                    )
-            return 0
-
-        if args.command == "prediction-mappings-import":
-            store.init_db()
-            try:
-                mappings = load_prediction_verified_mapping_file(Path(args.input))
-            except PredictionMappingError as exc:
-                print(f"Prediction mapping import failed: {exc}", file=sys.stderr)
-                return 2
-            if args.dry_run:
-                print("Prediction trusted mapping import dry run")
-                print(f"  valid mappings: {len(mappings)}")
-                return 0
-            inserted = store.upsert_prediction_verified_contract_mappings(mappings)
-            print("Prediction trusted mappings imported")
-            print(f"  mappings: {inserted}")
-            return 0
-
-        if args.command == "prediction-mappings-report":
-            store.init_db()
-            mappings = store.prediction_verified_contract_mappings()
-            print("Prediction trusted mappings")
-            if not mappings:
-                print("  нет trusted mappings")
-                return 0
-            for row in mappings[: max(0, int(args.limit))]:
-                print(
-                    f"  {row['venue_a']}:{row['market_id_a']} <=> "
-                    f"{row['venue_b']}:{row['market_id_b']} | "
-                    f"confidence={float(row.get('confidence_score') or 0):.3f} | "
-                    f"status={row.get('status')}"
-                )
-            return 0
-
-        if args.command == "risex-status":
-            from smart_money_radar.risex.points import (
-                RiseXPointsClient,
-                fetch_leaderboard_snapshot,
-                fetch_points_epoch,
-            )
-            from smart_money_radar.risex.farming import (
-                RiseXFarmingConfig,
-                estimate_farming_economics,
-            )
-
-            client = RiseXPointsClient()
-            epoch = fetch_points_epoch(client)
-            print("RiseX Status")
-            print(f"  epoch: {epoch.get('epoch_id', '-')} ({epoch.get('description', '-')})")
-            dist_secs = epoch.get("seconds_until_distribution", 0)
-            print(f"  distribution in: {dist_secs / 3600:.1f}h")
-            print()
-
-            lb = fetch_leaderboard_snapshot(client, timeframe=args.timeframe, limit=args.limit)
-            print(f"Volume leaderboard ({args.timeframe})")
-            print(f"  total notional: ${lb['total_notional_volume']:,.0f}")
-            print(f"  top notional: ${lb['top_notional_volume']:,.0f}")
-            print(f"  median notional: ${lb['median_notional_volume']:,.0f}")
-            for e in lb["entries"][: args.limit]:
-                print(
-                    f"  #{e['rank']:>3} | notional=${e['notional_volume']:>14,.0f} | "
-                    f"share={e['notional_share_pct']:.2f}% | trades={e['trades']:>6}"
-                )
-            print()
-
-            econ = estimate_farming_economics(RiseXFarmingConfig(
-                target_notional_usd=10_000,
-                cycles_per_day=12,
-            ))
-            print("Farming estimate ($10K notional, 12 cycles/day)")
-            print(f"  weekly volume: ${econ['volume']['weekly_usd']:,.0f}")
-            print(f"  weekly fees: ${econ['costs']['weekly_fees_usd']:,.2f}")
-            print(f"  weekly leaderboard reward: ${econ['revenue']['weekly_leaderboard_usd']:,.2f}")
-            print(f"  weekly funding income: ${econ['revenue']['weekly_funding_usd']:,.2f}")
-            print(f"  weekly net P&L: ${econ['net_pnl']['weekly_usd']:,.2f}")
-            print(f"  volume share: {econ['revenue']['volume_share_pct']:.3f}%")
-            print(f"  est. weekly points: {econ['revenue']['weekly_points_est']:.0f}")
-            return 0
-
-        if args.command == "risex-leaderboard":
-            from smart_money_radar.risex.points import (
-                RiseXPointsClient,
-                fetch_leaderboard_snapshot,
-            )
-
-            client = RiseXPointsClient()
-            lb = fetch_leaderboard_snapshot(client, timeframe=args.timeframe, limit=args.limit)
-            print(f"RiseX Volume Leaderboard ({args.timeframe})")
-            print(f"  total notional: ${lb['total_notional_volume']:,.0f}")
-            print(f"  entries: {lb['entry_count']}")
-            print()
-            for e in lb["entries"]:
-                print(
-                    f"  #{e['rank']:>3} | {e['address'][:10]}... | "
-                    f"notional=${e['notional_volume']:>14,.0f} | "
-                    f"referral=${e['referral_volume']:>14,.0f} | "
-                    f"combined=${e['combined_volume']:>14,.0f} | "
-                    f"trades={e['trades']:>6} | "
-                    f"share={e['notional_share_pct']:.2f}%"
-                )
-            return 0
-
-        if args.command == "risex-farming-estimate":
-            from smart_money_radar.risex.farming import (
-                RiseXFarmingConfig,
-                estimate_farming_economics,
-                paper_farming_cycle,
-            )
-
-            config = RiseXFarmingConfig(
-                target_notional_usd=args.notional,
-                cycles_per_day=args.cycles,
-                hedge_venue=args.hedge_venue,
-            )
-            econ = estimate_farming_economics(config)
-            print("RiseX Volume Farming Estimate")
-            print(f"  notional: ${econ['config']['target_notional_usd']:,.0f}")
-            print(f"  cycles/day: {econ['config']['cycles_per_day']}")
-            print(f"  hedge venue: {econ['config']['hedge_venue']}")
-            print(f"  RiseX fee: {econ['config']['risex_fee_rate_bps']:.1f} bps")
-            print(f"  hedge fee: {econ['config']['hedge_fee_rate_bps']:.1f} bps")
-            print(f"  point boost: {econ['config']['point_boost_pct']:.0f}%")
-            print()
-            print("Volume")
-            print(f"  daily: ${econ['volume']['daily_usd']:,.0f}")
-            print(f"  weekly: ${econ['volume']['weekly_usd']:,.0f}")
-            print(f"  monthly: ${econ['volume']['monthly_usd']:,.0f}")
-            print()
-            print("Costs")
-            print(f"  daily fees: ${econ['costs']['daily_fees_usd']:,.2f}")
-            print(f"  weekly fees: ${econ['costs']['weekly_fees_usd']:,.2f}")
-            print(f"  monthly fees: ${econ['costs']['monthly_fees_usd']:,.2f}")
-            print()
-            print("Revenue")
-            print(f"  weekly leaderboard: ${econ['revenue']['weekly_leaderboard_usd']:,.2f}")
-            print(f"  weekly funding: ${econ['revenue']['weekly_funding_usd']:,.2f}")
-            print(f"  monthly funding: ${econ['revenue']['monthly_funding_usd']:,.2f}")
-            print(f"  weekly points (est): {econ['revenue']['weekly_points_est']:.0f}")
-            print(f"  volume share: {econ['revenue']['volume_share_pct']:.3f}%")
-            print()
-            print("Net P&L")
-            print(f"  weekly: ${econ['net_pnl']['weekly_usd']:,.2f}")
-            print(f"  monthly: ${econ['net_pnl']['monthly_usd']:,.2f}")
-            print()
-            print("Breakeven")
-            print(f"  min volume share: {econ['breakeven']['min_volume_share_pct']:.3f}%")
-            print(f"  min weekly volume: ${econ['breakeven']['min_weekly_volume_usd']:,.0f}")
-            print()
-
-            cycle = paper_farming_cycle(config, cycle_number=1)
-            print("Paper cycle #1")
-            print(f"  notional: ${cycle['notional_usd']:,.0f}")
-            print(f"  RiseX fee: ${cycle['risex_fee_usd']:,.4f}")
-            print(f"  hedge fee: ${cycle['hedge_fee_usd']:,.4f}")
-            print(f"  funding earned: ${cycle['funding_earned_usd']:,.4f}")
-            print(f"  net P&L: ${cycle['net_pnl_usd']:,.4f}")
-            print(f"  volume generated: ${cycle['volume_generated_usd']:,.0f}")
-            return 0
-
-        if args.command == "risex-bot":
-            from smart_money_radar.risex.bot import RiseXBot, RiseXBotConfig
-
-            store.init_db()
-            bot_config = RiseXBotConfig(
-                venue_starting_balance=args.balance,
-                target_notional_per_leg=args.notional,
-                scan_interval_seconds=args.scan_interval,
-                status_report_interval_seconds=args.report_interval,
-                iterations=args.iterations,
-                telegram_enabled=not args.no_telegram,
-                hedge_venues=tuple(args.hedge_venues),
-                funding_carry_enabled=not args.no_funding_carry,
-                spread_arb_enabled=not args.no_spread_arb,
-            ).validated()
-            bot = RiseXBot(
-                store,
-                config=bot_config,
-                notifier=TelegramNotifier(
-                    token_env_var="RISEX_TELEGRAM_BOT_TOKEN",
-                    chat_id_env_var="RISEX_TELEGRAM_CHAT_ID",
-                ),
-            )
-            bot.run_loop()
-            return 0
-
         if args.command == "funding-scan":
             store.init_db()
             result = run_funding_scan(store, config=funding_scan_config(args))
@@ -753,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "funding-paper-trader":
             store.init_db()
-            trader = FundingPaperTrader(
+            trader = PaperBot(
                 store,
                 config=funding_paper_trader_config(args),
                 notifier=TelegramNotifier(
@@ -852,12 +446,6 @@ def main(argv: list[str] | None = None) -> int:
 
         parser.print_help()
         return 2
-    except AnalyticsError as exc:
-        print(f"Analytics error: {exc}", file=sys.stderr)
-        return 1
-    except PredictionDataError as exc:
-        print(f"Prediction market data error: {exc}", file=sys.stderr)
-        return 1
     except FundingDataError as exc:
         print(f"Funding market data error: {exc}", file=sys.stderr)
         return 1
@@ -918,38 +506,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print concise project status and next blockers.",
     )
 
-    subparsers.add_parser(
-        "analytics-init",
-        help="Initialize local Radar Analytics views and built-in queries.",
-    )
-
-    subparsers.add_parser(
-        "analytics-list",
-        help="List local Radar Analytics datasets and saved queries.",
-    )
-
-    analytics_run = subparsers.add_parser(
-        "analytics-run",
-        help="Run a saved local analytics query without Dune.",
-    )
-    analytics_run.add_argument("--slug", required=True)
-    analytics_run.add_argument("--limit", type=int, default=100)
-    analytics_run.add_argument("--json", action="store_true")
-
-    analytics_query = subparsers.add_parser(
-        "analytics-query",
-        help="Run a read-only local SQL analytics query without Dune.",
-    )
-    sql_source = analytics_query.add_mutually_exclusive_group(required=True)
-    sql_source.add_argument("--sql")
-    sql_source.add_argument("--sql-file")
-    analytics_query.add_argument("--limit", type=int, default=100)
-    analytics_query.add_argument("--json", action="store_true")
-
-    subparsers.add_parser(
-        "dune-health",
-        help="Check whether Dune API configuration is present.",
-    )
     buyers_report = subparsers.add_parser(
         "buyers-report",
         help="Print summarized pre-listing buyer results.",
@@ -977,124 +533,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the latest Live Radar observations and qualified signals.",
     )
     live_report.add_argument("--limit", type=int, default=20)
-
-    prediction_scan = subparsers.add_parser(
-        "prediction-scan",
-        help="Collect prediction-market books, scan routes, and paper execute.",
-    )
-    add_prediction_scan_arguments(prediction_scan)
-
-    prediction_watch = subparsers.add_parser(
-        "prediction-watch",
-        help="Continuously refresh the Prediction Radar paper pipeline.",
-    )
-    add_prediction_scan_arguments(prediction_watch)
-    prediction_watch.add_argument("--interval-seconds", type=int, default=300)
-    prediction_watch.add_argument("--iterations", type=int)
-
-    prediction_bot = subparsers.add_parser(
-        "prediction-bot",
-        help="Run Prediction Radar every 5 minutes and send Telegram status reports.",
-    )
-    prediction_bot.add_argument("--scan-interval-seconds", type=int, default=300)
-    prediction_bot.add_argument(
-        "--status-report-interval-seconds",
-        type=int,
-        default=3_600,
-        help="Telegram status report interval; use 0 to disable.",
-    )
-    prediction_bot.add_argument(
-        "--status-report-max-routes",
-        type=int,
-        default=5,
-        help="Maximum prediction routes included in each status report.",
-    )
-    prediction_bot.add_argument("--events-per-venue", type=int, default=75)
-    prediction_bot.add_argument("--max-markets-per-venue", type=int, default=1_500)
-    prediction_bot.add_argument("--kalshi-market-pages", type=int, default=10)
-    prediction_bot.add_argument("--http-timeout-seconds", type=int, default=8)
-    prediction_bot.add_argument("--http-max-retries", type=int, default=1)
-    prediction_bot.add_argument("--paper-size", type=float, default=100.0)
-    prediction_bot.add_argument("--paper-latency-ms", type=int, default=750)
-    prediction_bot.add_argument("--paper-depth-haircut", type=float, default=0.8)
-    prediction_bot.add_argument("--skip-hyperliquid", action="store_true")
-    prediction_bot.add_argument("--iterations", type=int)
-    prediction_bot.add_argument("--no-telegram", action="store_true")
-    prediction_bot.add_argument(
-        "--lifecycle-telegram",
-        action="store_true",
-        help="Also send normal Prediction Radar start/stop Telegram notifications.",
-    )
-
-    prediction_report = subparsers.add_parser(
-        "prediction-report",
-        help="Print the latest research-only prediction-market paper candidates.",
-    )
-    prediction_report.add_argument("--limit", type=int, default=20)
-
-    prediction_backlog_report = subparsers.add_parser(
-        "prediction-backlog-report",
-        help="Print bounded Prediction Radar candidate/trade backlog.",
-    )
-    prediction_backlog_report.add_argument("--limit", type=int, default=20)
-
-    prediction_mappings_import = subparsers.add_parser(
-        "prediction-mappings-import",
-        help="Import manually verified Polymarket/Kalshi equivalent contracts.",
-    )
-    prediction_mappings_import.add_argument("--input", required=True)
-    prediction_mappings_import.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate and print the number of mappings without writing to SQLite.",
-    )
-
-    prediction_mappings_report = subparsers.add_parser(
-        "prediction-mappings-report",
-        help="Print trusted prediction cross-venue contract mappings.",
-    )
-    prediction_mappings_report.add_argument("--limit", type=int, default=50)
-
-    risex_status = subparsers.add_parser(
-        "risex-status",
-        help="Show RiseX points epoch, leaderboard snapshot, and farming economics.",
-    )
-    risex_status.add_argument("--timeframe", default="7d", choices=("24h", "7d", "30d", "all"))
-    risex_status.add_argument("--limit", type=int, default=10)
-
-    risex_leaderboard = subparsers.add_parser(
-        "risex-leaderboard",
-        help="Print RiseX volume leaderboard.",
-    )
-    risex_leaderboard.add_argument("--timeframe", default="7d", choices=("24h", "7d", "30d", "all"))
-    risex_leaderboard.add_argument("--limit", type=int, default=20)
-
-    risex_farming = subparsers.add_parser(
-        "risex-farming-estimate",
-        help="Estimate RiseX volume farming economics.",
-    )
-    risex_farming.add_argument("--notional", type=float, default=10_000)
-    risex_farming.add_argument("--cycles", type=int, default=12)
-    risex_farming.add_argument("--hedge-venue", default="binance")
-
-    risex_bot = subparsers.add_parser(
-        "risex-bot",
-        help="Run RiseX paper trading bot with funding carry and spread arb (scanner pipeline, no artificial BPS filters).",
-    )
-    risex_bot.add_argument("--balance", type=float, default=2_000.0, help="Starting balance per venue (default 2000)")
-    risex_bot.add_argument("--notional", type=float, default=500.0)
-    risex_bot.add_argument("--scan-interval", type=int, default=180)
-    risex_bot.add_argument("--report-interval", type=int, default=900)
-    risex_bot.add_argument("--iterations", type=int)
-    risex_bot.add_argument("--no-telegram", action="store_true")
-    risex_bot.add_argument(
-        "--hedge-venues",
-        nargs="+",
-        default=["hyperliquid", "dydx", "lighter", "variational"],
-        choices=("hyperliquid", "dydx", "lighter", "variational"),
-    )
-    risex_bot.add_argument("--no-funding-carry", action="store_true")
-    risex_bot.add_argument("--no-spread-arb", action="store_true")
 
     funding_scan = subparsers.add_parser(
         "funding-scan",
@@ -1282,64 +720,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def add_prediction_scan_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--events-per-venue", type=int, default=75)
-    parser.add_argument("--max-markets-per-venue", type=int, default=1_500)
-    parser.add_argument("--kalshi-market-pages", type=int, default=10)
-    parser.add_argument("--http-timeout-seconds", type=int, default=8)
-    parser.add_argument("--http-max-retries", type=int, default=1)
-    parser.add_argument("--wallet-limit", type=int, default=10)
-    parser.add_argument("--wallet-position-limit", type=int, default=60)
-    parser.add_argument("--wallet-refresh-hours", type=float, default=24.0)
-    parser.add_argument("--paper-size", type=float, default=100.0)
-    parser.add_argument("--paper-latency-ms", type=int, default=750)
-    parser.add_argument("--paper-depth-haircut", type=float, default=0.8)
-    parser.add_argument("--retention-scans", type=int, default=1)
-    parser.add_argument("--dashboard-freshness-minutes", type=float, default=15.0)
-    parser.add_argument("--skip-wallets", action="store_true")
-    parser.add_argument("--skip-hyperliquid", action="store_true")
-
-
-def prediction_scan_config(args: argparse.Namespace) -> PredictionScanConfig:
-    return PredictionScanConfig(
-        events_per_venue=args.events_per_venue,
-        max_markets_per_venue=args.max_markets_per_venue,
-        kalshi_market_pages=args.kalshi_market_pages,
-        http_timeout_seconds=args.http_timeout_seconds,
-        http_max_retries=args.http_max_retries,
-        wallet_limit=args.wallet_limit,
-        wallet_position_limit=args.wallet_position_limit,
-        wallet_refresh_hours=args.wallet_refresh_hours,
-        paper_size=args.paper_size,
-        paper_latency_ms=args.paper_latency_ms,
-        paper_depth_haircut=args.paper_depth_haircut,
-        retention_scans=args.retention_scans,
-        dashboard_freshness_minutes=args.dashboard_freshness_minutes,
-        collect_wallets=not args.skip_wallets,
-        collect_hyperliquid=not args.skip_hyperliquid,
-    )
-
-
-def prediction_bot_config(args: argparse.Namespace) -> PredictionBotConfig:
-    return PredictionBotConfig(
-        scan_interval_seconds=args.scan_interval_seconds,
-        status_report_interval_seconds=args.status_report_interval_seconds,
-        status_report_max_routes=args.status_report_max_routes,
-        events_per_venue=args.events_per_venue,
-        max_markets_per_venue=args.max_markets_per_venue,
-        kalshi_market_pages=args.kalshi_market_pages,
-        http_timeout_seconds=args.http_timeout_seconds,
-        http_max_retries=args.http_max_retries,
-        paper_size=args.paper_size,
-        paper_latency_ms=args.paper_latency_ms,
-        paper_depth_haircut=args.paper_depth_haircut,
-        collect_hyperliquid=not args.skip_hyperliquid,
-        iterations=args.iterations,
-        telegram_enabled=not args.no_telegram,
-        lifecycle_telegram_enabled=args.lifecycle_telegram,
-    ).validated()
-
-
 def add_funding_scan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-notional", type=float, default=10_000.0)
     parser.add_argument(
@@ -1468,14 +848,14 @@ def funding_scan_config(args: argparse.Namespace) -> FundingScanConfig:
     ).validated()
 
 
-def funding_paper_trader_config(args: argparse.Namespace) -> FundingPaperTraderConfig:
+def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
     venue_set_raw = getattr(args, "venue_set", None)
     venue_set = (
         tuple(v.strip() for v in str(venue_set_raw).split(",") if v.strip())
         if venue_set_raw
         else None
     )
-    return FundingPaperTraderConfig(
+    return PaperBotConfig(
         venue_starting_balance=args.venue_starting_balance,
         target_notional_per_leg=args.target_notional,
         entry_window_seconds=args.entry_window_seconds,
@@ -1506,68 +886,6 @@ def funding_paper_trader_config(args: argparse.Namespace) -> FundingPaperTraderC
     ).validated()
 
 
-def print_analytics_result(result: dict[str, object], as_json: bool = False) -> None:
-    if as_json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-
-    rows = result["rows"]
-    columns = result["columns"]
-    assert isinstance(rows, list)
-    assert isinstance(columns, list)
-    print(
-        "Analytics execution "
-        f"{result['analytics_execution_id']} | "
-        f"engine={result['engine']} | rows={result['row_count']} | "
-        f"limit={result['limit']}"
-    )
-    if not rows:
-        print("No rows.")
-        return
-
-    visible_columns = [str(column) for column in columns[:8]]
-    widths = {
-        column: min(
-            36,
-            max(
-                len(column),
-                *[
-                    len(format_analytics_cell(row.get(column)))
-                    for row in rows[:20]
-                    if isinstance(row, dict)
-                ],
-            ),
-        )
-        for column in visible_columns
-    }
-    header = " | ".join(column.ljust(widths[column]) for column in visible_columns)
-    print(header)
-    print("-+-".join("-" * widths[column] for column in visible_columns))
-    for row in rows:
-        assert isinstance(row, dict)
-        print(
-            " | ".join(
-                format_analytics_cell(row.get(column))[: widths[column]].ljust(
-                    widths[column]
-                )
-                for column in visible_columns
-            )
-        )
-    if len(columns) > len(visible_columns):
-        hidden = ", ".join(str(column) for column in columns[len(visible_columns) :])
-        print(f"... hidden columns: {hidden}")
-
-
-def format_analytics_cell(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float):
-        return f"{value:.6g}"
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value)
-
-
 def print_status(store: SQLiteStore) -> None:
     summary = store.dashboard_summary()
     registry = store.registry_summary()
@@ -1580,17 +898,13 @@ def print_status(store: SQLiteStore) -> None:
     print(f"  Listing events: {registry['listing_events']}")
     print(f"  Spot backtest targets: {registry['backtest_targets']}")
     print(f"  Base-ready targets: {len(base_targets)}")
-    print(f"  Dune executions: {summary['dune_execution_count']}")
     print(f"  Pre-listing wallet buys: {summary['pre_listing_wallet_buy_count']}")
     print(f"  Wallet holding metrics: {summary['wallet_holding_metric_count']}")
     print(f"  Wallet scores: {summary['wallet_score_count']}")
-    print(f"  DUNE_API_KEY: {'present' if api_status['DUNE_API_KEY'] else 'missing'}")
     print("")
     print("Next checks")
-    if not api_status["DUNE_API_KEY"]:
-        print("  1. Add DUNE_API_KEY to .env to run Dune queries.")
-    print("  2. Run: python3 -m smart_money_radar.cli funding-scan --target-notional 10000")
-    print("  3. Run: python3 -m smart_money_radar.cli prediction-scan")
+    print("  1. Run: python3 -m smart_money_radar.cli funding-scan --target-notional 10000")
+    print("  2. Run: python3 -m smart_money_radar.cli funding-paper-trader")
 
 
 def json_load(path: Path) -> dict:

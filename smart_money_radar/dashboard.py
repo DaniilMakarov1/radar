@@ -9,21 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from smart_money_radar.analytics import (
-    AnalyticsError,
-    prune_analytics_executions,
-    run_saved_query,
-    run_sql,
-)
 from smart_money_radar.config import (
     DEFAULT_DB_PATH,
     api_key_status,
     x_social_gate_enabled,
-)
-from smart_money_radar.dashboard_dune import (
-    DUNE_ANALYTICS_EXECUTION_RETENTION,
-    build_dune_overview,
-    dashboard_int,
 )
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.presentation import (
@@ -32,10 +21,6 @@ from smart_money_radar.funding.presentation import (
 )
 from smart_money_radar.funding.service import (
     run_funding_scan,
-)
-from smart_money_radar.prediction.service import (
-    PredictionScanConfig,
-    run_prediction_scan,
 )
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
 
