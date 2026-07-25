@@ -15,7 +15,6 @@ from smart_money_radar.funding.adapters.aevo import AevoFundingClient
 from smart_money_radar.funding.adapters.apex import ApexFundingClient
 from smart_money_radar.funding.adapters.pacifica import PacificaFundingClient
 from smart_money_radar.funding.adapters.reya import ReyaFundingClient
-from smart_money_radar.funding.adapters.risex import RiseXFundingClient
 from smart_money_radar.funding.adapters.aster import AsterFundingClient
 from smart_money_radar.funding.adapters.backpack import BackpackFundingClient
 from smart_money_radar.funding.adapters.binance import BinanceFundingClient
@@ -112,7 +111,6 @@ from smart_money_radar.funding.service import (
     run_funding_scan,
 )
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
-
 
 class FundingRadarTest(unittest.TestCase):
     def test_risky_venues_are_not_active_default_funding_clients(self) -> None:
@@ -3702,36 +3700,6 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(history[-1]["hourly_funding_rate"], 0.00012)
         self.assertEqual(client.http.symbol_calls, 1)
 
-    def test_risex_adapter_uses_hourly_funding_and_nanosecond_timestamps(self) -> None:
-        observed_at = "2026-07-14T12:00:00+00:00"
-        client = RiseXFundingClient(
-            http=FakeRiseXHttp(),
-            base_url="https://risex.test",
-        )
-
-        instruments, markets, warnings = client.catalog_and_markets(observed_at)
-        book_row = client.orderbook("BTC/USDC", observed_at)
-        history = client.funding_history("BTC/USDC", 1, 1, observed_at)
-
-        self.assertEqual(warnings, [])
-        self.assertEqual(len(instruments), 1)
-        self.assertEqual(instruments[0]["venue"], "risex")
-        self.assertEqual(instruments[0]["canonical_asset"], "BTC")
-        self.assertEqual(markets[0]["funding_interval_hours"], 1)
-        self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
-        self.assertAlmostEqual(markets[0]["funding_rate"], 0.0001)
-        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001)
-        self.assertAlmostEqual(markets[0]["mark_price"], 100.0)
-        self.assertAlmostEqual(markets[0]["index_price"], 100.0)
-        self.assertAlmostEqual(markets[0]["open_interest_usd"], 1000.0)
-        self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0003)
-        self.assertAlmostEqual(markets[0]["maker_fee_rate"], 0.0001)
-        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
-        self.assertEqual(book_row["asks"][0], [100.1, 3.0])
-        self.assertEqual(len(history), 2)
-        self.assertEqual(history[-1]["funding_interval_hours"], 1)
-        self.assertAlmostEqual(history[-1]["hourly_funding_rate"], 0.00012)
-
     def test_vertex_response_fails_closed_on_unsuccessful_status(self) -> None:
         with self.assertRaises(FundingDataError):
             vertex_response_data(
@@ -3983,7 +3951,6 @@ class FundingRadarTest(unittest.TestCase):
         )
         self.assertEqual(len(dashboard["routes"]), 1)
 
-
 class FakeClient:
     def __init__(self, venue: str) -> None:
         self.venue = venue
@@ -4033,7 +4000,6 @@ class FakeClient:
             observed_at=observed_at,
         )
 
-
 class CountingFakeClient(FakeClient):
     def __init__(self, venue: str) -> None:
         super().__init__(venue)
@@ -4057,7 +4023,6 @@ class CountingFakeClient(FakeClient):
         self.orderbook_calls += 1
         return super().orderbook(symbol, observed_at, limit)
 
-
 class NoHistoryClient(FakeClient):
     def funding_history(
         self,
@@ -4067,7 +4032,6 @@ class NoHistoryClient(FakeClient):
         observed_at: str,
     ) -> list[dict[str, Any]]:
         raise AssertionError("auto scan must not fetch historical funding")
-
 
 class FakeOKXWebSocket:
     def __init__(self) -> None:
@@ -4090,7 +4054,6 @@ class FakeOKXWebSocket:
 
     def close(self) -> None:
         self.closed = True
-
 
 class FakeBinanceHttp:
     def get_json(self, url: str) -> Any:
@@ -4122,7 +4085,6 @@ class FakeBinanceHttp:
             }]
         raise AssertionError(url)
 
-
 class FakeHyperliquidHttp:
     def post_json(self, url: str, payload: dict[str, Any]) -> Any:
         if payload == {"type": "metaAndAssetCtxs"}:
@@ -4149,7 +4111,6 @@ class FakeHyperliquidHttp:
                 ]],
             ]]
         raise AssertionError((url, payload))
-
 
 class FakeBybitHttp:
     def get_json(self, url: str) -> dict[str, Any]:
@@ -4216,7 +4177,6 @@ class FakeBybitHttp:
             )
         raise AssertionError(url)
 
-
 class FakeBitgetHttp:
     def get_json(self, url: str) -> dict[str, Any]:
         if "/contracts?" in url:
@@ -4270,7 +4230,6 @@ class FakeBitgetHttp:
             )
         raise AssertionError(url)
 
-
 class FakeBackpackHttp:
     def get_json(self, url: str) -> Any:
         if "/markets?" in url:
@@ -4310,7 +4269,6 @@ class FakeBackpackHttp:
                 },
             ]
         raise AssertionError(url)
-
 
 class FakeAsterHttp:
     def get_json(self, url: str) -> Any:
@@ -4365,7 +4323,6 @@ class FakeAsterHttp:
             }]
         raise AssertionError(url)
 
-
 class FakeLighterHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/orderBooks"):
@@ -4416,7 +4373,6 @@ class FakeLighterHttp:
             }
         raise AssertionError(url)
 
-
 class FakeKuCoinHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/contracts/active"):
@@ -4453,10 +4409,8 @@ class FakeKuCoinHttp:
             }])
         raise AssertionError(url)
 
-
 def kucoin_payload(data: Any) -> dict[str, Any]:
     return {"code": "200000", "data": data}
-
 
 class FakeMEXCHttp:
     def get_json(self, url: str) -> Any:
@@ -4525,10 +4479,8 @@ class FakeMEXCHttp:
             })
         raise AssertionError(url)
 
-
 def mexc_payload(data: Any) -> dict[str, Any]:
     return {"success": True, "code": 0, "data": data}
-
 
 class FakeParadexHttp:
     def get_json(self, url: str) -> Any:
@@ -4620,10 +4572,8 @@ class FakeParadexHttp:
             ])
         raise AssertionError(url)
 
-
 def paradex_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"next": None, "results": rows}
-
 
 class FakeDriftHttp:
     def get_json(self, url: str) -> Any:
@@ -4675,7 +4625,6 @@ class FakeDriftHttp:
                 "asks": [{"price": "100100000", "size": "3000000000"}],
             }
         raise AssertionError(url)
-
 
 class FakeEtherealHttp:
     def get_json(self, url: str) -> Any:
@@ -4745,7 +4694,6 @@ class FakeEtherealHttp:
             }
         raise AssertionError(url)
 
-
 class FakeExtendedHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/api/v1/info/markets"):
@@ -4807,7 +4755,6 @@ class FakeExtendedHttp:
             }
         raise AssertionError(url)
 
-
 class FakePacificaHttp:
     def get_json(self, url: str) -> Any:
         if "/info" in url:
@@ -4842,7 +4789,6 @@ class FakePacificaHttp:
             }
         raise AssertionError(url)
 
-
 class FakeReyaHttp:
     def get_json(self, url: str) -> Any:
         if "/v2/perpMarketDefinitions" in url:
@@ -4866,7 +4812,6 @@ class FakeReyaHttp:
                 },
             ]
         raise AssertionError(url)
-
 
 class FakeApexHttp:
     def get_json(self, url: str) -> Any:
@@ -4941,7 +4886,6 @@ class FakeApexHttp:
                 },
             }
         raise AssertionError(url)
-
 
 class FakeEdgexHttp:
     def get_json(self, url: str) -> Any:
@@ -5026,7 +4970,6 @@ class FakeEdgexHttp:
             }
         raise AssertionError(url)
 
-
 class FakeGrvtHttp:
     def post_json(self, url: str, payload: Any) -> Any:
         if url.endswith("/full/v1/all_instruments"):
@@ -5093,7 +5036,6 @@ class FakeGrvtHttp:
             }
         raise AssertionError(url)
 
-
 class FakeGateHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/contracts"):
@@ -5134,7 +5076,6 @@ class FakeGateHttp:
         if "/funding_rate?" in url:
             return [{"r": "0.0001", "t": 1784016001}]
         raise AssertionError(url)
-
 
 class FakeBingXHttp:
     def get_json(self, url: str) -> Any:
@@ -5178,10 +5119,8 @@ class FakeBingXHttp:
             ])
         raise AssertionError(url)
 
-
 def bingx_payload(data: Any) -> dict[str, Any]:
     return {"code": 0, "msg": "", "data": data}
-
 
 class FakeHTXHttp:
     def get_json(self, url: str) -> Any:
@@ -5246,10 +5185,8 @@ class FakeHTXHttp:
             })
         raise AssertionError(url)
 
-
 def htx_payload(data: Any) -> dict[str, Any]:
     return {"status": "ok", "data": data}
-
 
 class FakeOKXHttp:
     def get_json(self, url: str) -> dict[str, Any]:
@@ -5339,7 +5276,6 @@ class FakeOKXHttp:
             )
         raise AssertionError(url)
 
-
 class FakeDydxHttp:
     def get_json(self, url: str) -> dict[str, Any]:
         if url.endswith("/perpetualMarkets"):
@@ -5378,7 +5314,6 @@ class FakeDydxHttp:
                 ]
             }
         raise AssertionError(url)
-
 
 class FakeKrakenHttp:
     def get_json(self, url: str) -> dict[str, Any]:
@@ -5453,7 +5388,6 @@ class FakeKrakenHttp:
             )
         raise AssertionError(url)
 
-
 class FakeDeribitHttp:
     def get_json(self, url: str) -> dict[str, Any]:
         if "/public/get_instruments?" in url:
@@ -5522,7 +5456,6 @@ class FakeDeribitHttp:
                 ],
             }
         raise AssertionError(url)
-
 
 class FakeVertexHttp:
     def __init__(self) -> None:
@@ -5610,102 +5543,6 @@ class FakeVertexHttp:
                 }
         raise AssertionError((url, payload))
 
-
-class FakeRiseXHttp:
-    def get_json(self, url: str) -> Any:
-        if url.endswith("/v1/markets"):
-            return {
-                "data": {
-                    "markets": [
-                        {
-                            "market_id": "1",
-                            "display_name": "BTC/USDC",
-                            "active": True,
-                            "mark_price": "100",
-                            "index_price": "100",
-                            "last_price": "100",
-                            "current_funding_rate": "0.0001",
-                            "funding_rate_8h": "0.0008",
-                            "funding_interval": "3600000000000",
-                            "next_funding_time": "1784034000000000000",
-                            "open_interest": "10",
-                            "quote_volume_24h": "100000",
-                            "config": {
-                                "max_leverage": "25",
-                                "step_size": "0.000001",
-                                "step_price": "0.1",
-                            },
-                        },
-                        {
-                            "market_id": "99",
-                            "display_name": "DOGE/USDC [deprecated-123]",
-                            "active": True,
-                            "mark_price": "0.07",
-                            "index_price": "0.07",
-                            "last_price": "0.07",
-                            "current_funding_rate": "0.0001",
-                            "funding_rate_8h": "0.0008",
-                            "funding_interval": "3600000000000",
-                            "next_funding_time": "1784034000000000000",
-                            "open_interest": "10",
-                            "quote_volume_24h": "1000",
-                            "config": {"max_leverage": "10"},
-                        },
-                        {
-                            "market_id": "100",
-                            "display_name": "DEAD/USDC",
-                            "active": False,
-                            "mark_price": "0",
-                            "index_price": "0",
-                            "last_price": "0",
-                            "current_funding_rate": "0",
-                            "funding_rate_8h": "0",
-                            "funding_interval": "3600000000000",
-                            "next_funding_time": "1784034000000000000",
-                            "open_interest": "0",
-                            "quote_volume_24h": "0",
-                            "config": {"max_leverage": "10"},
-                        },
-                    ]
-                }
-            }
-        if "/v1/orderbook?" in url:
-            return {
-                "data": {
-                    "market_id": "1",
-                    "bids": [
-                        {"price": "99.9", "quantity": "2", "order_count": 1},
-                    ],
-                    "asks": [
-                        {"price": "100.1", "quantity": "3", "order_count": 1},
-                    ],
-                }
-            }
-        if "/funding-rate-history?" in url:
-            return {
-                "data": {
-                    "market_id": "1",
-                    "records": [
-                        {
-                            "funding_rate": "0.0001",
-                            "start_time": "1784023200000000000",
-                            "end_time": "1784026800000000000",
-                            "index_price": "100",
-                        },
-                        {
-                            "funding_rate": "0.00012",
-                            "start_time": "1784026800000000000",
-                            "end_time": "1784030400000000000",
-                            "index_price": "100",
-                        },
-                    ],
-                    "page": 1,
-                    "has_next_page": False,
-                }
-            }
-        raise AssertionError(url)
-
-
 class FakeWOOXHttp:
     def get_json(self, url: str) -> Any:
         if "/v3/public/futures" in url:
@@ -5772,7 +5609,6 @@ class FakeWOOXHttp:
                 ],
             }
         raise AssertionError(url)
-
 
 class FakeCoinExHttp:
     def get_json(self, url: str) -> Any:
@@ -5863,7 +5699,6 @@ class FakeCoinExHttp:
             }
         raise AssertionError(url)
 
-
 class FakeBitunixHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/api/v1/futures/market/trading_pairs"):
@@ -5927,7 +5762,6 @@ class FakeBitunixHttp:
                 "data": {"bids": [["99.9", "2"]], "asks": [["100.1", "3"]]},
             }
         raise AssertionError(url)
-
 
 class FakeBitMartHttp:
     def get_json(self, url: str) -> Any:
@@ -6002,7 +5836,6 @@ class FakeBitMartHttp:
             }
         raise AssertionError(url)
 
-
 class FakeBloFinHttp:
     def get_json(self, url: str) -> Any:
         if "/api/v1/market/instruments?" in url:
@@ -6073,7 +5906,6 @@ class FakeBloFinHttp:
             }
         raise AssertionError(url)
 
-
 class FakePhemexHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/public/products"):
@@ -6138,7 +5970,6 @@ class FakePhemexHttp:
             }
         raise AssertionError(url)
 
-
 class FakeAevoHttp:
     def get_json(self, url: str) -> Any:
         if "/markets?" in url:
@@ -6175,7 +6006,6 @@ class FakeAevoHttp:
             }
         raise AssertionError(url)
 
-
 class FailingClient:
     venue = "bybit"
 
@@ -6185,7 +6015,6 @@ class FailingClient:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
         raise FundingDataError("temporary outage")
 
-
 def bybit_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "retCode": 0,
@@ -6193,18 +6022,14 @@ def bybit_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "result": {"list": rows, "nextPageCursor": ""},
     }
 
-
 def bitget_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"code": "00000", "msg": "success", "data": rows}
-
 
 def okx_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"code": "0", "msg": "", "data": rows}
 
-
 def kraken_payload(key: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"result": "success", key: rows}
-
 
 def market(
     venue: str,
@@ -6231,7 +6056,6 @@ def market(
         "raw": {},
     }
 
-
 def book(venue: str, symbol: str, observed_at: str) -> dict[str, Any]:
     return {
         "venue": venue,
@@ -6246,7 +6070,6 @@ def book(venue: str, symbol: str, observed_at: str) -> dict[str, Any]:
         "ask_depth_usd": 200_020,
         "raw": {},
     }
-
 
 def shifted_book(
     venue: str,
@@ -6280,7 +6103,6 @@ def shifted_book(
     ]
     return result
 
-
 def tiered_book(venue: str, symbol: str, observed_at: str) -> dict[str, Any]:
     return {
         "venue": venue,
@@ -6295,7 +6117,6 @@ def tiered_book(venue: str, symbol: str, observed_at: str) -> dict[str, Any]:
         "ask_depth_usd": 10_512.05,
         "raw": {},
     }
-
 
 def sequence_book(
     observed_at: str,
@@ -6316,7 +6137,6 @@ def sequence_book(
         "ask_depth_usd": best_ask * level_size,
         "raw": {},
     }
-
 
 def history_rows(
     venue: str,
@@ -6347,7 +6167,6 @@ def history_rows(
         )
     return rows
 
-
 def forecast_schedule(hours: int) -> dict[str, Any]:
     return {
         "horizon_mode": "fixed",
@@ -6366,7 +6185,6 @@ def forecast_schedule(hours: int) -> dict[str, Any]:
             }
         ],
     }
-
 
 if __name__ == "__main__":
     unittest.main()

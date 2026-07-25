@@ -1573,7 +1573,7 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
         "bitget", "bybit", "coinex", "deribit", "drift", "dydx",
         "edgex", "ethereal", "extended", "gate", "grvt", "htx",
         "hyperliquid", "kraken", "kucoin", "lighter", "mexc", "okx",
-        "pacifica", "paradex", "reya", "risex", "variational",
+        "pacifica", "paradex", "reya", "variational",
         "vertex_base", "woox",
     ]
     for venue in active_venues:

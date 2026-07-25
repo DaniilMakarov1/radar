@@ -37,7 +37,6 @@ from smart_money_radar.funding.adapters import (
     PacificaFundingClient,
     ParadexFundingClient,
     ReyaFundingClient,
-    RiseXFundingClient,
     VariationalFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
@@ -97,7 +96,6 @@ def active_default_funding_clients() -> list[FundingVenueClient]:
         ApexFundingClient(),
         PacificaFundingClient(),
         ReyaFundingClient(),
-        RiseXFundingClient(),
         VariationalFundingClient(),
     ]
 

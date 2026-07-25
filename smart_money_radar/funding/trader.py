@@ -44,7 +44,6 @@ from smart_money_radar.funding.adapters import (
     ParadexFundingClient,
     PhemexFundingClient,
     ReyaFundingClient,
-    RiseXFundingClient,
     VariationalFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
@@ -255,7 +254,7 @@ class PaperBot:
     """Paper trading bot for funding carry arbitrage.
 
     Lifecycle: run_loop → scan → evaluate → entry → monitor → settlement → exit.
-    Supports inheritance for venue-specific bots (e.g. RiseXBot).
+    Supports inheritance for venue-specific bots.
     """
 
     def __init__(
@@ -1480,7 +1479,6 @@ def funding_client_for_venue(
         "paradex": ParadexFundingClient,
         "phemex": PhemexFundingClient,
         "reya": ReyaFundingClient,
-        "risex": RiseXFundingClient,
         "variational": VariationalFundingClient,
         "vertex_base": VertexFundingClient,
         "woox": WOOXFundingClient,

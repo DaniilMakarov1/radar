@@ -30,7 +30,6 @@ from smart_money_radar.funding.adapters.pacifica import PacificaFundingClient
 from smart_money_radar.funding.adapters.paradex import ParadexFundingClient
 from smart_money_radar.funding.adapters.phemex import PhemexFundingClient
 from smart_money_radar.funding.adapters.reya import ReyaFundingClient
-from smart_money_radar.funding.adapters.risex import RiseXFundingClient
 from smart_money_radar.funding.adapters.variational import VariationalFundingClient
 from smart_money_radar.funding.adapters.vertex import VertexFundingClient
 from smart_money_radar.funding.adapters.woox import WOOXFundingClient
@@ -69,7 +68,6 @@ __all__ = [
     "ParadexFundingClient",
     "PhemexFundingClient",
     "ReyaFundingClient",
-    "RiseXFundingClient",
     "VariationalFundingClient",
     "VertexFundingClient",
     "WOOXFundingClient",
