@@ -826,8 +826,8 @@
 
     <nav class="nav" aria-label="Разделы">
       <button class="nav-button" data-view="funding" aria-selected="true">Funding</button>
-      <button class="nav-button" data-view="prediction" aria-selected="false">Prediction</button>
-      <button class="nav-button" data-view="dune" aria-selected="false">Dune</button>
+      <button class="nav-button" data-view="prediction" aria-selected="false" hidden>Prediction</button>
+      <button class="nav-button" data-view="dune" aria-selected="false" hidden>Dune</button>
     </nav>
 
     <div class="actions">
@@ -1401,10 +1401,8 @@
       try {
         const requests = [
           ["overview", "/api/overview"],
-          ["prediction", "/api/prediction"],
           ["funding", fundingApiPath()],
           ["fundingPaper", "/api/funding-paper"],
-          ["dune", "/api/dune"],
         ];
         const results = await Promise.allSettled(requests.map(([, path]) => api(path)));
         const failed = [];
@@ -1415,7 +1413,6 @@
         });
         renderAll();
         resumeFundingRefresh();
-        resumePredictionRefresh();
         if (failed.length) {
           const critical = failed.filter((item) => item.startsWith("overview:") || item.startsWith("funding:"));
           if (critical.length) showJob({ status: "failed", message: critical.join("; "), progress: 1 });
@@ -1452,9 +1449,7 @@
 
     function renderAll() {
       renderHeader();
-      renderPrediction();
       renderFunding();
-      renderDune();
       if (window.lucide) lucide.createIcons();
     }
 
@@ -1463,7 +1458,7 @@
       const capital = state.overview.capital_readiness || {};
       const running = ["queued", "running"].includes(job.status);
       $("statusDot").className = "dot" + (running ? " running" : job.status === "failed" ? " failed" : "");
-      $("statusText").textContent = running ? "Scan выполняется" : "Local paper · Funding + Prediction + Dune";
+      $("statusText").textContent = running ? "Scan выполняется" : "Local paper · Funding";
       updateHeaderContext();
       $("predictionScanButton").disabled = running || state.busy;
       $("fundingScanButton").disabled = running || state.busy;
@@ -1476,9 +1471,7 @@
       const activeView = view || document.querySelector('[data-view][aria-selected="true"]')?.dataset.view || "funding";
       $("brandSub").textContent = activeView === "funding"
         ? "Funding · live paper testing"
-        : activeView === "dune"
-          ? "Dune · local analytics"
-          : "Prediction · paper-only";
+        : "Funding · live paper testing";
       $("recomputeButton").hidden = true;
       $("scanButton").hidden = true;
     }
@@ -2452,53 +2445,15 @@
     }
 
     async function runDuneSavedQuery() {
-      const queries = state.dune?.catalog?.queries || [];
-      const slug = state.selectedDuneQuery || queries[0]?.query_slug || "";
-      if (!slug) {
-        state.duneResultError = "Нет выбранного saved query";
-        renderDuneResult();
-        return;
-      }
-      setDuneBusy(true);
-      state.duneResultError = "";
-      $("duneResultMeta").innerHTML = `<span class="badge info">running</span><span>Выполняю ${esc(slug)}</span>`;
-      try {
-        const response = await api("/api/dune/saved-query", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ slug, limit: duneLimit() }),
-        });
-        state.duneResult = response.result;
-        await loadDuneOnly();
-      } catch (error) {
-        state.duneResult = null;
-        state.duneResultError = error.message;
-        renderDuneResult();
-      } finally {
-        setDuneBusy(false);
-      }
+      state.duneResult = null;
+      state.duneResultError = "Dune module disabled in Funding-first build";
+      renderDuneResult();
     }
 
     async function runDuneSql() {
-      const sql = $("duneSql").value;
-      setDuneBusy(true);
-      state.duneResultError = "";
-      $("duneResultMeta").innerHTML = `<span class="badge info">running</span><span>Выполняю custom SQL</span>`;
-      try {
-        const response = await api("/api/dune/query", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sql, limit: duneLimit() }),
-        });
-        state.duneResult = response.result;
-        await loadDuneOnly();
-      } catch (error) {
-        state.duneResult = null;
-        state.duneResultError = error.message;
-        renderDuneResult();
-      } finally {
-        setDuneBusy(false);
-      }
+      state.duneResult = null;
+      state.duneResultError = "Dune module disabled in Funding-first build";
+      renderDuneResult();
     }
 
     function duneScanPayload() {
@@ -2517,30 +2472,7 @@
     }
 
     async function requestDuneLocalScan() {
-      if (state.duneScanInFlight) return;
-      state.duneScanInFlight = true;
-      setDuneControlsDisabled();
-      try {
-        const job = await api("/api/actions/dune-local-scan", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(duneScanPayload()),
-        });
-        state.overview.latest_job = {
-          job_id: job.job_id,
-          job_type: "dune_local_base_scan",
-          status: "queued",
-          progress: 0.05,
-          message: "Local Base scan поставлен в очередь",
-        };
-        showJob({ status: "running", message: "Local Base scan поставлен в очередь", progress: 0.05 });
-        setDuneControlsDisabled();
-        pollJob(job.job_id);
-      } catch (error) {
-        state.duneScanInFlight = false;
-        setDuneControlsDisabled();
-        showJob({ status: "failed", message: error.message, progress: 1 });
-      }
+      showJob({ status: "failed", message: "Dune module disabled in Funding-first build", progress: 1 });
     }
 
     function renderWallets() {
@@ -2734,14 +2666,7 @@
     });
 
     $("predictionScanButton").addEventListener("click", async () => {
-      try {
-        const job = await api("/api/actions/prediction-scan", { method: "POST" });
-        showJob({ status: "running", message: "Prediction scan поставлен в очередь", progress: 0.05 });
-        $("predictionScanButton").disabled = true;
-        $("fundingScanButton").disabled = true;
-        $("scanButton").disabled = true;
-        pollJob(job.job_id);
-      } catch (error) { showJob({ status: "failed", message: error.message, progress: 1 }); }
+      showJob({ status: "failed", message: "Prediction module disabled in Funding-first build", progress: 1 });
     });
 
     $("fundingScanButton").addEventListener("click", () => requestFundingRefresh("manual"));
@@ -2770,14 +2695,7 @@
     });
 
     $("duneRefreshButton").addEventListener("click", async () => {
-      setDuneBusy(true);
-      try {
-        await loadDuneOnly();
-      } catch (error) {
-        showJob({ status: "failed", message: error.message, progress: 1 });
-      } finally {
-        setDuneBusy(false);
-      }
+      showJob({ status: "failed", message: "Dune module disabled in Funding-first build", progress: 1 });
     });
 
     $("duneRunSqlButton").addEventListener("click", runDuneSql);
@@ -2790,7 +2708,6 @@
         clearPredictionRefreshTimer();
       } else {
         resumeFundingRefresh();
-        resumePredictionRefresh();
       }
     });
 

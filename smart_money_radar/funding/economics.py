@@ -27,6 +27,10 @@ from smart_money_radar.funding.normalization import (
 )
 
 
+MAX_ABSOLUTE_HOURLY_FUNDING_RATE = 0.02
+MAX_ABSOLUTE_INTERVAL_FUNDING_RATE = 0.08
+
+
 def evaluate_perp_route(
     long_market: dict[str, Any],
     short_market: dict[str, Any],
@@ -329,6 +333,9 @@ def evaluate_perp_route(
         else:
             block(flag, reason)
 
+    funding_unit_outlier = market_funding_rate_unit_outlier(
+        long_market
+    ) or market_funding_rate_unit_outlier(short_market)
     unit_identity_mismatch = (
         leg_notional_imbalance is not None
         and leg_notional_imbalance >= 3.0
@@ -353,6 +360,11 @@ def evaluate_perp_route(
         block(
             "stale_funding_nowcast",
             "Текущий funding nowcast одной из площадок устарел.",
+        )
+    if funding_unit_outlier:
+        block(
+            "funding_rate_unit_outlier",
+            "Funding rate выходит за sanity cap; вероятна ошибка единиц API или ручной override биржи.",
         )
     if not schedule_ready:
         block(
@@ -2025,3 +2037,17 @@ def market_funding_cap_floor_state(market: dict[str, Any]) -> str | None:
 
 def market_funding_rate_at_cap_or_floor(market: dict[str, Any]) -> bool:
     return market_funding_cap_floor_state(market) is not None
+
+
+def market_funding_rate_unit_outlier(market: dict[str, Any]) -> bool:
+    interval_rate = finite_float_or_none(market.get("funding_rate"))
+    hourly_rate = finite_float_or_none(market.get("hourly_funding_rate"))
+    if (
+        hourly_rate is not None
+        and abs(hourly_rate) > MAX_ABSOLUTE_HOURLY_FUNDING_RATE
+    ):
+        return True
+    return (
+        interval_rate is not None
+        and abs(interval_rate) > MAX_ABSOLUTE_INTERVAL_FUNDING_RATE
+    )

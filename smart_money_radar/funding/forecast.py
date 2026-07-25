@@ -765,6 +765,7 @@ def funding_nowcast_source_trusted(market: dict[str, Any]) -> bool:
     return source in {
         "published_next_estimate",
         "published_current_estimate",
+        "published_current_interval_estimate",
         "published_current_hourly",
         "published_predicted_next",
         "published_next_hour",

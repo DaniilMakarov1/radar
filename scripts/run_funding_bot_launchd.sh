@@ -26,7 +26,6 @@ cd "$ROOT_DIR"
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting funding paper trader"
 exec "$PYTHON_BIN" -u -m smart_money_radar.cli funding-paper-trader \
   --target-notional "${FUNDING_PAPER_TARGET_NOTIONAL:-500}" \
-  --entry-window-seconds "${FUNDING_PAPER_ENTRY_WINDOW_SECONDS:-180}" \
   --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-0}" \
   --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-15}" \
   --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-900}" \

@@ -509,8 +509,13 @@ def settlement_rate_or_entry(
 ) -> float:
     if settlement_row is not None:
         return float(settlement_row.get("funding_rate") or 0.0)
-    hourly = float(entry_leg.get("funding_rate") or 0.0)
+    interval_rate = optional_float(entry_leg.get("funding_rate"))
     interval = max(1.0, float(entry_leg.get("funding_interval_hours") or 1.0))
+    if str(entry_leg.get("funding_rate_kind") or "") == "published_current_hourly":
+        return float(interval_rate or 0.0) * interval
+    if interval_rate is not None:
+        return interval_rate
+    hourly = float(entry_leg.get("hourly_funding_rate") or 0.0)
     return hourly * interval
 
 

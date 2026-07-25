@@ -68,7 +68,8 @@ class VariationalFundingClient:
             if mark_price <= 0:
                 continue
 
-            funding_rate = as_float(raw.get("funding_rate")) / 100.0
+            raw_funding_rate = as_float(raw.get("funding_rate"))
+            funding_rate = raw_funding_rate / 100.0
             funding_interval_s = int(as_float(raw.get("funding_interval_s")) or 28800)
             interval_hours = max(funding_interval_s / 3600.0, 1.0)
             hourly_funding_rate = funding_rate / interval_hours
@@ -106,15 +107,17 @@ class VariationalFundingClient:
                     "venue": self.venue,
                     "symbol": ticker,
                     "canonical_asset": canonical_asset,
-                    "funding_rate": hourly_funding_rate,
+                    "funding_rate": funding_rate,
                     "funding_interval_hours": interval_hours,
                     "hourly_funding_rate": hourly_funding_rate,
-                    "funding_rate_kind": "published_current_hourly",
+                    "funding_rate_kind": "published_current_interval_estimate",
                     "published_funding_rate": funding_rate,
                     "published_funding_interval_hours": interval_hours,
+                    "raw_funding_rate": raw_funding_rate,
+                    "funding_rate_source_unit": "api_percent_points_assumed",
                     "funding_display_note": (
                         f"interval {funding_interval_s}s; "
-                        "rate normalized to hourly"
+                        "API rate treated as percent points and stored per interval"
                     ),
                     "next_funding_at": next_funding_at,
                     "mark_price": mark_price,

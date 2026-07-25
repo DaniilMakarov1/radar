@@ -131,10 +131,10 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                 self.send_json(store.dashboard_summary())
                 return
             if path == "/api/research":
-                self.send_json(build_research_overview(store))
+                self.send_json(disabled_module_payload("research"))
                 return
             if path == "/api/prediction":
-                self.send_json(store.prediction_dashboard(route_limit=100))
+                self.send_json(disabled_module_payload("prediction"))
                 return
             if path == "/api/funding":
                 horizon_mode, horizon_hours = funding_query_horizon(query)
@@ -179,13 +179,7 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                 ))
                 return
             if path == "/api/dune":
-                try:
-                    self.send_json(build_dune_overview(store))
-                except Exception as exc:
-                    self.send_json(
-                        {"status": "failed", "error": str(exc)},
-                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
+                self.send_json(disabled_module_payload("dune"))
                 return
             if path == "/health":
                 self.send_json({"status": "ok", "time": utc_now_iso()})
@@ -195,105 +189,18 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             path = urlparse(self.path).path
             if path == "/api/actions/prediction-scan":
-                with job_lock:
-                    if active_job["job_id"] is not None or funding_state["running"]:
-                        self.send_json(
-                            {
-                                "status": "already_running",
-                                "job_id": active_job["job_id"],
-                            },
-                            status=HTTPStatus.CONFLICT,
-                        )
-                        return
-                    job_id = store.create_app_job(
-                        "prediction_scan",
-                        "Preparing public prediction-market collectors",
-                    )
-                    active_job["job_id"] = job_id
-                    thread = threading.Thread(
-                        target=run_prediction_scan_job,
-                        args=(store, job_id, active_job, job_lock),
-                        daemon=True,
-                    )
-                    thread.start()
                 self.send_json(
-                    {"status": "queued", "job_id": job_id},
-                    status=HTTPStatus.ACCEPTED,
+                    disabled_module_payload("prediction"),
+                    status=HTTPStatus.GONE,
                 )
                 return
 
             if path == "/api/dune/saved-query":
-                try:
-                    payload = self.read_json_body()
-                    slug = str(payload.get("slug") or "").strip()
-                    if not slug:
-                        raise ValueError("slug is required")
-                    result = run_saved_query(
-                        store,
-                        slug,
-                        limit=dashboard_int(payload, "limit", 100, 1, 5_000),
-                    )
-                    pruned = prune_analytics_executions(
-                        store,
-                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
-                    )
-                    self.send_json(
-                        {
-                            "status": "success",
-                            "result": result,
-                            "pruned_execution_count": pruned,
-                        }
-                    )
-                except (AnalyticsError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    prune_analytics_executions(
-                        store,
-                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
-                    )
-                    self.send_json(
-                        {"status": "invalid_request", "error": str(exc)},
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-                except Exception as exc:
-                    self.send_json(
-                        {"status": "failed", "error": str(exc)},
-                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
+                self.send_json(disabled_module_payload("dune"), status=HTTPStatus.GONE)
                 return
 
             if path == "/api/dune/query":
-                try:
-                    payload = self.read_json_body()
-                    sql = str(payload.get("sql") or "")
-                    result = run_sql(
-                        store,
-                        sql,
-                        limit=dashboard_int(payload, "limit", 100, 1, 5_000),
-                    )
-                    pruned = prune_analytics_executions(
-                        store,
-                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
-                    )
-                    self.send_json(
-                        {
-                            "status": "success",
-                            "result": result,
-                            "pruned_execution_count": pruned,
-                        }
-                    )
-                except (AnalyticsError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    prune_analytics_executions(
-                        store,
-                        keep_latest=DUNE_ANALYTICS_EXECUTION_RETENTION,
-                    )
-                    self.send_json(
-                        {"status": "invalid_request", "error": str(exc)},
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-                except Exception as exc:
-                    self.send_json(
-                        {"status": "failed", "error": str(exc)},
-                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
+                self.send_json(disabled_module_payload("dune"), status=HTTPStatus.GONE)
                 return
 
             if path == "/api/actions/funding-scan":
@@ -595,49 +502,23 @@ def build_app_overview(store: SQLiteStore) -> dict[str, object]:
     }
 
 
+def disabled_module_payload(module: str) -> dict[str, object]:
+    return {
+        "status": "disabled",
+        "module": module,
+        "reason": "module_removed_funding_focus",
+        "message": (
+            "This module is disabled in the current Funding-first build. "
+            "Use the Funding dashboard and paper trader endpoints."
+        ),
+    }
+
+
 def build_research_overview(store: SQLiteStore) -> dict[str, object]:
     result: dict[str, object] = store.research_dashboard()
-    result["dune_executions"] = store.dashboard_dune_executions(limit=5)
     result["identity"] = store.identity_coverage_summary()
     result["shadow"] = store.signal_shadow_summary()
     return result
-
-
-def run_prediction_scan_job(
-    store: SQLiteStore,
-    job_id: int,
-    active_job: dict[str, int | None],
-    job_lock: threading.Lock,
-) -> None:
-    try:
-        store.update_app_job(
-            job_id,
-            status="running",
-            progress=0.12,
-            message="Collecting Polymarket and Kalshi orderbooks",
-        )
-        result = run_prediction_scan(
-            store,
-            PredictionScanConfig(collect_wallets=False),
-        )
-        store.update_app_job(
-            job_id,
-            status="success",
-            progress=1.0,
-            message="Prediction Radar scan completed",
-            result=result,
-        )
-    except Exception as exc:
-        store.update_app_job(
-            job_id,
-            status="failed",
-            progress=1.0,
-            message="Prediction Radar scan failed",
-            error=str(exc),
-        )
-    finally:
-        with job_lock:
-            active_job["job_id"] = None
 
 
 def run_funding_scan_job(

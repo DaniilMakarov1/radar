@@ -56,6 +56,7 @@ from smart_money_radar.funding.adapters.vertex import (
     VertexFundingClient,
     vertex_response_data,
 )
+from smart_money_radar.funding.adapters.variational import VariationalFundingClient
 from smart_money_radar.funding.adapters.woox import WOOXFundingClient
 from smart_money_radar.dashboard import (
     filter_deactivated_funding_paper_payload,
@@ -68,6 +69,7 @@ from smart_money_radar.funding.economics import (
     evaluate_perp_route,
     displayed_side_capacity,
     fill_notional,
+    market_funding_rate_unit_outlier,
     market_fee_rate,
     notional_economics,
     wilson_lower_bound,
@@ -2967,6 +2969,55 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(book_row["bids"][0][1], 3.0)
         self.assertEqual(len(history), 1)
         self.assertAlmostEqual(history[0]["funding_rate"], -0.000012)
+
+    def test_variational_adapter_keeps_interval_rate_and_hourly_rate(self) -> None:
+        class FakeVariationalHttp:
+            def get_json(self, url: str) -> dict[str, Any]:
+                assert "/metadata/stats" in url
+                return {
+                    "listings": [
+                        {
+                            "ticker": "BTC",
+                            "mark_price": "100000",
+                            "funding_rate": "0.031145",
+                            "funding_interval_s": "28800",
+                            "open_interest": {
+                                "long_open_interest": "1.5",
+                                "short_open_interest": "1.0",
+                            },
+                            "volume_24h": "1000000",
+                            "quotes": {},
+                        }
+                    ]
+                }
+
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = VariationalFundingClient(http=FakeVariationalHttp())
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "variational")
+        self.assertEqual(markets[0]["funding_interval_hours"], 8)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.00031145)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.00031145 / 8)
+        self.assertEqual(
+            markets[0]["funding_rate_kind"],
+            "published_current_interval_estimate",
+        )
+
+    def test_funding_rate_unit_outlier_blocks_implausible_units(self) -> None:
+        self.assertTrue(
+            market_funding_rate_unit_outlier(
+                {"funding_rate": -0.22, "hourly_funding_rate": -0.22}
+            )
+        )
+        self.assertFalse(
+            market_funding_rate_unit_outlier(
+                {"funding_rate": -0.052, "hourly_funding_rate": -0.0065}
+            )
+        )
 
     def test_kucoin_adapter_converts_contract_depth_and_xbt_alias(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"

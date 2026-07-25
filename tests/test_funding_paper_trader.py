@@ -315,14 +315,36 @@ def test_funding_leg_pnl_signs_match_perp_cashflow() -> None:
 
 def test_settlement_rate_or_entry_history_vs_fallback() -> None:
     history_row = {"funding_rate": 0.0004, "funding_interval_hours": 8.0}
-    entry_leg = {"funding_rate": 0.00005, "funding_interval_hours": 8.0}
+    entry_leg = {
+        "funding_rate": 0.0004,
+        "hourly_funding_rate": 0.00005,
+        "funding_interval_hours": 8.0,
+    }
     assert settlement_rate_or_entry(history_row, entry_leg) == 0.0004
-    assert settlement_rate_or_entry(None, entry_leg) == 0.00005 * 8.0
+    assert settlement_rate_or_entry(None, entry_leg) == 0.0004
 
 
 def test_settlement_rate_or_entry_variational_4h_interval() -> None:
-    entry_leg = {"funding_rate": 0.0001, "funding_interval_hours": 4.0}
-    assert settlement_rate_or_entry(None, entry_leg) == 0.0001 * 4.0
+    entry_leg = {
+        "funding_rate": 0.0004,
+        "hourly_funding_rate": 0.0001,
+        "funding_interval_hours": 4.0,
+    }
+    assert settlement_rate_or_entry(None, entry_leg) == 0.0004
+
+
+def test_settlement_rate_or_entry_hourly_only_fallback() -> None:
+    entry_leg = {"hourly_funding_rate": 0.0001, "funding_interval_hours": 4.0}
+    assert settlement_rate_or_entry(None, entry_leg) == 0.0004
+
+
+def test_settlement_rate_or_entry_legacy_hourly_kind_fallback() -> None:
+    entry_leg = {
+        "funding_rate": 0.0001,
+        "funding_interval_hours": 4.0,
+        "funding_rate_kind": "published_current_hourly",
+    }
+    assert settlement_rate_or_entry(None, entry_leg) == 0.0004
 
 
 def test_open_close_updates_virtual_balances(tmp_path) -> None:

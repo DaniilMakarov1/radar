@@ -134,6 +134,8 @@ FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 
 @dataclass(frozen=True)
 class PaperBotConfig:
+    profile_name: str = "default"
+    strategy_set: tuple[str, ...] = ("funding_carry",)
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
     entry_min_lead_seconds: int = 0
@@ -149,7 +151,7 @@ class PaperBotConfig:
     monitor_interval_seconds: int = 120
     hot_interval_seconds: int = 6
     hot_route_recheck_workers: int = 6
-    status_report_interval_seconds: int = 1_800
+    status_report_interval_seconds: int = 3_600
     status_report_max_routes: int = 5
     retention_interval_seconds: int = 300
     iterations: int | None = None
@@ -163,6 +165,12 @@ class PaperBotConfig:
 
     def validated(self) -> "PaperBotConfig":
         return PaperBotConfig(
+            profile_name=str(self.profile_name or "default"),
+            strategy_set=tuple(
+                str(strategy)
+                for strategy in (self.strategy_set or ("funding_carry",))
+                if str(strategy).strip()
+            ) or ("funding_carry",),
             venue_starting_balance=max(100.0, float(self.venue_starting_balance)),
             target_notional_per_leg=max(50.0, float(self.target_notional_per_leg)),
             entry_min_lead_seconds=max(

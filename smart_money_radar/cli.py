@@ -8,6 +8,10 @@ from pathlib import Path
 from smart_money_radar.config import DEFAULT_DB_PATH, api_key_status
 from smart_money_radar.funding.adapters import FundingDataError
 from smart_money_radar.funding.models import FundingScanConfig
+from smart_money_radar.funding.profiles import (
+    funding_bot_profile,
+    funding_bot_profile_names,
+)
 from smart_money_radar.funding.retention import (
     apply_funding_retention_plan,
     build_funding_retention_plan,
@@ -21,6 +25,7 @@ from smart_money_radar.funding.trader import (
     PaperBot,
     PaperBotConfig,
     export_funding_paper_csv,
+    funding_client_for_venue,
 )
 from smart_money_radar.dashboard import (
     DEFAULT_DASHBOARD_HOST,
@@ -449,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
     except FundingDataError as exc:
         print(f"Funding market data error: {exc}", file=sys.stderr)
         return 1
+    except ValueError as exc:
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -655,7 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
     funding_paper_trader.add_argument(
         "--status-report-interval-seconds",
         type=int,
-        default=1_800,
+        default=3_600,
         help="Telegram status report interval; use 0 to disable.",
     )
     funding_paper_trader.add_argument(
@@ -672,6 +680,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--venue-set",
         default=None,
         help="Comma-separated venue whitelist (e.g. binance,bybit,hyperliquid).",
+    )
+    funding_paper_trader.add_argument(
+        "--profile",
+        choices=funding_bot_profile_names(),
+        default="default",
+        help="Named paper bot profile. CLI venue-set overrides profile venues.",
     )
     funding_paper_trader.add_argument("--spread-arb", action="store_true")
     funding_paper_trader.add_argument(
@@ -848,13 +862,27 @@ def funding_scan_config(args: argparse.Namespace) -> FundingScanConfig:
 
 
 def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
+    profile = funding_bot_profile(getattr(args, "profile", "default"))
+    missing_required_venues = [
+        venue
+        for venue in profile.required_venues
+        if funding_client_for_venue(venue, fast=True) is None
+    ]
+    if missing_required_venues:
+        raise ValueError(
+            "Funding bot profile "
+            f"{profile.name!r} requires missing verified venue adapter(s): "
+            + ", ".join(missing_required_venues)
+        )
     venue_set_raw = getattr(args, "venue_set", None)
     venue_set = (
         tuple(v.strip() for v in str(venue_set_raw).split(",") if v.strip())
         if venue_set_raw
-        else None
+        else profile.venue_set
     )
     return PaperBotConfig(
+        profile_name=profile.name,
+        strategy_set=profile.strategy_set,
         venue_starting_balance=args.venue_starting_balance,
         target_notional_per_leg=args.target_notional,
         entry_min_lead_seconds=args.entry_min_lead_seconds,
