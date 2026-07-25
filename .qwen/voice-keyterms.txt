@@ -1,0 +1,70 @@
+# Voice transcription keyterms for Smart Money Radar.
+# One term per line; "#" starts a comment. Used by the local ASR shim
+# (scripts/asr_shim.py) as a Whisper initial_prompt to bias recognition
+# toward domain jargon that the model tends to misspell. Keep it concise
+# and high-value — only terms the ASR gets wrong, in both RU and EN.
+
+# Russian domain jargon (transliteration the user actually says)
+фандинг
+фандинг рейт
+перп
+перпы
+перпетуал
+базис
+арбитраж
+биржа
+биржи
+биткоин
+биток
+эфир
+альткоин
+ликвидация
+лонг
+шорт
+плечо
+нотионал
+сеттлмент
+ставка
+доходность
+годовых
+скольжение
+стакан
+ликвидность
+стейблкоин
+кит
+смарт мани
+дашборд
+бэктест
+валидность
+
+# English terms / proper nouns
+funding rate
+funding
+perp
+perpetual
+delta-neutral
+basis
+notional
+settlement
+VWAP
+slippage
+carry
+Binance
+Bybit
+OKX
+Bitget
+Gate
+KuCoin
+MEXC
+Kraken
+Deribit
+Hyperliquid
+dYdX
+Polymarket
+Kalshi
+Dune
+SQLite
+Telegram
+PnL
+ROI
+TVL

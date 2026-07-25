@@ -92,9 +92,10 @@ class PredictionHttpClient:
     def _reserve_request_slot(self) -> None:
         with self._lock:
             elapsed = time.monotonic() - self._last_request_at
-            if elapsed < self.min_delay_seconds:
-                time.sleep(self.min_delay_seconds - elapsed)
+            wait = self.min_delay_seconds - elapsed
             self._last_request_at = time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
 
 
 class PolymarketClient:
@@ -250,7 +251,10 @@ class KalshiClient:
                 for index, event_id in enumerate(event_ids)
             }
             for future in as_completed(futures):
-                event = future.result()
+                try:
+                    event = future.result()
+                except Exception:
+                    continue
                 if event:
                     events_by_index[futures[future]] = event
         return [
@@ -325,7 +329,10 @@ class HyperliquidClient:
                 for coin in unique_coins
             }
             for future in as_completed(futures):
-                book = future.result()
+                try:
+                    book = future.result()
+                except Exception:
+                    continue
                 if book and book.get("coin"):
                     output[str(book["coin"])] = book
         return output

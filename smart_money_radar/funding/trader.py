@@ -746,7 +746,7 @@ class FundingPaperTrader:
                 notify=False,
                 severity="warning",
             )
-            return None
+            # Fall through to scan-based fallback instead of returning None.
         clients = funding_clients_for_route(route, fast=True)
         if len(clients) < 2:
             return None
@@ -1455,6 +1455,18 @@ def close_decision(
 ) -> dict[str, Any]:
     max_settlement = parse_iso(position.get("max_settlement_at"))
     if max_settlement is None:
+        opened = parse_iso(position.get("opened_at"))
+        lag = config.max_settlement_publication_lag_seconds
+        if opened is not None and (now - opened).total_seconds() > max(60, lag):
+            return {
+                "status": "close",
+                "close": build_close_payload(
+                    position, {}, None,
+                    use_entry_estimate_for_missing=True,
+                    close_reason="settlement_publication_timeout",
+                    hold_decision={"hold": False, "close_reason": "settlement_publication_timeout", "reasons": ["max_settlement_at_missing_timeout"]},
+                ),
+            }
         return {"status": "settlement_pending", "reason": "missing_max_settlement_at"}
     if now < max_settlement + timedelta(seconds=config.settlement_grace_seconds):
         return {"status": "wait", "reason": "settlement_not_reached"}

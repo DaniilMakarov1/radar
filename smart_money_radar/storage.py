@@ -8699,6 +8699,7 @@ class SQLiteStore:
     def prune_funding_auto_scans(self, keep: int = 360) -> int:
         retained = max(1, int(keep))
         with self.connect() as connection:
+            connection.execute("PRAGMA defer_foreign_keys = ON")
             scan_rows = connection.execute(
                 """
                 SELECT funding_scan_id, config_json
@@ -8730,8 +8731,17 @@ class SQLiteStore:
                         scan_ids,
                     ).fetchall()
                 ]
+                # Detach paper events referencing deleted scans/routes.
+                connection.execute(
+                    f"UPDATE funding_paper_events SET funding_scan_id = NULL WHERE funding_scan_id IN ({placeholders})",
+                    scan_ids,
+                )
                 if route_ids:
                     route_placeholders = ",".join("?" for _ in route_ids)
+                    connection.execute(
+                        f"UPDATE funding_paper_events SET funding_route_id = NULL WHERE funding_route_id IN ({route_placeholders})",
+                        route_ids,
+                    )
                     connection.execute(
                         f"""
                         DELETE FROM funding_paper_executions
@@ -9232,30 +9242,57 @@ class SQLiteStore:
                 "funding_route_id",
                 event.get("funding_route_id"),
             )
-            cursor = connection.execute(
-                """
-                INSERT INTO funding_paper_events (
-                    created_at, event_type, severity,
-                    funding_paper_position_id, funding_scan_id,
-                    funding_route_id, route_key, message, payload_json,
-                    telegram_status, telegram_error
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.get("created_at") or now,
-                    event["event_type"],
-                    event.get("severity") or "info",
-                    funding_paper_position_id,
-                    funding_scan_id,
-                    funding_route_id,
-                    event.get("route_key"),
-                    event["message"],
-                    json.dumps(event.get("payload") or {}, sort_keys=True),
-                    event.get("telegram_status") or "not_configured",
-                    event.get("telegram_error"),
-                ),
+            params = (
+                event.get("created_at") or now,
+                event["event_type"],
+                event.get("severity") or "info",
+                funding_paper_position_id,
+                funding_scan_id,
+                funding_route_id,
+                event.get("route_key"),
+                event["message"],
+                json.dumps(event.get("payload") or {}, sort_keys=True),
+                event.get("telegram_status") or "not_configured",
+                event.get("telegram_error"),
             )
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO funding_paper_events (
+                        created_at, event_type, severity,
+                        funding_paper_position_id, funding_scan_id,
+                        funding_route_id, route_key, message, payload_json,
+                        telegram_status, telegram_error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    params,
+                )
+            except sqlite3.IntegrityError:
+                # Retention may have deleted the referenced scan/route between
+                # the existing_row_id check and this INSERT.  Retry with NULL
+                # FK references so the event itself is never lost.
+                cursor = connection.execute(
+                    """
+                    INSERT INTO funding_paper_events (
+                        created_at, event_type, severity,
+                        funding_paper_position_id, funding_scan_id,
+                        funding_route_id, route_key, message, payload_json,
+                        telegram_status, telegram_error
+                    )
+                    VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        params[0],  # created_at
+                        params[1],  # event_type
+                        params[2],  # severity
+                        params[6],  # route_key
+                        params[7],  # message
+                        params[8],  # payload_json
+                        params[9],  # telegram_status
+                        params[10],  # telegram_error
+                    ),
+                )
         return int(cursor.lastrowid)
 
     def update_funding_paper_event_telegram_status(

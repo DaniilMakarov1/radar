@@ -704,5 +704,179 @@ def seed_funding_history(connection, row_count: int) -> None:
     )
 
 
+def test_closed_position_pnl_survives_retention(tmp_path) -> None:
+    """Retention must never delete paper positions or accounts."""
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    with store.connect() as connection:
+        seed_instrument(connection)
+        old_scan = seed_scan(connection, "2026-01-01T00:00:00+00:00")
+        latest_scan = seed_scan(connection, "2026-01-02T00:00:00+00:00")
+        old_route = seed_route(connection, old_scan, "old-route")
+        seed_route(connection, latest_scan, "latest-route")
+        seed_scan_children(connection, old_scan)
+        seed_scan_children(connection, latest_scan)
+        position_id = seed_paper_position(connection, old_scan, old_route)
+        connection.execute(
+            """
+            UPDATE funding_paper_positions
+            SET status = 'closed', closed_at = '2026-01-01T08:00:00+00:00',
+                close_funding_scan_id = ?, close_funding_route_id = ?,
+                actual_funding_pnl = 5.0, actual_execution_cost = 1.5,
+                actual_net_pnl = 3.5, close_reason = 'test'
+            WHERE funding_paper_position_id = ?
+            """,
+            (latest_scan, old_route, position_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO funding_paper_accounts (
+                venue, starting_balance, cash_balance, reserved_margin,
+                realized_pnl, updated_at
+            )
+            VALUES ('binance', 1000, 1003.5, 0, 3.5, '2026-01-01T08:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO funding_paper_balance_ledger (
+                created_at, venue, funding_paper_position_id, event_type,
+                cash_delta, reserved_delta, cash_balance_after,
+                reserved_margin_after, payload_json
+            )
+            VALUES (
+                '2026-01-01T08:00:00+00:00', 'binance', ?, 'close',
+                3.5, 0, 1003.5, 0, '{}'
+            )
+            """,
+            (position_id,),
+        )
+
+    apply_funding_retention_plan(store, keep_latest_scans=1)
+
+    with store.connect() as connection:
+        position = connection.execute(
+            "SELECT * FROM funding_paper_positions WHERE funding_paper_position_id = ?",
+            (position_id,),
+        ).fetchone()
+        account = connection.execute(
+            "SELECT * FROM funding_paper_accounts WHERE venue = 'binance'"
+        ).fetchone()
+        ledger = connection.execute(
+            "SELECT * FROM funding_paper_balance_ledger WHERE funding_paper_position_id = ?",
+            (position_id,),
+        ).fetchone()
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert position is not None
+    assert position["status"] == "closed"
+    assert float(position["actual_net_pnl"]) == 3.5
+    assert position["open_funding_scan_id"] == old_scan
+    assert position["open_funding_route_id"] == old_route
+    assert account is not None
+    assert float(account["realized_pnl"]) == 3.5
+    assert ledger is not None
+    assert violations == []
+
+
+def test_fk_integrity_after_retention(tmp_path) -> None:
+    """No FK violations may remain after retention runs."""
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    with store.connect() as connection:
+        seed_instrument(connection)
+        scans = []
+        for day in range(1, 6):
+            scan_id = seed_scan(connection, f"2026-01-{day:02d}T00:00:00+00:00")
+            route_id = seed_route(connection, scan_id, f"route-{day}")
+            seed_scan_children(connection, scan_id)
+            seed_paper_execution(connection, scan_id, route_id)
+            seed_paper_event(connection, scan_id, route_id, event_type="scan")
+            scans.append((scan_id, route_id))
+        position_id = seed_paper_position(connection, scans[0][0], scans[0][1])
+        seed_position_paper_event(
+            connection, position_id, scans[1][0], scans[1][1], event_type="open"
+        )
+
+    apply_funding_retention_plan(store, keep_latest_scans=1)
+
+    with store.connect() as connection:
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        remaining_scans = connection.execute(
+            "SELECT COUNT(*) FROM funding_scans"
+        ).fetchone()[0]
+        remaining_positions = connection.execute(
+            "SELECT COUNT(*) FROM funding_paper_positions"
+        ).fetchone()[0]
+
+    assert violations == []
+    assert remaining_scans >= 1
+    assert remaining_positions == 1
+
+
+def test_trade_events_preserved_during_routine_pruning(tmp_path) -> None:
+    """Pruning routine events must not delete trade events (open/close)."""
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    with store.connect() as connection:
+        seed_instrument(connection)
+        scan_id = seed_scan(connection, "2026-01-01T00:00:00+00:00")
+        route_id = seed_route(connection, scan_id, "route-one")
+        for i in range(5):
+            seed_paper_event(connection, scan_id, route_id, event_type="scan")
+        seed_paper_event(connection, scan_id, route_id, event_type="open")
+        seed_paper_event(connection, scan_id, route_id, event_type="close")
+
+    apply_funding_retention_plan(
+        store,
+        keep_latest_scans=20,
+        keep_latest_routine_paper_events=2,
+    )
+
+    with store.connect() as connection:
+        trade_events = connection.execute(
+            "SELECT event_type FROM funding_paper_events WHERE event_type IN ('open', 'close')"
+        ).fetchall()
+        routine_events = connection.execute(
+            "SELECT COUNT(*) FROM funding_paper_events WHERE event_type = 'scan'"
+        ).fetchone()[0]
+
+    assert len(trade_events) == 2
+    assert routine_events == 2
+
+
+def test_equity_snapshot_pruning(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    with store.connect() as connection:
+        seed_instrument(connection)
+        seed_scan(connection, "2026-01-01T00:00:00+00:00")
+        for i in range(10):
+            connection.execute(
+                """
+                INSERT INTO funding_paper_equity_snapshots (
+                    observed_at, total_cash, total_reserved_margin,
+                    total_equity, realized_pnl, open_position_count,
+                    closed_position_count, payload_json
+                )
+                VALUES (?, 1000, 0, 1000, 0, 0, 0, '{}')
+                """,
+                (f"2026-01-01T{i:02d}:00:00+00:00",),
+            )
+
+    apply_funding_retention_plan(
+        store,
+        keep_latest_scans=20,
+        keep_latest_equity_snapshots=3,
+    )
+
+    with store.connect() as connection:
+        remaining = connection.execute(
+            "SELECT COUNT(*) FROM funding_paper_equity_snapshots"
+        ).fetchone()[0]
+
+    assert remaining == 3
+
+
 if __name__ == "__main__":
     unittest.main()

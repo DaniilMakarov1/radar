@@ -69,6 +69,8 @@ def rank_perp_pairs(
             short_market,
             preserve_order=True,
         )
+        if pinned is None:
+            continue
         pinned.update(quick_route_economics(pinned, config, observed_at))
         key = candidate_key(pinned)
         if key in selected_keys:
@@ -544,6 +546,8 @@ def quick_route_economics(
         return {}
     long_market = candidate["long_market"]
     short_market = candidate["short_market"]
+    if long_market.get("hourly_funding_rate") is None or short_market.get("hourly_funding_rate") is None:
+        return {}
     schedule = paired_settlement_schedule(
         long_market,
         short_market,
@@ -708,10 +712,12 @@ def pair_candidate(
     second: dict[str, Any],
     *,
     preserve_order: bool = False,
-) -> dict[str, Any]:
-    if preserve_order or float(first["hourly_funding_rate"]) <= float(
-        second["hourly_funding_rate"]
-    ):
+) -> dict[str, Any] | None:
+    first_rate = first.get("hourly_funding_rate")
+    second_rate = second.get("hourly_funding_rate")
+    if first_rate is None or second_rate is None:
+        return None
+    if preserve_order or float(first_rate) <= float(second_rate):
         long_market, short_market = first, second
     else:
         long_market, short_market = second, first
@@ -720,8 +726,7 @@ def pair_candidate(
         "long_market": long_market,
         "short_market": short_market,
         "current_hourly_spread": (
-            float(short_market["hourly_funding_rate"])
-            - float(long_market["hourly_funding_rate"])
+            float(second_rate) - float(first_rate)
         ),
     }
 
@@ -739,7 +744,8 @@ def best_pair_orientation(
     necessarily the profitable long before the first revalidation checkpoint.
     """
     if config is None or observed_at is None:
-        return pair_candidate(asset, first, second)
+        result = pair_candidate(asset, first, second)
+        return result if result is not None else {}
 
     orientations = []
     for long_market, short_market in ((first, second), (second, first)):
@@ -749,8 +755,12 @@ def best_pair_orientation(
             short_market,
             preserve_order=True,
         )
+        if candidate is None:
+            continue
         candidate.update(quick_route_economics(candidate, config, observed_at))
         orientations.append(candidate)
+    if not orientations:
+        return {}
     return max(
         orientations,
         key=lambda row: (

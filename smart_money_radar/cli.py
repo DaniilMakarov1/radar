@@ -156,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "show-binance":
+            store.init_db()
             rows = store.list_binance_announcements(limit=args.limit)
             for row in rows:
                 print(
@@ -1225,6 +1226,161 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
 
+        if args.command == "risex-status":
+            from smart_money_radar.risex.points import (
+                RiseXPointsClient,
+                fetch_leaderboard_snapshot,
+                fetch_points_epoch,
+            )
+            from smart_money_radar.risex.farming import (
+                RiseXFarmingConfig,
+                estimate_farming_economics,
+            )
+
+            client = RiseXPointsClient()
+            epoch = fetch_points_epoch(client)
+            print("RiseX Status")
+            print(f"  epoch: {epoch.get('epoch_id', '-')} ({epoch.get('description', '-')})")
+            dist_secs = epoch.get("seconds_until_distribution", 0)
+            print(f"  distribution in: {dist_secs / 3600:.1f}h")
+            print()
+
+            lb = fetch_leaderboard_snapshot(client, timeframe=args.timeframe, limit=args.limit)
+            print(f"Volume leaderboard ({args.timeframe})")
+            print(f"  total notional: ${lb['total_notional_volume']:,.0f}")
+            print(f"  top notional: ${lb['top_notional_volume']:,.0f}")
+            print(f"  median notional: ${lb['median_notional_volume']:,.0f}")
+            for e in lb["entries"][: args.limit]:
+                print(
+                    f"  #{e['rank']:>3} | notional=${e['notional_volume']:>14,.0f} | "
+                    f"share={e['notional_share_pct']:.2f}% | trades={e['trades']:>6}"
+                )
+            print()
+
+            econ = estimate_farming_economics(RiseXFarmingConfig(
+                target_notional_usd=10_000,
+                cycles_per_day=12,
+            ))
+            print("Farming estimate ($10K notional, 12 cycles/day)")
+            print(f"  weekly volume: ${econ['volume']['weekly_usd']:,.0f}")
+            print(f"  weekly fees: ${econ['costs']['weekly_fees_usd']:,.2f}")
+            print(f"  weekly leaderboard reward: ${econ['revenue']['weekly_leaderboard_usd']:,.2f}")
+            print(f"  weekly funding income: ${econ['revenue']['weekly_funding_usd']:,.2f}")
+            print(f"  weekly net P&L: ${econ['net_pnl']['weekly_usd']:,.2f}")
+            print(f"  volume share: {econ['revenue']['volume_share_pct']:.3f}%")
+            print(f"  est. weekly points: {econ['revenue']['weekly_points_est']:.0f}")
+            return 0
+
+        if args.command == "risex-leaderboard":
+            from smart_money_radar.risex.points import (
+                RiseXPointsClient,
+                fetch_leaderboard_snapshot,
+            )
+
+            client = RiseXPointsClient()
+            lb = fetch_leaderboard_snapshot(client, timeframe=args.timeframe, limit=args.limit)
+            print(f"RiseX Volume Leaderboard ({args.timeframe})")
+            print(f"  total notional: ${lb['total_notional_volume']:,.0f}")
+            print(f"  entries: {lb['entry_count']}")
+            print()
+            for e in lb["entries"]:
+                print(
+                    f"  #{e['rank']:>3} | {e['address'][:10]}... | "
+                    f"notional=${e['notional_volume']:>14,.0f} | "
+                    f"referral=${e['referral_volume']:>14,.0f} | "
+                    f"combined=${e['combined_volume']:>14,.0f} | "
+                    f"trades={e['trades']:>6} | "
+                    f"share={e['notional_share_pct']:.2f}%"
+                )
+            return 0
+
+        if args.command == "risex-farming-estimate":
+            from smart_money_radar.risex.farming import (
+                RiseXFarmingConfig,
+                estimate_farming_economics,
+                paper_farming_cycle,
+            )
+
+            config = RiseXFarmingConfig(
+                target_notional_usd=args.notional,
+                cycles_per_day=args.cycles,
+                hedge_venue=args.hedge_venue,
+            )
+            econ = estimate_farming_economics(config)
+            print("RiseX Volume Farming Estimate")
+            print(f"  notional: ${econ['config']['target_notional_usd']:,.0f}")
+            print(f"  cycles/day: {econ['config']['cycles_per_day']}")
+            print(f"  hedge venue: {econ['config']['hedge_venue']}")
+            print(f"  RiseX fee: {econ['config']['risex_fee_rate_bps']:.1f} bps")
+            print(f"  hedge fee: {econ['config']['hedge_fee_rate_bps']:.1f} bps")
+            print(f"  point boost: {econ['config']['point_boost_pct']:.0f}%")
+            print()
+            print("Volume")
+            print(f"  daily: ${econ['volume']['daily_usd']:,.0f}")
+            print(f"  weekly: ${econ['volume']['weekly_usd']:,.0f}")
+            print(f"  monthly: ${econ['volume']['monthly_usd']:,.0f}")
+            print()
+            print("Costs")
+            print(f"  daily fees: ${econ['costs']['daily_fees_usd']:,.2f}")
+            print(f"  weekly fees: ${econ['costs']['weekly_fees_usd']:,.2f}")
+            print(f"  monthly fees: ${econ['costs']['monthly_fees_usd']:,.2f}")
+            print()
+            print("Revenue")
+            print(f"  weekly leaderboard: ${econ['revenue']['weekly_leaderboard_usd']:,.2f}")
+            print(f"  weekly funding: ${econ['revenue']['weekly_funding_usd']:,.2f}")
+            print(f"  monthly funding: ${econ['revenue']['monthly_funding_usd']:,.2f}")
+            print(f"  weekly points (est): {econ['revenue']['weekly_points_est']:.0f}")
+            print(f"  volume share: {econ['revenue']['volume_share_pct']:.3f}%")
+            print()
+            print("Net P&L")
+            print(f"  weekly: ${econ['net_pnl']['weekly_usd']:,.2f}")
+            print(f"  monthly: ${econ['net_pnl']['monthly_usd']:,.2f}")
+            print()
+            print("Breakeven")
+            print(f"  min volume share: {econ['breakeven']['min_volume_share_pct']:.3f}%")
+            print(f"  min weekly volume: ${econ['breakeven']['min_weekly_volume_usd']:,.0f}")
+            print()
+
+            cycle = paper_farming_cycle(config, cycle_number=1)
+            print("Paper cycle #1")
+            print(f"  notional: ${cycle['notional_usd']:,.0f}")
+            print(f"  RiseX fee: ${cycle['risex_fee_usd']:,.4f}")
+            print(f"  hedge fee: ${cycle['hedge_fee_usd']:,.4f}")
+            print(f"  funding earned: ${cycle['funding_earned_usd']:,.4f}")
+            print(f"  net P&L: ${cycle['net_pnl_usd']:,.4f}")
+            print(f"  volume generated: ${cycle['volume_generated_usd']:,.0f}")
+            return 0
+
+        if args.command == "risex-bot":
+            from smart_money_radar.risex.bot import RiseXBot, RiseXBotConfig
+
+            store.init_db()
+            bot_config = RiseXBotConfig(
+                starting_balance=args.balance,
+                target_notional_per_leg=args.notional,
+                scan_interval_seconds=args.scan_interval,
+                status_report_interval_seconds=args.report_interval,
+                position_hold_minutes=args.hold_minutes,
+                max_open_positions=args.max_positions,
+                min_funding_spread_bps=args.min_spread_bps,
+                iterations=args.iterations,
+                telegram_enabled=not args.no_telegram,
+                hedge_venues=tuple(args.hedge_venues),
+                funding_carry_enabled=not args.no_funding_carry,
+                volume_farming_enabled=not args.no_volume_farm,
+                spread_arb_enabled=not args.no_spread_arb,
+            ).validated()
+            bot = RiseXBot(
+                store,
+                config=bot_config,
+                notifier=TelegramNotifier(
+                    token_env_var="RISEX_TELEGRAM_BOT_TOKEN",
+                    chat_id_env_var="RISEX_TELEGRAM_CHAT_ID",
+                ),
+            )
+            bot.run_loop()
+            return 0
+
         if args.command == "funding-scan":
             store.init_db()
             result = run_funding_scan(store, config=funding_scan_config(args))
@@ -2083,6 +2239,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prediction_mappings_report.add_argument("--limit", type=int, default=50)
 
+    risex_status = subparsers.add_parser(
+        "risex-status",
+        help="Show RiseX points epoch, leaderboard snapshot, and farming economics.",
+    )
+    risex_status.add_argument("--timeframe", default="7d", choices=("24h", "7d", "30d", "all"))
+    risex_status.add_argument("--limit", type=int, default=10)
+
+    risex_leaderboard = subparsers.add_parser(
+        "risex-leaderboard",
+        help="Print RiseX volume leaderboard.",
+    )
+    risex_leaderboard.add_argument("--timeframe", default="7d", choices=("24h", "7d", "30d", "all"))
+    risex_leaderboard.add_argument("--limit", type=int, default=20)
+
+    risex_farming = subparsers.add_parser(
+        "risex-farming-estimate",
+        help="Estimate RiseX volume farming economics.",
+    )
+    risex_farming.add_argument("--notional", type=float, default=10_000)
+    risex_farming.add_argument("--cycles", type=int, default=12)
+    risex_farming.add_argument("--hedge-venue", default="binance")
+
+    risex_bot = subparsers.add_parser(
+        "risex-bot",
+        help="Run RiseX paper trading bot with funding carry, volume farming, and spread arb.",
+    )
+    risex_bot.add_argument("--balance", type=float, default=1_000.0)
+    risex_bot.add_argument("--notional", type=float, default=500.0)
+    risex_bot.add_argument("--scan-interval", type=int, default=60)
+    risex_bot.add_argument("--report-interval", type=int, default=1_800)
+    risex_bot.add_argument("--hold-minutes", type=int, default=120)
+    risex_bot.add_argument("--max-positions", type=int, default=3)
+    risex_bot.add_argument("--min-spread-bps", type=float, default=0.5)
+    risex_bot.add_argument("--iterations", type=int)
+    risex_bot.add_argument("--no-telegram", action="store_true")
+    risex_bot.add_argument(
+        "--hedge-venues",
+        nargs="+",
+        default=["hyperliquid", "dydx", "lighter"],
+        choices=("hyperliquid", "dydx", "lighter"),
+    )
+    risex_bot.add_argument("--no-funding-carry", action="store_true")
+    risex_bot.add_argument("--no-volume-farm", action="store_true")
+    risex_bot.add_argument("--no-spread-arb", action="store_true")
+
     funding_scan = subparsers.add_parser(
         "funding-scan",
         help="Collect public perp venues and scan paper carry routes.",
@@ -2588,7 +2789,12 @@ def print_status(store: SQLiteStore) -> None:
 
 
 def json_load(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"File not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {path}: {exc}")
 
 
 def format_optional_ratio(value: float | None) -> str:

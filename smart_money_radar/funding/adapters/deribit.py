@@ -201,15 +201,16 @@ class DeribitFundingClient:
         rows: list[dict[str, Any]] = []
         for timestamp in sorted(rows_by_time):
             raw = rows_by_time[timestamp]
-            rate = as_float(raw.get("interest_1h"))
+            rate_8h = as_float(raw.get("interest_8h"))
+            rate_1h = as_float(raw.get("interest_1h"))
             rows.append(
                 {
                     "venue": self.venue,
                     "symbol": symbol,
                     "funding_at": iso_from_milliseconds(timestamp),
-                    "funding_rate": rate,
-                    "funding_interval_hours": 1.0,
-                    "hourly_funding_rate": rate,
+                    "funding_rate": rate_8h,
+                    "funding_interval_hours": 8.0,
+                    "hourly_funding_rate": rate_1h,
                     "mark_price": as_float(raw.get("index_price")) or None,
                     "observed_at": observed_at,
                     "raw": raw,

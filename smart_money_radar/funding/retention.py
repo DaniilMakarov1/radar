@@ -154,6 +154,10 @@ def apply_funding_retention_plan(
                 keep_latest_equity_snapshots,
             )
             break
+        except sqlite3.IntegrityError as exc:
+            last_error = exc
+            if attempt < RETENTION_LOCK_RETRIES - 1:
+                time.sleep(RETENTION_LOCK_RETRY_DELAY_SECONDS * (attempt + 1))
         except sqlite3.OperationalError as exc:
             if "database is locked" not in str(exc):
                 raise

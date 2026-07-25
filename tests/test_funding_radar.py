@@ -12,6 +12,10 @@ from unittest.mock import patch
 
 from smart_money_radar.funding.adapters.base import FundingDataError, FundingHttpClient
 from smart_money_radar.funding.adapters.aevo import AevoFundingClient
+from smart_money_radar.funding.adapters.apex import ApexFundingClient
+from smart_money_radar.funding.adapters.pacifica import PacificaFundingClient
+from smart_money_radar.funding.adapters.reya import ReyaFundingClient
+from smart_money_radar.funding.adapters.risex import RiseXFundingClient
 from smart_money_radar.funding.adapters.aster import AsterFundingClient
 from smart_money_radar.funding.adapters.backpack import BackpackFundingClient
 from smart_money_radar.funding.adapters.binance import BinanceFundingClient
@@ -27,6 +31,8 @@ from smart_money_radar.funding.adapters.dydx import DydxFundingClient
 from smart_money_radar.funding.adapters.drift import DriftFundingClient
 from smart_money_radar.funding.adapters.ethereal import EtherealFundingClient
 from smart_money_radar.funding.adapters.extended import ExtendedFundingClient
+from smart_money_radar.funding.adapters.edgex import EdgexFundingClient
+from smart_money_radar.funding.adapters.grvt import GrvtFundingClient
 from smart_money_radar.funding.adapters.gate import GateFundingClient
 from smart_money_radar.funding.adapters.htx import HTXFundingClient
 from smart_money_radar.funding.adapters.hyperliquid import (
@@ -117,7 +123,11 @@ class FundingRadarTest(unittest.TestCase):
     def test_deactivated_venues_are_hidden_from_funding_paper_dashboard(self) -> None:
         payload = filter_deactivated_funding_paper_payload(
             {
-                "summary": {},
+                "summary": {
+                    "realized_pnl": 15,
+                    "closed_trade_count": 2,
+                    "win_rate": 1.0,
+                },
                 "accounts": [
                     {
                         "venue": "binance",
@@ -157,8 +167,8 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         self.assertEqual([row["venue"] for row in payload["accounts"]], ["binance"])
-        self.assertEqual(payload["summary"]["realized_pnl"], 10)
-        self.assertEqual(payload["summary"]["closed_trade_count"], 1)
+        self.assertEqual(payload["summary"]["realized_pnl"], 15)
+        self.assertEqual(payload["summary"]["closed_trade_count"], 2)
         self.assertEqual(payload["closed_positions"][0]["short_venue"], "okx")
         self.assertEqual(payload["events"], [{"message": "LONG binance / SHORT okx"}])
         self.assertEqual(payload["trade_events"], [])
@@ -3200,6 +3210,128 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(history[-1]["funding_interval_hours"], 1)
         self.assertAlmostEqual(history[-1]["hourly_funding_rate"], 0.000012)
 
+    def test_grvt_adapter_uses_per_instrument_ticker_and_nanosecond_timestamps(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = GrvtFundingClient(
+            http=FakeGrvtHttp(),
+            base_url="https://grvt.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC_USDT_Perp", observed_at, limit=2)
+        history = client.funding_history("BTC_USDT_Perp", 1, 8, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "grvt")
+        self.assertEqual(markets[0]["symbol"], "BTC_USDT_Perp")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 8)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.0003 / 100)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0003 / 100 / 8)
+        self.assertAlmostEqual(markets[0]["mark_price"], 65038.01)
+        self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.00045)
+        self.assertEqual(book_row["bids"][0], [65038.01, 3456.78])
+        self.assertEqual(book_row["asks"][0], [65038.02, 1234.56])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["funding_interval_hours"], 8)
+        self.assertAlmostEqual(history[0]["funding_rate"], 0.0002 / 100)
+        self.assertAlmostEqual(history[0]["hourly_funding_rate"], 0.0002 / 100 / 8)
+
+    def test_edgex_adapter_uses_contract_id_ticker_and_4h_funding(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = EdgexFundingClient(
+            http=FakeEdgexHttp(),
+            base_url="https://edgex.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTCUSDC", observed_at, limit=2)
+        history = client.funding_history("BTCUSDC", 1, 4, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "edgex")
+        self.assertEqual(markets[0]["symbol"], "BTCUSDC")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 4)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.00005)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.00005 / 4)
+        self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.00038)
+        self.assertEqual(book_row["bids"][0], [64214.3, 1.710])
+        self.assertEqual(book_row["asks"][0], [64214.5, 0.032])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["funding_interval_hours"], 4)
+
+    def test_apex_adapter_uses_v3_hourly_funding_and_dash_symbols(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = ApexFundingClient(
+            http=FakeApexHttp(),
+            base_url="https://apex.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC-USDT", observed_at, limit=2)
+        history = client.funding_history("BTC-USDT", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "apex")
+        self.assertEqual(markets[0]["symbol"], "BTC-USDT")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 1)
+        self.assertAlmostEqual(markets[0]["funding_rate"], -0.00001397)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], -0.00001397)
+        self.assertEqual(book_row["bids"][0], [64365.2, 4.371])
+        self.assertEqual(book_row["asks"][0], [64365.8, 5.112])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["funding_interval_hours"], 1)
+
+    def test_pacifica_adapter_uses_info_endpoint_and_book_depth(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = PacificaFundingClient(
+            http=FakePacificaHttp(),
+            base_url="https://pacifica.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC", observed_at, limit=2)
+        history = client.funding_history("BTC", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "pacifica")
+        self.assertEqual(markets[0]["symbol"], "BTC")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 1)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.0000125)
+        self.assertEqual(book_row["bids"][0], [64132.0, 0.785])
+        self.assertEqual(book_row["asks"][0], [64133.0, 1.234])
+        self.assertEqual(history, [])
+
+    def test_reya_adapter_uses_summary_funding_and_empty_book(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = ReyaFundingClient(
+            http=FakeReyaHttp(),
+            base_url="https://reya.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTCRUSDPERP", observed_at, limit=2)
+        history = client.funding_history("BTCRUSDPERP", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "reya")
+        self.assertEqual(markets[0]["symbol"], "BTCRUSDPERP")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 1)
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.00127969 / 100)
+        self.assertAlmostEqual(markets[0]["mark_price"], 64349.79)
+        self.assertEqual(book_row["bids"], [])
+        self.assertEqual(book_row["asks"], [])
+        self.assertEqual(history, [])
+
     def test_woox_adapter_uses_batch_funding_depth_and_history(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
         client = WOOXFundingClient(http=FakeWOOXHttp(), base_url="https://woox.test")
@@ -3535,7 +3667,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["taker_fee_rate"], 0.0005)
         self.assertEqual(book_row["bids"][0], [99.9, 2.0])
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["funding_interval_hours"], 1)
+        self.assertEqual(history[0]["funding_interval_hours"], 8.0)
+        self.assertAlmostEqual(history[0]["funding_rate"], 0.00088)
         self.assertAlmostEqual(history[0]["hourly_funding_rate"], 0.00011)
 
     def test_vertex_base_adapter_normalizes_x18_funding_fees_and_depth(self) -> None:
@@ -3568,6 +3701,36 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(history[-1]["funding_interval_hours"], 1)
         self.assertAlmostEqual(history[-1]["hourly_funding_rate"], 0.00012)
         self.assertEqual(client.http.symbol_calls, 1)
+
+    def test_risex_adapter_uses_hourly_funding_and_nanosecond_timestamps(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = RiseXFundingClient(
+            http=FakeRiseXHttp(),
+            base_url="https://risex.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC/USDC", observed_at)
+        history = client.funding_history("BTC/USDC", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(instruments[0]["venue"], "risex")
+        self.assertEqual(instruments[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 1)
+        self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
+        self.assertAlmostEqual(markets[0]["funding_rate"], 0.0001)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001)
+        self.assertAlmostEqual(markets[0]["mark_price"], 100.0)
+        self.assertAlmostEqual(markets[0]["index_price"], 100.0)
+        self.assertAlmostEqual(markets[0]["open_interest_usd"], 1000.0)
+        self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0003)
+        self.assertAlmostEqual(markets[0]["maker_fee_rate"], 0.0001)
+        self.assertEqual(book_row["bids"][0], [99.9, 2.0])
+        self.assertEqual(book_row["asks"][0], [100.1, 3.0])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[-1]["funding_interval_hours"], 1)
+        self.assertAlmostEqual(history[-1]["hourly_funding_rate"], 0.00012)
 
     def test_vertex_response_fails_closed_on_unsuccessful_status(self) -> None:
         with self.assertRaises(FundingDataError):
@@ -4645,6 +4808,292 @@ class FakeExtendedHttp:
         raise AssertionError(url)
 
 
+class FakePacificaHttp:
+    def get_json(self, url: str) -> Any:
+        if "/info" in url:
+            return {
+                "success": True,
+                "data": [
+                    {
+                        "symbol": "BTC",
+                        "base_asset": "BTC",
+                        "instrument_type": "perpetual",
+                        "funding_rate": "0.0000125",
+                        "next_funding_rate": "0.0000125",
+                        "max_leverage": 50,
+                    },
+                    {
+                        "symbol": "SOL-USDC",
+                        "base_asset": "SOL",
+                        "instrument_type": "spot",
+                    },
+                ],
+            }
+        if "/book" in url:
+            return {
+                "success": True,
+                "data": {
+                    "s": "BTC",
+                    "l": [
+                        [{"p": "64132", "a": "0.785", "n": 5}],
+                        [{"p": "64133", "a": "1.234", "n": 3}],
+                    ],
+                },
+            }
+        raise AssertionError(url)
+
+
+class FakeReyaHttp:
+    def get_json(self, url: str) -> Any:
+        if "/v2/perpMarketDefinitions" in url:
+            return [
+                {
+                    "symbol": "BTCRUSDPERP",
+                    "marketId": 1,
+                    "tickSize": "0.1",
+                    "maxLeverage": 50,
+                },
+            ]
+        if "/v2/perpMarkets/summary" in url:
+            return [
+                {
+                    "symbol": "BTCRUSDPERP",
+                    "fundingRate": "0.00127969409872345",
+                    "throttledOraclePrice": "64349.79",
+                    "throttledPoolPrice": "64357.34",
+                    "oiQty": "40.84",
+                    "volume24h": "96573858.96",
+                },
+            ]
+        raise AssertionError(url)
+
+
+class FakeApexHttp:
+    def get_json(self, url: str) -> Any:
+        if "/v3/config" in url:
+            return {
+                "data": {
+                    "contractConfig": {
+                        "perpetualContract": [
+                            {
+                                "symbol": "BTC-USDT",
+                                "symbolDisplayName": "BTCUSDT",
+                                "baseTokenId": "BTC",
+                                "settleAssetId": "USDT",
+                                "enableTrade": True,
+                                "enableFundingSettlement": True,
+                                "isPrelaunch": False,
+                                "contractType": "PERPETUAL_CONTRACT",
+                            },
+                            {
+                                "symbol": "PRE-USDT",
+                                "symbolDisplayName": "PREUSDT",
+                                "baseTokenId": "PRE",
+                                "enableTrade": True,
+                                "enableFundingSettlement": True,
+                                "isPrelaunch": True,
+                            },
+                        ],
+                    },
+                },
+            }
+        if "/v3/ticker" in url:
+            return {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "markPrice": "64356.82",
+                        "indexPrice": "64364.11",
+                        "fundingRate": "-0.00001397",
+                        "predictedFundingRate": "0.0000125",
+                        "nextFundingTime": "2026-07-14T13:00:00Z",
+                        "openInterest": "1596.202",
+                        "turnover24h": "1223380590.95",
+                    },
+                ],
+            }
+        if "/v3/depth" in url:
+            return {
+                "data": {
+                    "s": "BTCUSDT",
+                    "b": [["64365.2", "4.371"], ["64359.0", "0.515"]],
+                    "a": [["64365.8", "5.112"], ["64366.4", "0.514"]],
+                },
+            }
+        if "/v3/history-funding" in url:
+            return {
+                "data": {
+                    "historyFunds": [
+                        {
+                            "symbol": "BTC-USDT",
+                            "rate": "-0.00000798",
+                            "price": "64780.25",
+                            "fundingTime": 1784001600000,
+                        },
+                        {
+                            "symbol": "BTC-USDT",
+                            "rate": "-0.00000009",
+                            "price": "65081.0",
+                            "fundingTime": 1784005200000,
+                        },
+                    ],
+                    "totalSize": 2,
+                },
+            }
+        raise AssertionError(url)
+
+
+class FakeEdgexHttp:
+    def get_json(self, url: str) -> Any:
+        if "/api/v2/public/meta/getMetaData" in url:
+            return {
+                "code": "SUCCESS",
+                "data": {
+                    "contractList": [
+                        {
+                            "contractId": "30000001",
+                            "contractName": "BTCUSDC",
+                            "baseCoinId": "1001",
+                            "quoteCoinId": "1000",
+                            "enableTrade": True,
+                            "enableDisplay": True,
+                            "enableOpenPosition": True,
+                            "defaultTakerFeeRate": "0.00038",
+                            "defaultMakerFeeRate": "0.00018",
+                            "fundingRateIntervalMin": "240",
+                        },
+                        {
+                            "contractId": "30000099",
+                            "contractName": "DELISTED",
+                            "enableTrade": False,
+                            "enableDisplay": False,
+                        },
+                    ],
+                },
+            }
+        if "/api/v2/public/quote/getTicker" in url:
+            return {
+                "code": "SUCCESS",
+                "data": [
+                    {
+                        "contractId": "30000001",
+                        "contractName": "BTCUSDC",
+                        "markPrice": "64227.19",
+                        "indexPrice": "64258.25",
+                        "fundingRate": "0.00005000",
+                        "nextFundingTime": "1784908800000",
+                        "openInterest": "1083.013",
+                        "value": "50821443.74",
+                    },
+                ],
+            }
+        if "/api/v2/public/quote/getDepth" in url:
+            return {
+                "code": "SUCCESS",
+                "data": [
+                    {
+                        "contractId": "30000001",
+                        "contractName": "BTCUSDC",
+                        "bids": [{"price": "64214.3", "size": "1.710"}],
+                        "asks": [{"price": "64214.5", "size": "0.032"}],
+                    },
+                ],
+            }
+        if "/api/v2/public/funding/getFundingRatePage" in url:
+            return {
+                "code": "SUCCESS",
+                "data": {
+                    "dataList": [
+                        {
+                            "contractId": "30000001",
+                            "fundingTime": "1784001600000",
+                            "fundingRate": "0.00005000",
+                            "indexPrice": "64900.0",
+                            "fundingRateIntervalMin": "240",
+                            "isSettlement": True,
+                        },
+                        {
+                            "contractId": "30000001",
+                            "fundingTime": "1784016000000",
+                            "fundingRate": "0.00006000",
+                            "indexPrice": "65000.0",
+                            "fundingRateIntervalMin": "240",
+                            "isSettlement": True,
+                        },
+                    ],
+                    "nextPageOffsetData": "",
+                },
+            }
+        raise AssertionError(url)
+
+
+class FakeGrvtHttp:
+    def post_json(self, url: str, payload: Any) -> Any:
+        if url.endswith("/full/v1/all_instruments"):
+            return {
+                "result": [
+                    {
+                        "instrument": "BTC_USDT_Perp",
+                        "base": "BTC",
+                        "quote": "USDT",
+                        "kind": "PERPETUAL",
+                        "funding_interval_hours": 8,
+                        "adjusted_funding_rate_cap": 2.5,
+                        "adjusted_funding_rate_floor": -2.5,
+                    },
+                    {
+                        "instrument": "AAPL_USDT_Perp",
+                        "base": "AAPL",
+                        "quote": "USDT",
+                        "kind": "FUTURE",
+                        "funding_interval_hours": 8,
+                    },
+                ],
+            }
+        if url.endswith("/full/v1/ticker"):
+            return {
+                "result": {
+                    "instrument": "BTC_USDT_Perp",
+                    "mark_price": "65038.01",
+                    "index_price": "65038.01",
+                    "funding_rate": "0.0003",
+                    "next_funding_time": "1784034000000000000",
+                    "open_interest": "100.0",
+                    "buy_volume_24h_b": "500000",
+                    "sell_volume_24h_b": "500000",
+                },
+            }
+        if url.endswith("/full/v1/book"):
+            return {
+                "result": {
+                    "instrument": "BTC_USDT_Perp",
+                    "bids": [{"price": "65038.01", "size": "3456.78", "num_orders": 5}],
+                    "asks": [{"price": "65038.02", "size": "1234.56", "num_orders": 3}],
+                },
+            }
+        if url.endswith("/full/v1/funding"):
+            return {
+                "result": [
+                    {
+                        "instrument": "BTC_USDT_Perp",
+                        "funding_rate": "0.0002",
+                        "funding_time": "1784001600000000000",
+                        "mark_price": "64900.0",
+                        "funding_interval_hours": 8,
+                    },
+                    {
+                        "instrument": "BTC_USDT_Perp",
+                        "funding_rate": "0.00025",
+                        "funding_time": "1784030400000000000",
+                        "mark_price": "65000.0",
+                        "funding_interval_hours": 8,
+                    },
+                ],
+                "next": "",
+            }
+        raise AssertionError(url)
+
+
 class FakeGateHttp:
     def get_json(self, url: str) -> Any:
         if url.endswith("/contracts"):
@@ -5160,6 +5609,101 @@ class FakeVertexHttp:
                     ]
                 }
         raise AssertionError((url, payload))
+
+
+class FakeRiseXHttp:
+    def get_json(self, url: str) -> Any:
+        if url.endswith("/v1/markets"):
+            return {
+                "data": {
+                    "markets": [
+                        {
+                            "market_id": "1",
+                            "display_name": "BTC/USDC",
+                            "active": True,
+                            "mark_price": "100",
+                            "index_price": "100",
+                            "last_price": "100",
+                            "current_funding_rate": "0.0001",
+                            "funding_rate_8h": "0.0008",
+                            "funding_interval": "3600000000000",
+                            "next_funding_time": "1784034000000000000",
+                            "open_interest": "10",
+                            "quote_volume_24h": "100000",
+                            "config": {
+                                "max_leverage": "25",
+                                "step_size": "0.000001",
+                                "step_price": "0.1",
+                            },
+                        },
+                        {
+                            "market_id": "99",
+                            "display_name": "DOGE/USDC [deprecated-123]",
+                            "active": True,
+                            "mark_price": "0.07",
+                            "index_price": "0.07",
+                            "last_price": "0.07",
+                            "current_funding_rate": "0.0001",
+                            "funding_rate_8h": "0.0008",
+                            "funding_interval": "3600000000000",
+                            "next_funding_time": "1784034000000000000",
+                            "open_interest": "10",
+                            "quote_volume_24h": "1000",
+                            "config": {"max_leverage": "10"},
+                        },
+                        {
+                            "market_id": "100",
+                            "display_name": "DEAD/USDC",
+                            "active": False,
+                            "mark_price": "0",
+                            "index_price": "0",
+                            "last_price": "0",
+                            "current_funding_rate": "0",
+                            "funding_rate_8h": "0",
+                            "funding_interval": "3600000000000",
+                            "next_funding_time": "1784034000000000000",
+                            "open_interest": "0",
+                            "quote_volume_24h": "0",
+                            "config": {"max_leverage": "10"},
+                        },
+                    ]
+                }
+            }
+        if "/v1/orderbook?" in url:
+            return {
+                "data": {
+                    "market_id": "1",
+                    "bids": [
+                        {"price": "99.9", "quantity": "2", "order_count": 1},
+                    ],
+                    "asks": [
+                        {"price": "100.1", "quantity": "3", "order_count": 1},
+                    ],
+                }
+            }
+        if "/funding-rate-history?" in url:
+            return {
+                "data": {
+                    "market_id": "1",
+                    "records": [
+                        {
+                            "funding_rate": "0.0001",
+                            "start_time": "1784023200000000000",
+                            "end_time": "1784026800000000000",
+                            "index_price": "100",
+                        },
+                        {
+                            "funding_rate": "0.00012",
+                            "start_time": "1784026800000000000",
+                            "end_time": "1784030400000000000",
+                            "index_price": "100",
+                        },
+                    ],
+                    "page": 1,
+                    "has_next_page": False,
+                }
+            }
+        raise AssertionError(url)
 
 
 class FakeWOOXHttp:

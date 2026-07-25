@@ -175,7 +175,12 @@ def elapsed_milliseconds(start: str, end: str) -> int:
 
 
 def parse_time(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if not value or not str(value).strip():
+        return datetime.now(UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return datetime.now(UTC)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)

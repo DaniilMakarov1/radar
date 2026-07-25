@@ -28,7 +28,7 @@ Ship production-quality modules. Do not stop on minor blockers — work around t
 - **Surgical changes.** Touch only what you must. Don't "improve" adjacent code, comments, or formatting. Don't refactor things that aren't broken. Match existing style exactly. Every changed line should trace directly to the user's request.
 - **Goal-driven execution.** Transform tasks into verifiable goals. For multi-step tasks, state a brief plan with verification checks. Strong success criteria let you loop independently.
 - **Preserve existing architecture.** This is a mature codebase built with OpenAI Codex. Follow existing patterns, naming conventions, and module structure exactly.
-- **Test after changes.** Run `python3 -m unittest discover -s tests -p 'test_*.py'` after modifications.
+- **Test after changes.** Run `python3 -m pytest tests/ -x -q` after modifications. (unittest discover misses pytest-style function tests — 31 tests silently skipped.)
 
 ### Git & Repo Hygiene
 - **Commit coherent completed work.** Don't commit half-finished features.
@@ -74,7 +74,7 @@ python3 -m smart_money_radar.cli research-validity --chain base
 python3 -m smart_money_radar.cli train-research-models --chain evm
 
 # Tests
-python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m pytest tests/ -x -q
 ```
 
 ## Module Locations

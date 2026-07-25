@@ -8,6 +8,7 @@ from typing import Any
 
 from smart_money_radar.funding.adapters import (
     AevoFundingClient,
+    ApexFundingClient,
     AsterFundingClient,
     BackpackFundingClient,
     BinanceFundingClient,
@@ -19,11 +20,13 @@ from smart_money_radar.funding.adapters import (
     DeribitFundingClient,
     DydxFundingClient,
     DriftFundingClient,
+    EdgexFundingClient,
     EtherealFundingClient,
     ExtendedFundingClient,
     FundingDataError,
     FundingVenueClient,
     GateFundingClient,
+    GrvtFundingClient,
     HTXFundingClient,
     HyperliquidFundingClient,
     KrakenFundingClient,
@@ -31,7 +34,10 @@ from smart_money_radar.funding.adapters import (
     LighterFundingClient,
     MEXCFundingClient,
     OKXFundingClient,
+    PacificaFundingClient,
     ParadexFundingClient,
+    ReyaFundingClient,
+    RiseXFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
 )
@@ -68,9 +74,11 @@ def active_default_funding_clients() -> list[FundingVenueClient]:
         OKXFundingClient(),
         DydxFundingClient(),
         GateFundingClient(),
+        GrvtFundingClient(),
         HTXFundingClient(),
         BackpackFundingClient(),
         DriftFundingClient(),
+        EdgexFundingClient(),
         EtherealFundingClient(),
         ExtendedFundingClient(),
         AsterFundingClient(),
@@ -85,6 +93,10 @@ def active_default_funding_clients() -> list[FundingVenueClient]:
         CoinExFundingClient(),
         BitMartFundingClient(),
         AevoFundingClient(),
+        ApexFundingClient(),
+        PacificaFundingClient(),
+        ReyaFundingClient(),
+        RiseXFundingClient(),
     ]
 
 

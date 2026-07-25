@@ -1284,3 +1284,55 @@ class CountingRecheckTrader(FundingPaperTrader):
         finally:
             with self.recheck_lock:
                 self.active_rechecks -= 1
+
+
+def test_filtered_summary_preserves_original_pnl() -> None:
+    """Summary keeps realized_pnl and trade stats from the unfiltered source.
+
+    Deactivated venues are hidden from position/account lists, but the
+    aggregate PnL must reflect ALL historical trades — deactivation stops
+    future entries, it does not erase past results.
+    """
+    from smart_money_radar.funding.presentation import filtered_funding_paper_summary
+
+    original = {
+        "realized_pnl": 46.26,
+        "closed_trade_count": 13,
+        "win_rate": 1.0,
+        "starting_capital": 27000,
+        "total_cash": 27046.26,
+    }
+    accounts = [
+        {"venue": "binance", "starting_balance": 1000, "cash_balance": 986.34,
+         "reserved_margin": 0, "realized_pnl": -13.66},
+        {"venue": "bybit", "starting_balance": 1000, "cash_balance": 1003.50,
+         "reserved_margin": 0, "realized_pnl": 3.50},
+    ]
+    closed_positions = [
+        {"actual_net_pnl": 2.25, "long_venue": "bybit", "short_venue": "aster"},
+        {"actual_net_pnl": 1.43, "long_venue": "mexc", "short_venue": "bybit"},
+        {"actual_net_pnl": 0.31, "long_venue": "aster", "short_venue": "kraken"},
+    ]
+    summary = filtered_funding_paper_summary(original, accounts, [], closed_positions)
+    assert abs(summary["realized_pnl"] - 46.26) < 0.01
+    assert summary["closed_trade_count"] == 13
+    assert summary["win_rate"] == 1.0
+    assert summary["open_position_count"] == 0
+
+
+def test_filtered_summary_empty_positions_keeps_original() -> None:
+    from smart_money_radar.funding.presentation import filtered_funding_paper_summary
+
+    original = {
+        "realized_pnl": 46.26,
+        "closed_trade_count": 13,
+        "win_rate": 1.0,
+    }
+    accounts = [
+        {"venue": "binance", "starting_balance": 1000, "cash_balance": 986.34,
+         "reserved_margin": 0, "realized_pnl": -13.66},
+    ]
+    summary = filtered_funding_paper_summary(original, accounts, [], [])
+    assert summary["realized_pnl"] == 46.26
+    assert summary["closed_trade_count"] == 13
+    assert summary["open_position_count"] == 0
