@@ -452,10 +452,10 @@ def evaluate_perp_route(
             "basis_divergence",
             "Executable basis выше 2 000 bps; вероятна ошибка identity или единиц контракта.",
         )
-    if decision_mode == "settlement_capture" and current_nowcast_net <= 0:
+    if decision_mode == "settlement_capture" and current_nowcast_net < 0:
         block(
             "live_net_pnl_not_positive",
-            f"Текущий live net PnL ${current_nowcast_net:,.2f} не положительный.",
+            f"Текущий live net PnL ${current_nowcast_net:,.2f} отрицательный.",
         )
     elif (
         decision_mode == "settlement_capture"

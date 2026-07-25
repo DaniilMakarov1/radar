@@ -20,43 +20,93 @@ BOT_TOKEN = os.environ.get("QWEN_CHANNEL_TELEGRAM_TOKEN") or os.environ.get(
     "TELEGRAM_BOT_TOKEN", ""
 )
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-INTERVAL_MINUTES = int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES", "5"))
+INTERVAL_MINUTES = int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES", "60"))
 
 SERVICES = [
-    ("com.smartmoneyradar.qwen-channel", "qwen"),
-    ("com.smartmoneyradar.asr-shim", "asr"),
     ("com.smartmoneyradar.funding-paper-trader", "funding"),
+    ("com.smartmoneyradar.risex-paper-trader", "risex"),
+    ("com.smartmoneyradar.prediction-radar-bot", "prediction"),
 ]
 
+QWEN_CHANNEL_LABEL = "com.smartmoneyradar.qwen-channel"
+CPU_BUSY_THRESHOLD = 2.0
 
-def service_running(label: str) -> bool:
+
+def _launchctl_list() -> list[list[str]]:
     try:
         out = subprocess.check_output(
             ["launchctl", "list"], text=True, timeout=5
         )
+        rows: list[list[str]] = []
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) >= 3 and parts[2] == label:
-                pid = parts[0].strip()
-                return pid != "-"
+            if len(parts) >= 3:
+                rows.append([p.strip() for p in parts[:3]])
+        return rows
     except Exception:
-        pass
+        return []
+
+
+def service_running(label: str, rows: list[list[str]] | None = None) -> bool:
+    if rows is None:
+        rows = _launchctl_list()
+    for parts in rows:
+        if len(parts) >= 3 and parts[2] == label:
+            return parts[0] != "-"
     return False
+
+
+def service_pid(label: str, rows: list[list[str]] | None = None) -> int | None:
+    if rows is None:
+        rows = _launchctl_list()
+    for parts in rows:
+        if len(parts) >= 3 and parts[2] == label and parts[0] != "-":
+            try:
+                return int(parts[0])
+            except ValueError:
+                return None
+    return None
+
+
+def qwen_busy(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "%cpu=", "-p", str(pid)],
+            text=True,
+            timeout=5,
+        )
+        cpu = float(out.strip())
+        return cpu > CPU_BUSY_THRESHOLD
+    except Exception:
+        return False
 
 
 def build_message() -> str:
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    parts = []
+    rows = _launchctl_list()
+
+    parts: list[str] = []
     all_ok = True
     for label, short in SERVICES:
-        ok = service_running(label)
+        ok = service_running(label, rows)
         icon = "🟢" if ok else "🔴"
         if not ok:
             all_ok = False
         parts.append(f"{icon}{short}")
     status = " | ".join(parts)
+
+    qwen_pid = service_pid(QWEN_CHANNEL_LABEL, rows)
+    if qwen_pid is None:
+        qwen_line = "🔴 Qwen: оффлайн"
+    elif qwen_busy(qwen_pid):
+        qwen_line = "🟡 Qwen: работает над задачей"
+    else:
+        qwen_line = "🔵 Qwen: ожидает задачу"
+
     header = "✅ alive" if all_ok else "⚠️ issue"
-    return f"{header} · {now}\n{status}"
+    return f"{header} · {now}\n{status}\n{qwen_line}"
 
 
 def send_telegram(text: str, chat_id: str = "") -> None:

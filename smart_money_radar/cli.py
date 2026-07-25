@@ -1356,18 +1356,14 @@ def main(argv: list[str] | None = None) -> int:
 
             store.init_db()
             bot_config = RiseXBotConfig(
-                starting_balance=args.balance,
+                venue_starting_balance=args.balance,
                 target_notional_per_leg=args.notional,
                 scan_interval_seconds=args.scan_interval,
                 status_report_interval_seconds=args.report_interval,
-                position_hold_minutes=args.hold_minutes,
-                max_open_positions=args.max_positions,
-                min_funding_spread_bps=args.min_spread_bps,
                 iterations=args.iterations,
                 telegram_enabled=not args.no_telegram,
                 hedge_venues=tuple(args.hedge_venues),
                 funding_carry_enabled=not args.no_funding_carry,
-                volume_farming_enabled=not args.no_volume_farm,
                 spread_arb_enabled=not args.no_spread_arb,
             ).validated()
             bot = RiseXBot(
@@ -2263,25 +2259,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     risex_bot = subparsers.add_parser(
         "risex-bot",
-        help="Run RiseX paper trading bot with funding carry, volume farming, and spread arb.",
+        help="Run RiseX paper trading bot with funding carry and spread arb (scanner pipeline, no artificial BPS filters).",
     )
-    risex_bot.add_argument("--balance", type=float, default=1_000.0)
+    risex_bot.add_argument("--balance", type=float, default=2_000.0, help="Starting balance per venue (default 2000)")
     risex_bot.add_argument("--notional", type=float, default=500.0)
-    risex_bot.add_argument("--scan-interval", type=int, default=60)
-    risex_bot.add_argument("--report-interval", type=int, default=1_800)
-    risex_bot.add_argument("--hold-minutes", type=int, default=120)
-    risex_bot.add_argument("--max-positions", type=int, default=3)
-    risex_bot.add_argument("--min-spread-bps", type=float, default=0.5)
+    risex_bot.add_argument("--scan-interval", type=int, default=180)
+    risex_bot.add_argument("--report-interval", type=int, default=900)
     risex_bot.add_argument("--iterations", type=int)
     risex_bot.add_argument("--no-telegram", action="store_true")
     risex_bot.add_argument(
         "--hedge-venues",
         nargs="+",
-        default=["hyperliquid", "dydx", "lighter"],
-        choices=("hyperliquid", "dydx", "lighter"),
+        default=["hyperliquid", "dydx", "lighter", "variational"],
+        choices=("hyperliquid", "dydx", "lighter", "variational"),
     )
     risex_bot.add_argument("--no-funding-carry", action="store_true")
-    risex_bot.add_argument("--no-volume-farm", action="store_true")
     risex_bot.add_argument("--no-spread-arb", action="store_true")
 
     funding_scan = subparsers.add_parser(

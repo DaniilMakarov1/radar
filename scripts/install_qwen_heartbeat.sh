@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Deploys the qwen heartbeat and installs its launchd agent.
-# Sends a short Telegram status every 5 minutes so the user knows
+# Sends a short Telegram status every hour so the user knows
 # the bot infrastructure is alive.
 
 LABEL="com.smartmoneyradar.qwen-heartbeat"
@@ -35,7 +35,7 @@ cat > "$PLIST" <<EOF
     <string>${DEPLOY}/heartbeat.py</string>
   </array>
   <key>StartInterval</key>
-  <integer>300</integer>
+  <integer>3600</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
@@ -55,6 +55,6 @@ EOF
 
 launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "✅ ${LABEL} deployed (every 300s)"
+echo "✅ ${LABEL} deployed (every 3600s / 1 hour)"
 echo "   Script: ${DEPLOY}/heartbeat.py"
 echo "   Logs:   ${DEPLOY}/logs/heartbeat.log"
