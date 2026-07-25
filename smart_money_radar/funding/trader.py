@@ -275,6 +275,7 @@ class PaperBot:
         self.store = store
         self.config = cfg
         self.armed_routes: set[str] = set()
+        self.skipped_notified_routes: set[str] = set()
         self.hot_routes: dict[str, dict[str, Any]] = {}
         self.last_full_scan_monotonic = 0.0
         self.last_status_report_monotonic = 0.0
@@ -444,6 +445,7 @@ class PaperBot:
 
     def run_full_iteration(self) -> dict[str, Any]:
         self.store.init_db()
+        self.skipped_notified_routes.clear()
         scan_result = run_funding_scan(
             self.store,
             config=self.scan_config(),
@@ -1139,35 +1141,41 @@ class PaperBot:
             if recheck_before_open and self.config.focused_recheck_enabled:
                 rechecked = self.focused_recheck_route(route)
                 if not rechecked:
-                    self.record_event(
-                        "open_skipped",
-                        (
-                            "<b>Paper Bot SKIP OPEN</b>\n\n"
-                            f"<b>{tg(route.get('canonical_asset'))}</b>\n"
-                            "Focused recheck did not return the route."
-                        ),
-                        {"route": route_summary(route), "reason": "focused_route_missing"},
-                        funding_scan_id=route.get("funding_scan_id"),
-                        funding_route_id=route.get("funding_route_id"),
-                        route_key=route.get("route_key"),
-                        notify=True,
-                        severity="warning",
-                    )
+                    skip_key = f"{route_key}:focused_route_missing"
+                    if skip_key not in self.skipped_notified_routes:
+                        self.skipped_notified_routes.add(skip_key)
+                        self.record_event(
+                            "open_skipped",
+                            (
+                                "<b>Paper Bot SKIP OPEN</b>\n\n"
+                                f"<b>{tg(route.get('canonical_asset'))}</b>\n"
+                                "Focused recheck did not return the route."
+                            ),
+                            {"route": route_summary(route), "reason": "focused_route_missing"},
+                            funding_scan_id=route.get("funding_scan_id"),
+                            funding_route_id=route.get("funding_route_id"),
+                            route_key=route.get("route_key"),
+                            notify=True,
+                            severity="warning",
+                        )
                     continue
                 active_route = rechecked
                 now = datetime.now(UTC)
                 decision = route_entry_decision(active_route, accounts, now, self.config)
                 if not decision["eligible"]:
-                    self.record_event(
-                        "open_skipped",
-                        skipped_open_message(active_route, decision),
-                        {"route": route_summary(active_route), "decision": decision},
-                        funding_scan_id=active_route.get("funding_scan_id"),
-                        funding_route_id=active_route.get("funding_route_id"),
-                        route_key=active_route.get("route_key"),
-                        notify=True,
-                        severity="warning",
-                    )
+                    skip_key = f"{route_key}:not_eligible_after_recheck"
+                    if skip_key not in self.skipped_notified_routes:
+                        self.skipped_notified_routes.add(skip_key)
+                        self.record_event(
+                            "open_skipped",
+                            skipped_open_message(active_route, decision),
+                            {"route": route_summary(active_route), "decision": decision},
+                            funding_scan_id=active_route.get("funding_scan_id"),
+                            funding_route_id=active_route.get("funding_route_id"),
+                            route_key=active_route.get("route_key"),
+                            notify=True,
+                            severity="warning",
+                        )
                     continue
             entry_key = route_entry_key(active_route)
             if self.store.funding_paper_position_by_entry_key(entry_key):
