@@ -24,8 +24,6 @@ INTERVAL_MINUTES = int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES", "60"))
 
 SERVICES = [
     ("com.smartmoneyradar.funding-paper-trader", "funding"),
-    ("com.smartmoneyradar.risex-paper-trader", "risex"),
-    ("com.smartmoneyradar.prediction-radar-bot", "prediction"),
 ]
 
 QWEN_CHANNEL_LABEL = "com.smartmoneyradar.qwen-channel"
