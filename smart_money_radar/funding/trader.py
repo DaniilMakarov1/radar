@@ -44,7 +44,6 @@ from smart_money_radar.funding.adapters import (
     ParadexFundingClient,
     PhemexFundingClient,
     ReyaFundingClient,
-    VariationalFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
 )
@@ -56,6 +55,7 @@ from smart_money_radar.funding.normalization import (
     normalize_stored_orderbook_units,
 )
 from smart_money_radar.funding.presentation import (
+    filter_deactivated_funding_dashboard_payload,
     filter_deactivated_funding_paper_payload,
 )
 from smart_money_radar.funding.retention import apply_funding_retention_plan
@@ -461,6 +461,7 @@ class PaperBot:
             horizon_mode="next_settlement",
             include_watch_scans=True,
         )
+        funding = filter_deactivated_funding_dashboard_payload(funding)
         routes = list(funding.get("routes") or [])
         watch_routes = list(funding.get("watch_routes") or [])
         venues = venues_from_funding_payload(funding) or venues_from_routes(
@@ -1484,7 +1485,6 @@ def funding_client_for_venue(
         "paradex": ParadexFundingClient,
         "phemex": PhemexFundingClient,
         "reya": ReyaFundingClient,
-        "variational": VariationalFundingClient,
         "vertex_base": VertexFundingClient,
         "woox": WOOXFundingClient,
     }

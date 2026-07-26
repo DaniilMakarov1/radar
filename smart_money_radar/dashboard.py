@@ -16,6 +16,7 @@ from smart_money_radar.config import (
 )
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.presentation import (
+    filter_deactivated_funding_dashboard_payload,
     filter_deactivated_funding_paper_export_rows,
     filter_deactivated_funding_paper_payload,
 )
@@ -143,6 +144,7 @@ def build_handler(store: SQLiteStore) -> type[BaseHTTPRequestHandler]:
                     horizon_hours=horizon_hours,
                     include_watch_scans=True,
                 )
+                payload = filter_deactivated_funding_dashboard_payload(payload)
                 payload["selected_horizon"] = {
                     "horizon_mode": horizon_mode,
                     "horizon_hours": horizon_hours,

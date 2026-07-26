@@ -37,7 +37,6 @@ from smart_money_radar.funding.adapters import (
     PacificaFundingClient,
     ParadexFundingClient,
     ReyaFundingClient,
-    VariationalFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
 )
@@ -66,7 +65,7 @@ RETENTION_SCAN_MODES = {"auto", "watch"}
 
 
 def active_default_funding_clients() -> list[FundingVenueClient]:
-    return [
+    return filter_deactivated_funding_clients([
         BinanceFundingClient(),
         BitgetFundingClient(),
         HyperliquidFundingClient(),
@@ -96,8 +95,7 @@ def active_default_funding_clients() -> list[FundingVenueClient]:
         ApexFundingClient(),
         PacificaFundingClient(),
         ReyaFundingClient(),
-        VariationalFundingClient(),
-    ]
+    ])
 
 
 def filter_deactivated_funding_clients(

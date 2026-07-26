@@ -1590,8 +1590,7 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
         "bitget", "bybit", "coinex", "deribit", "drift", "dydx",
         "edgex", "ethereal", "extended", "gate", "grvt", "htx",
         "hyperliquid", "kraken", "kucoin", "lighter", "mexc", "okx",
-        "pacifica", "paradex", "reya", "variational",
-        "vertex_base", "woox",
+        "pacifica", "paradex", "reya", "vertex_base", "woox",
     ]
     for venue in active_venues:
         client = funding_client_for_venue(venue)
@@ -1600,7 +1599,7 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
 
 
 def test_funding_client_for_venue_rejects_deactivated() -> None:
-    for venue in ("bingx", "bitunix", "blofin", "phemex"):
+    for venue in ("bingx", "bitunix", "blofin", "phemex", "variational"):
         assert funding_client_for_venue(venue) is None
 
 

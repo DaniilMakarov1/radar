@@ -14,6 +14,10 @@ Older Prediction, Dune/local analytics, wallet research, and on-chain Radar modu
 - `smart_money_radar/cli.py` — commands for scan, paper bot, reports, export, dashboard.
 - `scripts/` — local launch helpers for dashboard and paper bot.
 
+## Agent Workflow
+
+Codex is the orchestrator/architect/reviewer. Qwen/QN is the full-access implementation worker for scoped coding tasks. See `docs/agent_operating_model.md`.
+
 ## Core Funding Contract
 
 Every venue adapter must normalize funding fields consistently:
@@ -78,6 +82,7 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 - If the final recheck fails, the bot may use the latest successful focused snapshot only if it is no older than 30 seconds.
 - Negative-PnL routes are not shown as candidates.
 - Risky venues disabled by user live in `smart_money_radar/funding/venues.py`.
+- Variational is quarantined because its public funding units produced implausible PnL; it must be rebuilt and re-tested before reactivation.
 
 ## Testing
 

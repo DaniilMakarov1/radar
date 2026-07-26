@@ -2,7 +2,9 @@
 
 ## Role
 
-Qwen is the implementation worker for this repository. Codex is the architect and reviewer. When Qwen is used from Codex, follow the task exactly and avoid broad redesign unless the prompt explicitly asks for it.
+Codex is the orchestrator, architect, and final reviewer for this repository. Qwen/QN is the full-access implementation worker: Codex decides what should be changed, Qwen/QN can edit code and run commands directly, then Codex reviews the result before anything is accepted.
+
+When Qwen is used from Codex, follow the task exactly and avoid broad redesign unless the prompt explicitly asks for it. Qwen should not change product direction, risk gates, venue eligibility, trading assumptions, or architecture boundaries on its own.
 
 ## Active Scope
 
@@ -86,7 +88,7 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 - Risky venues disabled by user live in `smart_money_radar/funding/venues.py`.
 - `risex_points` is a planned profile shell only. Do not expose or run it until a verified RiseX adapter exists.
 - DEX/perp venues with non-standard mechanics must be modeled conservatively. Pool-based venues need a separate pool perturbation model before they can be treated like normal orderbook venues.
-- Variational-style API units must be checked carefully. If normalized rates exceed sanity caps, block the candidate and surface the reason.
+- Variational is quarantined/deactivated. Do not include it in active scans, focused rechecks, dashboard candidates, paper bot profiles, or route displays until Codex explicitly rebuilds the adapter from official docs and tests the units again.
 
 ## Workflow
 
@@ -98,4 +100,12 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 
 ## Coordination With Codex
 
-When acting as Codex's worker, prefer read-only audits unless Codex explicitly asks for edits. Return concise findings with file paths, line examples, risks, and suggested patch direction. Codex owns final architecture, risk acceptance, and commit boundaries.
+Qwen/QN has full local write/edit/bash access for implementation tasks. When acting as Codex's worker, it may edit files, create tests, run formatters, run the app, and inspect local data without separate approval. Return concise summaries with file paths, risks, and tests. Codex owns final architecture, risk acceptance, and commit boundaries.
+
+Default workflow until Daniil says otherwise:
+
+1. Codex inspects the code and decides the architecture.
+2. Codex asks Qwen/QN for audits, implementation, tests, or mechanical refactors.
+3. Qwen/QN edits and tests directly within the scoped task.
+4. Codex reviews, adjusts, tests, and decides whether the change is accepted.
+5. Codex reports the final result to Daniil.

@@ -8,6 +8,10 @@ from pathlib import Path
 from smart_money_radar.config import DEFAULT_DB_PATH, api_key_status
 from smart_money_radar.funding.adapters import FundingDataError
 from smart_money_radar.funding.models import FundingScanConfig
+from smart_money_radar.funding.presentation import (
+    filter_deactivated_funding_dashboard_payload,
+    filter_deactivated_funding_paper_payload,
+)
 from smart_money_radar.funding.profiles import (
     funding_bot_profile,
     funding_bot_profile_names,
@@ -268,7 +272,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "funding-report":
             store.init_db()
-            report = store.funding_dashboard()
+            report = filter_deactivated_funding_dashboard_payload(
+                store.funding_dashboard()
+            )
             scan = report["latest_scan"]
             print("Funding Radar report")
             print(f"  latest scan: {scan.get('funding_scan_id', '-')}")
@@ -365,7 +371,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "funding-paper-report":
             store.init_db()
-            report = store.funding_paper_dashboard()
+            report = filter_deactivated_funding_paper_payload(
+                store.funding_paper_dashboard()
+            )
             summary = report["summary"]
             print("Funding Paper Trader report")
             print(f"  starting capital: ${summary['starting_capital']:.2f}")

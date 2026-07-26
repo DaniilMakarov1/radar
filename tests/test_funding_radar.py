@@ -59,6 +59,7 @@ from smart_money_radar.funding.adapters.vertex import (
 from smart_money_radar.funding.adapters.variational import VariationalFundingClient
 from smart_money_radar.funding.adapters.woox import WOOXFundingClient
 from smart_money_radar.dashboard import (
+    filter_deactivated_funding_dashboard_payload,
     filter_deactivated_funding_paper_payload,
     filter_deactivated_funding_paper_export_rows,
     funding_query_horizon,
@@ -172,6 +173,49 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(payload["closed_positions"][0]["short_venue"], "okx")
         self.assertEqual(payload["events"], [{"message": "LONG binance / SHORT okx"}])
         self.assertEqual(payload["trade_events"], [])
+
+    def test_deactivated_venues_are_hidden_from_funding_dashboard(self) -> None:
+        payload = filter_deactivated_funding_dashboard_payload(
+            {
+                "routes": [
+                    {"status": "paper_candidate", "long_venue": "binance", "short_venue": "okx"},
+                    {"status": "paper_candidate", "long_venue": "variational", "short_venue": "gate"},
+                ],
+                "watch_routes": [
+                    {"status": "watch", "long_venue": "aster", "short_venue": "variational"}
+                ],
+                "maker_routes": [
+                    {"status": "watch", "long_venue": "binance", "short_venue": "bybit"}
+                ],
+                "venues": [{"venue": "binance"}, {"venue": "variational"}],
+                "constraint_diagnostics": {
+                    "near_misses": [
+                        {"long_venue": "variational", "short_venue": "okx"},
+                        {"long_venue": "binance", "short_venue": "okx"},
+                    ]
+                },
+                "universe_summary": {
+                    "top_routes": [
+                        {"long_venue": "variational", "short_venue": "okx"},
+                        {"long_venue": "binance", "short_venue": "okx"},
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(len(payload["routes"]), 1)
+        self.assertEqual(payload["watch_routes"], [])
+        self.assertEqual(payload["venues"], [{"venue": "binance"}])
+        self.assertEqual(payload["visible_route_count"], 1)
+        self.assertEqual(payload["internal_watch_route_count"], 0)
+        self.assertEqual(
+            payload["constraint_diagnostics"]["near_misses"],
+            [{"long_venue": "binance", "short_venue": "okx"}],
+        )
+        self.assertEqual(
+            payload["universe_summary"]["top_routes"],
+            [{"long_venue": "binance", "short_venue": "okx"}],
+        )
 
     def test_deactivated_venues_are_hidden_from_funding_paper_export(self) -> None:
         rows = filter_deactivated_funding_paper_export_rows(
