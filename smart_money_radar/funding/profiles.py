@@ -10,7 +10,10 @@ class FundingBotProfile:
     description: str
     venue_set: tuple[str, ...] | None = None
     required_venues: tuple[str, ...] = ()
-    strategy_set: tuple[str, ...] = ("funding_carry",)
+    strategy_set: tuple[str, ...] = (
+        "funding_only",
+        "combined",
+    )
     metadata: dict[str, Any] | None = None
 
 
@@ -28,7 +31,6 @@ BUILTIN_FUNDING_BOT_PROFILES: dict[str, FundingBotProfile] = {
             "okx",
             "bitget",
             "gate",
-            "htx",
             "kucoin",
             "mexc",
             "kraken",
@@ -39,13 +41,14 @@ BUILTIN_FUNDING_BOT_PROFILES: dict[str, FundingBotProfile] = {
         name="risex_points",
         description=(
             "Points-farming profile shell. It keeps the shared funding/spread "
-            "logic and is meant to whitelist RiseX plus hedging venues once a "
-            "verified RiseX adapter is available."
+            "logic while whitelisting RiseX plus core hedging venues."
         ),
         venue_set=("risex", "binance", "bybit", "okx"),
-        required_venues=("risex",),
-        strategy_set=("funding_carry", "spread_monitor", "points_farming"),
-        metadata={"requires_verified_adapter": "risex"},
+        strategy_set=(
+            "funding_only",
+            "combined",
+        ),
+        metadata={"purpose": "risex_points_farming_research"},
     ),
 }
 

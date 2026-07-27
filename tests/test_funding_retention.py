@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import UTC, datetime, timedelta
 import unittest
 
 import smart_money_radar.funding.retention as retention_mod
@@ -213,13 +214,13 @@ class FundingRetentionTest(unittest.TestCase):
             {full_scan, focused_scan},
         )
 
-    def test_running_scan_is_never_pruned(self) -> None:
+    def test_recent_running_scan_is_never_pruned(self) -> None:
         with self.store.connect() as connection:
             seed_instrument(connection)
             old_scan = seed_scan(connection, "2026-01-01T00:00:00+00:00")
             running_scan = seed_running_scan(
                 connection,
-                "2026-01-02T00:00:00+00:00",
+                datetime.now(UTC).isoformat(timespec="seconds"),
             )
             latest_scan = seed_scan(connection, "2026-01-03T00:00:00+00:00")
             seed_scan_children(connection, old_scan)
@@ -244,6 +245,44 @@ class FundingRetentionTest(unittest.TestCase):
             ]
 
         self.assertEqual(remaining_scans, [running_scan, latest_scan])
+
+    def test_stale_running_scan_is_marked_failed_and_pruned(self) -> None:
+        stale_started_at = (
+            datetime.now(UTC) - timedelta(hours=2)
+        ).isoformat(timespec="seconds")
+        with self.store.connect() as connection:
+            seed_instrument(connection)
+            stale_scan = seed_running_scan(connection, stale_started_at)
+            latest_scan = seed_scan(
+                connection,
+                datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            seed_scan_children(connection, stale_scan)
+            seed_scan_children(connection, latest_scan)
+
+        plan = build_funding_retention_plan(
+            self.store,
+            keep_latest_scans=1,
+            stale_running_scan_seconds=3_600,
+        )
+        self.assertIn(stale_scan, plan.delete_scan_ids)
+
+        result = apply_funding_retention_plan(
+            self.store,
+            keep_latest_scans=1,
+            stale_running_scan_seconds=3_600,
+        )
+
+        self.assertEqual(result["stale_running_scans_marked"], 1)
+        self.assertEqual(result["deleted_rows"]["funding_scans"], 1)
+        with self.store.connect() as connection:
+            remaining_scans = [
+                row["funding_scan_id"]
+                for row in connection.execute(
+                    "SELECT funding_scan_id FROM funding_scans ORDER BY funding_scan_id"
+                )
+            ]
+        self.assertEqual(remaining_scans, [latest_scan])
 
     def test_keeps_position_linked_scan_and_route(self) -> None:
         with self.store.connect() as connection:

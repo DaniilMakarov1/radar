@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 import signal
 import sqlite3
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
@@ -44,6 +45,7 @@ from smart_money_radar.funding.adapters import (
     ParadexFundingClient,
     PhemexFundingClient,
     ReyaFundingClient,
+    RiseXFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
 )
@@ -90,6 +92,7 @@ from smart_money_radar.paper_bot.position import (
     build_settlement_accrual_payload,
     close_decision,
     close_reason_from_hold_reasons,
+    compute_price_move_snapshot,
     compute_spread_snapshot,
     current_position_leg,
     entry_cross_spread,
@@ -97,13 +100,16 @@ from smart_money_radar.paper_bot.position import (
     final_recheck_freeze_window_active,
     funding_leg_pnl,
     leg_vwap,
+    normalize_strategy_set,
     position_hold_decision,
     required_live_net_profit,
     route_entry_decision,
     route_monitor_decision,
+    selected_route_strategy,
     settlement_rate_or_entry,
     settlement_rates_for_position,
     settlement_payload,
+    price_stop_loss_triggered,
     spread_stop_loss_triggered,
     status_publishable_candidate,
 )
@@ -135,7 +141,10 @@ FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 @dataclass(frozen=True)
 class PaperBotConfig:
     profile_name: str = "default"
-    strategy_set: tuple[str, ...] = ("funding_carry",)
+    strategy_set: tuple[str, ...] = (
+        "funding_only",
+        "combined",
+    )
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
     entry_min_lead_seconds: int = 0
@@ -161,16 +170,18 @@ class PaperBotConfig:
     venue_set: tuple[str, ...] | None = None
     spread_arb_enabled: bool = False
     basis_stop_loss_bps: float = 200.0
+    price_stop_loss_fraction: float = 0.10
     spread_monitoring_enabled: bool = True
 
     def validated(self) -> "PaperBotConfig":
+        strategies = list(normalize_strategy_set(self.strategy_set))
+        if self.spread_arb_enabled:
+            for strategy in ("spread_only", "combined", "opportunistic_any"):
+                if strategy not in strategies:
+                    strategies.append(strategy)
         return PaperBotConfig(
             profile_name=str(self.profile_name or "default"),
-            strategy_set=tuple(
-                str(strategy)
-                for strategy in (self.strategy_set or ("funding_carry",))
-                if str(strategy).strip()
-            ) or ("funding_carry",),
+            strategy_set=tuple(strategies),
             venue_starting_balance=max(100.0, float(self.venue_starting_balance)),
             target_notional_per_leg=max(50.0, float(self.target_notional_per_leg)),
             entry_min_lead_seconds=max(
@@ -240,6 +251,10 @@ class PaperBotConfig:
             ),
             spread_arb_enabled=bool(self.spread_arb_enabled),
             basis_stop_loss_bps=max(0.0, float(self.basis_stop_loss_bps)),
+            price_stop_loss_fraction=max(
+                0.0,
+                float(self.price_stop_loss_fraction),
+            ),
             spread_monitoring_enabled=bool(self.spread_monitoring_enabled),
         ).normalized_entry_leads()
 
@@ -271,7 +286,10 @@ class PaperBot:
         cfg = (config or PaperBotConfig()).validated()
         self.iterations = cfg.iterations
         self.telegram_enabled = cfg.telegram_enabled
-        self.notifier = notifier or TelegramNotifier()
+        self.notifier = notifier or TelegramNotifier(
+            token_env_var="FUNDING_TELEGRAM_BOT_TOKEN",
+            chat_id_env_var="FUNDING_TELEGRAM_CHAT_ID",
+        )
         self.stop_requested = False
         self.stop_reason: str | None = None
         self.shutdown_notified = False
@@ -285,6 +303,9 @@ class PaperBot:
         self.last_status_report_monotonic = 0.0
         self.last_retention_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
+        self.background_full_scan_executor: ThreadPoolExecutor | None = None
+        self.background_full_scan_future: Future[dict[str, Any]] | None = None
+        self.background_full_scan_started_monotonic = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle: signal handling, sleep, notifications (folded from BaseBot)
@@ -407,6 +428,7 @@ class PaperBot:
             )
             raise
         finally:
+            self.shutdown_background_full_scan()
             self.restore_signal_handlers(previous_signal_handlers)
 
     def notify_shutdown(
@@ -429,23 +451,212 @@ class PaperBot:
         )
 
     def run_iteration(self) -> dict[str, Any]:
+        background_results: list[dict[str, Any]] = []
+        completed = self.collect_background_full_scan_result()
+        if completed is not None:
+            background_results.append(completed)
+
         if self.should_run_hot_iteration():
-            return self.run_hot_iteration()
-        return self.run_full_iteration()
+            result = self.run_hot_iteration()
+            background_started = self.maybe_start_background_full_scan()
+            if background_started:
+                result["background_full_scan_status"] = "started"
+        elif self.background_full_scan_running():
+            result = self.run_background_wait_iteration(background_running=True)
+        elif background_results:
+            result = self.run_background_wait_iteration(background_running=False)
+        else:
+            result = self.run_full_iteration()
+
+        completed = self.collect_background_full_scan_result()
+        if completed is not None:
+            background_results.append(completed)
+        if background_results:
+            result["background_full_scan_results"] = background_results
+        if self.background_full_scan_running():
+            result["background_full_scan_running"] = True
+        return result
 
     def should_run_hot_iteration(self) -> bool:
         if self.store.funding_paper_open_positions():
             return True
-        if not self.hot_routes or self.last_full_scan_monotonic <= 0:
-            return False
-        now = datetime.now(UTC)
-        if any(
-            route_monitor_decision(route, now, self.config)["urgent"]
-            for route in self.hot_routes.values()
-        ):
+        return bool(self.hot_routes)
+
+    def full_scan_due(self) -> bool:
+        if self.last_full_scan_monotonic <= 0:
             return True
         elapsed = time.monotonic() - self.last_full_scan_monotonic
-        return elapsed < self.config.scan_interval_seconds
+        return elapsed >= self.config.scan_interval_seconds
+
+    def background_full_scan_running(self) -> bool:
+        future = self.background_full_scan_future
+        return future is not None and not future.done()
+
+    def critical_entry_recheck_active(self) -> bool:
+        if not self.hot_routes:
+            return False
+        now = datetime.now(UTC)
+        return any(
+            route_monitor_decision(route, now, self.config)["urgent"]
+            for route in self.hot_routes.values()
+        )
+
+    def maybe_start_background_full_scan(self) -> bool:
+        if not self.full_scan_due() or self.background_full_scan_running():
+            return False
+        if self.critical_entry_recheck_active():
+            return False
+        if self.background_full_scan_executor is None:
+            self.background_full_scan_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="funding-full-scan",
+            )
+        self.background_full_scan_started_monotonic = time.monotonic()
+        self.background_full_scan_future = self.background_full_scan_executor.submit(
+            self.run_discovery_full_scan
+        )
+        return True
+
+    def collect_background_full_scan_result(self) -> dict[str, Any] | None:
+        future = self.background_full_scan_future
+        if future is None or not future.done():
+            return None
+        self.background_full_scan_future = None
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.last_full_scan_monotonic = time.monotonic()
+            payload = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            self.record_event(
+                "background_full_scan_failed",
+                (
+                    "Funding background full scan failed\n"
+                    f"Error: {type(exc).__name__}: {exc}"
+                ),
+                payload,
+                notify=False,
+                severity="warning",
+            )
+            return payload
+
+        self.last_full_scan_monotonic = float(
+            result.get("completed_monotonic") or time.monotonic()
+        )
+        routes = list(result.pop("_routes", []) or [])
+        watch_routes = list(result.pop("_watch_routes", []) or [])
+        venues = venues_from_routes([*routes, *watch_routes])
+        self.store.ensure_funding_paper_accounts(
+            venues,
+            self.config.venue_starting_balance,
+        )
+        self.update_hot_routes([*routes, *watch_routes])
+        self.apply_watch_scan_retention(
+            minimum_keep_latest_scans=max(1, len(routes) + 1)
+        )
+        if should_record_routine_scan(result):
+            self.record_event(
+                "background_scan",
+                (
+                    "Funding background full scan "
+                    f"{result.get('funding_scan_id')}: candidates={len(routes)}, "
+                    f"watch={len(watch_routes)}"
+                ),
+                result,
+                notify=False,
+            )
+        self.maybe_record_status_report(result, routes, watch_routes)
+        return result
+
+    def shutdown_background_full_scan(self) -> None:
+        if self.background_full_scan_executor is None:
+            return
+        self.background_full_scan_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+        self.background_full_scan_executor = None
+        self.background_full_scan_future = None
+
+    def run_discovery_full_scan(self) -> dict[str, Any]:
+        started = time.monotonic()
+        # The market-wide scan can be slow and write-heavy. Keep it isolated
+        # from the live paper DB so urgent focused rechecks do not wait on a
+        # long SQLite writer. Once complete, only the route payload is merged
+        # back into the in-memory watch list.
+        with tempfile.TemporaryDirectory(prefix="funding-background-scan-") as tmpdir:
+            discovery_store = SQLiteStore(Path(tmpdir) / "radar.sqlite")
+            discovery_store.init_db()
+            scan_result = run_funding_scan(
+                discovery_store,
+                config=self.scan_config(),
+                venue_clients=self.build_venue_clients(),
+                scan_mode="watch",
+            )
+            funding = discovery_store.funding_dashboard(
+                horizon_mode="next_settlement",
+                include_watch_scans=True,
+            )
+            funding = filter_deactivated_funding_dashboard_payload(funding)
+            routes = list(funding.get("routes") or [])
+            watch_routes = list(funding.get("watch_routes") or [])
+        return {
+            "mode": "background_full_market",
+            "funding_scan_id": scan_result["funding_scan_id"],
+            "candidate_count": len(routes),
+            "watch_count": len(watch_routes),
+            "opened_count": 0,
+            "closed_count": 0,
+            "repriced_count": 0,
+            "pending_count": 0,
+            "held_count": 0,
+            "open_position_count": len(self.store.funding_paper_open_positions()),
+            "hot_route_count": count_hot_routes([*routes, *watch_routes], self.config),
+            "urgent_route_count": count_urgent_routes([*routes, *watch_routes], self.config),
+            "universe_route_count": scan_result.get("universe_route_count"),
+            "execution_shortlist_count": scan_result.get("execution_shortlist_count"),
+            "route_count": scan_result.get("route_count"),
+            "screen_reasons": (
+                (funding.get("universe_summary") or {}).get("screen_reasons")
+                or []
+            ),
+            "blocker_summary": funding.get("blocker_summary") or [],
+            "started_monotonic": started,
+            "completed_monotonic": time.monotonic(),
+            "_routes": routes,
+            "_watch_routes": watch_routes,
+        }
+
+    def run_background_wait_iteration(
+        self,
+        *,
+        background_running: bool,
+    ) -> dict[str, Any]:
+        self.store.init_db()
+        repriced_count = self.refresh_and_publish_repriced_pnl()
+        snapshot = self.store.record_funding_paper_equity_snapshot()
+        return {
+            "mode": "background_full_scan_wait",
+            "funding_scan_id": None,
+            "candidate_count": 0,
+            "watch_count": 0,
+            "opened_count": 0,
+            "closed_count": 0,
+            "repriced_count": repriced_count,
+            "pending_count": 0,
+            "held_count": 0,
+            "open_position_count": snapshot["open_position_count"],
+            "hot_route_count": len(self.hot_routes),
+            "urgent_route_count": count_urgent_routes(
+                list(self.hot_routes.values()),
+                self.config,
+            ),
+            "background_full_scan_running": background_running,
+            "equity": snapshot,
+        }
 
     def run_full_iteration(self) -> dict[str, Any]:
         self.store.init_db()
@@ -496,6 +707,11 @@ class PaperBot:
             "universe_route_count": scan_result.get("universe_route_count"),
             "execution_shortlist_count": scan_result.get("execution_shortlist_count"),
             "route_count": scan_result.get("route_count"),
+            "screen_reasons": (
+                (funding.get("universe_summary") or {}).get("screen_reasons")
+                or []
+            ),
+            "blocker_summary": funding.get("blocker_summary") or [],
             "equity": snapshot,
         }
         if should_record_routine_scan(result):
@@ -709,6 +925,10 @@ class PaperBot:
             if not route_key:
                 continue
             if route_monitor_decision(route, now, self.config)["hot"]:
+                existing = self.hot_routes.get(route_key)
+                if existing is not None and route_is_older_than(route, existing):
+                    current_keys.add(route_key)
+                    continue
                 self.hot_routes[route_key] = route
                 current_keys.add(route_key)
         for route_key, route in list(self.hot_routes.items()):
@@ -1099,6 +1319,8 @@ class PaperBot:
         return books
 
     def next_sleep_seconds(self, result: dict[str, Any]) -> int:
+        if result.get("background_full_scan_running"):
+            return self.config.hot_interval_seconds
         if int(result.get("open_position_count") or 0) > 0:
             return self.config.hot_interval_seconds
         if int(result.get("pending_count") or 0) > 0:
@@ -1216,13 +1438,63 @@ class PaperBot:
             self.refresh_open_position_route(position)
             now = datetime.now(UTC)
             position_id = int(position["funding_paper_position_id"])
-            if self.config.spread_monitoring_enabled:
-                route_key = str(position.get("route_key") or "")
-                live_route = self.hot_routes.get(route_key) or (
-                    self.store.latest_funding_route_by_key(route_key)
-                    if route_key
-                    else None
+            route_key = str(position.get("route_key") or "")
+            live_route = self.hot_routes.get(route_key) or (
+                self.store.latest_funding_route_by_key(route_key)
+                if route_key
+                else None
+            )
+            price_snap = compute_price_move_snapshot(position, live_route)
+            price_triggered, price_reason = price_stop_loss_triggered(
+                price_snap, self.config
+            )
+            if price_triggered:
+                close_payload = build_close_payload(
+                    position,
+                    settlement_rates_for_position(position, self.store),
+                    live_route,
+                    use_entry_estimate_for_missing=True,
+                    close_reason=f"price_stop_loss:{price_reason}",
+                    hold_decision={
+                        "hold": False,
+                        "close_reason": "price_stop_loss",
+                        "reasons": [price_reason],
+                        "price_move_snapshot": price_snap,
+                    },
                 )
+                notes = dict(close_payload.get("notes") or {})
+                notes["price_stop_loss_triggered"] = True
+                notes["price_move_snapshot"] = price_snap
+                notes["simultaneous_close"] = "both_legs_same_live_snapshot"
+                close_payload["notes"] = notes
+                close_payload["price_move_snapshot"] = price_snap
+                self.store.close_funding_paper_position(
+                    position_id, close_payload
+                )
+                self.record_event(
+                    "close",
+                    (
+                        f"PRICE STOP-LOSS {position.get('canonical_asset')} "
+                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                        f"Reason: {price_reason}\n"
+                        "Action: long and short closed together from the same live snapshot\n"
+                        f"Long move: {float(price_snap.get('long_move_fraction') or 0.0) * 100:.2f}%\n"
+                        f"Short move: {float(price_snap.get('short_move_fraction') or 0.0) * 100:.2f}%\n"
+                        f"Total PnL: ${float(close_payload.get('actual_total_pnl') or 0.0):.2f}"
+                    ),
+                    {
+                        "position": position_summary(position),
+                        "close": close_payload,
+                        "price_move_snapshot": price_snap,
+                    },
+                    funding_paper_position_id=position_id,
+                    route_key=position.get("route_key"),
+                    notify=True,
+                    severity="warning",
+                )
+                outcomes.append("closed")
+                continue
+            if self.config.spread_monitoring_enabled:
                 spread_snap = compute_spread_snapshot(position, live_route)
                 triggered, reason = spread_stop_loss_triggered(
                     spread_snap, self.config
@@ -1423,6 +1695,23 @@ def venues_from_routes(routes: list[dict[str, Any]]) -> list[str]:
                 venues.add(str(value))
     return sorted(venues)
 
+def route_is_older_than(
+    incoming: dict[str, Any],
+    existing: dict[str, Any],
+) -> bool:
+    incoming_at = route_observed_datetime(incoming)
+    existing_at = route_observed_datetime(existing)
+    if incoming_at is None or existing_at is None:
+        return False
+    return incoming_at < existing_at
+
+def route_observed_datetime(route: dict[str, Any]) -> datetime | None:
+    observed_at = parse_iso(route.get("observed_at"))
+    if observed_at is not None:
+        return observed_at
+    focused = (route.get("evidence") or {}).get("focused_recheck") or {}
+    return parse_iso(focused.get("observed_at"))
+
 def venues_from_funding_payload(funding: dict[str, Any]) -> list[str]:
     return sorted(
         {
@@ -1485,6 +1774,7 @@ def funding_client_for_venue(
         "paradex": ParadexFundingClient,
         "phemex": PhemexFundingClient,
         "reya": ReyaFundingClient,
+        "risex": RiseXFundingClient,
         "vertex_base": VertexFundingClient,
         "woox": WOOXFundingClient,
     }
@@ -1524,6 +1814,9 @@ def count_urgent_routes(
 
 def route_summary(route: dict[str, Any]) -> dict[str, Any]:
     evidence = route.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
+    ) or {}
     return {
         "funding_scan_id": route.get("funding_scan_id"),
         "funding_route_id": route.get("funding_route_id"),
@@ -1533,8 +1826,13 @@ def route_summary(route: dict[str, Any]) -> dict[str, Any]:
         "short": f"{route.get('short_venue')} {route.get('short_symbol')}",
         "target_notional": route.get("target_notional"),
         "market_capacity": route.get("market_capacity"),
-        "current_nowcast_net": evidence.get("current_nowcast_net"),
+        "strategy_name": selected.get("strategy_name") or selected.get("strategy_class"),
+        "current_nowcast_net": selected.get("expected_net_pnl")
+        if selected.get("expected_net_pnl") is not None
+        else evidence.get("current_nowcast_net"),
         "current_nowcast_gross": evidence.get("current_nowcast_gross"),
+        "funding_pnl_component": selected.get("funding_pnl_component"),
+        "spread_pnl_component": selected.get("spread_pnl_component"),
         "actionable_profit_threshold": evidence.get("actionable_profit_threshold"),
         "execution_cost": evidence.get("execution_cost"),
         "risk_flags": route.get("risk_flags") or [],

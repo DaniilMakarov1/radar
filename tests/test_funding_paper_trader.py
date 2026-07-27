@@ -5,6 +5,8 @@ import time
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from smart_money_radar.funding.trader import (
     PaperBot,
     PaperBotConfig,
@@ -12,6 +14,7 @@ from smart_money_radar.funding.trader import (
     build_position_from_route,
     close_decision,
     close_message,
+    compute_price_move_snapshot,
     compute_spread_snapshot,
     entry_cross_spread,
     final_recheck_fallback_route,
@@ -21,16 +24,27 @@ from smart_money_radar.funding.trader import (
     position_hold_decision,
     route_entry_decision,
     route_monitor_decision,
+    selected_route_strategy,
     settlement_rate_or_entry,
+    price_stop_loss_triggered,
     spread_stop_loss_triggered,
 )
 from smart_money_radar.notifications import NotificationResult
+from smart_money_radar.paper_bot.helpers import format_seconds
+from smart_money_radar.paper_bot.telegram import (
+    funding_rate_lines,
+    status_report_message,
+)
 from smart_money_radar.storage import SQLiteStore
 
 
 def test_risky_venues_are_disabled_for_focused_rechecks() -> None:
     assert funding_client_for_venue("bitunix") is None
     assert funding_client_for_venue("blofin") is None
+
+
+def test_format_seconds_shows_overdue_settlement() -> None:
+    assert format_seconds(-75) == "просрочено 1m 15s"
 
 
 def paper_route(
@@ -120,6 +134,45 @@ def accounts() -> dict:
     }
 
 
+def strategy_route(
+    now: datetime,
+    strategy_name: str,
+    *,
+    expected_net: float,
+    funding_component: float,
+    spread_component: float,
+    live_net: float | None = None,
+) -> dict:
+    route = paper_route(
+        now,
+        long_lead=45,
+        short_lead=45,
+        live_net=live_net if live_net is not None else expected_net,
+    )
+    strategy = {
+        "strategy_name": strategy_name,
+        "strategy_class": strategy_name,
+        "primary_edge": {
+            "funding_only": "funding_carry",
+            "spread_only": "spread_convergence",
+            "combined": "funding_plus_spread",
+            "opportunistic_any": "opportunistic_total_edge",
+        }[strategy_name],
+        "eligible": True,
+        "expected_net_pnl": expected_net,
+        "gross_edge_pnl": funding_component + spread_component,
+        "funding_pnl_component": funding_component,
+        "spread_pnl_component": spread_component,
+        "execution_cost": 0.5,
+        "actionable_profit_threshold": 1.0,
+        "reasons": [],
+    }
+    route["evidence"]["strategy_candidates"] = [strategy]
+    route["evidence"]["selected_strategy"] = strategy
+    route["evidence"]["strategy_classification"] = strategy
+    return route
+
+
 def ensure_btc_instruments(store: SQLiteStore, observed_at: str) -> None:
     store.upsert_funding_instruments(
         [
@@ -203,6 +256,232 @@ def test_default_entry_window_targets_final_fifteen_seconds() -> None:
         config,
     )
     assert eligible["eligible"]
+
+
+def test_selected_route_strategy_supports_all_strategy_classes() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+
+    for name, funding_component, spread_component in (
+        ("funding_only", 2.0, 0.0),
+        ("spread_only", -0.25, 2.5),
+        ("combined", 1.5, 1.25),
+        ("opportunistic_any", 0.75, 0.25),
+    ):
+        route = strategy_route(
+            now,
+            name,
+            expected_net=1.25,
+            funding_component=funding_component,
+            spread_component=spread_component,
+        )
+
+        selected = selected_route_strategy(
+            route,
+            ("funding_only", "spread_only", "combined", "opportunistic_any"),
+        )
+
+        assert selected is not None
+        assert selected["strategy_name"] == name
+
+
+def test_selected_route_strategy_normalizes_legacy_strategy_alias() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "funding_only",
+        expected_net=1.25,
+        funding_component=1.75,
+        spread_component=0.0,
+    )
+    route["evidence"]["strategy_candidates"][0]["strategy_name"] = "funding_carry"
+    route["evidence"]["strategy_candidates"][0]["strategy_class"] = "funding_carry"
+
+    selected = selected_route_strategy(route, ("funding_only",))
+
+    assert selected is not None
+    assert selected["strategy_name"] == "funding_only"
+
+
+def test_spread_only_entry_uses_strategy_net_not_funding_nowcast() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "spread_only",
+        expected_net=1.75,
+        funding_component=-0.40,
+        spread_component=2.65,
+        live_net=-0.40,
+    )
+    config = PaperBotConfig(
+        strategy_set=("spread_only",),
+        entry_min_lead_seconds=30,
+        entry_max_lead_seconds=60,
+    ).validated()
+
+    decision = route_entry_decision(route, accounts(), now, config)
+
+    assert decision["eligible"]
+    assert decision["strategy_name"] == "spread_only"
+    assert decision["live_net"] == 1.75
+
+
+def test_strategy_set_can_reject_otherwise_positive_route() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "spread_only",
+        expected_net=1.75,
+        funding_component=-0.40,
+        spread_component=2.65,
+        live_net=-0.40,
+    )
+    config = PaperBotConfig(
+        strategy_set=("funding_only",),
+        entry_min_lead_seconds=30,
+        entry_max_lead_seconds=60,
+    ).validated()
+
+    decision = route_entry_decision(route, accounts(), now, config)
+
+    assert not decision["eligible"]
+    assert "no_allowed_strategy_candidate" in decision["reasons"]
+
+
+def test_opportunistic_any_entry_can_use_total_edge_with_warning() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "opportunistic_any",
+        expected_net=1.50,
+        funding_component=1.80,
+        spread_component=0.0,
+    )
+    route["evidence"]["strategy_candidates"][0]["warnings"] = [
+        "basis_stress_not_covered",
+        "spread_component_absent",
+    ]
+    config = PaperBotConfig(
+        strategy_set=("opportunistic_any",),
+        entry_min_lead_seconds=30,
+        entry_max_lead_seconds=60,
+    ).validated()
+
+    decision = route_entry_decision(route, accounts(), now, config)
+
+    assert decision["eligible"]
+    assert decision["strategy_name"] == "opportunistic_any"
+    assert decision["selected_strategy"]["warnings"] == [
+        "basis_stress_not_covered",
+        "spread_component_absent",
+    ]
+
+
+def test_clean_strategy_has_priority_over_opportunistic_candidate() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "funding_only",
+        expected_net=1.25,
+        funding_component=1.75,
+        spread_component=0.0,
+    )
+    opportunistic = dict(route["evidence"]["strategy_candidates"][0])
+    opportunistic.update(
+        {
+            "strategy_name": "opportunistic_any",
+            "strategy_class": "opportunistic_any",
+            "primary_edge": "opportunistic_total_edge",
+            "expected_net_pnl": 2.50,
+            "warnings": ["basis_stress_not_covered"],
+        }
+    )
+    route["evidence"]["strategy_candidates"].append(opportunistic)
+
+    selected = selected_route_strategy(
+        route,
+        ("funding_only", "opportunistic_any"),
+    )
+
+    assert selected is not None
+    assert selected["strategy_name"] == "funding_only"
+
+
+def test_entry_armed_false_when_route_has_blocking_reason() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "funding_only",
+        expected_net=1.25,
+        funding_component=1.75,
+        spread_component=0.0,
+    )
+    route["status"] = "watch"
+    config = PaperBotConfig(
+        strategy_set=("funding_only",),
+        entry_min_lead_seconds=30,
+        entry_max_lead_seconds=60,
+        arm_window_seconds=900,
+    ).validated()
+
+    decision = route_entry_decision(route, accounts(), now, config)
+
+    assert not decision["eligible"]
+    assert not decision["armed"]
+    assert "route_not_candidate" in decision["reasons"]
+
+
+def test_missing_selected_strategy_eligible_requires_positive_candidate_status() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "funding_only",
+        expected_net=1.25,
+        funding_component=1.75,
+        spread_component=0.0,
+    )
+    selected = dict(route["evidence"].pop("selected_strategy"))
+    selected.pop("eligible", None)
+    route["evidence"]["strategy_candidates"] = []
+    route["evidence"]["strategy_classification"] = selected
+    route["status"] = "watch"
+
+    assert selected_route_strategy(route, ("funding_only",)) is None
+
+
+def test_invalid_strategy_config_fails_closed() -> None:
+    with pytest.raises(ValueError):
+        PaperBotConfig(strategy_set=("funding_onlly",)).validated()
+
+
+def test_default_paper_bot_strategy_set_is_funding_led() -> None:
+    config = PaperBotConfig().validated()
+    assert config.strategy_set == ("funding_only", "combined")
+    assert "spread_only" not in config.strategy_set
+    assert "opportunistic_any" not in config.strategy_set
+
+
+def test_build_position_records_selected_strategy_components() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    route = strategy_route(
+        now,
+        "combined",
+        expected_net=2.25,
+        funding_component=1.20,
+        spread_component=1.55,
+    )
+    config = PaperBotConfig(
+        strategy_set=("funding_only", "spread_only", "combined"),
+        entry_min_lead_seconds=30,
+        entry_max_lead_seconds=60,
+    ).validated()
+    decision = route_entry_decision(route, accounts(), now, config)
+
+    position = build_position_from_route(route, decision, config)
+
+    assert position["expected_live_net"] == 2.25
+    assert position["notes"]["strategy"]["strategy_name"] == "combined"
+    assert position["notes"]["strategy"]["funding_pnl_component"] == 1.20
+    assert position["notes"]["strategy"]["spread_pnl_component"] == 1.55
 
 
 def test_final_recheck_freeze_uses_recent_successful_snapshot() -> None:
@@ -468,6 +747,7 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
             "expected_live_gross": 0.0,
             "expected_live_net": -2.0,
             "expected_execution_cost": 2.0,
+            "actual_basis_pnl": 0.75,
             "entry_legs": [],
             "entry_evidence": {},
         }
@@ -476,10 +756,11 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
         position_id,
         {
             "actual_funding_pnl": 0.0,
+            "actual_basis_pnl": 0.75,
             "actual_execution_cost": 2.0,
-            "actual_net_pnl": -2.0,
-            "long_cash_delta": -1.0,
-            "short_cash_delta": -1.0,
+            "actual_net_pnl": -1.25,
+            "long_cash_delta": -0.625,
+            "short_cash_delta": -0.625,
             "close_reason": "settlement_capture_complete_estimated_missing_history",
             "close_evidence": {"current_nowcast_net": -0.4},
             "settlement": {
@@ -530,7 +811,8 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
     dashboard = store.funding_paper_dashboard()
 
     assert report_rows[0]["Funding PnL $"] == "1.50"
-    assert report_rows[0]["Net PnL $"] == "-0.50"
+    assert report_rows[0]["Basis PnL $"] == "0.75"
+    assert report_rows[0]["Net PnL $"] == "0.25"
     assert report_rows[0]["Причина закрытия"].startswith("Закрыто старой логикой")
     assert "уже не выглядело положительным" in report_rows[0][
         "Состояние окна при закрытии"
@@ -542,7 +824,7 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
     assert "уже не выглядело положительным" in dashboard["closed_positions"][0][
         "close_window_label"
     ]
-    assert dashboard["summary"]["realized_pnl"] == -0.5
+    assert dashboard["summary"]["realized_pnl"] == 0.25
     notifier = FakeNotifier()
     trader = PaperBot(
         store,
@@ -553,7 +835,8 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
     assert trader.publish_repriced_pnl_events() == 1
     assert len(notifier.messages) == 1
     assert "Paper Bot PnL REPRICED" in notifier.messages[0]
-    assert "Net PnL: <b>-$0.50</b>" in notifier.messages[0]
+    assert "Basis PnL: <b>+$0.75</b>" in notifier.messages[0]
+    assert "Net PnL: <b>+$0.25</b>" in notifier.messages[0]
     events = store.funding_paper_dashboard()["events"]
     reprice_event = next(
         event for event in events if event["event_type"] == "pnl_repriced"
@@ -734,6 +1017,66 @@ def test_settlement_closes_when_window_is_not_positive(tmp_path) -> None:
     )
     assert decision["close"]["actual_funding_pnl"] == 1.5
     assert decision["close"]["actual_net_pnl"] == 1.0
+
+
+def test_pre_settlement_closes_when_fresh_window_turns_negative(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
+    settlement_at = "2026-07-19T12:10:00+00:00"
+    entry_route = paper_route(
+        datetime(2026, 7, 19, 11, 59, tzinfo=UTC),
+        660,
+        660,
+        live_net=1.25,
+    )
+    position = {
+        "entry_key": "route-1:2026-07-19T12:10:00+00:00",
+        "route_key": "route-1",
+        "canonical_asset": "BTC",
+        "long_venue": "aster",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "binance",
+        "short_symbol": "BTCUSDT",
+        "base_quantity": 0.01,
+        "target_notional": 500.0,
+        "long_notional": 500.0,
+        "short_notional": 500.0,
+        "long_reserved_margin": 550.0,
+        "short_reserved_margin": 550.0,
+        "long_settlement_at": settlement_at,
+        "short_settlement_at": settlement_at,
+        "max_settlement_at": settlement_at,
+        "expected_live_gross": 2.0,
+        "expected_live_net": 1.25,
+        "expected_execution_cost": 0.5,
+        "entry_legs": entry_route["legs"],
+        "entry_evidence": entry_route["evidence"],
+        "entry_cross_spread": 0.0,
+        "notes": {"accrued_funding_pnl": 0.75},
+    }
+    scan_id = store.start_funding_scan({"scan_mode": "watch"})
+    continuation = paper_route(now, 480, 480, live_net=-0.2)
+    continuation["legs"][0]["vwap"] = 50_000.0
+    continuation["legs"][1]["vwap"] = 50_000.0
+    store.insert_funding_routes(scan_id, [continuation])
+    store.finish_funding_scan(scan_id, "success", route_count=1)
+
+    decision = close_decision(
+        position,
+        now,
+        store,
+        PaperBotConfig(settlement_grace_seconds=0).validated(),
+    )
+
+    assert decision["status"] == "close"
+    close = decision["close"]
+    assert close["close_reason"] == "arbitrage_window_closed_live_net_non_positive"
+    assert close["hold_decision"]["pre_settlement_close"] is True
+    assert close["actual_funding_pnl"] == 0.75
+    assert close["settlement"]["current_funding_pnl"] == 0.0
+    assert close["settlement"]["current_settlement_funding_included"] is False
+    assert close["settlement"]["long"]["source"] == "pre_settlement_no_funding"
 
 
 def test_close_message_explains_interval_and_settlement_mismatch(tmp_path) -> None:
@@ -1085,9 +1428,82 @@ def test_status_report_sends_once_per_interval(tmp_path) -> None:
 
     assert len(notifier.messages) == 1
     assert "Paper Bot STATUS" in notifier.messages[0]
+    assert "DB scan" in notifier.messages[0]
     assert "Candidates: 1" in notifier.messages[0]
     event_types = [row["event_type"] for row in store.funding_paper_dashboard()["events"]]
     assert event_types.count("status_report") == 1
+
+
+def test_status_report_labels_background_scan_scope(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    notifier = FakeNotifier()
+    trader = PaperBot(
+        store,
+        config=PaperBotConfig(status_report_interval_seconds=1_800),
+        notifier=notifier,
+    )
+
+    trader.maybe_record_status_report(
+        {
+            "mode": "background_full_market",
+            "funding_scan_id": 99,
+            "candidate_count": 0,
+            "watch_count": 0,
+            "opened_count": 0,
+            "closed_count": 0,
+            "pending_count": 0,
+            "hot_route_count": 0,
+            "urgent_route_count": 0,
+        },
+        [],
+        [],
+    )
+
+    assert len(notifier.messages) == 1
+    assert "Background scan" in notifier.messages[0]
+    assert "Scan:" not in notifier.messages[0]
+
+
+def test_funding_rate_display_does_not_multiply_interval_rate_twice() -> None:
+    now = datetime.now(UTC)
+    route = paper_route(now, 60, 60)
+    route["long_venue"] = "risex"
+    route["long_symbol"] = "BTC/USDC"
+    long_leg = route["legs"][0]
+    long_leg["funding_rate"] = 0.001
+    long_leg["funding_interval_hours"] = 8.0
+    long_leg["hourly_funding_rate"] = 0.001 / 8.0
+
+    message = funding_rate_lines(route)
+
+    assert "0.1000%/8h" in message
+    assert "0.8000%/8h" not in message
+
+
+def test_status_report_uses_published_risex_8h_display_with_hourly_cashflow() -> None:
+    now = datetime.now(UTC)
+    route = paper_route(now, 60, 60)
+    route["long_venue"] = "risex"
+    route["long_symbol"] = "BTC/USDC"
+    long_leg = route["legs"][0]
+    long_leg["venue"] = "risex"
+    long_leg["symbol"] = "BTC/USDC"
+    long_leg["funding_rate"] = -0.001
+    long_leg["funding_interval_hours"] = 1.0
+    long_leg["hourly_funding_rate"] = -0.001
+    long_leg["published_funding_rate"] = -0.008
+    long_leg["published_funding_interval_hours"] = 8.0
+
+    message = status_report_message(
+        {"mode": "full_market", "funding_scan_id": 123},
+        [route],
+        [],
+        {"open_position_count": 0, "closed_trade_count": 0, "realized_pnl": 0},
+        PaperBotConfig(status_report_interval_seconds=1_800),
+    )
+
+    assert "LONG <code>risex BTC/USDC</code> -0.8000%/8h (-0.1000%/h)" in message
 
 
 def test_status_report_does_not_publish_watch_routes(tmp_path) -> None:
@@ -1209,6 +1625,124 @@ def test_urgent_route_keeps_focused_loop_after_base_interval(tmp_path) -> None:
     assert trader.should_run_hot_iteration()
 
 
+def test_non_urgent_hot_route_keeps_focused_loop_when_full_scan_due(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = PaperBot(
+        store,
+        config=PaperBotConfig(scan_interval_seconds=300),
+    )
+    trader.hot_routes["route-1"] = paper_route(now, 600, 540)
+    trader.last_full_scan_monotonic = time.monotonic() - 301
+
+    assert trader.full_scan_due()
+    assert trader.should_run_hot_iteration()
+
+
+def test_background_scan_does_not_overwrite_newer_hot_route(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = PaperBot(store, config=PaperBotConfig())
+    older = paper_route(now - timedelta(seconds=20), 600, 540, live_net=0.5)
+    newer = paper_route(now, 600, 540, live_net=1.25)
+    trader.hot_routes["route-1"] = newer
+
+    trader.update_hot_routes([older])
+
+    assert trader.hot_routes["route-1"]["evidence"]["current_nowcast_net"] == 1.25
+
+
+def test_background_full_scan_does_not_block_hot_iterations(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = SlowBackgroundScanTrader(
+        store,
+        config=PaperBotConfig(scan_interval_seconds=300),
+        background_delay=0.35,
+    )
+    trader.hot_routes["route-1"] = paper_route(now, 600, 540)
+    trader.last_full_scan_monotonic = time.monotonic() - 301
+
+    first_started = time.perf_counter()
+    first = trader.run_iteration()
+    first_elapsed = time.perf_counter() - first_started
+
+    assert first["mode"] == "hot_routes"
+    assert first["background_full_scan_status"] == "started"
+    assert trader.background_started.wait(0.2)
+    assert first_elapsed < 0.15
+    assert trader.hot_iterations == 1
+
+    second_started = time.perf_counter()
+    second = trader.run_iteration()
+    second_elapsed = time.perf_counter() - second_started
+
+    assert second["mode"] == "hot_routes"
+    assert second.get("background_full_scan_running") is True
+    assert second_elapsed < 0.15
+    assert trader.hot_iterations == 2
+
+    assert trader.background_finished.wait(1.0)
+    third = trader.run_iteration()
+    assert third["mode"] == "hot_routes"
+    assert third["background_full_scan_results"][0]["mode"] == "background_full_market"
+    trader.shutdown_background_full_scan()
+
+
+def test_urgent_hot_route_does_not_start_background_full_scan(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = SlowBackgroundScanTrader(
+        store,
+        config=PaperBotConfig(scan_interval_seconds=300, entry_max_lead_seconds=15),
+        background_delay=0.1,
+    )
+    trader.hot_routes["route-1"] = paper_route(now, 12, 10)
+    trader.last_full_scan_monotonic = time.monotonic() - 301
+
+    result = trader.run_iteration()
+
+    assert result["mode"] == "hot_routes"
+    assert "background_full_scan_status" not in result
+    assert not trader.background_started.is_set()
+
+
+def test_background_discovery_scan_uses_isolated_database(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path / "main.sqlite")
+    store.init_db()
+    trader = PaperBot(store, config=PaperBotConfig())
+    seen_db_paths: list[str] = []
+
+    def fake_run_funding_scan(scan_store, **kwargs):
+        seen_db_paths.append(str(scan_store.db_path))
+        return {
+            "funding_scan_id": 123,
+            "universe_route_count": 0,
+            "execution_shortlist_count": 0,
+            "route_count": 0,
+        }
+
+    def fake_funding_dashboard(self, **kwargs):
+        return {"routes": [], "watch_routes": [], "venues": []}
+
+    monkeypatch.setattr(
+        "smart_money_radar.funding.trader.run_funding_scan",
+        fake_run_funding_scan,
+    )
+    monkeypatch.setattr(SQLiteStore, "funding_dashboard", fake_funding_dashboard)
+
+    result = trader.run_discovery_full_scan()
+
+    assert result["mode"] == "background_full_market"
+    assert seen_db_paths
+    assert seen_db_paths[0] != str(store.db_path)
+    assert "funding-background-scan-" in seen_db_paths[0]
+
+
 def test_hot_route_rechecks_are_parallelized(tmp_path) -> None:
     now = datetime.now(UTC)
     store = SQLiteStore(tmp_path / "radar.sqlite")
@@ -1321,6 +1855,56 @@ class CountingRecheckTrader(PaperBot):
         finally:
             with self.recheck_lock:
                 self.active_rechecks -= 1
+
+
+class SlowBackgroundScanTrader(PaperBot):
+    def __init__(self, *args, background_delay: float = 0.35, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.background_delay = background_delay
+        self.background_started = threading.Event()
+        self.background_finished = threading.Event()
+        self.hot_iterations = 0
+
+    def run_hot_iteration(self) -> dict:
+        self.hot_iterations += 1
+        return {
+            "mode": "hot_routes",
+            "funding_scan_id": None,
+            "candidate_count": 0,
+            "watch_count": len(self.hot_routes),
+            "opened_count": 0,
+            "closed_count": 0,
+            "repriced_count": 0,
+            "pending_count": 0,
+            "held_count": 0,
+            "open_position_count": 0,
+            "hot_route_count": len(self.hot_routes),
+            "urgent_route_count": 0,
+        }
+
+    def run_discovery_full_scan(self) -> dict:
+        self.background_started.set()
+        try:
+            time.sleep(self.background_delay)
+            return {
+                "mode": "background_full_market",
+                "funding_scan_id": 99,
+                "candidate_count": 0,
+                "watch_count": 0,
+                "opened_count": 0,
+                "closed_count": 0,
+                "repriced_count": 0,
+                "pending_count": 0,
+                "held_count": 0,
+                "open_position_count": 0,
+                "hot_route_count": 0,
+                "urgent_route_count": 0,
+                "completed_monotonic": time.monotonic(),
+                "_routes": [],
+                "_watch_routes": [],
+            }
+        finally:
+            self.background_finished.set()
 
 
 def test_filtered_summary_preserves_original_pnl() -> None:
@@ -1481,6 +2065,205 @@ def test_spread_stop_loss_ignores_untracked_snapshot() -> None:
     assert not triggered
 
 
+def test_price_move_snapshot_tracks_both_legs_from_entry() -> None:
+    position = {
+        "entry_legs": [
+            {"side": "long", "evidence": {"vwap": 10.0}},
+            {"side": "short", "evidence": {"vwap": 10.0}},
+        ],
+    }
+    route = {
+        "legs": [
+            {"side": "long", "evidence": {"vwap": 11.0}},
+            {"side": "short", "evidence": {"vwap": 10.5}},
+        ],
+    }
+
+    snapshot = compute_price_move_snapshot(position, route)
+
+    assert snapshot["price_move_tracking"] is True
+    assert snapshot["long_move_fraction"] == pytest.approx(0.10)
+    assert snapshot["short_move_fraction"] == pytest.approx(0.05)
+    assert snapshot["max_abs_move_fraction"] == pytest.approx(0.10)
+    assert snapshot["max_move_side"] == "long"
+
+
+def test_price_stop_loss_triggers_at_configured_threshold() -> None:
+    config = PaperBotConfig(price_stop_loss_fraction=0.10).validated()
+    snapshot = {
+        "price_move_tracking": True,
+        "long_move_fraction": 0.10,
+        "short_move_fraction": 0.02,
+        "max_abs_move_fraction": 0.10,
+        "max_move_side": "long",
+    }
+
+    triggered, reason = price_stop_loss_triggered(snapshot, config)
+
+    assert triggered
+    assert "price_stop_loss" in reason
+    assert "10.00%" in reason
+
+
+def test_price_stop_loss_does_not_trigger_below_threshold() -> None:
+    config = PaperBotConfig(price_stop_loss_fraction=0.10).validated()
+    snapshot = {
+        "price_move_tracking": True,
+        "long_move_fraction": 0.099,
+        "short_move_fraction": -0.04,
+        "max_abs_move_fraction": 0.099,
+        "max_move_side": "long",
+    }
+
+    triggered, _ = price_stop_loss_triggered(snapshot, config)
+
+    assert not triggered
+
+
+def test_price_stop_loss_ignores_untracked_snapshot() -> None:
+    config = PaperBotConfig(price_stop_loss_fraction=0.10).validated()
+    triggered, _ = price_stop_loss_triggered({"price_move_tracking": False}, config)
+    assert not triggered
+
+
+def test_price_stop_loss_close_payload_has_both_legs_in_one_close() -> None:
+    position = {
+        "long_venue": "aster",
+        "long_symbol": "ABCUSDT",
+        "short_venue": "binance",
+        "short_symbol": "ABCUSDT",
+        "long_notional": 500.0,
+        "short_notional": 500.0,
+        "base_quantity": 50.0,
+        "expected_execution_cost": 1.0,
+        "entry_cross_spread": 0.0,
+        "entry_legs": [
+            {
+                "side": "long",
+                "venue": "aster",
+                "symbol": "ABCUSDT",
+                "notional": 500.0,
+                "evidence": {"vwap": 10.0, "funding_rate": -0.001},
+            },
+            {
+                "side": "short",
+                "venue": "binance",
+                "symbol": "ABCUSDT",
+                "notional": 500.0,
+                "evidence": {"vwap": 10.0, "funding_rate": 0.001},
+            },
+        ],
+        "notes": {},
+    }
+    close_route = {
+        "legs": [
+            {
+                "side": "long",
+                "venue": "aster",
+                "symbol": "ABCUSDT",
+                "evidence": {"vwap": 11.0},
+            },
+            {
+                "side": "short",
+                "venue": "binance",
+                "symbol": "ABCUSDT",
+                "evidence": {"vwap": 11.0},
+            },
+        ]
+    }
+
+    payload = build_close_payload(
+        position,
+        {"long": None, "short": None},
+        close_route,
+        use_entry_estimate_for_missing=True,
+        close_reason="price_stop_loss:test",
+    )
+
+    assert payload["close_reason"].startswith("price_stop_loss")
+    assert len(payload["close_legs"]) == 2
+    assert "long_cash_delta" in payload
+    assert "short_cash_delta" in payload
+    assert payload["notes"]["basis_pnl_included"] is True
+
+
+def test_process_open_positions_price_stop_loss_closes_whole_position(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["aster", "binance"], 1_000.0)
+    now = datetime.now(UTC)
+    store.open_funding_paper_position(
+        {
+            "entry_key": "route-1:price-stop",
+            "route_key": "route-1",
+            "canonical_asset": "ABC",
+            "long_venue": "aster",
+            "long_symbol": "ABCUSDT",
+            "short_venue": "binance",
+            "short_symbol": "ABCUSDT",
+            "base_quantity": 50.0,
+            "target_notional": 500.0,
+            "long_notional": 500.0,
+            "short_notional": 500.0,
+            "long_reserved_margin": 550.0,
+            "short_reserved_margin": 550.0,
+            "long_settlement_at": (now + timedelta(hours=1)).isoformat(),
+            "short_settlement_at": (now + timedelta(hours=1)).isoformat(),
+            "max_settlement_at": (now + timedelta(hours=1)).isoformat(),
+            "expected_live_gross": 2.0,
+            "expected_live_net": 1.0,
+            "expected_execution_cost": 1.0,
+            "entry_cross_spread": 0.0,
+            "entry_legs": [
+                {
+                    "side": "long",
+                    "venue": "aster",
+                    "symbol": "ABCUSDT",
+                    "notional": 500.0,
+                    "evidence": {"vwap": 10.0, "funding_rate": 0.0},
+                },
+                {
+                    "side": "short",
+                    "venue": "binance",
+                    "symbol": "ABCUSDT",
+                    "notional": 500.0,
+                    "evidence": {"vwap": 10.0, "funding_rate": 0.0},
+                },
+            ],
+            "entry_evidence": {},
+        }
+    )
+    live_route = paper_route(now, 3_600, 3_600, live_net=1.25)
+    live_route["funding_scan_id"] = None
+    live_route["funding_route_id"] = None
+    live_route["route_key"] = "route-1"
+    live_route["canonical_asset"] = "ABC"
+    live_route["long_symbol"] = "ABCUSDT"
+    live_route["short_symbol"] = "ABCUSDT"
+    live_route["legs"][0]["symbol"] = "ABCUSDT"
+    live_route["legs"][0]["vwap"] = 11.0
+    live_route["legs"][1]["symbol"] = "ABCUSDT"
+    live_route["legs"][1]["vwap"] = 11.0
+    trader = PaperBot(
+        store,
+        config=PaperBotConfig(
+            focused_recheck_enabled=False,
+            price_stop_loss_fraction=0.10,
+            telegram_enabled=False,
+        ),
+        notifier=FakeNotifier(),
+    )
+    trader.hot_routes["route-1"] = live_route
+
+    outcomes = trader.process_open_positions()
+
+    assert outcomes == ["closed"]
+    assert store.funding_paper_open_positions() == []
+    closed = store.funding_paper_dashboard()["closed_positions"][0]
+    assert closed["close_reason"].startswith("price_stop_loss")
+    assert "обе ноги закрыты одновременно" in closed["close_reason_label"]
+
+
 def test_hold_decision_detects_funding_rate_inversion() -> None:
     now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
     config = PaperBotConfig(
@@ -1555,10 +2338,12 @@ def test_build_close_payload_includes_basis_pnl() -> None:
         "entry_legs": [
             {"side": "long", "venue": "aster", "symbol": "BTCUSDT",
              "funding_rate": -0.001, "notional": 500.0, "base_quantity": 2.0,
-             "next_funding_at": "2026-07-19T12:00:00+00:00"},
+             "next_funding_at": "2026-07-19T12:00:00+00:00",
+             "evidence": {"vwap": 100.5}},
             {"side": "short", "venue": "binance", "symbol": "BTCUSDT",
              "funding_rate": 0.001, "notional": 500.0, "base_quantity": 2.0,
-             "next_funding_at": "2026-07-19T12:00:00+00:00"},
+             "next_funding_at": "2026-07-19T12:00:00+00:00",
+             "evidence": {"vwap": 100.2}},
         ],
         "notes": {"accrued_funding_pnl": 0.0},
     }
@@ -1579,18 +2364,32 @@ def test_build_close_payload_includes_basis_pnl() -> None:
         close_reason="test",
     )
     assert "actual_basis_pnl" in close
+    assert abs(close["actual_basis_pnl"] - 0.4) < 1e-9
+    assert abs(close["actual_net_pnl"] - 0.4) < 1e-9
+    assert abs(close["long_cash_delta"] - 1.0) < 1e-9
+    assert abs(close["short_cash_delta"] - (-0.6)) < 1e-9
+    assert (
+        abs(
+            close["long_cash_delta"]
+            + close["short_cash_delta"]
+            - close["actual_net_pnl"]
+        )
+        < 1e-9
+    )
     assert close["spread_snapshot"]["spread_tracking"] is True
+    assert abs(close["spread_snapshot"]["long_basis_pnl"] - 1.0) < 1e-9
+    assert abs(close["spread_snapshot"]["short_basis_pnl"] - (-0.6)) < 1e-9
     assert close["notes"]["paper_model"] == "funding_paper_trader_v2"
     assert close["notes"]["basis_pnl_included"] is True
 
 
 def test_funding_client_for_venue_covers_all_active_venues() -> None:
     active_venues = [
-        "aevo", "apex", "aster", "backpack", "binance", "bitmart",
-        "bitget", "bybit", "coinex", "deribit", "drift", "dydx",
-        "edgex", "ethereal", "extended", "gate", "grvt", "htx",
+        "aevo", "apex", "aster", "backpack", "binance",
+        "bitget", "bybit", "deribit", "dydx",
+        "edgex", "ethereal", "extended", "gate", "grvt",
         "hyperliquid", "kraken", "kucoin", "lighter", "mexc", "okx",
-        "pacifica", "paradex", "reya", "vertex_base", "woox",
+        "paradex", "risex",
     ]
     for venue in active_venues:
         client = funding_client_for_venue(venue)
@@ -1599,7 +2398,10 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
 
 
 def test_funding_client_for_venue_rejects_deactivated() -> None:
-    for venue in ("bingx", "bitunix", "blofin", "phemex", "variational"):
+    for venue in (
+        "bingx", "bitmart", "bitunix", "blofin", "coinex", "drift",
+        "htx", "pacifica", "phemex", "reya", "variational", "vertex_base", "woox",
+    ):
         assert funding_client_for_venue(venue) is None
 
 

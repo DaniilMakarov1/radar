@@ -1,7 +1,8 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="${RADAR_ROOT_DIR:-$SCRIPT_ROOT}"
 PYTHON_BIN="${RADAR_DASHBOARD_PYTHON:-/opt/homebrew/bin/python3}"
 HOST="${RADAR_DASHBOARD_HOST:-127.0.0.1}"
 PORT="${RADAR_DASHBOARD_PORT:-8787}"

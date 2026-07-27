@@ -6075,10 +6075,21 @@ class SQLiteStore:
                                   evidence_json,
                                   '$.decision_mode'
                               ), '') = 'settlement_capture'
-                              AND COALESCE(CAST(json_extract(
-                                  evidence_json,
-                                  '$.current_nowcast_net'
-                              ) AS REAL), 0) >= ?
+                              AND COALESCE(
+                                  CAST(json_extract(
+                                      evidence_json,
+                                      '$.selected_strategy.expected_net_pnl'
+                                  ) AS REAL),
+                                  CAST(json_extract(
+                                      evidence_json,
+                                      '$.strategy_classification.expected_net_pnl'
+                                  ) AS REAL),
+                                  CAST(json_extract(
+                                      evidence_json,
+                                      '$.current_nowcast_net'
+                                  ) AS REAL),
+                                  0
+                              ) >= ?
                           )
                           OR (
                               COALESCE(json_extract(
@@ -6091,10 +6102,20 @@ class SQLiteStore:
                               ) AS REAL), expected_net_profit, 0) >= ?
                           )
                       )
-                    ORDER BY CAST(json_extract(
-                                 evidence_json,
-                                 '$.current_nowcast_net'
-                             ) AS REAL) DESC,
+                    ORDER BY COALESCE(
+                                 CAST(json_extract(
+                                     evidence_json,
+                                     '$.selected_strategy.expected_net_pnl'
+                                 ) AS REAL),
+                                 CAST(json_extract(
+                                     evidence_json,
+                                     '$.strategy_classification.expected_net_pnl'
+                                 ) AS REAL),
+                                 CAST(json_extract(
+                                     evidence_json,
+                                     '$.current_nowcast_net'
+                                 ) AS REAL)
+                             ) DESC,
                              CAST(json_extract(
                                  evidence_json,
                                  '$.conservative_net_profit'
@@ -6123,11 +6144,29 @@ class SQLiteStore:
                               evidence_json,
                               '$.current_nowcast_net'
                           ) AS REAL) > 0
+                          OR CAST(json_extract(
+                              evidence_json,
+                              '$.selected_strategy.expected_net_pnl'
+                          ) AS REAL) > 0
+                          OR CAST(json_extract(
+                              evidence_json,
+                              '$.strategy_classification.expected_net_pnl'
+                          ) AS REAL) > 0
                       )
-                    ORDER BY CAST(json_extract(
-                                 evidence_json,
-                                 '$.current_nowcast_net'
-                             ) AS REAL) DESC,
+                    ORDER BY COALESCE(
+                                 CAST(json_extract(
+                                     evidence_json,
+                                     '$.selected_strategy.expected_net_pnl'
+                                 ) AS REAL),
+                                 CAST(json_extract(
+                                     evidence_json,
+                                     '$.strategy_classification.expected_net_pnl'
+                                 ) AS REAL),
+                                 CAST(json_extract(
+                                     evidence_json,
+                                     '$.current_nowcast_net'
+                                 ) AS REAL)
+                             ) DESC,
                              CAST(json_extract(
                                  evidence_json,
                                  '$.conservative_net_profit'
@@ -6350,6 +6389,7 @@ class SQLiteStore:
             "operations_buffer": [],
             "execution_cost": [],
             "current_raw_net": [],
+            "current_opportunity_net": [],
             "forecast_median_net": [],
             "q25_net": [],
             "break_even_gap": [],
@@ -6394,13 +6434,13 @@ class SQLiteStore:
             if not capacity_eligible:
                 constraint_counts["insufficient_capacity"] += 1
                 continue
-            blocker_counts.update(str(flag) for flag in flags)
             economics_funnel["capacity_eligible"] += 1
             data_quality_flags = {
                 "unit_identity_mismatch",
                 "basis_divergence",
             }
             if set(flags).intersection(data_quality_flags):
+                blocker_counts.update(str(flag) for flag in flags)
                 constraint_counts["data_quality_issue"] += 1
                 continue
 
@@ -6422,6 +6462,11 @@ class SQLiteStore:
                     or 0
                 )
             )
+            opportunity_gross = float(
+                evidence.get("current_opportunity_gross")
+                if evidence.get("current_opportunity_gross") is not None
+                else raw_gross
+            )
             median_net = float(row.get("expected_net_profit") or 0)
             q25_net = float(evidence.get("conservative_net_profit") or 0)
             actionable_threshold = float(
@@ -6436,7 +6481,12 @@ class SQLiteStore:
             basis_stress_loss = float(evidence.get("basis_stress_loss") or 0)
             operations_buffer = float(row.get("operations_buffer") or 0)
             current_raw_net = raw_gross - execution_cost
-            break_even_gap = max(0.0, execution_cost - raw_gross)
+            opportunity_net = float(
+                evidence.get("current_opportunity_net")
+                if evidence.get("current_opportunity_net") is not None
+                else current_raw_net
+            )
+            break_even_gap = max(0.0, execution_cost - opportunity_gross)
             component_values = {
                 "current_raw_gross": raw_gross,
                 "forecast_median_gross": forecast_median_gross,
@@ -6447,6 +6497,7 @@ class SQLiteStore:
                 "operations_buffer": operations_buffer,
                 "execution_cost": execution_cost,
                 "current_raw_net": current_raw_net,
+                "current_opportunity_net": opportunity_net,
                 "forecast_median_net": median_net,
                 "q25_net": q25_net,
                 "break_even_gap": break_even_gap,
@@ -6462,8 +6513,10 @@ class SQLiteStore:
                     "target_notional": float(row.get("target_notional") or 0),
                     "funding_notional": funding_notional,
                     "current_raw_gross": raw_gross,
+                    "current_opportunity_gross": opportunity_gross,
                     "execution_cost": execution_cost,
                     "current_raw_net": current_raw_net,
+                    "current_opportunity_net": opportunity_net,
                     "break_even_gap": break_even_gap,
                     "expected_net_profit": median_net,
                     "q25_net_profit": q25_net,
@@ -6482,10 +6535,10 @@ class SQLiteStore:
                     0,
                 )
             )
-            if raw_gross > execution_cost:
+            if opportunity_gross > execution_cost:
                 economics_funnel["current_raw_gross_covers_full_cost"] += 1
             if (
-                raw_gross - execution_cost > 0
+                opportunity_net > 0
                 and settlement_lead_seconds is not None
                 and float(settlement_lead_seconds) >= minimum_lead_seconds
             ):
@@ -6499,6 +6552,10 @@ class SQLiteStore:
             if q25_net >= actionable_threshold:
                 economics_funnel["q25_actionable"] += 1
             probability = float(evidence.get("net_profit_probability") or 0)
+            if row.get("status") == "paper_candidate":
+                constraint_counts["paper_candidate"] += 1
+                continue
+            blocker_counts.update(str(flag) for flag in flags)
             settlement_capture = (
                 evidence.get("decision_mode") == "settlement_capture"
             )
@@ -6512,9 +6569,9 @@ class SQLiteStore:
             non_economic_blockers = [
                 flag for flag in flags if flag not in economic_flags
             ]
-            if raw_gross <= execution_cost:
+            if opportunity_gross <= execution_cost:
                 constraint_counts["current_spread_below_cost"] += 1
-            elif settlement_capture and current_raw_net <= 0:
+            elif settlement_capture and opportunity_net <= 0:
                 constraint_counts["live_pnl_not_positive"] += 1
             elif settlement_capture and (
                 "basis_not_covered_by_live_funding" in flags
@@ -6522,8 +6579,6 @@ class SQLiteStore:
                 constraint_counts["basis_not_covered_by_live_funding"] += 1
             elif settlement_capture and non_economic_blockers:
                 constraint_counts["model_or_execution_quality_gate"] += 1
-            elif settlement_capture and row.get("status") == "paper_candidate":
-                constraint_counts["paper_candidate"] += 1
             elif settlement_capture:
                 constraint_counts["unclassified_gate"] += 1
             elif median_net <= 0:
@@ -6538,8 +6593,6 @@ class SQLiteStore:
                 constraint_counts["basis_not_covered_by_funding"] += 1
             elif non_economic_blockers:
                 constraint_counts["model_or_execution_quality_gate"] += 1
-            elif row.get("status") == "paper_candidate":
-                constraint_counts["paper_candidate"] += 1
             else:
                 constraint_counts["unclassified_gate"] += 1
         stage_order = (
@@ -7516,7 +7569,10 @@ class SQLiteStore:
                     or position.get("expected_execution_cost")
                     or 0.0
                 )
-                actual_net_pnl = actual_funding_pnl - actual_execution_cost
+                actual_basis_pnl = float(position.get("actual_basis_pnl") or 0.0)
+                actual_net_pnl = (
+                    actual_funding_pnl + actual_basis_pnl - actual_execution_cost
+                )
                 new_settlement["history_missing_fallback"] = history_missing
                 notes = dict(position.get("notes") or {})
                 notes["pnl_repriced_at"] = now
@@ -7525,6 +7581,7 @@ class SQLiteStore:
                     """
                     UPDATE funding_paper_positions
                     SET actual_funding_pnl = ?,
+                        actual_basis_pnl = ?,
                         actual_net_pnl = ?,
                         settlement_json = ?,
                         notes_json = ?
@@ -7532,6 +7589,7 @@ class SQLiteStore:
                     """,
                     (
                         actual_funding_pnl,
+                        actual_basis_pnl,
                         actual_net_pnl,
                         json.dumps(new_settlement, sort_keys=True),
                         json.dumps(notes, sort_keys=True),
@@ -7606,6 +7664,7 @@ class SQLiteStore:
                         json.dumps(
                             {
                                 "actual_funding_pnl": actual_funding_pnl,
+                                "actual_basis_pnl": actual_basis_pnl,
                                 "actual_net_pnl": actual_net_pnl,
                                 "history_missing_fallback": history_missing,
                             },
@@ -7842,6 +7901,14 @@ def decode_funding_route(item: dict[str, Any]) -> dict[str, Any]:
 
 def funding_route_decision_profit(row: dict[str, Any]) -> float:
     evidence = row.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
+    ) or {}
+    if selected:
+        return safe_float(
+            selected.get("expected_net_pnl"),
+            evidence.get("current_nowcast_net"),
+        )
     if evidence.get("decision_mode") == "settlement_capture":
         return safe_float(evidence.get("current_nowcast_net"))
     return safe_float(
@@ -7925,9 +7992,14 @@ def add_funding_paper_display_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def funding_paper_trade_report_row(row: dict[str, Any]) -> dict[str, Any]:
+    strategy = (row.get("notes") or {}).get("strategy") or {}
+    strategy_name = strategy.get("strategy_name") or (row.get("notes") or {}).get(
+        "strategy_name"
+    )
     return {
         "ID": row.get("funding_paper_position_id"),
         "Статус": funding_paper_status_label(row.get("status")),
+        "Стратегия": strategy_name or "",
         "Открыто": report_datetime(row.get("opened_at")),
         "Закрыто": report_datetime(row.get("closed_at")),
         "Актив": row.get("canonical_asset"),
@@ -7990,6 +8062,17 @@ def funding_paper_status_label(value: Any) -> str:
 
 
 def funding_paper_close_reason_label(value: Any) -> str:
+    raw = str(value or "")
+    if raw.startswith("price_stop_loss"):
+        return (
+            "Закрыто по price stop-loss: цена ушла от входа сильнее порога, "
+            "обе ноги закрыты одновременно."
+        )
+    if raw.startswith("spread_stop_loss"):
+        return (
+            "Закрыто по basis/spread stop-loss: hedge spread ушел против позиции "
+            "сильнее порога."
+        )
     return {
         "arbitrage_window_closed_live_net_non_positive": (
             "Окно арбитража закрылось: live net стал неположительным."
@@ -8026,7 +8109,7 @@ def funding_paper_close_reason_label(value: Any) -> str:
         ),
         "test": "Тестовое закрытие.",
         "": "",
-    }.get(str(value or ""), str(value or ""))
+    }.get(raw, raw)
 
 
 def funding_paper_pnl_quality_label(row: dict[str, Any]) -> str:

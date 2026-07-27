@@ -4,11 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="com.smartmoneyradar.dashboard"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="$ROOT_DIR/logs"
+DEPLOY="$HOME/.local/share/smartmoneyradar"
+LOG_DIR="$DEPLOY/logs"
 UID_VALUE="$(id -u)"
-RUNNER="$ROOT_DIR/scripts/run_dashboard_launchd.sh"
+RUNNER="$DEPLOY/run_dashboard.sh"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+cp "$ROOT_DIR/scripts/run_dashboard_launchd.sh" "$RUNNER"
 chmod +x "$RUNNER"
 
 cat > "$PLIST" <<PLIST
@@ -19,7 +21,7 @@ cat > "$PLIST" <<PLIST
   <key>Label</key>
   <string>$LABEL</string>
   <key>WorkingDirectory</key>
-  <string>$ROOT_DIR</string>
+  <string>$DEPLOY</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
@@ -31,6 +33,8 @@ cat > "$PLIST" <<PLIST
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
+    <key>RADAR_ROOT_DIR</key>
+    <string>$ROOT_DIR</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -52,6 +56,7 @@ sleep 1
 pid="$(ps ax -o pid=,command= | awk '/[p]ython.*smart_money_radar[.]dashboard/{print $1; exit}')"
 echo "Installed and started $LABEL"
 echo "Plist: $PLIST"
+echo "Runner: $RUNNER"
 [[ -n "${pid:-}" ]] && echo "PID: $pid"
 echo "Logs:"
 echo "  $LOG_DIR/dashboard.out.log"

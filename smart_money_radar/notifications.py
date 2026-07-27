@@ -32,15 +32,24 @@ class TelegramNotifier:
         timeout_seconds: int = 10,
         token_env_var: str = "TELEGRAM_BOT_TOKEN",
         chat_id_env_var: str = "TELEGRAM_CHAT_ID",
+        fallback_to_default: bool = False,
     ) -> None:
         load_env_file()
         self.token_env_var = token_env_var
         self.chat_id_env_var = chat_id_env_var
         self.token = token or os.environ.get(token_env_var)
         self.chat_id = chat_id or os.environ.get(chat_id_env_var)
-        if not self.token and token_env_var != "TELEGRAM_BOT_TOKEN":
+        if (
+            fallback_to_default
+            and not self.token
+            and token_env_var != "TELEGRAM_BOT_TOKEN"
+        ):
             self.token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        if not self.chat_id and chat_id_env_var != "TELEGRAM_CHAT_ID":
+        if (
+            fallback_to_default
+            and not self.chat_id
+            and chat_id_env_var != "TELEGRAM_CHAT_ID"
+        ):
             self.chat_id = os.environ.get("TELEGRAM_CHAT_ID")
         self.timeout_seconds = max(1, int(timeout_seconds))
 

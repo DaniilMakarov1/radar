@@ -1,10 +1,16 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="${RADAR_ROOT_DIR:-$SCRIPT_ROOT}"
+RUNTIME_DIR="${RADAR_RUNTIME_DIR:-$ROOT_DIR}"
 PYTHON_BIN="${FUNDING_PAPER_PYTHON:-/opt/homebrew/bin/python3}"
 
-if [[ -f "$ROOT_DIR/.env" ]]; then
+if [[ -f "$RUNTIME_DIR/.env" ]]; then
+  set -a
+  source "$RUNTIME_DIR/.env"
+  set +a
+elif [[ -f "$ROOT_DIR/.env" ]]; then
   set -a
   source "$ROOT_DIR/.env"
   set +a
@@ -37,6 +43,8 @@ exec "$PYTHON_BIN" -u -m smart_money_radar.cli funding-paper-trader \
   --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-120}" \
   --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}" \
   --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
-  --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-3600}" \
+  --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-900}" \
   --status-report-max-routes "${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}" \
+  --strategy-set "${FUNDING_PAPER_STRATEGY_SET:-funding_only,combined}" \
+  --price-stop-loss-pct "${FUNDING_PAPER_PRICE_STOP_LOSS_PCT:-10}" \
   "${funding_telegram_arg[@]}"

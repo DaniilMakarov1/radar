@@ -1,4 +1,7 @@
 {
+  "model": {
+    "name": "qwen3.7-plus"
+  },
   "tools": {
     "approvalMode": "yolo"
   },

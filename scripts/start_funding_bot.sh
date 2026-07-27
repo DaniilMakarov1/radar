@@ -111,8 +111,10 @@ if command -v screen >/dev/null 2>&1; then
       --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-120}" \
       --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}" \
       --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
-      --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-3600}" \
+      --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-900}" \
       --status-report-max-routes "${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}" \
+      --strategy-set "${FUNDING_PAPER_STRATEGY_SET:-funding_only,combined}" \
+      --price-stop-loss-pct "${FUNDING_PAPER_PRICE_STOP_LOSS_PCT:-10}" \
       ${telegram_arg} \
       >> "$2" 2>&1
   ' _ "$ROOT_DIR" "$LOG_FILE"
@@ -144,8 +146,10 @@ nohup python3 -m smart_money_radar.cli funding-paper-trader \
   --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-120}" \
   --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}" \
   --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
-  --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-3600}" \
+  --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-900}" \
   --status-report-max-routes "${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}" \
+  --strategy-set "${FUNDING_PAPER_STRATEGY_SET:-funding_only,combined}" \
+  --price-stop-loss-pct "${FUNDING_PAPER_PRICE_STOP_LOSS_PCT:-10}" \
   "${funding_telegram_arg[@]}" \
   >> "$LOG_FILE" 2>&1 < /dev/null &
 

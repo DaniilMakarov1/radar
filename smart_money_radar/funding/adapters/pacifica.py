@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from smart_money_radar.funding.adapters.base import (
@@ -10,6 +11,7 @@ from smart_money_radar.funding.adapters.base import (
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
     normalize_orderbook,
+    parse_timestamp,
 )
 
 
@@ -55,8 +57,16 @@ class PacificaFundingClient:
             if not symbol or not canonical_asset:
                 continue
 
-            funding_rate = as_float(row.get("funding_rate"))
-            next_funding_rate = as_float(row.get("next_funding_rate"))
+            raw_next_funding_rate = row.get("next_funding_rate")
+            has_next_funding_rate = (
+                raw_next_funding_rate is not None
+                and str(raw_next_funding_rate).strip() != ""
+            )
+            published_rate = (
+                as_float(raw_next_funding_rate)
+                if has_next_funding_rate
+                else as_float(row.get("funding_rate"))
+            )
 
             instruments.append(
                 {
@@ -79,13 +89,19 @@ class PacificaFundingClient:
                     "venue": self.venue,
                     "symbol": symbol,
                     "canonical_asset": canonical_asset,
-                    "funding_rate": funding_rate,
+                    "funding_rate": published_rate,
                     "funding_interval_hours": PACIFICA_FUNDING_INTERVAL_HOURS,
-                    "hourly_funding_rate": funding_rate,
-                    "funding_rate_kind": "published_current_hour_estimate",
-                    "next_funding_at": None,
+                    "hourly_funding_rate": published_rate,
+                    "funding_rate_kind": (
+                        "published_next_hour_estimate"
+                        if has_next_funding_rate
+                        else "published_current_hour_estimate"
+                    ),
+                    "next_funding_at": next_utc_hour(observed_at),
                     "mark_price": None,
+                    "mark_price_kind": "orderbook_mid_at_route_evaluation",
                     "index_price": None,
+                    "index_price_kind": "orderbook_mid_proxy",
                     "open_interest_usd": None,
                     "volume_24h_usd": None,
                     "maker_fee_rate": PACIFICA_MAKER_FEE_RATE,
@@ -137,3 +153,13 @@ class PacificaFundingClient:
         observed_at: str,
     ) -> list[dict[str, Any]]:
         return []
+
+
+def next_utc_hour(observed_at: str) -> str:
+    observed = parse_timestamp(observed_at) or datetime.now(UTC)
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    return (
+        observed.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+        + timedelta(hours=1)
+    ).isoformat()

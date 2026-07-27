@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from smart_money_radar.storage import SQLiteStore
@@ -18,9 +19,21 @@ FUNDING_SCAN_CHILD_TABLES = (
     "funding_route_universe",
     "funding_scan_warnings",
 )
-ROUTINE_PAPER_EVENT_TYPES = ("scan", "hot_scan", "status_report")
+ROUTINE_PAPER_EVENT_TYPES = (
+    "scan",
+    "hot_scan",
+    "background_scan",
+    "status_report",
+    "armed",
+    "disarmed",
+    "focused_recheck_failed",
+    "focused_recheck_failed_inside_freeze_window",
+    "focused_recheck_skipped",
+    "retention_skipped",
+)
 DEFAULT_KEEP_LATEST_ROUTINE_PAPER_EVENTS = 200
 DEFAULT_KEEP_LATEST_EQUITY_SNAPSHOTS = 300
+DEFAULT_STALE_RUNNING_SCAN_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,7 @@ def build_funding_retention_plan(
     keep_latest_history_per_market: int = 24,
     keep_latest_routine_paper_events: int = DEFAULT_KEEP_LATEST_ROUTINE_PAPER_EVENTS,
     keep_latest_equity_snapshots: int = DEFAULT_KEEP_LATEST_EQUITY_SNAPSHOTS,
+    stale_running_scan_seconds: int = DEFAULT_STALE_RUNNING_SCAN_SECONDS,
 ) -> FundingRetentionPlan:
     retained = max(1, int(keep_latest_scans))
     retained_history = max(1, int(keep_latest_history_per_market))
@@ -80,7 +94,10 @@ def build_funding_retention_plan(
         protected_scan_ids = (
             latest_scan_ids
             | latest_non_focused_scan_ids
-            | running_funding_scan_ids(connection)
+            | running_funding_scan_ids(
+                connection,
+                stale_running_scan_seconds=stale_running_scan_seconds,
+            )
             | paper_linked_scan_ids(connection)
             | route_scan_ids(connection, protected_route_ids)
         )
@@ -128,13 +145,19 @@ def apply_funding_retention_plan(
     keep_latest_history_per_market: int = 24,
     keep_latest_routine_paper_events: int = DEFAULT_KEEP_LATEST_ROUTINE_PAPER_EVENTS,
     keep_latest_equity_snapshots: int = DEFAULT_KEEP_LATEST_EQUITY_SNAPSHOTS,
+    stale_running_scan_seconds: int = DEFAULT_STALE_RUNNING_SCAN_SECONDS,
 ) -> dict[str, Any]:
+    stale_running_marked = mark_stale_running_funding_scans(
+        store,
+        stale_running_scan_seconds=stale_running_scan_seconds,
+    )
     plan = build_funding_retention_plan(
         store,
         keep_latest_scans=keep_latest_scans,
         keep_latest_history_per_market=keep_latest_history_per_market,
         keep_latest_routine_paper_events=keep_latest_routine_paper_events,
         keep_latest_equity_snapshots=keep_latest_equity_snapshots,
+        stale_running_scan_seconds=stale_running_scan_seconds,
     )
     deleted_rows = {key: 0 for key in plan.rows_by_table}
     if not plan.delete_scan_ids and all(
@@ -142,6 +165,7 @@ def apply_funding_retention_plan(
     ):
         result = plan.as_dict()
         result["deleted_rows"] = deleted_rows
+        result["stale_running_scans_marked"] = stale_running_marked
         return result
 
     last_error: Exception | None = None
@@ -173,6 +197,7 @@ def apply_funding_retention_plan(
         scan_id for scan_id in plan.delete_scan_ids if scan_id not in delete_scan_ids
     ]
     result["deleted_rows"] = deleted_rows
+    result["stale_running_scans_marked"] = stale_running_marked
     return result
 
 
@@ -271,15 +296,51 @@ def paper_linked_scan_ids(connection: sqlite3.Connection) -> set[int]:
     return scan_ids
 
 
-def running_funding_scan_ids(connection: sqlite3.Connection) -> set[int]:
+def running_funding_scan_ids(
+    connection: sqlite3.Connection,
+    *,
+    stale_running_scan_seconds: int = DEFAULT_STALE_RUNNING_SCAN_SECONDS,
+) -> set[int]:
+    cutoff = stale_running_scan_cutoff(stale_running_scan_seconds)
     rows = connection.execute(
         """
         SELECT funding_scan_id
         FROM funding_scans
         WHERE status = 'running'
+          AND started_at >= ?
         """
+        ,
+        (cutoff,),
     ).fetchall()
     return {int(row["funding_scan_id"]) for row in rows}
+
+
+def stale_running_scan_cutoff(stale_running_scan_seconds: int) -> str:
+    seconds = max(60, int(stale_running_scan_seconds))
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat(
+        timespec="seconds"
+    )
+
+
+def mark_stale_running_funding_scans(
+    store: SQLiteStore,
+    *,
+    stale_running_scan_seconds: int = DEFAULT_STALE_RUNNING_SCAN_SECONDS,
+) -> int:
+    cutoff = stale_running_scan_cutoff(stale_running_scan_seconds)
+    with store.connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE funding_scans
+            SET status = 'failed',
+                finished_at = COALESCE(finished_at, ?),
+                error = COALESCE(error, 'stale_running_scan_timeout')
+            WHERE status = 'running'
+              AND started_at < ?
+            """,
+            (datetime.now(UTC).isoformat(timespec="seconds"), cutoff),
+        )
+        return int(cursor.rowcount or 0)
 
 
 def latest_non_focused_funding_scan_ids(

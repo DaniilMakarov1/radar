@@ -18,6 +18,14 @@ The current active product is **Funding Radar**:
 
 Prediction, Dune/local analytics, wallet research, and old on-chain Radar modules are intentionally disabled or archived in the current Funding-first build. Do not reintroduce them unless explicitly requested.
 
+## Required Reading
+
+Before changing repository logic, read:
+
+1. `docs/MODEL_INSTRUCTIONS.md` — detailed operating contract, entry/hold/close rules, funding-unit invariants, and testing requirements.
+2. `docs/AGENT_HANDOFF.md` — current handoff context and where large raw chat transcripts live.
+3. The specific source file and matching tests for the task.
+
 ## Commands
 
 ```bash
@@ -86,7 +94,7 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 ## Current Venue Notes
 
 - Risky venues disabled by user live in `smart_money_radar/funding/venues.py`.
-- `risex_points` is a planned profile shell only. Do not expose or run it until a verified RiseX adapter exists.
+- `risex_points` is a paper-only profile that whitelists RiseX plus core hedging venues. RiseX uses `current_funding_rate` as the per-settlement cashflow rate and `funding_rate_8h` only as audit metadata.
 - DEX/perp venues with non-standard mechanics must be modeled conservatively. Pool-based venues need a separate pool perturbation model before they can be treated like normal orderbook venues.
 - Variational is quarantined/deactivated. Do not include it in active scans, focused rechecks, dashboard candidates, paper bot profiles, or route displays until Codex explicitly rebuilds the adapter from official docs and tests the units again.
 

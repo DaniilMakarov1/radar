@@ -14,6 +14,32 @@ from smart_money_radar.paper_bot.helpers import (
 )
 from smart_money_radar.storage import SQLiteStore
 
+STRATEGY_ALIASES = {
+    "funding": "funding_only",
+    "funding_carry": "funding_only",
+    "funnel_only": "funding_only",
+    "carry": "funding_only",
+    "spread": "spread_only",
+    "spread_capture": "spread_only",
+    "spread_monitor": "spread_only",
+    "basis": "spread_only",
+    "basis_capture": "spread_only",
+    "combined_carry_spread": "combined",
+    "combined_funding_spread": "combined",
+    "any": "opportunistic_any",
+    "any_edge": "opportunistic_any",
+    "best_edge": "opportunistic_any",
+    "mixed": "opportunistic_any",
+    "opportunistic": "opportunistic_any",
+    "opportunistic_total_edge": "opportunistic_any",
+}
+ALLOWED_STRATEGIES = ("funding_only", "spread_only", "combined", "opportunistic_any")
+
+
+def normalize_strategy_name(raw: Any) -> str:
+    key = str(raw or "").strip().lower().replace("-", "_")
+    return STRATEGY_ALIASES.get(key, key)
+
 
 def route_entry_decision(
     route: dict[str, Any],
@@ -29,7 +55,10 @@ def route_entry_decision(
     if route.get("status") != "paper_candidate":
         reasons.append("route_not_candidate")
     evidence = route.get("evidence") or {}
-    live_net = float(evidence.get("current_nowcast_net") or 0.0)
+    selected_strategy = selected_route_strategy(route, config.strategy_set)
+    if selected_strategy is None:
+        reasons.append("no_allowed_strategy_candidate")
+    live_net = strategy_expected_net(route, selected_strategy)
     if not long_leg or not short_leg:
         reasons.append("missing_route_legs")
     else:
@@ -66,8 +95,14 @@ def route_entry_decision(
     ):
         reasons.append("entry_snapshot_stale")
     required_live_net = required_live_net_profit(route, config)
+    if live_net <= 0:
+        if "live_net_not_positive" not in reasons:
+            reasons.append("live_net_not_positive")
+    elif live_net < required_live_net:
+        reasons.append("live_net_below_required_profit")
     armed = bool(
-        long_leg
+        not reasons
+        and long_leg
         and short_leg
         and all(
             lead is not None and 0 <= lead <= config.arm_window_seconds
@@ -75,11 +110,6 @@ def route_entry_decision(
         )
         and live_net >= required_live_net
     )
-    if live_net <= 0:
-        if "live_net_not_positive" not in reasons:
-            reasons.append("live_net_not_positive")
-    elif live_net < required_live_net:
-        reasons.append("live_net_below_required_profit")
     return {
         "eligible": not reasons,
         "armed": armed,
@@ -90,6 +120,8 @@ def route_entry_decision(
         "arm_window_seconds": config.arm_window_seconds,
         "live_net": live_net,
         "required_live_net": required_live_net,
+        "selected_strategy": selected_strategy,
+        "strategy_name": (selected_strategy or {}).get("strategy_name"),
         "snapshot_age_seconds": snapshot_age,
         "max_entry_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
     }
@@ -101,6 +133,9 @@ def required_live_net_profit(
 ) -> float:
     evidence = route.get("evidence") or {}
     threshold = optional_float(evidence.get("actionable_profit_threshold"))
+    selected = selected_route_strategy(route, config.strategy_set)
+    if selected is not None:
+        threshold = optional_float(selected.get("actionable_profit_threshold")) or threshold
     return max(float(config.min_live_net_profit), threshold or 0.0)
 
 
@@ -124,7 +159,10 @@ def route_monitor_decision(
             reasons.append(f"{side}_settlement_already_passed")
         elif lead > config.arm_window_seconds:
             reasons.append(f"{side}_settlement_outside_arm_window")
-    live_net = float((route.get("evidence") or {}).get("current_nowcast_net") or 0.0)
+    selected_strategy = selected_route_strategy(route, config.strategy_set)
+    if selected_strategy is None:
+        reasons.append("no_allowed_strategy_candidate")
+    live_net = strategy_expected_net(route, selected_strategy)
     required_live_net = required_live_net_profit(route, config)
     if live_net <= 0:
         reasons.append("live_net_not_positive")
@@ -152,6 +190,8 @@ def route_monitor_decision(
         "lead_seconds": leads,
         "live_net": live_net,
         "required_live_net": required_live_net,
+        "selected_strategy": selected_strategy,
+        "strategy_name": (selected_strategy or {}).get("strategy_name"),
     }
 
 
@@ -164,6 +204,29 @@ def build_position_from_route(
     long_leg = leg_by_side(legs, "long") or {}
     short_leg = leg_by_side(legs, "short") or {}
     evidence = route.get("evidence") or {}
+    selected_strategy = selected_route_strategy(route, config.strategy_set) or {}
+    strategy_name = str(selected_strategy.get("strategy_name") or "funding_only")
+    strategy_components = {
+        "strategy_name": strategy_name,
+        "primary_edge": selected_strategy.get("primary_edge"),
+        "selection_model": selected_strategy.get("selection_model"),
+        "edge_type": selected_strategy.get("edge_type"),
+        "edge_label": selected_strategy.get("edge_label"),
+        "edge_quality": selected_strategy.get("edge_quality"),
+        "thesis": selected_strategy.get("thesis"),
+        "funding_pnl_component": selected_strategy.get("funding_pnl_component"),
+        "spread_pnl_component": selected_strategy.get("spread_pnl_component"),
+        "signed_spread_pnl_component": selected_strategy.get(
+            "signed_spread_pnl_component"
+        ),
+        "expected_net_pnl": selected_strategy.get("expected_net_pnl"),
+        "basis_stress_net_pnl": selected_strategy.get("basis_stress_net_pnl"),
+        "risk_adjusted_net_pnl": selected_strategy.get(
+            "risk_adjusted_net_pnl"
+        ),
+        "coverage_ratio": selected_strategy.get("coverage_ratio"),
+        "warnings": selected_strategy.get("warnings") or [],
+    }
     long_notional = float(long_leg.get("notional") or route.get("target_notional") or 0.0)
     short_notional = float(short_leg.get("notional") or route.get("target_notional") or 0.0)
     long_settlement = str(long_leg.get("next_funding_at") or "")
@@ -194,15 +257,160 @@ def build_position_from_route(
         "long_settlement_at": long_settlement,
         "short_settlement_at": short_settlement,
         "max_settlement_at": max_settlement,
-        "expected_live_gross": float(evidence.get("current_nowcast_gross") or 0.0),
-        "expected_live_net": float(evidence.get("current_nowcast_net") or 0.0),
+        "expected_live_gross": float(selected_strategy.get("gross_edge_pnl") or evidence.get("current_nowcast_gross") or 0.0),
+        "expected_live_net": float(selected_strategy.get("expected_net_pnl") or evidence.get("current_nowcast_net") or 0.0),
         "expected_execution_cost": float(evidence.get("execution_cost") or 0.0),
         "entry_legs": legs,
         "entry_evidence": evidence,
         "entry_cross_spread": entry_cross_spread(long_leg, short_leg),
         "entry_basis_bps": float(evidence.get("signed_entry_basis") or 0.0) * 10_000.0,
-        "notes": {"decision": decision, "paper_model": "funding_paper_trader_v2"},
+        "notes": {
+            "decision": decision,
+            "paper_model": "funding_paper_trader_v2",
+            "strategy": strategy_components,
+            "strategy_name": strategy_name,
+        },
     }
+
+
+def normalize_strategy_set(strategies: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    raw_values = tuple(strategies or ())
+    if not raw_values:
+        raw_values = ("funding_only",)
+    normalized: list[str] = []
+    for raw in raw_values:
+        key = normalize_strategy_name(raw)
+        if key in ALLOWED_STRATEGIES and key not in normalized:
+            normalized.append(key)
+    if not normalized:
+        allowed = ", ".join(ALLOWED_STRATEGIES)
+        raise ValueError(
+            f"No valid funding paper strategies in {raw_values!r}. Allowed: {allowed}"
+        )
+    return tuple(normalized)
+
+
+def selected_route_strategy(
+    route: dict[str, Any],
+    allowed_strategies: tuple[str, ...] | list[str] | None,
+) -> dict[str, Any] | None:
+    allowed = set(normalize_strategy_set(allowed_strategies))
+    evidence = route.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
+    )
+    if (
+        selected
+        and str((selected or {}).get("selection_model") or "")
+        == "opportunity_engine_v1"
+    ):
+        selected_name = normalize_strategy_name(
+            (selected or {}).get("strategy_name")
+            or (selected or {}).get("strategy_class")
+        )
+        if selected_name in allowed:
+            candidate = dict(selected)
+            expected_net = optional_float(candidate.get("expected_net_pnl"))
+            candidate_eligible = (
+                bool(candidate["eligible"])
+                if "eligible" in candidate
+                else route.get("status") == "paper_candidate"
+                and expected_net is not None
+                and expected_net > 0
+            )
+            if candidate_eligible:
+                candidate["strategy_name"] = selected_name
+                candidate["strategy_class"] = selected_name
+                candidate["eligible"] = True
+                return candidate
+    candidates = []
+    for row in evidence.get("strategy_candidates") or []:
+        name = normalize_strategy_name(
+            row.get("strategy_name") or row.get("strategy_class")
+        )
+        if name not in allowed or not bool(row.get("eligible")):
+            continue
+        candidate = dict(row)
+        candidate["strategy_name"] = name
+        candidate["strategy_class"] = name
+        candidates.append(candidate)
+    if not candidates:
+        selected_name = normalize_strategy_name(
+            (selected or {}).get("strategy_name")
+            or (selected or {}).get("strategy_class")
+        )
+        if selected and selected_name in allowed:
+            candidate = dict(selected)
+            expected_net = optional_float(candidate.get("expected_net_pnl"))
+            candidate_eligible = (
+                bool(candidate["eligible"])
+                if "eligible" in candidate
+                else route.get("status") == "paper_candidate"
+                and expected_net is not None
+                and expected_net > 0
+            )
+            if candidate_eligible:
+                candidate["strategy_name"] = selected_name
+                candidate["strategy_class"] = selected_name
+                candidate["eligible"] = True
+                candidates.append(candidate)
+    if not candidates:
+        legacy_net = optional_float(evidence.get("current_nowcast_net"))
+        if (
+            legacy_net is not None
+            and legacy_net > 0
+            and route.get("status") == "paper_candidate"
+            and "funding_only" in allowed
+        ):
+            threshold = optional_float(evidence.get("actionable_profit_threshold")) or 0.0
+            return {
+                "strategy_name": "funding_only",
+                "strategy_class": "funding_only",
+                "primary_edge": "funding_carry",
+                "eligible": True,
+                "expected_net_pnl": legacy_net,
+                "gross_edge_pnl": evidence.get("current_nowcast_gross"),
+                "funding_pnl_component": evidence.get("current_nowcast_gross"),
+                "spread_pnl_component": 0.0,
+                "execution_cost": evidence.get("execution_cost"),
+                "actionable_profit_threshold": threshold,
+                "reasons": [],
+                "legacy_strategy_fallback": True,
+            }
+        return None
+    strict_candidates = [
+        row for row in candidates if row.get("strategy_name") != "opportunistic_any"
+    ]
+    if strict_candidates:
+        candidates = strict_candidates
+    priority = {
+        "combined": 4,
+        "spread_only": 3,
+        "funding_only": 2,
+        "opportunistic_any": 1,
+    }
+    selected = max(
+        candidates,
+        key=lambda row: (
+            float(row.get("expected_net_pnl") or 0.0),
+            priority.get(str(row.get("strategy_name") or row.get("strategy_class")), 0),
+        ),
+    )
+    selected.setdefault("strategy_name", selected.get("strategy_class") or "funding_only")
+    selected.setdefault("strategy_class", selected.get("strategy_name"))
+    return selected
+
+
+def strategy_expected_net(
+    route: dict[str, Any],
+    selected_strategy: dict[str, Any] | None,
+) -> float:
+    if selected_strategy is not None:
+        value = optional_float(selected_strategy.get("expected_net_pnl"))
+        if value is not None:
+            return value
+    evidence = route.get("evidence") or {}
+    return float(evidence.get("current_nowcast_net") or 0.0)
 
 
 def close_decision(
@@ -226,13 +434,43 @@ def close_decision(
                 ),
             }
         return {"status": "settlement_pending", "reason": "missing_max_settlement_at"}
+    close_route = store.latest_funding_route_by_key(str(position["route_key"]))
+    hold = position_hold_decision(position, close_route, now, config)
     if now < max_settlement + timedelta(seconds=config.settlement_grace_seconds):
+        pre_settlement_exit_reasons = {
+            "live_net_not_positive",
+            "funding_rate_inverted",
+            "no_allowed_strategy_candidate",
+        }
+        unverifiable_reasons = {
+            "route_snapshot_stale",
+            "route_snapshot_age_missing",
+            "latest_route_missing",
+            "missing_route_legs",
+        }
+        if (
+            not hold["hold"]
+            and pre_settlement_exit_reasons.intersection(hold["reasons"])
+            and not unverifiable_reasons.intersection(hold["reasons"])
+        ):
+            close = build_close_payload(
+                position,
+                {"long": None, "short": None},
+                close_route,
+                use_entry_estimate_for_missing=False,
+                close_reason=str(hold["close_reason"]),
+                hold_decision={
+                    **hold,
+                    "pre_settlement_close": True,
+                    "current_settlement_funding_included": False,
+                },
+                include_current_settlement_funding=False,
+            )
+            return {"status": "close", "close": close}
         return {"status": "wait", "reason": "settlement_not_reached"}
 
     settlement = settlement_rates_for_position(position, store)
     missing = [side for side, row in settlement.items() if row is None]
-    close_route = store.latest_funding_route_by_key(str(position["route_key"]))
-    hold = position_hold_decision(position, close_route, now, config)
     if hold["hold"]:
         accrual = build_settlement_accrual_payload(
             position,
@@ -299,18 +537,33 @@ def position_hold_decision(
             reasons.append(f"{side}_next_settlement_not_future")
             continue
         next_settlements[side] = settlement.isoformat()
-    live_net = optional_float(evidence.get("current_nowcast_net"))
-    if live_net is None:
+    selected_strategy = selected_route_strategy(route, config.strategy_set)
+    if selected_strategy is None:
+        reasons.append("no_allowed_strategy_candidate")
+    live_net = strategy_expected_net(route, selected_strategy)
+    if optional_float(live_net) is None:
         reasons.append("live_net_missing")
     elif live_net <= max(0.0, float(config.min_live_net_profit)):
         reasons.append("live_net_not_positive")
     if long_leg and short_leg:
         long_hourly = optional_float(long_leg.get("hourly_funding_rate"))
         short_hourly = optional_float(short_leg.get("hourly_funding_rate"))
+        strategy_name = (selected_strategy or {}).get("strategy_name")
+        edge_type = (selected_strategy or {}).get("edge_type")
+        funding_component = optional_float(
+            (selected_strategy or {}).get("funding_pnl_component")
+        )
+        funding_sensitive = edge_type in {"funding_led", "mixed_edge"} or (
+            strategy_name in {"funding_only", "combined"}
+        ) or (
+            strategy_name == "opportunistic_any"
+            and (funding_component or 0.0) > 0.0
+        )
         if (
             long_hourly is not None
             and short_hourly is not None
             and short_hourly < long_hourly
+            and funding_sensitive
         ):
             reasons.append("funding_rate_inverted")
     close_reason = close_reason_from_hold_reasons(reasons)
@@ -319,6 +572,8 @@ def position_hold_decision(
         "close_reason": close_reason,
         "reasons": reasons,
         "live_net": live_net,
+        "selected_strategy": selected_strategy,
+        "strategy_name": (selected_strategy or {}).get("strategy_name"),
         "route_snapshot_age_seconds": route_age,
         "max_route_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
         "next_settlements": next_settlements,
@@ -329,6 +584,8 @@ def position_hold_decision(
 def close_reason_from_hold_reasons(reasons: list[str]) -> str:
     if "live_net_not_positive" in reasons:
         return "arbitrage_window_closed_live_net_non_positive"
+    if "no_allowed_strategy_candidate" in reasons:
+        return "arbitrage_window_closed_no_allowed_strategy"
     if "data_quality_issue" in reasons:
         return "arbitrage_window_data_quality_issue"
     if (
@@ -374,12 +631,24 @@ def build_settlement_accrual_payload(
     ).isoformat()
     funding_pnl_delta = long_funding_pnl + short_funding_pnl
     evidence = continuation_route.get("evidence") or {}
+    selected_strategy = (
+        evidence.get("selected_strategy")
+        or evidence.get("strategy_classification")
+        or {}
+    )
+    next_expected_live_gross = selected_strategy.get("gross_edge_pnl")
+    if next_expected_live_gross is None:
+        next_expected_live_gross = evidence.get("current_nowcast_gross")
+    next_expected_live_net = selected_strategy.get("expected_net_pnl")
+    if next_expected_live_net is None:
+        next_expected_live_net = evidence.get("current_nowcast_net")
     settlement_payload_value = {
         "long": settlement_payload(settlement.get("long"), current_long, long_rate),
         "short": settlement_payload(settlement.get("short"), current_short, short_rate),
         "funding_pnl_delta": funding_pnl_delta,
         "history_missing_fallback": use_entry_estimate_for_missing,
-        "continued_live_net": evidence.get("current_nowcast_net"),
+        "continued_live_net": next_expected_live_net,
+        "continued_strategy": selected_strategy,
     }
     return {
         "settlement_key": ":".join(
@@ -401,8 +670,8 @@ def build_settlement_accrual_payload(
         "next_max_settlement_at": next_max_settlement,
         "next_entry_legs": next_legs,
         "next_entry_evidence": evidence,
-        "next_expected_live_gross": evidence.get("current_nowcast_gross"),
-        "next_expected_live_net": evidence.get("current_nowcast_net"),
+        "next_expected_live_gross": next_expected_live_gross,
+        "next_expected_live_net": next_expected_live_net,
     }
 
 
@@ -432,11 +701,18 @@ def build_close_payload(
     use_entry_estimate_for_missing: bool,
     close_reason: str,
     hold_decision: dict[str, Any] | None = None,
+    include_current_settlement_funding: bool = True,
 ) -> dict[str, Any]:
     entry_long = current_position_leg(position, "long")
     entry_short = current_position_leg(position, "short")
-    long_rate = settlement_rate_or_entry(settlement.get("long"), entry_long)
-    short_rate = settlement_rate_or_entry(settlement.get("short"), entry_short)
+    if include_current_settlement_funding:
+        long_rate = settlement_rate_or_entry(settlement.get("long"), entry_long)
+        short_rate = settlement_rate_or_entry(settlement.get("short"), entry_short)
+        settlement_source = None
+    else:
+        long_rate = 0.0
+        short_rate = 0.0
+        settlement_source = "pre_settlement_no_funding"
     long_notional = float(position.get("long_notional") or 0.0)
     short_notional = float(position.get("short_notional") or 0.0)
     long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
@@ -450,9 +726,13 @@ def build_close_payload(
     spread_snap = compute_spread_snapshot(position, close_route)
     basis_pnl = float(spread_snap.get("unrealized_basis_pnl") or 0.0)
     actual_net_pnl = actual_funding_pnl + basis_pnl - actual_execution_cost
-    long_cash_delta = long_funding_pnl - actual_execution_cost / 2.0
-    short_cash_delta = short_funding_pnl - actual_execution_cost / 2.0
+    long_basis_pnl = float(spread_snap.get("long_basis_pnl") or 0.0)
+    short_basis_pnl = float(spread_snap.get("short_basis_pnl") or 0.0)
+    long_cash_delta = long_funding_pnl + long_basis_pnl - actual_execution_cost / 2.0
+    short_cash_delta = short_funding_pnl + short_basis_pnl - actual_execution_cost / 2.0
     close_evidence = (close_route or {}).get("evidence") or {}
+    strategy = dict((position.get("notes") or {}).get("strategy") or {})
+    strategy_name = str(strategy.get("strategy_name") or position.get("strategy_name") or "funding_only")
     return {
         "close_funding_scan_id": (close_route or {}).get("funding_scan_id"),
         "close_funding_route_id": (close_route or {}).get("funding_route_id"),
@@ -460,6 +740,13 @@ def build_close_payload(
         "actual_basis_pnl": basis_pnl,
         "actual_execution_cost": actual_execution_cost,
         "actual_net_pnl": actual_net_pnl,
+        "strategy_name": strategy_name,
+        "pnl_decomposition": {
+            "funding_pnl": actual_funding_pnl,
+            "basis_pnl": basis_pnl,
+            "execution_cost": actual_execution_cost,
+            "net_pnl": actual_net_pnl,
+        },
         "long_cash_delta": long_cash_delta,
         "short_cash_delta": short_cash_delta,
         "close_reason": close_reason,
@@ -468,18 +755,31 @@ def build_close_payload(
         "close_evidence": close_evidence,
         "spread_snapshot": spread_snap,
         "settlement": {
-            "long": settlement_payload(settlement.get("long"), entry_long, long_rate),
-            "short": settlement_payload(settlement.get("short"), entry_short, short_rate),
+            "long": settlement_payload(
+                settlement.get("long"),
+                entry_long,
+                long_rate,
+                source=settlement_source,
+            ),
+            "short": settlement_payload(
+                settlement.get("short"),
+                entry_short,
+                short_rate,
+                source=settlement_source,
+            ),
             "current_funding_pnl": current_funding_pnl,
             "accrued_funding_pnl": accrued_funding_pnl,
             "entry_expected_live_net": position.get("expected_live_net"),
             "entry_expected_live_gross": position.get("expected_live_gross"),
             "history_missing_fallback": use_entry_estimate_for_missing,
+            "current_settlement_funding_included": include_current_settlement_funding,
         },
         "notes": {
             "paper_model": "funding_paper_trader_v2",
             "execution_cost_source": "entry_route_expected_execution_cost",
             "basis_pnl_included": spread_snap.get("spread_tracking", False),
+            "strategy": strategy,
+            "strategy_name": strategy_name,
         },
     }
 
@@ -523,6 +823,8 @@ def settlement_payload(
     settlement_row: dict[str, Any] | None,
     entry_leg: dict[str, Any],
     funding_rate: float,
+    *,
+    source: str | None = None,
 ) -> dict[str, Any]:
     return {
         "venue": (settlement_row or {}).get("venue") or entry_leg.get("venue"),
@@ -530,7 +832,8 @@ def settlement_payload(
         "settlement_at": (settlement_row or {}).get("funding_at")
         or entry_leg.get("next_funding_at"),
         "funding_rate": funding_rate,
-        "source": "history" if settlement_row is not None else "entry_estimate_fallback",
+        "source": source
+        or ("history" if settlement_row is not None else "entry_estimate_fallback"),
         "history_row": settlement_row,
     }
 
@@ -558,6 +861,12 @@ def compute_spread_snapshot(
     current_spread = current_long - current_short
     quantity = float(position.get("base_quantity") or 0.0)
     unrealized_basis_pnl = (current_spread - entry_spread) * quantity
+    long_basis_pnl, short_basis_pnl = spread_leg_pnls(
+        position,
+        current_long,
+        current_short,
+        unrealized_basis_pnl,
+    )
     notional = float(position.get("target_notional") or 0.0)
     reference = (current_long + current_short) / 2.0
     current_basis_bps = (
@@ -578,12 +887,117 @@ def compute_spread_snapshot(
         "current_long_price": current_long,
         "current_short_price": current_short,
         "unrealized_basis_pnl": unrealized_basis_pnl,
+        "long_basis_pnl": long_basis_pnl,
+        "short_basis_pnl": short_basis_pnl,
         "current_basis_bps": current_basis_bps,
         "entry_basis_bps": entry_basis_bps,
         "accrued_funding_pnl": accrued_funding,
         "total_unrealized_pnl": total_unrealized,
         "notional": notional,
     }
+
+
+def spread_leg_pnls(
+    position: dict[str, Any],
+    current_long: float,
+    current_short: float,
+    total_basis_pnl: float,
+) -> tuple[float, float]:
+    quantity = float(position.get("base_quantity") or 0.0)
+    entry_long = leg_vwap(current_position_leg(position, "long"))
+    entry_short = leg_vwap(current_position_leg(position, "short"))
+    if quantity > 0 and entry_long is not None and entry_short is not None:
+        return (
+            (current_long - entry_long) * quantity,
+            (entry_short - current_short) * quantity,
+        )
+    # Older paper rows may only have the cross-spread, not both entry prices.
+    # Preserve total PnL and split it evenly so account equity still matches
+    # the trade-level PnL.
+    return total_basis_pnl / 2.0, total_basis_pnl / 2.0
+
+
+def compute_price_move_snapshot(
+    position: dict[str, Any],
+    route: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Measure current leg price moves from the paper entry snapshot."""
+    if route is None:
+        return {"price_move_tracking": False, "reason": "missing_route"}
+    legs = route.get("legs") or []
+    long_leg = leg_by_side(legs, "long")
+    short_leg = leg_by_side(legs, "short")
+    if not long_leg or not short_leg:
+        return {"price_move_tracking": False, "reason": "missing_route_legs"}
+
+    entry_long = leg_vwap(current_position_leg(position, "long"))
+    entry_short = leg_vwap(current_position_leg(position, "short"))
+    current_long = leg_vwap(long_leg)
+    current_short = leg_vwap(short_leg)
+    entry_prices = {"long": entry_long, "short": entry_short}
+    current_prices = {"long": current_long, "short": current_short}
+    missing = [
+        side
+        for side, value in (
+            ("entry_long", entry_long),
+            ("entry_short", entry_short),
+            ("current_long", current_long),
+            ("current_short", current_short),
+        )
+        if value is None or value <= 0
+    ]
+    if missing:
+        return {
+            "price_move_tracking": False,
+            "reason": "missing_or_invalid_price",
+            "missing": missing,
+            "entry_prices": entry_prices,
+            "current_prices": current_prices,
+        }
+
+    assert entry_long is not None
+    assert entry_short is not None
+    assert current_long is not None
+    assert current_short is not None
+    long_move = (current_long - entry_long) / entry_long
+    short_move = (current_short - entry_short) / entry_short
+    entry_mid = (entry_long + entry_short) / 2.0
+    current_mid = (current_long + current_short) / 2.0
+    mid_move = (current_mid - entry_mid) / entry_mid if entry_mid > 0 else 0.0
+    max_side = "long" if abs(long_move) >= abs(short_move) else "short"
+    max_abs_move = max(abs(long_move), abs(short_move))
+    return {
+        "price_move_tracking": True,
+        "entry_prices": entry_prices,
+        "current_prices": current_prices,
+        "long_move_fraction": long_move,
+        "short_move_fraction": short_move,
+        "mid_move_fraction": mid_move,
+        "max_abs_move_fraction": max_abs_move,
+        "max_move_side": max_side,
+        "entry_mid_price": entry_mid,
+        "current_mid_price": current_mid,
+    }
+
+
+def price_stop_loss_triggered(
+    snapshot: dict[str, Any],
+    config: PaperBotConfig,
+) -> tuple[bool, str]:
+    if not snapshot.get("price_move_tracking"):
+        return False, ""
+    threshold = float(getattr(config, "price_stop_loss_fraction", 0.0) or 0.0)
+    if threshold <= 0:
+        return False, ""
+    max_abs_move = abs(float(snapshot.get("max_abs_move_fraction") or 0.0))
+    if max_abs_move + 1e-12 < threshold:
+        return False, ""
+    side = str(snapshot.get("max_move_side") or "")
+    signed_move = float(snapshot.get(f"{side}_move_fraction") or 0.0) if side else 0.0
+    return True, (
+        f"price_stop_loss: {side or 'leg'}_move={signed_move * 100:.2f}% "
+        f"abs={max_abs_move * 100:.2f}% >= {threshold * 100:.2f}%"
+    )
 
 
 def spread_stop_loss_triggered(
@@ -676,8 +1090,12 @@ def status_publishable_candidate(
 ) -> bool:
     if route.get("status") != "paper_candidate":
         return False
-    evidence = route.get("evidence") or {}
-    live_net = optional_float(evidence.get("current_nowcast_net"))
+    selected = selected_route_strategy(route, config.strategy_set)
+    live_net = (
+        optional_float(selected.get("expected_net_pnl"))
+        if selected is not None
+        else None
+    )
     if live_net is None or live_net <= 0:
         return False
     return live_net >= required_live_net_profit(route, config)

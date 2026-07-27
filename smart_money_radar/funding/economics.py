@@ -29,6 +29,17 @@ from smart_money_radar.funding.normalization import (
 
 MAX_ABSOLUTE_HOURLY_FUNDING_RATE = 0.02
 MAX_ABSOLUTE_INTERVAL_FUNDING_RATE = 0.08
+STRATEGY_ECONOMIC_BLOCKERS = {
+    "basis_not_covered_by_funding",
+    "basis_not_covered_by_live_funding",
+    "conservative_net_after_costs_too_low",
+    "forecast_median_net_negative",
+    "funding_direction_unstable",
+    "insufficient_forward_samples",
+    "live_net_pnl_below_actionable_threshold",
+    "live_net_pnl_not_positive",
+    "profit_probability_too_low",
+}
 
 
 def evaluate_perp_route(
@@ -186,8 +197,7 @@ def evaluate_perp_route(
         row
         for row in sizing_rows
         if row["fill_complete"]
-        and row["current_nowcast_net"] > 0
-        and row["meets_live_basis_coverage_gate"]
+        and row["current_opportunity_net"] > 0
     ]
     selected_size = (
         select_live_sizing_row(sizing_rows, live_passing_sizes)
@@ -234,6 +244,10 @@ def evaluate_perp_route(
     )
     current_nowcast_gross = float(selected_size["current_nowcast_gross"])
     current_nowcast_net = float(selected_size["current_nowcast_net"])
+    current_opportunity_net = float(selected_size["current_opportunity_net"])
+    current_opportunity_basis_stress_net = float(
+        selected_size["current_opportunity_basis_stress_net"]
+    )
     current_basis_stress_net_profit = float(
         selected_size["current_basis_stress_net_profit"]
     )
@@ -242,6 +256,9 @@ def evaluate_perp_route(
     )
     meets_live_basis_coverage_gate = bool(
         selected_size["meets_live_basis_coverage_gate"]
+    )
+    meets_live_opportunity_basis_coverage_gate = bool(
+        selected_size["meets_live_opportunity_basis_coverage_gate"]
     )
     liquidity_profile = build_route_liquidity_profile(
         long_book,
@@ -269,8 +286,8 @@ def evaluate_perp_route(
         long_market,
         short_market,
         current_nowcast_gross,
-        current_nowcast_net,
-        current_basis_stress_net_profit,
+        current_opportunity_net,
+        current_opportunity_basis_stress_net,
         actionable_profit_threshold,
         basis_stress_loss,
         basis_gap,
@@ -432,21 +449,24 @@ def evaluate_perp_route(
         and int(basis_history.get("change_sample_count") or 0)
         < config.minimum_liquidity_snapshots
     ):
-        block(
+        assess_history(
             "insufficient_basis_history",
-            "Для большого executable basis недостаточно совместной L2-истории.",
+            "Для большого executable basis недостаточно совместной L2-истории: "
+            "paper-тест может проверить окно, но для real trade это риск фантомного или быстро исчезающего spread.",
         )
     if large_basis:
-        risk_flags.append("large_basis_requires_carry_coverage")
+        risk_flags.append("large_basis_requires_stop_loss")
     if large_basis:
         if (
             decision_mode == "settlement_capture"
-            and not meets_live_basis_coverage_gate
+            and not meets_live_opportunity_basis_coverage_gate
         ):
-            block(
+            advise(
                 "basis_not_covered_by_live_funding",
-                f"Текущий funding не покрывает basis stress и полные расходы: "
-                f"live stress PnL ${current_basis_stress_net_profit:,.2f}.",
+                f"Текущий total opportunity не покрывает basis stress "
+                f"и полные расходы: live stress PnL "
+                f"${current_opportunity_basis_stress_net:,.2f}. "
+                f"Это warning для stop-loss, не veto для live opportunity.",
             )
         elif decision_mode != "settlement_capture" and not meets_basis_coverage_gate:
             block(
@@ -464,18 +484,21 @@ def evaluate_perp_route(
             "basis_divergence",
             "Executable basis выше 2 000 bps; вероятна ошибка identity или единиц контракта.",
         )
-    if decision_mode == "settlement_capture" and current_nowcast_net < 0:
+    if decision_mode == "settlement_capture" and current_opportunity_net < 0:
         block(
             "live_net_pnl_not_positive",
-            f"Текущий live net PnL ${current_nowcast_net:,.2f} отрицательный.",
+            f"Текущий total opportunity net PnL "
+            f"${current_opportunity_net:,.2f} отрицательный.",
         )
     elif (
         decision_mode == "settlement_capture"
-        and current_nowcast_net < actionable_profit_threshold
+        and current_opportunity_net < actionable_profit_threshold
     ):
         block(
             "live_net_pnl_below_actionable_threshold",
-            f"Текущий live net PnL ${current_nowcast_net:,.2f} ниже минимально значимой прибыли ${actionable_profit_threshold:,.2f}.",
+            f"Текущий total opportunity net PnL "
+            f"${current_opportunity_net:,.2f} ниже минимально "
+            f"значимой прибыли ${actionable_profit_threshold:,.2f}.",
         )
     if expected_net_profit <= 0:
         assess_history(
@@ -517,7 +540,26 @@ def evaluate_perp_route(
         risk_flags.append("limited_regime_duration_history")
     risk_flags.append("account_margin_unverified")
 
-    paper_candidate = not blocking_reasons
+    strategy_evaluation = build_strategy_evaluation(
+        selected_size,
+        current_nowcast_gross,
+        current_nowcast_net,
+        current_basis_stress_net_profit,
+        actionable_profit_threshold,
+        blocking_risk_flags,
+        decision_mode,
+    )
+    selected_strategy = strategy_evaluation["selected_strategy"]
+
+    legacy_paper_candidate = not blocking_reasons
+    strategy_paper_candidate = bool(
+        selected_strategy and selected_strategy.get("eligible")
+    )
+    paper_candidate = (
+        strategy_paper_candidate
+        if decision_mode == "settlement_capture"
+        else legacy_paper_candidate
+    )
     status = "paper_candidate" if paper_candidate else "watch"
     current_depth_score = min(1.0, capacity / max(config.target_notional, 1.0))
     sequence_depth_score = (
@@ -556,6 +598,16 @@ def evaluate_perp_route(
         if remaining_hours is not None and survival_probability is not None
         else "Истории завершённых сопоставимых funding-режимов пока мало для duration forecast."
     )
+    decision_net_profit = (
+        float(selected_strategy.get("expected_net_pnl"))
+        if selected_strategy and selected_strategy.get("expected_net_pnl") is not None
+        else current_nowcast_net
+    )
+    decision_edge_label = (
+        str(selected_strategy.get("edge_label"))
+        if selected_strategy and selected_strategy.get("edge_label")
+        else "funding-only"
+    )
     if current_hourly_spread >= 0:
         orientation_rationale = [
             f"Long {long_venue}: funding ниже на нормализованной почасовой базе.",
@@ -586,8 +638,9 @@ def evaluate_perp_route(
             f"coverage {basis_coverage_ratio:.2f}x."
         ),
         (
-            f"Settlement-capture gate требует только положительный live net; "
-            f"сейчас ${current_nowcast_net:,.2f}. Минимально значимая прибыль "
+            f"Settlement-capture gate использует полный opportunity net "
+            f"({decision_edge_label}); сейчас ${decision_net_profit:,.2f}. "
+            f"Минимально значимая прибыль "
             f"${actionable_profit_threshold:,.2f} используется как warning, не veto. "
             f"Исторический Q25 ${conservative_net_profit:,.2f} тоже предупреждение, а не veto."
             if decision_mode == "settlement_capture"
@@ -605,6 +658,8 @@ def evaluate_perp_route(
         duration_rationale,
         liquidity_rationale(liquidity_profile),
     ]
+    if selected_strategy:
+        rationale.append(strategy_rationale(selected_strategy))
     return {
         "route_key": route_key,
         "route_type": "perp_perp",
@@ -636,8 +691,10 @@ def evaluate_perp_route(
         "basis_gap": basis_gap,
         "basis_reserve": basis_reserve,
         "operations_buffer": operations_buffer,
-        "long_next_funding_at": long_market.get("next_funding_at"),
-        "short_next_funding_at": short_market.get("next_funding_at"),
+        "long_next_funding_at": schedule.get("long_next_settlement_at")
+        or long_market.get("next_funding_at"),
+        "short_next_funding_at": schedule.get("short_next_settlement_at")
+        or short_market.get("next_funding_at"),
         "observed_at": observed_at,
         "legs": [
             route_leg(
@@ -648,6 +705,7 @@ def evaluate_perp_route(
                 long_close,
                 fee_long,
                 float(selected_size["long_open_notional"]),
+                schedule.get("long_next_settlement_at"),
             ),
             route_leg(
                 "short",
@@ -657,6 +715,7 @@ def evaluate_perp_route(
                 short_close,
                 fee_short,
                 float(selected_size["short_open_notional"]),
+                schedule.get("short_next_settlement_at"),
             ),
         ],
         "rationale": rationale,
@@ -664,6 +723,10 @@ def evaluate_perp_route(
         "evidence": {
             "decision_mode": decision_mode,
             "history_is_advisory": decision_mode == "settlement_capture",
+            "strategy_candidates": strategy_evaluation["strategy_candidates"],
+            "selected_strategy": selected_strategy,
+            "strategy_classification": selected_strategy,
+            "pnl_components": strategy_evaluation["pnl_components"],
             "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
             "blocking_risk_flags": list(dict.fromkeys(blocking_risk_flags)),
             "advisory_reasons": list(dict.fromkeys(advisory_reasons)),
@@ -702,6 +765,18 @@ def evaluate_perp_route(
                     ],
                     "current_nowcast_gross": row["current_nowcast_gross"],
                     "current_nowcast_net": row["current_nowcast_net"],
+                    "current_signed_spread_pnl": row[
+                        "current_signed_spread_pnl"
+                    ],
+                    "current_opportunity_gross": row[
+                        "current_opportunity_gross"
+                    ],
+                    "current_opportunity_net": row[
+                        "current_opportunity_net"
+                    ],
+                    "current_opportunity_basis_stress_net": row[
+                        "current_opportunity_basis_stress_net"
+                    ],
                     "current_basis_stress_net_profit": row[
                         "current_basis_stress_net_profit"
                     ],
@@ -745,9 +820,19 @@ def evaluate_perp_route(
             "current_nowcast_settlement_rate": current_nowcast_settlement_rate,
             "current_nowcast_gross": current_nowcast_gross,
             "current_nowcast_net": current_nowcast_net,
+            "current_opportunity_gross": selected_size[
+                "current_opportunity_gross"
+            ],
+            "current_opportunity_net": current_opportunity_net,
+            "current_opportunity_basis_stress_net": (
+                current_opportunity_basis_stress_net
+            ),
             "current_basis_stress_net_profit": current_basis_stress_net_profit,
             "meets_live_actionable_profit_gate": meets_live_actionable_profit_gate,
             "meets_live_basis_coverage_gate": meets_live_basis_coverage_gate,
+            "meets_live_opportunity_basis_coverage_gate": (
+                meets_live_opportunity_basis_coverage_gate
+            ),
             "target_quantity": selected_size["target_quantity"],
             "long_open_notional": long_open_notional,
             "short_open_notional": short_open_notional,
@@ -1067,6 +1152,16 @@ def add_live_settlement_economics(
     """Attach current, executable next-settlement economics to a sizing row."""
     current_gross = float(row["funding_notional"]) * float(current_settlement_rate)
     current_net = current_gross - float(row["execution_cost"])
+    signed_spread = float(row["funding_notional"]) * float(
+        (row.get("basis_model") or {}).get("signed_entry_basis") or 0.0
+    )
+    opportunity_gross = current_gross + signed_spread
+    opportunity_net = opportunity_gross - float(row["execution_cost"])
+    incremental_basis_stress_loss = max(
+        0.0,
+        float(row["basis_stress_loss"]) - max(0.0, -signed_spread),
+    )
+    opportunity_basis_stress_net = opportunity_net - incremental_basis_stress_loss
     current_basis_stress_net = current_net - float(row["basis_stress_loss"])
     threshold = float(row["actionable_profit_threshold"])
     large_basis = bool((row.get("basis_model") or {}).get("tier") != "standard")
@@ -1074,12 +1169,315 @@ def add_live_settlement_economics(
         **row,
         "current_nowcast_gross": current_gross,
         "current_nowcast_net": current_net,
+        "current_signed_spread_pnl": signed_spread,
+        "current_opportunity_gross": opportunity_gross,
+        "current_opportunity_net": opportunity_net,
+        "current_opportunity_basis_stress_net": opportunity_basis_stress_net,
         "current_basis_stress_net_profit": current_basis_stress_net,
         "meets_live_actionable_profit_gate": current_net > 0.0,
+        "meets_live_opportunity_profit_gate": opportunity_net > threshold,
         "meets_live_basis_coverage_gate": (
             not large_basis or current_basis_stress_net > 0.0
         ),
+        "meets_live_opportunity_basis_coverage_gate": (
+            not large_basis or opportunity_basis_stress_net > 0.0
+        ),
     }
+
+
+def build_strategy_evaluation(
+    row: dict[str, Any],
+    current_funding_gross: float,
+    current_funding_net: float,
+    current_basis_stress_net: float,
+    actionable_profit_threshold: float,
+    blocking_risk_flags: list[str],
+    decision_mode: str,
+) -> dict[str, Any]:
+    funding_notional = float(row.get("funding_notional") or 0.0)
+    execution_cost = float(row.get("execution_cost") or 0.0)
+    basis_model = dict(row.get("basis_model") or {})
+    signed_entry_basis = float(basis_model.get("signed_entry_basis") or 0.0)
+    spread_convergence = funding_notional * signed_entry_basis
+    total_with_spread = current_funding_gross + spread_convergence - execution_cost
+    threshold = max(0.0, float(actionable_profit_threshold or 0.0))
+    operational_blockers = [
+        flag
+        for flag in dict.fromkeys(str(flag) for flag in blocking_risk_flags)
+        if flag not in STRATEGY_ECONOMIC_BLOCKERS
+    ]
+    common_ok = not operational_blockers and str(decision_mode) == "settlement_capture"
+    basis_stress_loss = float(row.get("basis_stress_loss") or 0.0)
+    incremental_basis_stress_loss = max(
+        0.0,
+        basis_stress_loss - max(0.0, -spread_convergence),
+    )
+    risk_adjusted_net = total_with_spread - incremental_basis_stress_loss
+    positive_edge = max(0.0, current_funding_gross) + max(0.0, spread_convergence)
+    drag = execution_cost + max(0.0, -current_funding_gross) + max(
+        0.0,
+        -spread_convergence,
+    )
+    coverage_ratio = (
+        positive_edge / drag
+        if drag > 0
+        else math.inf if positive_edge > 0 else 0.0
+    )
+    edge_type = classify_opportunity_edge(
+        current_funding_gross,
+        spread_convergence,
+        total_with_spread,
+    )
+    edge_quality, quality_warnings = classify_opportunity_quality(
+        total_with_spread,
+        risk_adjusted_net,
+        threshold,
+        coverage_ratio,
+        current_funding_gross,
+        spread_convergence,
+    )
+    strategy_name = opportunity_strategy_name(edge_type)
+    warnings = opportunity_warnings(
+        current_funding_gross,
+        spread_convergence,
+        risk_adjusted_net,
+        threshold,
+        edge_quality,
+        quality_warnings,
+    )
+    reasons = list(operational_blockers)
+    if edge_type == "no_positive_edge":
+        reasons.append("no_positive_edge_component")
+    if total_with_spread < threshold:
+        reasons.append("opportunity_net_below_required_profit")
+    eligible = common_ok and not reasons
+
+    opportunity = {
+        "selection_model": "opportunity_engine_v1",
+        "strategy_name": strategy_name,
+        "strategy_class": strategy_name,
+        "primary_edge": opportunity_primary_edge(edge_type),
+        "edge_type": edge_type,
+        "edge_label": opportunity_edge_label(edge_type),
+        "edge_quality": edge_quality,
+        "eligible": bool(eligible),
+        "expected_net_pnl": total_with_spread,
+        "gross_edge_pnl": current_funding_gross + spread_convergence,
+        "funding_pnl_component": current_funding_gross,
+        "spread_pnl_component": spread_convergence,
+        "signed_spread_pnl_component": spread_convergence,
+        "execution_cost": execution_cost,
+        "actionable_profit_threshold": threshold,
+        "basis_stress_loss": basis_stress_loss,
+        "incremental_basis_stress_loss": incremental_basis_stress_loss,
+        "basis_stress_net_pnl": risk_adjusted_net,
+        "risk_adjusted_net_pnl": risk_adjusted_net,
+        "positive_edge_pnl": positive_edge,
+        "drag_pnl": drag,
+        "coverage_ratio": coverage_ratio,
+        "operational_blocking_risk_flags": operational_blockers,
+        "hard_blocking_risk_flags": operational_blockers,
+        "reasons": list(dict.fromkeys(reasons)),
+        "warnings": list(dict.fromkeys(warnings)),
+        "thesis": opportunity_thesis(
+            edge_type,
+            edge_quality,
+            current_funding_gross,
+            spread_convergence,
+            execution_cost,
+            total_with_spread,
+            risk_adjusted_net,
+            coverage_ratio,
+        ),
+    }
+    candidates = [opportunity]
+    selected = select_strategy_candidate(candidates)
+    return {
+        "strategy_candidates": candidates,
+        "selected_strategy": selected,
+        "pnl_components": {
+            "funding_pnl_component": current_funding_gross,
+            "spread_pnl_component": spread_convergence,
+            "signed_spread_pnl_component": spread_convergence,
+            "spread_convergence_component": spread_convergence,
+            "execution_cost": execution_cost,
+            "funding_only_net_pnl": current_funding_net,
+            "spread_total_net_pnl": total_with_spread,
+            "combined_net_pnl": total_with_spread,
+            "opportunistic_any_net_pnl": total_with_spread,
+            "opportunity_expected_net_pnl": total_with_spread,
+            "opportunity_risk_adjusted_net_pnl": risk_adjusted_net,
+            "opportunistic_risk_adjusted_net_pnl": risk_adjusted_net,
+            "basis_stress_loss": basis_stress_loss,
+            "incremental_basis_stress_loss": incremental_basis_stress_loss,
+            "funding_basis_stress_net_pnl": current_basis_stress_net,
+            "spread_basis_stress_net_pnl": risk_adjusted_net,
+            "positive_edge_pnl": positive_edge,
+            "drag_pnl": drag,
+            "coverage_ratio": coverage_ratio,
+        },
+    }
+
+
+def classify_opportunity_edge(
+    funding_component: float,
+    spread_component: float,
+    expected_net: float,
+) -> str:
+    if expected_net <= 0:
+        return "no_positive_edge"
+    gross_edge = abs(funding_component) + abs(spread_component)
+    material = max(0.05, gross_edge * 0.10)
+    funding_material = funding_component > material
+    spread_material = spread_component > material
+    if funding_material and spread_material:
+        return "mixed_edge"
+    if funding_component > 0 and funding_component >= spread_component:
+        return "funding_led"
+    if spread_component > 0:
+        return "spread_led"
+    return "no_positive_edge"
+
+
+def classify_opportunity_quality(
+    expected_net: float,
+    risk_adjusted_net: float,
+    threshold: float,
+    coverage_ratio: float,
+    funding_component: float,
+    spread_component: float,
+) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    if expected_net < threshold:
+        warnings.append("net_below_actionable_threshold")
+    if risk_adjusted_net <= 0:
+        warnings.append("basis_stress_not_covered")
+    elif risk_adjusted_net < threshold:
+        warnings.append("basis_stress_net_below_required_profit")
+    if coverage_ratio < 1.25:
+        warnings.append("thin_total_edge_coverage")
+    if (funding_component < 0 or spread_component < 0) and coverage_ratio < 1.50:
+        warnings.append("thin_component_coverage")
+    if warnings:
+        return "fragile", warnings
+    return "clean", []
+
+
+def opportunity_strategy_name(edge_type: str) -> str:
+    return {
+        "funding_led": "funding_only",
+        "spread_led": "spread_only",
+        "mixed_edge": "combined",
+        "no_positive_edge": "opportunistic_any",
+    }.get(edge_type, "opportunistic_any")
+
+
+def opportunity_primary_edge(edge_type: str) -> str:
+    return {
+        "funding_led": "funding_carry",
+        "spread_led": "spread_convergence",
+        "mixed_edge": "funding_plus_spread",
+        "no_positive_edge": "none",
+    }.get(edge_type, "opportunistic_total_edge")
+
+
+def opportunity_edge_label(edge_type: str) -> str:
+    return {
+        "funding_led": "Funding-led",
+        "spread_led": "Spread-led",
+        "mixed_edge": "Mixed edge",
+        "no_positive_edge": "No positive edge",
+    }.get(edge_type, str(edge_type or "Unknown"))
+
+
+def opportunity_warnings(
+    funding_component: float,
+    spread_component: float,
+    risk_adjusted_net: float,
+    threshold: float,
+    edge_quality: str,
+    quality_warnings: list[str],
+) -> list[str]:
+    warnings = list(quality_warnings)
+    if funding_component < 0:
+        warnings.append("funding_drag")
+    if spread_component < 0:
+        warnings.append("spread_drag")
+    if edge_quality == "fragile":
+        warnings.append("fragile_positive_total_edge")
+    if risk_adjusted_net <= 0 and "basis_stress_not_covered" not in warnings:
+        warnings.append("basis_stress_not_covered")
+    elif (
+        0 < risk_adjusted_net < threshold
+        and "basis_stress_net_below_required_profit" not in warnings
+    ):
+        warnings.append("basis_stress_net_below_required_profit")
+    return warnings
+
+
+def opportunity_thesis(
+    edge_type: str,
+    edge_quality: str,
+    funding_component: float,
+    spread_component: float,
+    execution_cost: float,
+    expected_net: float,
+    risk_adjusted_net: float,
+    coverage_ratio: float,
+) -> str:
+    label = opportunity_edge_label(edge_type)
+    coverage = "inf" if math.isinf(coverage_ratio) else f"{coverage_ratio:.2f}x"
+    return (
+        f"{label} ({edge_quality}): funding ${funding_component:,.2f}, "
+        f"spread ${spread_component:,.2f}, cost ${execution_cost:,.2f}, "
+        f"net ${expected_net:,.2f}; stress net ${risk_adjusted_net:,.2f}, "
+        f"coverage {coverage}."
+    )
+
+
+def select_strategy_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    eligible = [row for row in candidates if row.get("eligible")]
+    if not eligible:
+        return None
+    strict = [
+        row
+        for row in eligible
+        if str(row.get("strategy_name")) != "opportunistic_any"
+    ]
+    if strict:
+        eligible = strict
+    priority = {
+        "combined": 4,
+        "spread_only": 3,
+        "funding_only": 2,
+        "opportunistic_any": 1,
+    }
+    return max(
+        eligible,
+        key=lambda row: (
+            float(row.get("expected_net_pnl") or 0.0),
+            priority.get(str(row.get("strategy_name")), 0),
+        ),
+    )
+
+
+def strategy_rationale(strategy: dict[str, Any]) -> str:
+    if strategy.get("selection_model") == "opportunity_engine_v1":
+        thesis = str(strategy.get("thesis") or "").strip()
+        if thesis:
+            return f"Opportunity {thesis}"
+    warning_text = ""
+    warnings = [str(item) for item in strategy.get("warnings") or []]
+    if warnings:
+        warning_text = f" Warnings: {', '.join(warnings)}."
+    return (
+        f"Strategy {strategy.get('strategy_name')}: "
+        f"funding ${float(strategy.get('funding_pnl_component') or 0.0):,.2f}, "
+        f"spread ${float(strategy.get('spread_pnl_component') or 0.0):,.2f}, "
+        f"cost ${float(strategy.get('execution_cost') or 0.0):,.2f}, "
+        f"net ${float(strategy.get('expected_net_pnl') or 0.0):,.2f}."
+        f"{warning_text}"
+    )
 
 
 def select_live_sizing_row(
@@ -1091,8 +1489,8 @@ def select_live_sizing_row(
     return max(
         eligible,
         key=lambda row: (
-            float(row["current_nowcast_net"]),
-            float(row["current_basis_stress_net_profit"]),
+            float(row["current_opportunity_net"]),
+            float(row["current_opportunity_basis_stress_net"]),
             float(row["notional"]),
         ),
     )
@@ -1884,11 +2282,24 @@ def market_with_book_mark(
     market: dict[str, Any],
     book: dict[str, Any],
 ) -> dict[str, Any]:
+    mark_ready = False
     try:
         if float(market.get("mark_price")) > 0:
-            return market
+            mark_ready = True
     except (TypeError, ValueError):
-        pass
+        mark_ready = False
+    index_ready = False
+    try:
+        if float(market.get("index_price")) > 0:
+            index_ready = True
+    except (TypeError, ValueError):
+        index_ready = False
+    needs_index_proxy = (
+        str(market.get("index_price_kind") or "")
+        == "orderbook_mid_proxy"
+    )
+    if mark_ready and (index_ready or not needs_index_proxy):
+        return market
     try:
         mid_price = float(book.get("mid_price"))
     except (TypeError, ValueError):
@@ -1896,8 +2307,12 @@ def market_with_book_mark(
     if mid_price <= 0:
         return market
     enriched = dict(market)
-    enriched["mark_price"] = mid_price
-    enriched["mark_price_kind"] = "orderbook_mid"
+    if not mark_ready:
+        enriched["mark_price"] = mid_price
+        enriched["mark_price_kind"] = "orderbook_mid"
+    if needs_index_proxy and not index_ready:
+        enriched["index_price"] = mid_price
+        enriched["index_price_kind"] = "orderbook_mid_proxy"
     return enriched
 
 
@@ -1980,6 +2395,7 @@ def route_leg(
     close_fill: dict[str, float],
     fee_rate: float,
     notional: float,
+    next_settlement_at: Any | None = None,
 ) -> dict[str, Any]:
     return {
         "side": side,
@@ -2003,7 +2419,7 @@ def route_leg(
             market["funding_interval_hours"],
         ),
         "funding_display_note": market.get("funding_display_note"),
-        "next_funding_at": market.get("next_funding_at"),
+        "next_funding_at": next_settlement_at or market.get("next_funding_at"),
         "mark_price": market.get("mark_price"),
         "index_price": market.get("index_price"),
         "best_bid": book.get("best_bid"),

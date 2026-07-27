@@ -16,7 +16,7 @@ Older Prediction, Dune/local analytics, wallet research, and on-chain Radar modu
 
 ## Agent Workflow
 
-Codex is the orchestrator/architect/reviewer. Qwen/QN is the full-access implementation worker for scoped coding tasks. See `docs/agent_operating_model.md`.
+Codex is the orchestrator/architect/reviewer. Qwen/QN is the full-access implementation worker for scoped coding tasks. See `docs/agent_operating_model.md` and the detailed repository contract in `docs/MODEL_INSTRUCTIONS.md`.
 
 ## Core Funding Contract
 

@@ -37,6 +37,7 @@ from smart_money_radar.funding.adapters import (
     PacificaFundingClient,
     ParadexFundingClient,
     ReyaFundingClient,
+    RiseXFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
 )
@@ -95,6 +96,7 @@ def active_default_funding_clients() -> list[FundingVenueClient]:
         ApexFundingClient(),
         PacificaFundingClient(),
         ReyaFundingClient(),
+        RiseXFundingClient(),
     ])
 
 
@@ -117,6 +119,7 @@ def run_funding_scan(
     bybit: BybitFundingClient | None = None,
     deribit: DeribitFundingClient | None = None,
     okx: OKXFundingClient | None = None,
+    risex: RiseXFundingClient | None = None,
     dydx: DydxFundingClient | None = None,
     gate: GateFundingClient | None = None,
     bingx: BingXFundingClient | None = None,
@@ -153,7 +156,7 @@ def run_funding_scan(
         for client in (
             binance, bitget, hyperliquid, bybit, okx, dydx, gate, backpack, drift,
             ethereal, extended, bingx, htx, aster, lighter, kucoin, mexc, paradex,
-            kraken, deribit, vertex_base,
+            kraken, deribit, vertex_base, risex,
         )
     ):
         configured_clients = [
@@ -161,7 +164,7 @@ def run_funding_scan(
             for client in (
                 binance, bitget, hyperliquid, bybit, okx, dydx, gate, backpack, drift,
                 ethereal, extended, bingx, htx, aster, lighter, kucoin, mexc,
-                paradex, kraken, deribit, vertex_base,
+                paradex, kraken, deribit, vertex_base, risex,
             )
             if client is not None
         ]
@@ -660,6 +663,13 @@ def backfill_funding_history(
         list(venue_clients) if venue_clients is not None else active_default_funding_clients()
     )
     clients = {str(client.venue): client for client in clients_list}
+    if target_venues:
+        requested_venues = {str(venue) for venue in target_venues}
+        clients = {
+            venue: client
+            for venue, client in clients.items()
+            if venue in requested_venues
+        }
     catalog_results: list[tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]] = []
     warnings: list[str] = []
     with ThreadPoolExecutor(max_workers=max(1, len(clients))) as executor:
@@ -696,7 +706,10 @@ def backfill_funding_history(
     eligible = [
         market
         for market in markets
-        if str(market["canonical_asset"]) in overlapping_assets
+        if (
+            target_venues
+            or str(market["canonical_asset"]) in overlapping_assets
+        )
         and (
             not target_venues
             or str(market["venue"]) in target_venues

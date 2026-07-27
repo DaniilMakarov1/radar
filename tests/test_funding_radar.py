@@ -15,6 +15,7 @@ from smart_money_radar.funding.adapters.aevo import AevoFundingClient
 from smart_money_radar.funding.adapters.apex import ApexFundingClient
 from smart_money_radar.funding.adapters.pacifica import PacificaFundingClient
 from smart_money_radar.funding.adapters.reya import ReyaFundingClient
+from smart_money_radar.funding.adapters.risex import RiseXFundingClient
 from smart_money_radar.funding.adapters.aster import AsterFundingClient
 from smart_money_radar.funding.adapters.backpack import BackpackFundingClient
 from smart_money_radar.funding.adapters.binance import BinanceFundingClient
@@ -66,6 +67,8 @@ from smart_money_radar.dashboard import (
     funding_request_config,
 )
 from smart_money_radar.funding.economics import (
+    add_live_settlement_economics,
+    build_strategy_evaluation,
     current_schedule_carry_rate,
     evaluate_perp_route,
     displayed_side_capacity,
@@ -73,6 +76,7 @@ from smart_money_radar.funding.economics import (
     market_funding_rate_unit_outlier,
     market_fee_rate,
     notional_economics,
+    select_live_sizing_row,
     wilson_lower_bound,
 )
 from smart_money_radar.funding.forecast import (
@@ -103,7 +107,13 @@ from smart_money_radar.funding.normalization import (
     normalized_contract_type,
 )
 from smart_money_radar.funding.paper import simulate_paper_revalidations
-from smart_money_radar.funding.scanner import execution_shortlist, rank_perp_pairs
+from smart_money_radar.funding.profiles import funding_bot_profile_names
+from smart_money_radar.funding.scanner import (
+    execution_shortlist,
+    quick_price_identity_gap,
+    quick_signed_spread_rate,
+    rank_perp_pairs,
+)
 from smart_money_radar.funding.service import (
     DEACTIVATED_FUNDING_VENUES,
     active_default_funding_clients,
@@ -120,6 +130,10 @@ class FundingRadarTest(unittest.TestCase):
         venues = {str(client.venue) for client in active_default_funding_clients()}
 
         self.assertFalse(venues & DEACTIVATED_FUNDING_VENUES)
+        self.assertIn("risex", venues)
+
+    def test_risex_points_profile_is_available_after_adapter_registration(self) -> None:
+        self.assertIn("risex_points", funding_bot_profile_names())
 
     def test_deactivated_venues_are_hidden_from_funding_paper_dashboard(self) -> None:
         payload = filter_deactivated_funding_paper_payload(
@@ -597,6 +611,320 @@ class FundingRadarTest(unittest.TestCase):
             route["legs"][1]["base_quantity"],
         )
         self.assertGreater(route["expected_net_profit"], 0)
+
+    def test_route_evidence_contains_strategy_candidates(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+        next_funding_at = (now + timedelta(seconds=45)).isoformat()
+        long_market = market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at)
+        short_market = market(
+            "hyperliquid", "BTC", "BTC", 0.01, 1, observed_at
+        )
+        long_market["next_funding_at"] = next_funding_at
+        short_market["next_funding_at"] = next_funding_at
+
+        route = evaluate_perp_route(
+            long_market,
+            short_market,
+            book("binance", "BTCUSDT", observed_at),
+            book("hyperliquid", "BTC", observed_at),
+            history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "BTC", now, 1, 0.01, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+
+        evidence = route["evidence"]
+        names = {row["strategy_name"] for row in evidence["strategy_candidates"]}
+
+        self.assertEqual(len(evidence["strategy_candidates"]), 1)
+        self.assertIn(evidence["selected_strategy"]["strategy_name"], names)
+        self.assertEqual(
+            evidence["strategy_classification"],
+            evidence["selected_strategy"],
+        )
+        self.assertEqual(
+            evidence["selected_strategy"]["selection_model"],
+            "opportunity_engine_v1",
+        )
+        self.assertIn(
+            evidence["selected_strategy"]["edge_type"],
+            {"funding_led", "spread_led", "mixed_edge", "no_positive_edge"},
+        )
+        self.assertIn("funding_pnl_component", evidence["pnl_components"])
+        self.assertIn("spread_pnl_component", evidence["pnl_components"])
+        self.assertIn("opportunity_expected_net_pnl", evidence["pnl_components"])
+
+    def test_strategy_spread_stress_includes_spread_edge(self) -> None:
+        result = build_strategy_evaluation(
+            {
+                "funding_notional": 500.0,
+                "execution_cost": 0.5,
+                "basis_stress_loss": 0.75,
+                "basis_model": {"signed_entry_basis": 0.01},
+            },
+            current_funding_gross=-0.25,
+            current_funding_net=-0.75,
+            current_basis_stress_net=-1.50,
+            actionable_profit_threshold=1.0,
+            blocking_risk_flags=[],
+            decision_mode="settlement_capture",
+        )
+
+        spread = next(
+            row
+            for row in result["strategy_candidates"]
+            if row["strategy_name"] == "spread_only"
+        )
+
+        self.assertTrue(spread["eligible"])
+        self.assertAlmostEqual(spread["expected_net_pnl"], 4.25)
+        self.assertAlmostEqual(spread["basis_stress_net_pnl"], 3.50)
+
+    def test_funding_led_can_be_fragile_when_basis_stress_not_covered(self) -> None:
+        result = build_strategy_evaluation(
+            {
+                "funding_notional": 500.0,
+                "execution_cost": 0.25,
+                "basis_stress_loss": 2.0,
+                "basis_model": {"signed_entry_basis": 0.0},
+            },
+            current_funding_gross=1.50,
+            current_funding_net=1.25,
+            current_basis_stress_net=-0.75,
+            actionable_profit_threshold=1.0,
+            blocking_risk_flags=[],
+            decision_mode="settlement_capture",
+        )
+
+        selected = result["selected_strategy"]
+
+        self.assertTrue(selected["eligible"])
+        self.assertEqual(
+            selected["strategy_name"],
+            "funding_only",
+        )
+        self.assertEqual(selected["edge_type"], "funding_led")
+        self.assertEqual(selected["edge_quality"], "fragile")
+        self.assertAlmostEqual(selected["expected_net_pnl"], 1.25)
+        self.assertAlmostEqual(selected["risk_adjusted_net_pnl"], -0.75)
+        self.assertIn(
+            "basis_stress_not_covered",
+            selected["warnings"],
+        )
+        self.assertIn(
+            "fragile_positive_total_edge",
+            selected["warnings"],
+        )
+        self.assertAlmostEqual(
+            result["pnl_components"]["opportunistic_any_net_pnl"],
+            1.25,
+        )
+        self.assertAlmostEqual(
+            result["pnl_components"]["opportunistic_risk_adjusted_net_pnl"],
+            -0.75,
+        )
+
+    def test_clean_funding_led_opportunity_is_selected_directly(self) -> None:
+        result = build_strategy_evaluation(
+            {
+                "funding_notional": 500.0,
+                "execution_cost": 0.25,
+                "basis_stress_loss": 0.25,
+                "basis_model": {"signed_entry_basis": 0.0},
+            },
+            current_funding_gross=2.0,
+            current_funding_net=1.75,
+            current_basis_stress_net=1.50,
+            actionable_profit_threshold=1.0,
+            blocking_risk_flags=[],
+            decision_mode="settlement_capture",
+        )
+
+        selected = result["selected_strategy"]
+
+        self.assertTrue(selected["eligible"])
+        self.assertEqual(selected["strategy_name"], "funding_only")
+        self.assertEqual(selected["edge_type"], "funding_led")
+        self.assertEqual(selected["edge_quality"], "clean")
+
+    def test_funding_led_subtracts_negative_spread_but_can_cover_it(self) -> None:
+        result = build_strategy_evaluation(
+            {
+                "funding_notional": 500.0,
+                "execution_cost": 1.0,
+                "basis_stress_loss": 2.0,
+                "basis_model": {"signed_entry_basis": -0.004},
+            },
+            current_funding_gross=6.0,
+            current_funding_net=5.0,
+            current_basis_stress_net=3.0,
+            actionable_profit_threshold=1.0,
+            blocking_risk_flags=[],
+            decision_mode="settlement_capture",
+        )
+
+        selected = result["selected_strategy"]
+
+        self.assertTrue(selected["eligible"])
+        self.assertEqual(selected["strategy_name"], "funding_only")
+        self.assertEqual(selected["edge_type"], "funding_led")
+        self.assertAlmostEqual(selected["funding_pnl_component"], 6.0)
+        self.assertAlmostEqual(selected["spread_pnl_component"], -2.0)
+        self.assertAlmostEqual(selected["expected_net_pnl"], 3.0)
+        self.assertAlmostEqual(selected["risk_adjusted_net_pnl"], 3.0)
+        self.assertIn("spread_drag", selected["warnings"])
+
+    def test_spread_led_subtracts_negative_funding_but_can_cover_it(self) -> None:
+        result = build_strategy_evaluation(
+            {
+                "funding_notional": 500.0,
+                "execution_cost": 1.0,
+                "basis_stress_loss": 0.5,
+                "basis_model": {"signed_entry_basis": 0.012},
+            },
+            current_funding_gross=-1.0,
+            current_funding_net=-2.0,
+            current_basis_stress_net=-2.5,
+            actionable_profit_threshold=1.0,
+            blocking_risk_flags=[],
+            decision_mode="settlement_capture",
+        )
+
+        selected = result["selected_strategy"]
+
+        self.assertTrue(selected["eligible"])
+        self.assertEqual(selected["strategy_name"], "spread_only")
+        self.assertEqual(selected["edge_type"], "spread_led")
+        self.assertAlmostEqual(selected["funding_pnl_component"], -1.0)
+        self.assertAlmostEqual(selected["spread_pnl_component"], 6.0)
+        self.assertAlmostEqual(selected["expected_net_pnl"], 4.0)
+        self.assertAlmostEqual(selected["risk_adjusted_net_pnl"], 3.5)
+        self.assertIn("funding_drag", selected["warnings"])
+
+    def test_low_coverage_positive_opportunity_is_fragile_not_blocked(self) -> None:
+        result = build_strategy_evaluation(
+            {
+                "funding_notional": 500.0,
+                "execution_cost": 5.0,
+                "basis_stress_loss": 0.0,
+                "basis_model": {"signed_entry_basis": 0.006},
+            },
+            current_funding_gross=3.0,
+            current_funding_net=-2.0,
+            current_basis_stress_net=-2.0,
+            actionable_profit_threshold=1.0,
+            blocking_risk_flags=[],
+            decision_mode="settlement_capture",
+        )
+
+        selected = result["selected_strategy"]
+
+        self.assertTrue(selected["eligible"])
+        self.assertEqual(selected["edge_type"], "mixed_edge")
+        self.assertEqual(selected["edge_quality"], "fragile")
+        self.assertAlmostEqual(selected["expected_net_pnl"], 1.0)
+        self.assertIn("thin_total_edge_coverage", selected["warnings"])
+
+    def test_live_sizing_uses_full_opportunity_net_not_funding_only_net(self) -> None:
+        small = add_live_settlement_economics(
+            {
+                "notional": 500.0,
+                "funding_notional": 500.0,
+                "execution_cost": 1.0,
+                "basis_stress_loss": 0.0,
+                "basis_model": {"signed_entry_basis": 0.0, "tier": "standard"},
+                "actionable_profit_threshold": 1.0,
+                "fill_complete": True,
+            },
+            current_settlement_rate=0.006,
+        )
+        spread_led = add_live_settlement_economics(
+            {
+                "notional": 1_000.0,
+                "funding_notional": 1_000.0,
+                "execution_cost": 1.0,
+                "basis_stress_loss": 0.0,
+                "basis_model": {"signed_entry_basis": 0.01, "tier": "standard"},
+                "actionable_profit_threshold": 1.0,
+                "fill_complete": True,
+            },
+            current_settlement_rate=-0.002,
+        )
+
+        selected = select_live_sizing_row([small, spread_led], [small, spread_led])
+
+        self.assertEqual(selected["notional"], 1_000.0)
+        self.assertLess(
+            selected["current_nowcast_net"],
+            small["current_nowcast_net"],
+        )
+        self.assertGreater(
+            selected["current_opportunity_net"],
+            small["current_opportunity_net"],
+        )
+
+    def test_dashboard_candidate_filter_uses_selected_strategy_net(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+        next_funding_at = (now + timedelta(seconds=45)).isoformat()
+        long_market = market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at)
+        short_market = market(
+            "hyperliquid", "BTC", "BTC", 0.01, 1, observed_at
+        )
+        long_market["next_funding_at"] = next_funding_at
+        short_market["next_funding_at"] = next_funding_at
+        route = evaluate_perp_route(
+            long_market,
+            short_market,
+            book("binance", "BTCUSDT", observed_at),
+            book("hyperliquid", "BTC", observed_at),
+            history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "BTC", now, 1, 0.01, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+        route["expected_net_profit"] = -1.0
+        route["evidence"]["current_nowcast_net"] = 0.50
+        route["evidence"]["selected_strategy"]["expected_net_pnl"] = 1.25
+        route["evidence"]["strategy_classification"] = route["evidence"][
+            "selected_strategy"
+        ]
+
+        with TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "radar.sqlite")
+            store.init_db()
+            scan_id = store.start_funding_scan(
+                {
+                    "horizon_mode": "next_settlement",
+                    "scan_mode": "watch",
+                    "minimum_net_profit": 1.0,
+                }
+            )
+            store.insert_funding_routes(scan_id, [route])
+            store.finish_funding_scan(
+                scan_id,
+                "success",
+                route_count=1,
+                paper_candidate_count=1,
+            )
+            dashboard = store.funding_dashboard(include_watch_scans=True)
+
+        self.assertEqual(len(dashboard["routes"]), 1)
+        self.assertEqual(
+            dashboard["routes"][0]["evidence"]["selected_strategy"][
+                "expected_net_pnl"
+            ],
+            1.25,
+        )
 
     def test_tiny_five_hundred_dollar_profit_is_candidate_with_warning(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -1077,6 +1405,61 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(len(dashboard["routes"]), 1)
         self.assertEqual(dashboard["watch_routes"], [])
 
+    def test_dashboard_blockers_exclude_candidate_warnings(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+        candidate = evaluate_perp_route(
+            market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at),
+            market("hyperliquid", "BTC", "BTC", 0.006, 1, observed_at),
+            book("binance", "BTCUSDT", observed_at),
+            book("hyperliquid", "BTC", observed_at),
+            history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "BTC", now, 1, -0.0001, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+        candidate["evidence"]["blocking_risk_flags"] = [
+            "basis_not_covered_by_live_funding"
+        ]
+        candidate["risk_flags"] = ["basis_not_covered_by_live_funding"]
+        blocked = copy.deepcopy(candidate)
+        blocked["route_key"] = "blocked-live-net"
+        blocked["status"] = "watch"
+        blocked["evidence"]["blocking_risk_flags"] = ["live_net_pnl_not_positive"]
+        blocked["risk_flags"] = ["live_net_pnl_not_positive"]
+        blocked["evidence"]["current_nowcast_gross"] = 0.25
+        blocked["evidence"]["current_nowcast_net"] = -1.0
+
+        with TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "radar.sqlite")
+            store.init_db()
+            scan_id = store.start_funding_scan(
+                {"scan_mode": "manual", "horizon_mode": "next_settlement"}
+            )
+            store.insert_funding_routes(scan_id, [candidate, blocked])
+            store.finish_funding_scan(
+                scan_id,
+                "success",
+                route_count=2,
+                paper_candidate_count=1,
+            )
+            dashboard = store.funding_dashboard()
+
+        blockers = {
+            row["risk_flag"]: row["route_count"]
+            for row in dashboard["blocker_summary"]
+        }
+        self.assertNotIn("basis_not_covered_by_live_funding", blockers)
+        self.assertEqual(blockers["live_net_pnl_not_positive"], 1)
+        self.assertIn(
+            {"stage": "paper_candidate", "route_count": 1},
+            dashboard["constraint_diagnostics"]["exclusive_stages"],
+        )
+
     def test_dashboard_live_hold_columns_ignore_stale_fixed_scan(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
         now = datetime.fromisoformat(observed_at)
@@ -1462,6 +1845,147 @@ class FundingRadarTest(unittest.TestCase):
             dashboard["constraint_diagnostics"]["exclusive_stages"],
             [{"stage": "paper_candidate", "route_count": 1}],
         )
+
+    def test_large_basis_history_is_advisory_for_next_settlement(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+        long_market = market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at)
+        short_market = market("hyperliquid", "BTC", "BTC", 0.0, 1, observed_at)
+        long_book = shifted_book("binance", "BTCUSDT", observed_at, 100.0)
+        short_book = shifted_book("hyperliquid", "BTC", observed_at, 102.0)
+        long_book["_history"] = []
+        short_book["_history"] = []
+
+        route = evaluate_perp_route(
+            long_market,
+            short_market,
+            long_book,
+            short_book,
+            history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "BTC", now, 1, 0.0, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+
+        evidence = route["evidence"]
+
+        self.assertEqual(route["status"], "paper_candidate")
+        self.assertIn("insufficient_basis_history", evidence["advisory_risk_flags"])
+        self.assertNotIn(
+            "insufficient_basis_history",
+            evidence["blocking_risk_flags"],
+        )
+        self.assertGreaterEqual(
+            evidence["current_opportunity_net"],
+            evidence["actionable_profit_threshold"],
+        )
+
+    def test_large_basis_stress_does_not_veto_live_spread_candidate(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+        long_book = shifted_book("binance", "AAAUSDT", observed_at, 100.0)
+        short_book = shifted_book("hyperliquid", "AAA", observed_at, 102.0)
+        base_time = datetime.fromisoformat(observed_at)
+        long_book["_history"] = []
+        short_book["_history"] = []
+        for index, short_mid in enumerate(
+            [102.0, 104.0, 108.0, 112.0, 116.0, 120.0]
+        ):
+            timestamp = (base_time - timedelta(minutes=50 - index * 10)).isoformat()
+            long_history = shifted_book("binance", "AAAUSDT", timestamp, 100.0)
+            short_history = shifted_book("hyperliquid", "AAA", timestamp, short_mid)
+            long_history["_history"] = []
+            short_history["_history"] = []
+            long_book["_history"].append(long_history)
+            short_book["_history"].append(short_history)
+
+        route = evaluate_perp_route(
+            market("binance", "AAAUSDT", "AAA", 0.0, 8, observed_at),
+            market("hyperliquid", "AAA", "AAA", 0.0, 1, observed_at),
+            long_book,
+            short_book,
+            history_rows("binance", "AAAUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "AAA", now, 1, 0.0, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+        evidence = route["evidence"]
+
+        self.assertEqual(route["status"], "paper_candidate")
+        self.assertGreater(
+            evidence["current_opportunity_net"],
+            evidence["actionable_profit_threshold"],
+        )
+        self.assertLess(evidence["current_opportunity_basis_stress_net"], 0)
+        self.assertNotIn(
+            "basis_not_covered_by_live_funding",
+            evidence["blocking_risk_flags"],
+        )
+        self.assertIn(
+            "basis_not_covered_by_live_funding",
+            evidence["advisory_risk_flags"],
+        )
+        self.assertEqual(
+            evidence["selected_strategy"]["warnings"],
+            ["basis_stress_not_covered", "fragile_positive_total_edge"],
+        )
+        with TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "radar.sqlite")
+            store.init_db()
+            scan_id = store.start_funding_scan(
+                {"scan_mode": "manual", "horizon_mode": "next_settlement"}
+            )
+            store.insert_funding_routes(scan_id, [route])
+            store.finish_funding_scan(
+                scan_id,
+                "success",
+                route_count=1,
+                paper_candidate_count=1,
+            )
+            dashboard = store.funding_dashboard()
+
+        funnel = dashboard["economics_funnel"]
+        self.assertEqual(funnel["current_raw_gross_covers_full_cost"], 1)
+        self.assertEqual(funnel["current_raw_actionable"], 1)
+        self.assertEqual(
+            dashboard["constraint_diagnostics"]["exclusive_stages"],
+            [{"stage": "paper_candidate", "route_count": 1}],
+        )
+
+    def test_route_legs_use_normalized_future_settlement_times(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        now = datetime.fromisoformat(observed_at)
+
+        route = evaluate_perp_route(
+            market("binance", "BTCUSDT", "BTC", 0.0, 8, observed_at),
+            market("hyperliquid", "BTC", "BTC", 0.01, 1, observed_at),
+            book("binance", "BTCUSDT", observed_at),
+            book("hyperliquid", "BTC", observed_at),
+            history_rows("binance", "BTCUSDT", now, 8, 0.0, 90),
+            history_rows("hyperliquid", "BTC", now, 1, 0.01, 720),
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                horizon_mode="next_settlement",
+                minimum_history_points=12,
+            ),
+        )
+
+        long_leg = next(leg for leg in route["legs"] if leg["side"] == "long")
+        short_leg = next(leg for leg in route["legs"] if leg["side"] == "short")
+
+        self.assertEqual(long_leg["next_funding_at"], "2026-07-14T20:00:00+00:00")
+        self.assertEqual(short_leg["next_funding_at"], "2026-07-14T13:00:00+00:00")
+        self.assertEqual(route["long_next_funding_at"], long_leg["next_funding_at"])
+        self.assertEqual(route["short_next_funding_at"], short_leg["next_funding_at"])
 
     def test_orderbook_sequence_is_returned_in_chronological_order(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2824,6 +3348,148 @@ class FundingRadarTest(unittest.TestCase):
         self.assertLess(ranked[0]["current_hourly_spread"], 0)
         self.assertAlmostEqual(ranked[0]["quick_gross_rate"], 0.0008)
 
+    def test_pair_preselection_can_choose_spread_led_direction_over_bad_funding(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        observed = datetime.fromisoformat(observed_at)
+        cheap_high_funding = market(
+            "cheap", "AAA-CHEAP", "AAA", 0.0020, 1, observed_at
+        )
+        rich_low_funding = market(
+            "rich", "AAA-RICH", "AAA", 0.0, 1, observed_at
+        )
+        for row, price in (
+            (cheap_high_funding, 100.0),
+            (rich_low_funding, 100.6),
+        ):
+            row["next_funding_at"] = (observed + timedelta(hours=1)).isoformat()
+            row["mark_price"] = price
+            row["index_price"] = price
+            row["maker_fee_rate"] = 0.0
+            row["taker_fee_rate"] = 0.0
+
+        config = FundingScanConfig(
+            horizon_mode="next_settlement",
+            basis_reserve_bps=0,
+            operations_buffer_bps=0,
+        ).validated()
+        ranked = rank_perp_pairs(
+            [cheap_high_funding, rich_low_funding],
+            None,
+            config=config,
+            observed_at=observed_at,
+        )
+
+        self.assertEqual(ranked[0]["long_market"]["venue"], "cheap")
+        self.assertEqual(ranked[0]["short_market"]["venue"], "rich")
+        self.assertLess(ranked[0]["quick_gross_rate"], 0.0)
+        self.assertGreater(ranked[0]["quick_signed_spread_rate"], 0.0)
+        self.assertGreater(ranked[0]["quick_opportunity_best_case_net_rate"], 0.0)
+
+        selected = execution_shortlist(ranked, near_miss_limit=0, config=config)
+
+        self.assertEqual(selected, [ranked[0]])
+        self.assertEqual(
+            ranked[0]["execution_screen_reason"],
+            "spread_opportunity_full_depth",
+        )
+
+    def test_missing_quick_reference_price_is_unknown_not_unit_mismatch(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        missing_price_market = market(
+            "needs-book", "AAA", "AAA", 0.0, 1, observed_at
+        )
+        priced_market = market("priced", "AAAUSDT", "AAA", 0.0015, 1, observed_at)
+        missing_price_market["mark_price"] = None
+        missing_price_market["index_price"] = None
+
+        self.assertIsNone(
+            quick_price_identity_gap(missing_price_market, priced_market)
+        )
+        self.assertEqual(
+            quick_signed_spread_rate(missing_price_market, priced_market),
+            0.0,
+        )
+
+        ranked = rank_perp_pairs(
+            [missing_price_market, priced_market],
+            None,
+            config=FundingScanConfig(horizon_mode="next_settlement").validated(),
+            observed_at=observed_at,
+        )
+
+        self.assertEqual(len(ranked), 1)
+        self.assertFalse(ranked[0]["quick_identity_mismatch"])
+
+    def test_execution_shortlist_keeps_spread_opportunity_with_negative_funding(self) -> None:
+        candidate = {
+            "quick_schedule_ready": True,
+            "quick_gross_rate": -0.001,
+            "quick_signed_spread_rate": 0.006,
+            "quick_opportunity_gross_rate": 0.005,
+            "quick_best_case_cost_rate": 0.001,
+            "quick_opportunity_best_case_net_rate": 0.004,
+            "quick_best_case_net_rate": 0.004,
+        }
+
+        selected = execution_shortlist(
+            [candidate],
+            near_miss_limit=0,
+            config=FundingScanConfig(),
+        )
+
+        self.assertEqual(selected, [candidate])
+        self.assertEqual(
+            candidate["execution_screen_reason"],
+            "spread_opportunity_full_depth",
+        )
+
+    def test_execution_shortlist_sends_wide_spread_to_full_depth(self) -> None:
+        candidate = {
+            "quick_schedule_ready": True,
+            "quick_gross_rate": -0.001,
+            "quick_signed_spread_rate": 0.20,
+            "quick_opportunity_gross_rate": 0.199,
+            "quick_best_case_cost_rate": 0.197,
+            "quick_opportunity_best_case_net_rate": 0.002,
+            "quick_best_case_net_rate": 0.002,
+            "quick_liquidity_score": 0.0,
+        }
+
+        selected = execution_shortlist(
+            [candidate],
+            near_miss_limit=0,
+            config=FundingScanConfig(target_notional=500),
+        )
+
+        self.assertEqual(selected, [candidate])
+        self.assertEqual(
+            candidate["execution_screen_reason"],
+            "spread_opportunity_full_depth",
+        )
+
+    def test_execution_shortlist_keeps_tiny_spread_edge_out_of_strict_full_depth(self) -> None:
+        candidate = {
+            "quick_schedule_ready": True,
+            "quick_gross_rate": -0.0001,
+            "quick_signed_spread_rate": 0.00035,
+            "quick_opportunity_gross_rate": 0.00025,
+            "quick_best_case_cost_rate": 0.0001,
+            "quick_opportunity_best_case_net_rate": 0.00015,
+            "quick_best_case_net_rate": 0.00015,
+        }
+
+        selected = execution_shortlist(
+            [candidate],
+            near_miss_limit=0,
+            config=FundingScanConfig(target_notional=500),
+        )
+
+        self.assertEqual(selected, [])
+        self.assertEqual(
+            candidate["execution_screen_reason"],
+            "spread_opportunity_below_actionable_threshold",
+        )
+
     def test_paper_revalidation_never_extrapolates_beyond_repriced_size(self) -> None:
         previous = {
             "funding_route_id": 7,
@@ -3398,9 +4064,70 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["canonical_asset"], "BTC")
         self.assertEqual(markets[0]["funding_interval_hours"], 1)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.0000125)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0000125)
+        self.assertEqual(
+            markets[0]["funding_rate_kind"],
+            "published_next_hour_estimate",
+        )
+        self.assertEqual(
+            markets[0]["next_funding_at"],
+            "2026-07-14T13:00:00+00:00",
+        )
+        self.assertEqual(
+            markets[0]["mark_price_kind"],
+            "orderbook_mid_at_route_evaluation",
+        )
+        self.assertEqual(markets[0]["index_price_kind"], "orderbook_mid_proxy")
         self.assertEqual(book_row["bids"][0], [64132.0, 0.785])
         self.assertEqual(book_row["asks"][0], [64133.0, 1.234])
         self.assertEqual(history, [])
+
+    def test_pacifica_full_depth_uses_orderbook_mid_as_reference_proxy(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = PacificaFundingClient(
+            http=FakePacificaHttp(),
+            base_url="https://pacifica.test",
+        )
+        _, markets, _ = client.catalog_and_markets(observed_at)
+        pacifica_market = markets[0]
+        pacifica_book = client.orderbook("BTC", observed_at, limit=2)
+        short_market = market(
+            "binance",
+            "BTCUSDT",
+            "BTC",
+            0.0002,
+            1,
+            observed_at,
+        )
+        short_market["next_funding_at"] = pacifica_market["next_funding_at"]
+        short_market["mark_price"] = 64132.5
+        short_market["index_price"] = 64132.5
+        short_book = shifted_book("binance", "BTCUSDT", observed_at, 64132.5)
+
+        route = evaluate_perp_route(
+            pacifica_market,
+            short_market,
+            pacifica_book,
+            short_book,
+            [],
+            [],
+            observed_at,
+            FundingScanConfig(
+                target_notional=500,
+                minimum_market_capacity=500,
+                minimum_history_points=0,
+                minimum_liquidity_snapshots=0,
+                basis_reserve_bps=0,
+                operations_buffer_bps=0,
+                horizon_mode="next_settlement",
+            ).validated(),
+        )
+
+        self.assertNotIn("missing_reference_price", route["risk_flags"])
+        self.assertEqual(
+            route["evidence"]["reference_price_kinds"]["pacifica"],
+            "orderbook_mid",
+        )
 
     def test_reya_adapter_uses_summary_funding_and_empty_book(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -3424,6 +4151,42 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(book_row["bids"], [])
         self.assertEqual(book_row["asks"], [])
         self.assertEqual(history, [])
+
+    def test_risex_adapter_uses_current_interval_rate_and_depth(self) -> None:
+        observed_at = "2026-07-14T12:30:00+00:00"
+        client = RiseXFundingClient(
+            http=FakeRiseXHttp(),
+            base_url="https://risex.test",
+        )
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC/USDC", observed_at, limit=2)
+        history = client.funding_history("BTC/USDC", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "risex")
+        self.assertEqual(markets[0]["symbol"], "BTC/USDC")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["funding_interval_hours"], 1)
+        self.assertAlmostEqual(markets[0]["funding_rate"], -0.001)
+        self.assertAlmostEqual(markets[0]["hourly_funding_rate"], -0.001)
+        self.assertAlmostEqual(markets[0]["published_funding_rate"], -0.008)
+        self.assertEqual(markets[0]["published_funding_interval_hours"], 8)
+        self.assertEqual(
+            markets[0]["funding_display_note"],
+            "published 8h equivalent; cashflow 1h",
+        )
+        self.assertEqual(markets[0]["raw"]["funding_rate_8h"], "-0.008")
+        self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
+        self.assertAlmostEqual(markets[0]["maker_fee_rate"], 0.0001)
+        self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0003)
+        self.assertEqual(book_row["bids"][0], [100.0, 2.0])
+        self.assertEqual(book_row["asks"][0], [100.5, 1.5])
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["funding_interval_hours"], 1)
+        self.assertAlmostEqual(history[0]["funding_rate"], -0.0008)
+        self.assertAlmostEqual(history[0]["hourly_funding_rate"], -0.0008)
 
     def test_woox_adapter_uses_batch_funding_depth_and_history(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -4010,17 +4773,21 @@ class FundingRadarTest(unittest.TestCase):
     def test_history_backfill_can_target_one_venue(self) -> None:
         with TemporaryDirectory() as directory:
             store = SQLiteStore(Path(directory) / "radar.sqlite")
+            binance = CountingFakeClient("binance")
+            hyperliquid = CountingFakeClient("hyperliquid")
             result = backfill_funding_history(
                 store,
                 days=90,
                 limit=0,
-                venue_clients=[FakeClient("binance"), FakeClient("hyperliquid")],
+                venue_clients=[binance, hyperliquid],
                 target_venues={"binance"},
             )
 
         self.assertEqual(result["target_venues"], ["binance"])
         self.assertEqual(result["eligible_market_count"], 1)
         self.assertEqual(result["attempted_market_count"], 1)
+        self.assertEqual(binance.catalog_calls, 1)
+        self.assertEqual(hyperliquid.catalog_calls, 0)
 
     def test_dashboard_keeps_last_successful_snapshot_during_next_scan(self) -> None:
         with TemporaryDirectory() as directory:
@@ -4907,6 +5674,101 @@ class FakeReyaHttp:
                 },
             ]
         raise AssertionError(url)
+
+
+class FakeRiseXHttp:
+    def get_json(self, url: str) -> Any:
+        if "/v1/markets/" not in url and "/v1/markets" in url:
+            next_funding_ns = int(
+                datetime(2026, 7, 14, 13, 0, tzinfo=UTC).timestamp()
+                * 1_000_000_000
+            )
+            return {
+                "data": {
+                    "markets": [
+                        {
+                            "market_id": "1",
+                            "config": {
+                                "name": "BTC/USDC",
+                                "unlocked": True,
+                            },
+                            "base_asset_symbol": "BTC/USDC",
+                            "quote_asset_symbol": "USDC",
+                            "display_name": "BTC/USDC",
+                            "quote_volume_24h": "1000000",
+                            "last_price": "100.25",
+                            "mark_price": "100.2",
+                            "index_price": "100.1",
+                            "open_interest": "123.4",
+                            "funding_interval": "3600000000000",
+                            "next_funding_time": str(next_funding_ns),
+                            "current_funding_rate": "-0.001",
+                            "funding_rate_8h": "-0.008",
+                            "active": True,
+                            "post_only": False,
+                        },
+                        {
+                            "market_id": "2",
+                            "config": {
+                                "name": "ETH/USDC [deprecated-1]",
+                                "unlocked": True,
+                            },
+                            "base_asset_symbol": "ETH/USDC",
+                            "funding_interval": "3600000000000",
+                            "current_funding_rate": "0.001",
+                            "active": True,
+                        },
+                    ]
+                }
+            }
+        if "/v1/orderbook" in url:
+            return {
+                "data": {
+                    "market_id": "1",
+                    "bids": [
+                        {"price": "100.0", "quantity": "2.0"},
+                        {"price": "99.5", "quantity": "3.0"},
+                    ],
+                    "asks": [
+                        {"price": "100.5", "quantity": "1.5"},
+                        {"price": "101.0", "quantity": "4.0"},
+                    ],
+                }
+            }
+        if "/funding-rate-history" in url:
+            first_start = int(
+                datetime(2026, 7, 14, 10, 0, tzinfo=UTC).timestamp()
+                * 1_000_000_000
+            )
+            second_start = int(
+                datetime(2026, 7, 14, 11, 0, tzinfo=UTC).timestamp()
+                * 1_000_000_000
+            )
+            one_hour_ns = 3_600_000_000_000
+            return {
+                "data": {
+                    "market_id": "1",
+                    "records": [
+                        {
+                            "funding_rate": "-0.0007",
+                            "index_price": "100",
+                            "start_time": str(second_start),
+                            "end_time": str(second_start + one_hour_ns),
+                            "block_time": str(second_start + one_hour_ns),
+                        },
+                        {
+                            "funding_rate": "-0.0008",
+                            "index_price": "100",
+                            "start_time": str(first_start),
+                            "end_time": str(first_start + one_hour_ns),
+                            "block_time": str(first_start + one_hour_ns),
+                        },
+                    ],
+                    "has_next_page": False,
+                }
+            }
+        raise AssertionError(url)
+
 
 class FakeApexHttp:
     def get_json(self, url: str) -> Any:

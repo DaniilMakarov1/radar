@@ -31,6 +31,10 @@ from smart_money_radar.funding.trader import (
     export_funding_paper_csv,
     funding_client_for_venue,
 )
+from smart_money_radar.maintenance import (
+    delete_legacy_module_rows,
+    prune_dune_page_cache,
+)
 from smart_money_radar.dashboard import (
     DEFAULT_DASHBOARD_HOST,
     DEFAULT_DASHBOARD_PORT,
@@ -332,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
                     keep_latest_history_per_market=(
                         args.keep_latest_history_per_market
                     ),
+                    stale_running_scan_seconds=args.stale_running_scan_seconds,
                 )
                 print("Funding retention applied")
                 rows = result["deleted_rows"]
@@ -342,18 +347,61 @@ def main(argv: list[str] | None = None) -> int:
                     keep_latest_history_per_market=(
                         args.keep_latest_history_per_market
                     ),
+                    stale_running_scan_seconds=args.stale_running_scan_seconds,
                 ).as_dict()
                 print("Funding retention dry run")
                 rows = result["rows_by_table"]
             print(f"  total scans: {result['total_scan_count']}")
             print(f"  protected scans: {result['protected_scan_count']}")
             print(f"  delete scans: {result['delete_scan_count']}")
+            if args.apply:
+                print(
+                    "  stale running scans marked failed: "
+                    f"{result.get('stale_running_scans_marked', 0)}"
+                )
             for table, count in rows.items():
                 print(f"  {table}: {count}")
             if not args.apply:
                 print("  apply: rerun with --apply to delete these rows")
             else:
                 print("  note: run sqlite VACUUM separately to return disk space to the OS")
+            return 0
+
+        if args.command == "cleanup-legacy-modules":
+            store.init_db()
+            legacy_result = delete_legacy_module_rows(store, apply=args.apply)
+            print(
+                "Legacy module cleanup "
+                + ("applied" if args.apply else "dry run")
+            )
+            rows = (
+                legacy_result["deleted_rows"]
+                if args.apply
+                else legacy_result["rows_before"]
+            )
+            for table, count in rows.items():
+                print(f"  {table}: {count}")
+            if args.include_dune_cache:
+                cache_result = prune_dune_page_cache(
+                    apply=args.apply,
+                    max_age_days=(
+                        None
+                        if args.all_dune_cache
+                        else args.dune_cache_max_age_days
+                    ),
+                ).as_dict()
+                print("Dune page cache cleanup")
+                print(f"  path: {cache_result['path']}")
+                print(f"  files: {cache_result['deleted_files']}")
+                print(f"  dirs: {cache_result['deleted_dirs']}")
+                print(
+                    "  bytes: "
+                    f"{cache_result['deleted_bytes']}"
+                )
+            if not args.apply:
+                print("  apply: rerun with --apply to delete rows/files")
+            else:
+                print("  note: run sqlite-maintenance --vacuum to reclaim DB file space")
             return 0
 
         if args.command == "funding-paper-trader":
@@ -587,7 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "aster", "backpack", "binance", "bitget", "bybit", "dydx",
             "deribit", "drift", "ethereal", "extended", "gate", "hyperliquid",
-            "kraken", "kucoin", "lighter", "mexc", "okx", "paradex",
+            "kraken", "kucoin", "lighter", "mexc", "okx", "paradex", "risex",
             "vertex_base",
         ),
         help="Backfill only this venue; repeat the option for multiple venues.",
@@ -613,6 +661,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Actually delete rows. Omit for a dry-run plan.",
+    )
+    funding_prune.add_argument(
+        "--stale-running-scan-seconds",
+        type=int,
+        default=900,
+        help="Treat running funding scans older than this as stale failed scans.",
+    )
+
+    cleanup_legacy = subparsers.add_parser(
+        "cleanup-legacy-modules",
+        help="Delete old Prediction/Wallet/Binance research rows and optional Dune cache.",
+    )
+    cleanup_legacy.add_argument("--apply", action="store_true")
+    cleanup_legacy.add_argument("--include-dune-cache", action="store_true")
+    cleanup_legacy.add_argument("--all-dune-cache", action="store_true")
+    cleanup_legacy.add_argument(
+        "--dune-cache-max-age-days",
+        type=int,
+        default=7,
+        help="Delete Dune page cache files older than this many days.",
     )
 
     funding_paper_trader = subparsers.add_parser(
@@ -697,10 +765,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     funding_paper_trader.add_argument("--spread-arb", action="store_true")
     funding_paper_trader.add_argument(
+        "--strategy-set",
+        default=None,
+        help=(
+            "Comma-separated strategy list: "
+            "funding_only,combined by default. "
+            "Research-only strategy names spread_only/opportunistic_any are accepted."
+        ),
+    )
+    funding_paper_trader.add_argument(
         "--basis-stop-loss-bps",
         type=float,
         default=200.0,
         help="Close position when unrealized basis loss exceeds this many bps.",
+    )
+    funding_paper_trader.add_argument(
+        "--price-stop-loss-pct",
+        type=float,
+        default=10.0,
+        help=(
+            "Close both legs when either leg price moves this many percent from entry; "
+            "use 0 to disable."
+        ),
     )
     funding_paper_trader.add_argument("--no-spread-monitoring", action="store_true")
 
@@ -888,9 +974,15 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         if venue_set_raw
         else profile.venue_set
     )
+    strategy_set_raw = getattr(args, "strategy_set", None)
+    strategy_set = (
+        tuple(v.strip() for v in str(strategy_set_raw).split(",") if v.strip())
+        if strategy_set_raw
+        else profile.strategy_set
+    )
     return PaperBotConfig(
         profile_name=profile.name,
-        strategy_set=profile.strategy_set,
+        strategy_set=strategy_set,
         venue_starting_balance=args.venue_starting_balance,
         target_notional_per_leg=args.target_notional,
         entry_min_lead_seconds=args.entry_min_lead_seconds,
@@ -916,6 +1008,9 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         venue_set=venue_set,
         spread_arb_enabled=getattr(args, "spread_arb", False),
         basis_stop_loss_bps=getattr(args, "basis_stop_loss_bps", 200.0),
+        price_stop_loss_fraction=(
+            float(getattr(args, "price_stop_loss_pct", 10.0) or 0.0) / 100.0
+        ),
         spread_monitoring_enabled=not getattr(args, "no_spread_monitoring", False),
     ).validated()
 

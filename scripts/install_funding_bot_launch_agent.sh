@@ -6,12 +6,16 @@ LABEL="com.smartmoneyradar.funding-paper-trader"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PID_FILE="$ROOT_DIR/.funding-paper-trader.pid"
 PYTHON_BIN="${FUNDING_PAPER_PYTHON:-$(command -v python3)}"
-LOG_DIR="$ROOT_DIR/logs"
+DEPLOY="$HOME/.local/share/smartmoneyradar"
+LOG_DIR="$DEPLOY/logs"
 UID_VALUE="$(id -u)"
-RUNNER="$ROOT_DIR/scripts/run_funding_bot_launchd.sh"
+RUNNER="$DEPLOY/run_funding_bot.sh"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+cp "$ROOT_DIR/scripts/run_funding_bot_launchd.sh" "$RUNNER"
+cp "$ROOT_DIR/.env" "$DEPLOY/.env" 2>/dev/null || true
 chmod +x "$RUNNER"
+chmod 600 "$DEPLOY/.env" 2>/dev/null || true
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -21,7 +25,7 @@ cat > "$PLIST" <<PLIST
   <key>Label</key>
   <string>$LABEL</string>
   <key>WorkingDirectory</key>
-  <string>$ROOT_DIR</string>
+  <string>$DEPLOY</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
@@ -33,6 +37,10 @@ cat > "$PLIST" <<PLIST
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
+    <key>RADAR_ROOT_DIR</key>
+    <string>$ROOT_DIR</string>
+    <key>RADAR_RUNTIME_DIR</key>
+    <string>$DEPLOY</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -57,6 +65,7 @@ fi
 
 echo "Installed and started $LABEL"
 echo "Plist: $PLIST"
+echo "Runner: $RUNNER"
 echo "Python: $PYTHON_BIN"
 [[ -n "${pid:-}" ]] && echo "PID: $pid"
 echo "Logs:"

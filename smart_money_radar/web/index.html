@@ -1247,10 +1247,10 @@
       ticker_identity_unverified: "identity только по тикеру",
       unit_identity_mismatch: "несовместимые contract units",
       basis_divergence: "basis расходится",
-      insufficient_basis_history: "мало совместной L2-истории basis",
-      large_basis_requires_carry_coverage: "большой basis требует stress coverage",
+      insufficient_basis_history: "мало L2/basis history для wide spread",
+      large_basis_requires_stop_loss: "большой basis: нужен stop-loss",
       basis_not_covered_by_funding: "funding не покрывает basis stress",
-      basis_not_covered_by_live_funding: "live funding не покрывает basis stress",
+      basis_not_covered_by_live_funding: "basis stress warning",
       net_after_costs_too_low: "расходы съели carry",
       conservative_net_after_costs_too_low: "Q25 PnL отрицательный",
       actionable_profit_too_low: "ниже advisory minimum",
@@ -1293,8 +1293,10 @@
     const fundingUniverseReasonName = (value) => ({
       unit_identity_mismatch: "несовместимые contract units",
       funding_schedule_unavailable: "нет settlement в горизонте",
-      non_positive_settlement_carry: "неположительный settlement carry",
-      best_case_carry_below_unavoidable_cost: "best-case carry ниже неизбежных расходов",
+      non_positive_settlement_carry: "нет положительного funding или spread edge",
+      best_case_opportunity_below_unavoidable_cost: "total opportunity <= cost",
+      spread_opportunity_below_actionable_threshold: "total net < $1 в spread-led precheck",
+      best_case_carry_below_unavoidable_cost: "total net <= 0 без полезного spread-edge",
       quick_profit_below_actionable_floor: "quick PnL ниже минимально значимой прибыли",
       full_execution_required: "прошли в full-depth",
       projected_interval_full_depth: "projected interval full-depth",
@@ -1967,7 +1969,22 @@
 
     function fundingDecisionProfit(row) {
       const evidence = row.evidence || {};
+      const selected = evidence.selected_strategy || evidence.strategy_classification || {};
+      const selectedNet = Number(selected.expected_net_pnl);
+      if (evidence.decision_mode === "settlement_capture" && Number.isFinite(selectedNet)) return selectedNet;
       return Number(evidence.decision_mode === "settlement_capture" ? evidence.current_nowcast_net : evidence.conservative_net_profit) || 0;
+    }
+
+    function fundingSelectedOpportunity(row) {
+      const evidence = row?.evidence || {};
+      return evidence.selected_strategy || evidence.strategy_classification || {};
+    }
+
+    function fundingEdgeLabel(row) {
+      const selected = fundingSelectedOpportunity(row);
+      const base = selected.edge_label || ({ funding_only: "Funding-led", spread_only: "Spread-led", combined: "Mixed edge", opportunistic_any: "Opportunistic" })[selected.strategy_name] || "Edge";
+      const quality = String(selected.edge_quality || "").toLowerCase();
+      return quality && quality !== "clean" ? `${base} · ${quality}` : base;
     }
 
     function renderFunding() {
@@ -2220,13 +2237,13 @@
       const shortLeg = legs.find((leg) => leg.side === "short") || {};
       const evidence = row.evidence || {};
       const conservativeNet = Number(evidence.conservative_net_profit || 0);
-      const liveNowcastNet = Number(evidence.current_nowcast_net || 0);
+      const liveNowcastNet = fundingDecisionProfit(row);
       const settlementCapture = evidence.decision_mode === "settlement_capture";
       const fundingCell = fundingLegsCell(row);
       const pnlCell = settlementCapture
         ? `<strong class="${liveNowcastNet > 0 ? "positive" : ""}">${moneyPrecise(liveNowcastNet)}</strong><div class="muted">next settlement · after costs</div>`
         : `<strong>${moneyPrecise(conservativeNet)}</strong><div class="muted">median ${moneyPrecise(row.expected_net_profit)}</div>`;
-      return `<tr><td><button class="row-button" data-funding-index="${index}"><strong>${esc(row.canonical_asset)}</strong></button><div class="muted">${esc(fundingHorizonLabel(row))}</div></td><td class="route-title"><div><span class="badge info">LONG</span> ${esc(row.long_venue)}</div><div class="muted"><span class="badge warn">SHORT</span> ${esc(row.short_venue)}</div></td><td class="number">${fundingCell}</td><td class="number">${pnlCell}</td><td>${fundingNeededImprovementCell(row)}</td><td class="number">${fundingComparisonPnlCell(row, "4h")}</td><td class="number">${fundingComparisonPnlCell(row, "8h")}</td><td class="number"><strong>${money(row.target_notional)}</strong></td><td class="number">${money(row.market_capacity)}</td><td>${fundingRiskCell(risks)}</td></tr>`;
+      return `<tr><td><button class="row-button" data-funding-index="${index}"><strong>${esc(row.canonical_asset)}</strong></button><div class="muted">${esc(fundingEdgeLabel(row))} · ${esc(fundingHorizonLabel(row))}</div></td><td class="route-title"><div><span class="badge info">LONG</span> ${esc(row.long_venue)}</div><div class="muted"><span class="badge warn">SHORT</span> ${esc(row.short_venue)}</div></td><td class="number">${fundingCell}</td><td class="number">${pnlCell}</td><td>${fundingNeededImprovementCell(row)}</td><td class="number">${fundingComparisonPnlCell(row, "4h")}</td><td class="number">${fundingComparisonPnlCell(row, "8h")}</td><td class="number"><strong>${money(row.target_notional)}</strong></td><td class="number">${money(row.market_capacity)}</td><td>${fundingRiskCell(risks)}</td></tr>`;
     }
 
     function fundingRiskCell(risks) {
@@ -2299,12 +2316,14 @@
       const statusClass = row.status === "paper_candidate" && !researchOnly ? "good" : "warn";
       const statusLabel = researchOnly ? "Research" : row.status === "paper_candidate" ? (settlementCapture ? "Settlement candidate" : "Carry candidate") : "Watch";
       const conservativeNet = Number(evidence.conservative_net_profit || 0);
-      const liveNowcastNet = Number(evidence.current_nowcast_net || 0);
+      const liveNowcastNet = fundingDecisionProfit(row);
+      const selected = fundingSelectedOpportunity(row);
+      const thesis = selected.thesis ? [selected.thesis] : [];
       const probability = Number(evidence.net_profit_probability || 0);
       const simpleLegRows = (row.legs || []).map((leg) => `<div class="route-leg"><div class="route-leg-head"><strong>${esc(leg.side.toUpperCase())} ${esc(leg.symbol)}</strong><span class="badge info">${esc(leg.venue)}</span></div><div class="route-leg-meta">${num(leg.base_quantity || 0)} ${esc(row.canonical_asset)} · notional ${money(leg.notional || 0)} · published ${signedFundingPct(leg.published_funding_rate ?? leg.funding_rate)} / ${num(leg.published_funding_interval_hours ?? leg.funding_interval_hours)}ч · cashflow ${signedFundingPct(leg.funding_rate)} / ${num(leg.funding_interval_hours)}ч · hourly ${signedFundingPct(leg.hourly_funding_rate)}${leg.funding_rate_cap_floor_state ? ` · ${esc(leg.funding_rate_cap_floor_state)}` : ""} · entry ${marketPrice(leg.open_vwap ?? leg.vwap)} · close ${marketPrice(leg.close_vwap)} · next ${shortTime(leg.next_funding_at)}</div></div>`).join("");
       const neededBlock = fundingNeededImprovementBlock(row);
-      const compactDecision = `<div><div class="detail-key">Next net PnL</div><div class="detail-value">${moneyPrecise(liveNowcastNet)}</div></div><div><div class="detail-key">History Q25 warning</div><div class="detail-value">${moneyPrecise(conservativeNet)}</div></div>`;
-      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(row.canonical_asset)}</div><div class="detail-contract">LONG ${esc(row.long_venue)} · SHORT ${esc(row.short_venue)} · ${esc(fundingHorizonLabel(row))}</div></div><span class="badge ${statusClass}">${statusLabel}</span></div><div class="detail-grid">${compactDecision}<div><div class="detail-key">Позиция / нога</div><div class="detail-value">${money(row.target_notional)}</div></div><div><div class="detail-key">Capacity</div><div class="detail-value">${money(row.market_capacity)}</div></div><div><div class="detail-key">Fees + slippage</div><div class="detail-value">${moneyPrecise(Number(row.total_fees || 0) + Number(row.slippage_cost || 0))}</div></div><div><div class="detail-key">Basis reserve</div><div class="detail-value">${moneyPrecise(row.basis_reserve)}</div></div><div><div class="detail-key">Шанс прибыли</div><div class="detail-value">${pct(probability)}</div></div><div><div class="detail-key">History role</div><div class="detail-value">${settlementCapture ? "warning only" : "gate"}</div></div></div>${neededBlock}${simpleLegRows ? `<div class="reason-block"><h3>Ноги</h3>${simpleLegRows}</div>` : ""}${fundingDecisionNoteBlock("Почему интересно", rationale, "info")}${fundingDecisionNoteBlock("Что блокирует", blocking, "bad")}${fundingDecisionNoteBlock("Предупреждения", advisories, "warn")}<div class="risk-list">${risks.map((risk) => `<span class="badge warn">${esc(fundingRiskName(risk))}</span>`).join("")}</div>`;
+      const compactDecision = `<div><div class="detail-key">Next net PnL</div><div class="detail-value">${moneyPrecise(liveNowcastNet)}</div></div><div><div class="detail-key">Edge</div><div class="detail-value">${esc(fundingEdgeLabel(row))}</div></div><div><div class="detail-key">History Q25 warning</div><div class="detail-value">${moneyPrecise(conservativeNet)}</div></div>`;
+      root.innerHTML = `<div class="detail-title"><div><div class="detail-symbol">${esc(row.canonical_asset)}</div><div class="detail-contract">LONG ${esc(row.long_venue)} · SHORT ${esc(row.short_venue)} · ${esc(fundingHorizonLabel(row))}</div></div><span class="badge ${statusClass}">${statusLabel}</span></div><div class="detail-grid">${compactDecision}<div><div class="detail-key">Позиция / нога</div><div class="detail-value">${money(row.target_notional)}</div></div><div><div class="detail-key">Capacity</div><div class="detail-value">${money(row.market_capacity)}</div></div><div><div class="detail-key">Fees + slippage</div><div class="detail-value">${moneyPrecise(Number(row.total_fees || 0) + Number(row.slippage_cost || 0))}</div></div><div><div class="detail-key">Basis reserve</div><div class="detail-value">${moneyPrecise(row.basis_reserve)}</div></div><div><div class="detail-key">Шанс прибыли</div><div class="detail-value">${pct(probability)}</div></div><div><div class="detail-key">History role</div><div class="detail-value">${settlementCapture ? "warning only" : "gate"}</div></div></div>${neededBlock}${simpleLegRows ? `<div class="reason-block"><h3>Ноги</h3>${simpleLegRows}</div>` : ""}${fundingDecisionNoteBlock("Opportunity thesis", thesis, "info")}${fundingDecisionNoteBlock("Почему интересно", rationale, "info")}${fundingDecisionNoteBlock("Что блокирует", blocking, "bad")}${fundingDecisionNoteBlock("Предупреждения", advisories, "warn")}<div class="risk-list">${risks.map((risk) => `<span class="badge warn">${esc(fundingRiskName(risk))}</span>`).join("")}</div>`;
     }
 
     function renderDune() {

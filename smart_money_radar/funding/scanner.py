@@ -41,8 +41,14 @@ def rank_perp_pairs(
     candidates.sort(
         key=lambda row: (
             bool(row.get("quick_schedule_ready", True)),
-            float(row.get("quick_net_rate", row["current_hourly_spread"])),
-            float(row["current_hourly_spread"]),
+            float(
+                row.get(
+                    "quick_opportunity_best_case_net_rate",
+                    row.get("quick_net_rate", row["current_hourly_spread"]),
+                )
+            ),
+            float(row.get("quick_positive_edge_rate") or 0.0),
+            float(row.get("quick_gross_rate") or row["current_hourly_spread"]),
             quick_liquidity(row),
         ),
         reverse=True,
@@ -102,22 +108,28 @@ def execution_shortlist(
     selected_markets: set[tuple[str, str]] = set()
     for candidate in candidates:
         candidate.update(quick_opportunity_metrics(candidate, settings))
+        has_positive_edge = bool(candidate.get("quick_has_positive_edge"))
+        spread_reject_reason = spread_dominant_strict_reject_reason(
+            candidate,
+            settings,
+        )
         if bool(candidate.get("quick_identity_mismatch")):
             candidate["execution_eligible"] = False
             candidate["execution_screen_reason"] = "unit_identity_mismatch"
         elif not bool(candidate.get("quick_schedule_ready")):
             candidate["execution_eligible"] = False
             candidate["execution_screen_reason"] = "funding_schedule_unavailable"
-        elif float(candidate.get("quick_gross_rate") or 0.0) <= 0:
+        elif not has_positive_edge:
             candidate["execution_eligible"] = False
             candidate["execution_screen_reason"] = "non_positive_settlement_carry"
-        elif float(candidate.get("quick_best_case_net_rate") or 0.0) <= 0:
+        elif float(candidate.get("quick_opportunity_best_case_net_rate") or 0.0) <= 0:
             candidate["execution_eligible"] = False
-            candidate["execution_screen_reason"] = (
-                "best_case_carry_below_unavoidable_cost"
-            )
-            if float(candidate.get("quick_gross_rate") or 0.0) > 0:
-                near_misses.append(candidate)
+            candidate["execution_screen_reason"] = best_case_reject_reason(candidate)
+            near_misses.append(candidate)
+        elif spread_reject_reason is not None:
+            candidate["execution_eligible"] = False
+            candidate["execution_screen_reason"] = spread_reject_reason
+            near_misses.append(candidate)
         elif candidate.get("is_pinned_revalidation"):
             candidate["execution_eligible"] = True
             candidate["execution_screen_reason"] = "pinned_revalidation"
@@ -125,11 +137,7 @@ def execution_shortlist(
             selected_markets.update(candidate_market_keys(candidate))
         else:
             candidate["execution_eligible"] = True
-            candidate["execution_screen_reason"] = (
-                "projected_interval_full_depth"
-                if bool(candidate.get("quick_projection_used"))
-                else "full_execution_required"
-            )
+            candidate["execution_screen_reason"] = full_depth_reason(candidate)
             strict_candidates.append(candidate)
 
     for candidate in strict_candidates:
@@ -146,8 +154,8 @@ def execution_shortlist(
             bool(row.get("quick_extreme_gross")),
             float(row.get("quick_opportunity_score") or 0.0),
             float(row.get("quick_cost_coverage") or 0.0),
-            float(row.get("quick_best_case_net_rate") or 0.0),
-            float(row.get("quick_gross_rate") or 0.0),
+            float(row.get("quick_opportunity_best_case_net_rate") or 0.0),
+            float(row.get("quick_positive_edge_rate") or 0.0),
             quick_liquidity(row),
         ),
         reverse=True,
@@ -279,9 +287,44 @@ def deep_sweep_reason(candidate: dict[str, Any]) -> str:
     )
 
 
+def best_case_reject_reason(candidate: dict[str, Any]) -> str:
+    if bool(candidate.get("quick_has_positive_spread_edge")):
+        return "best_case_opportunity_below_unavoidable_cost"
+    return "best_case_carry_below_unavoidable_cost"
+
+
+def spread_dominant_strict_reject_reason(
+    candidate: dict[str, Any],
+    config: FundingScanConfig,
+) -> str | None:
+    spread_rate = max(0.0, float(candidate.get("quick_signed_spread_rate") or 0.0))
+    funding_rate = max(0.0, float(candidate.get("quick_gross_rate") or 0.0))
+    if spread_rate <= 0.0 or spread_rate < funding_rate:
+        return None
+    if float(candidate.get("quick_best_case_net_profit") or 0.0) < float(
+        candidate.get("quick_actionable_profit_threshold") or 0.0
+    ):
+        return "spread_opportunity_below_actionable_threshold"
+    return None
+
+
+def full_depth_reason(candidate: dict[str, Any]) -> str:
+    if bool(candidate.get("quick_projection_used")):
+        return "projected_interval_full_depth"
+    has_funding = bool(candidate.get("quick_has_positive_funding_edge"))
+    has_spread = bool(candidate.get("quick_has_positive_spread_edge"))
+    if has_funding and has_spread:
+        return "combined_opportunity_full_depth"
+    if has_spread:
+        return "spread_opportunity_full_depth"
+    return "full_execution_required"
+
+
 def adaptive_selection_reason(candidate: dict[str, Any]) -> str:
     if bool(candidate.get("quick_projection_used")):
         return "adaptive_projected_interval_full_depth"
+    if bool(candidate.get("quick_has_positive_spread_edge")):
+        return "adaptive_spread_opportunity_full_depth"
     stage = str(candidate.get("quick_selection_stage") or "quality_score")
     return {
         "dynamic_gross": "adaptive_dynamic_gross_full_depth",
@@ -296,9 +339,9 @@ def adaptive_stage_rank(candidate: dict[str, Any]) -> tuple[float, float, float,
     return (
         float(candidate.get("quick_opportunity_score") or 0.0),
         float(candidate.get("quick_cost_coverage") or 0.0),
-        float(candidate.get("quick_gross_rate") or 0.0),
+        float(candidate.get("quick_positive_edge_rate") or 0.0),
         quick_liquidity(candidate),
-        float(candidate.get("quick_best_case_net_rate") or 0.0),
+        float(candidate.get("quick_opportunity_best_case_net_rate") or 0.0),
     )
 
 
@@ -355,15 +398,28 @@ def quick_opportunity_metrics(
     candidate: dict[str, Any],
     config: FundingScanConfig,
 ) -> dict[str, Any]:
-    gross_rate = max(0.0, float(candidate.get("quick_gross_rate") or 0.0))
-    best_net_rate = float(candidate.get("quick_best_case_net_rate") or 0.0)
+    funding_rate = float(candidate.get("quick_gross_rate") or 0.0)
+    spread_rate = float(candidate.get("quick_signed_spread_rate") or 0.0)
+    positive_edge_rate = max(0.0, funding_rate) + max(0.0, spread_rate)
+    gross_rate = positive_edge_rate
+    best_net_rate = float(
+        candidate.get(
+            "quick_opportunity_best_case_net_rate",
+            candidate.get("quick_best_case_net_rate") or 0.0,
+        )
+    )
     best_cost_rate = float(candidate.get("quick_best_case_cost_rate") or 0.0)
     if best_cost_rate <= 0:
         best_cost_rate = max(
             0.0,
-            gross_rate - best_net_rate,
+            float(candidate.get("quick_opportunity_gross_rate") or funding_rate)
+            - best_net_rate,
         )
-    cost_coverage = safe_divide(gross_rate, best_cost_rate)
+    cost_coverage = (
+        math.inf
+        if best_cost_rate <= 0.0 and gross_rate > 0.0
+        else safe_divide(gross_rate, best_cost_rate)
+    )
     target_notional = float(config.target_notional)
     estimated_capital_required = target_notional * (
         2.0 * config.margin_fraction_per_leg
@@ -394,6 +450,11 @@ def quick_opportunity_metrics(
     )
     return {
         "quick_cost_coverage": cost_coverage,
+        "quick_opportunity_gross_rate": float(
+            candidate.get("quick_opportunity_gross_rate") or funding_rate
+        ),
+        "quick_opportunity_best_case_net_rate": best_net_rate,
+        "quick_best_case_net_rate": best_net_rate,
         "quick_best_case_net_profit": quick_best_case_net_profit,
         "quick_actionable_profit_threshold": actionable_profit_threshold,
         "quick_actionable_net": (
@@ -413,6 +474,10 @@ def quick_opportunity_metrics(
         "quick_extreme_gross": (
             emergency_gross_rate > 0 and gross_rate >= emergency_gross_rate
         ),
+        "quick_has_positive_funding_edge": funding_rate > 0.0,
+        "quick_has_positive_spread_edge": spread_rate > 0.0,
+        "quick_has_positive_edge": positive_edge_rate > 0.0,
+        "quick_positive_edge_rate": positive_edge_rate,
     }
 
 
@@ -632,11 +697,41 @@ def quick_route_economics(
         "quick_taker_unavoidable_cost_rate": taker_unavoidable_cost_rate,
         "quick_maker_unavoidable_cost_rate": maker_unavoidable_cost_rate,
         "quick_best_case_cost_rate": best_case_cost_rate,
-        "quick_best_case_net_rate": raw_gross_rate - best_case_cost_rate,
+        "quick_funding_best_case_net_rate": raw_gross_rate - best_case_cost_rate,
         "quick_schedule_ready": schedule_ready,
         "quick_settlement_lead_seconds": settlement_lead_seconds,
         "quick_identity_gap": identity_gap,
         "quick_identity_mismatch": identity_mismatch,
+        **quick_spread_opportunity_fields(
+            long_market,
+            short_market,
+            raw_gross_rate,
+            best_case_cost_rate,
+        ),
+    }
+
+
+def quick_spread_opportunity_fields(
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+    funding_gross_rate: float,
+    best_case_cost_rate: float,
+) -> dict[str, float]:
+    signed_spread_rate = quick_signed_spread_rate(long_market, short_market)
+    opportunity_gross_rate = float(funding_gross_rate) + signed_spread_rate
+    opportunity_best_case_net_rate = (
+        opportunity_gross_rate - float(best_case_cost_rate)
+    )
+    return {
+        "quick_signed_spread_rate": signed_spread_rate,
+        "quick_opportunity_gross_rate": opportunity_gross_rate,
+        "quick_opportunity_best_case_net_rate": opportunity_best_case_net_rate,
+        # The existing DB/UI column stores the best quick net score. With the
+        # opportunity engine enabled that score includes signed spread, while
+        # quick_funding_best_case_net_rate keeps funding-only diagnostics.
+        "quick_best_case_net_rate": opportunity_best_case_net_rate,
+        "quick_positive_edge_rate": max(0.0, float(funding_gross_rate))
+        + max(0.0, signed_spread_rate),
     }
 
 
@@ -689,10 +784,26 @@ def quick_price_identity_gap(
 ) -> float | None:
     long_price = quick_reference_price(long_market)
     short_price = quick_reference_price(short_market)
+    if long_price <= 0 or short_price <= 0:
+        return None
     reference = (long_price + short_price) / 2.0
     if reference <= 0:
         return None
     return abs(short_price - long_price) / reference
+
+
+def quick_signed_spread_rate(
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+) -> float:
+    long_price = quick_reference_price(long_market)
+    short_price = quick_reference_price(short_market)
+    if long_price <= 0 or short_price <= 0:
+        return 0.0
+    reference = (long_price + short_price) / 2.0
+    if reference <= 0:
+        return 0.0
+    return (short_price - long_price) / reference
 
 
 def quick_reference_price(market: dict[str, Any]) -> float:
@@ -765,8 +876,9 @@ def best_pair_orientation(
         orientations,
         key=lambda row: (
             bool(row.get("quick_schedule_ready")),
+            float(row.get("quick_opportunity_best_case_net_rate") or 0.0),
+            float(row.get("quick_positive_edge_rate") or 0.0),
             float(row.get("quick_gross_rate") or 0.0),
-            float(row.get("quick_best_case_net_rate") or 0.0),
             float(row.get("current_hourly_spread") or 0.0),
         ),
     )
@@ -812,9 +924,7 @@ def scan_ranked_pairs(
     routes.sort(
         key=lambda row: (
             row["status"] == "paper_candidate",
-            float(
-                (row.get("evidence") or {}).get("current_nowcast_net") or 0
-            ),
+            route_opportunity_sort_net(row),
             float(
                 (row.get("evidence") or {}).get("conservative_net_profit") or 0
             ),
@@ -827,3 +937,21 @@ def scan_ranked_pairs(
         reverse=True,
     )
     return routes
+
+
+def route_opportunity_sort_net(route: dict[str, Any]) -> float:
+    evidence = route.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or {}
+    for value in (
+        selected.get("expected_net_pnl"),
+        evidence.get("current_opportunity_net"),
+        evidence.get("current_nowcast_net"),
+        route.get("expected_net_profit"),
+    ):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            return parsed
+    return 0.0

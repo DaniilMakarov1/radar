@@ -22,6 +22,7 @@ from smart_money_radar.paper_bot.position import (
     position_hold_decision,
     required_live_net_profit,
     route_monitor_decision,
+    selected_route_strategy,
     status_publishable_candidate,
 )
 
@@ -50,7 +51,7 @@ def status_report_message(
         "",
         (
             f"<b>Mode:</b> <code>{tg(result.get('mode'))}</code> | "
-            f"<b>Scan:</b> <code>{tg(result.get('funding_scan_id') or '-')}</code>"
+            f"{status_scan_label(result)}"
         ),
         (
             f"<b>Candidates: {len(candidates)}</b> | "
@@ -74,6 +75,9 @@ def status_report_message(
                 ),
             ]
         )
+        filter_lines = compact_filter_lines(result)
+        if filter_lines:
+            lines.extend(filter_lines)
     if candidates:
         lines.extend(["", "<b>Candidates</b>"])
         lines.extend(
@@ -93,6 +97,77 @@ def status_report_message(
     return "\n".join(lines)
 
 
+def status_scan_label(result: dict[str, Any]) -> str:
+    scan_id = result.get("funding_scan_id")
+    if result.get("mode") == "background_full_market":
+        return f"<b>Background scan:</b> <code>{tg(scan_id or '-')}</code>"
+    if scan_id:
+        return f"<b>DB scan:</b> <code>{tg(scan_id)}</code>"
+    return "<b>DB scan:</b> <code>-</code>"
+
+
+def compact_filter_lines(result: dict[str, Any]) -> list[str]:
+    screen_reasons = list(result.get("screen_reasons") or [])[:4]
+    blocker_summary = list(result.get("blocker_summary") or [])[:4]
+    lines: list[str] = []
+    if screen_reasons:
+        lines.append("<b>Pre-depth rejects</b>")
+        for row in screen_reasons:
+            reason = screen_reason_label(row.get("execution_screen_reason"))
+            count = int(row.get("route_count") or 0)
+            lines.append(f"• {tg(reason)}: <b>{count:,}</b>")
+    if blocker_summary:
+        lines.append("<b>Full-model blockers</b>")
+        for row in blocker_summary:
+            reason = blocker_label(row.get("risk_flag"))
+            count = int(row.get("route_count") or 0)
+            lines.append(f"• {tg(reason)}: <b>{count:,}</b>")
+    return lines
+
+
+def screen_reason_label(value: Any) -> str:
+    labels = {
+        "best_case_opportunity_below_unavoidable_cost": "total opportunity <= cost",
+        "spread_opportunity_below_actionable_threshold": "total net < $1 в spread-led precheck",
+        "best_case_carry_below_unavoidable_cost": "total net <= 0 без полезного spread-edge",
+        "funding_schedule_unavailable": "нет подтвержденного settlement",
+        "unit_identity_mismatch": "несовместимые contract units",
+        "non_positive_settlement_carry": "нет положительного funding или spread edge",
+        "combined_opportunity_full_depth": "combined отправлен в full-depth",
+        "spread_opportunity_full_depth": "spread отправлен в full-depth",
+        "full_execution_required": "funding отправлен в full-depth",
+        "pinned_revalidation": "повторная проверка watch-route",
+    }
+    key = str(value or "unknown")
+    return labels.get(key, key.replace("_", " "))
+
+
+def blocker_label(value: Any) -> str:
+    labels = {
+        "live_net_pnl_not_positive": "total opportunity net <= 0",
+        "live_net_pnl_below_actionable_threshold": "total opportunity net < минимум",
+        "insufficient_basis_history": "мало L2/basis history для wide spread",
+        "basis_not_covered_by_live_funding": "basis stress не покрыт",
+        "invalid_orderbook": "некорректный стакан",
+        "unit_identity_mismatch": "несовместимые contract units",
+        "funding_schedule_unavailable": "нет settlement",
+        "stale_funding_nowcast": "устаревший nowcast",
+    }
+    key = str(value or "unknown")
+    return labels.get(key, key.replace("_", " "))
+
+
+def leg_display_rate(leg: dict[str, Any]) -> tuple[float | None, float | None]:
+    published_rate = optional_float(leg.get("published_funding_rate"))
+    published_interval = optional_float(leg.get("published_funding_interval_hours"))
+    if published_rate is not None and published_interval is not None:
+        return published_rate, published_interval
+    return (
+        optional_float(leg.get("funding_rate")),
+        optional_float(leg.get("funding_interval_hours")),
+    )
+
+
 def status_route_line(route: dict[str, Any], index: int) -> str:
     evidence = route.get("evidence") or {}
     legs = route.get("legs") or []
@@ -103,28 +178,42 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     short_lead = lead_seconds(short_leg.get("next_funding_at"), now)
     live_net = float(evidence.get("current_nowcast_net") or 0.0)
     threshold = float(evidence.get("actionable_profit_threshold") or 0.0)
-    long_interval = format_interval_hours(long_leg.get("funding_interval_hours"))
-    short_interval = format_interval_hours(short_leg.get("funding_interval_hours"))
+    long_display_rate, long_display_interval = leg_display_rate(long_leg)
+    short_display_rate, short_display_interval = leg_display_rate(short_leg)
+    long_interval = format_interval_hours(long_display_interval)
+    short_interval = format_interval_hours(short_display_interval)
     long_hourly = optional_float(long_leg.get("hourly_funding_rate"))
     short_hourly = optional_float(short_leg.get("hourly_funding_rate"))
     long_hourly_label = f"{long_hourly * 100:.4f}%/h" if long_hourly is not None else ""
     short_hourly_label = f"{short_hourly * 100:.4f}%/h" if short_hourly is not None else ""
-    long_interval_rate = optional_float(long_leg.get("funding_rate"))
-    short_interval_rate = optional_float(short_leg.get("funding_rate"))
-    long_iv = max(1.0, float(long_leg.get("funding_interval_hours") or 1.0))
-    short_iv = max(1.0, float(short_leg.get("funding_interval_hours") or 1.0))
-    long_rate_display = format_rate(long_interval_rate * long_iv if long_interval_rate is not None else None)
-    short_rate_display = format_rate(short_interval_rate * short_iv if short_interval_rate is not None else None)
+    long_rate_display = format_rate(long_display_rate)
+    short_rate_display = format_rate(short_display_rate)
+    strategy = selected_route_strategy(
+        route,
+        ("funding_only", "spread_only", "combined", "opportunistic_any"),
+    )
+    edge_name = opportunity_label(strategy)
+    strategy_net = float(
+        (strategy or {}).get("expected_net_pnl")
+        if (strategy or {}).get("expected_net_pnl") is not None
+        else evidence.get("current_nowcast_net")
+        or 0.0
+    )
+    funding_component = optional_float((strategy or {}).get("funding_pnl_component"))
+    spread_component = optional_float((strategy or {}).get("spread_pnl_component"))
     return (
         f"\n<b>{index}. {tg(route.get('canonical_asset'))}</b>\n"
+        f"Edge: <code>{tg(edge_name)}</code>\n"
         f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
         f"{long_rate_display}/{long_interval}"
         f"{f' ({long_hourly_label})' if long_hourly_label else ''}\n"
         f"SHORT <code>{tg(route.get('short_venue'))} {tg(route.get('short_symbol'))}</code> "
         f"{short_rate_display}/{short_interval}"
         f"{f' ({short_hourly_label})' if short_hourly_label else ''}\n"
-        f"Next net PnL after costs: <b>{format_signed_money(live_net)}</b> | "
+        f"Next net PnL after costs: <b>{format_signed_money(strategy_net)}</b> | "
         f"Min: ${threshold:.2f}\n"
+        f"Funding {format_signed_money(funding_component)} | "
+        f"Spread {format_signed_money(spread_component)}\n"
         f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"
     )
 
@@ -136,7 +225,28 @@ def lead_seconds(value: Any, now: datetime) -> float | None:
     return (settlement - now).total_seconds()
 
 
+def strategy_label(value: Any) -> str:
+    labels = {
+        "funding_only": "Funding only",
+        "spread_only": "Spread only",
+        "combined": "Combined",
+        "opportunistic_any": "Opportunistic any",
+    }
+    key = str(value or "funding_only").strip().lower()
+    return labels.get(key, key or "Funding only")
+
+
+def opportunity_label(strategy: dict[str, Any] | None) -> str:
+    strategy = strategy or {}
+    label = str(strategy.get("edge_label") or strategy_label(strategy.get("strategy_name")))
+    quality = str(strategy.get("edge_quality") or "").strip().lower()
+    if quality and quality != "clean":
+        return f"{label} ({quality})"
+    return label
+
+
 def position_summary(position: dict[str, Any]) -> dict[str, Any]:
+    strategy = (position.get("notes") or {}).get("strategy") or {}
     return {
         "funding_paper_position_id": position.get("funding_paper_position_id"),
         "entry_key": position.get("entry_key"),
@@ -145,6 +255,7 @@ def position_summary(position: dict[str, Any]) -> dict[str, Any]:
         "long": f"{position.get('long_venue')} {position.get('long_symbol')}",
         "short": f"{position.get('short_venue')} {position.get('short_symbol')}",
         "expected_live_net": position.get("expected_live_net"),
+        "strategy_name": strategy.get("strategy_name"),
         "max_settlement_at": position.get("max_settlement_at"),
     }
 
@@ -155,17 +266,15 @@ def funding_rate_lines(route: dict[str, Any]) -> str:
     for side in ("long", "short"):
         leg = leg_by_side(legs, side) or {}
         venue = leg.get("venue") or route.get(f"{side}_venue") or ""
-        rate = optional_float(leg.get("funding_rate"))
-        interval = optional_float(leg.get("funding_interval_hours"))
+        rate, interval = leg_display_rate(leg)
         hourly = optional_float(leg.get("hourly_funding_rate"))
         if rate is None:
             continue
         interval_label = format_interval_hours(interval) if interval else "?"
-        interval_rate = rate * max(1.0, interval or 1.0)
         hourly_label = f"{hourly * 100:.4f}%/h" if hourly is not None else "?"
         lines.append(
             f"{side.upper()} <code>{tg(venue)}</code>: "
-            f"{format_rate(interval_rate)}/{interval_label} ({hourly_label})"
+            f"{format_rate(rate)}/{interval_label} ({hourly_label})"
         )
     return "\n".join(lines)
 
@@ -173,13 +282,17 @@ def funding_rate_lines(route: dict[str, Any]) -> str:
 def armed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
     leads = decision.get("lead_seconds") or {}
     rates = funding_rate_lines(route)
+    strategy = decision.get("selected_strategy") or {}
     return (
         "<b>Paper Bot ARMED</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
         f"{rates}\n"
         f"Live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
+        f"Funding: {format_signed_money(strategy.get('funding_pnl_component'))} | "
+        f"Spread: {format_signed_money(strategy.get('spread_pnl_component'))}\n"
         f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"До funding: long {format_seconds(leads.get('long'))}, "
         f"short {format_seconds(leads.get('short'))}"
@@ -193,14 +306,18 @@ def open_message(
 ) -> str:
     leads = decision.get("lead_seconds") or {}
     rates = funding_rate_lines(route)
+    strategy = decision.get("selected_strategy") or (position.get("notes") or {}).get("strategy") or {}
     return (
         "<b>Paper Bot OPEN</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
         f"{rates}\n"
         f"Size: <b>${float(position.get('target_notional') or 0):.0f}</b> per leg\n"
         f"Expected live net: <b>${float(position.get('expected_live_net') or 0):.2f}</b>\n"
+        f"Funding: {format_signed_money(strategy.get('funding_pnl_component'))} | "
+        f"Spread: {format_signed_money(strategy.get('spread_pnl_component'))}\n"
         f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"До funding: long {format_seconds(leads.get('long'))}, "
         f"short {format_seconds(leads.get('short'))}"
@@ -208,11 +325,13 @@ def open_message(
 
 
 def skipped_open_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
+    strategy = decision.get("selected_strategy") or {}
     return (
         "<b>Paper Bot SKIP OPEN</b>\n\n"
         f"<b>{tg(route['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(route['long_venue'])}</code> / "
         f"SHORT <code>{tg(route['short_venue'])}</code>\n\n"
+        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
         f"Fresh live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
         f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"Reasons: {tg(', '.join(decision.get('reasons') or []) or 'recheck failed')}"
@@ -220,11 +339,13 @@ def skipped_open_message(route: dict[str, Any], decision: dict[str, Any]) -> str
 
 
 def disarmed_message(route: dict[str, Any], decision: dict[str, Any]) -> str:
+    strategy = decision.get("selected_strategy") or {}
     return (
         "<b>Paper Bot DISARMED</b>\n\n"
         f"<b>{tg(route.get('canonical_asset'))}</b>\n"
         f"LONG <code>{tg(route.get('long_venue'))}</code> / "
         f"SHORT <code>{tg(route.get('short_venue'))}</code>\n\n"
+        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
         f"Fresh live net: <b>${float(decision.get('live_net') or 0):.2f}</b>\n"
         f"Need: ${float(decision.get('required_live_net') or 0):.2f}\n"
         f"Reasons: {tg(', '.join(decision.get('reasons') or []) or 'not hot')}"
@@ -244,6 +365,9 @@ def pending_message(position: dict[str, Any], result: dict[str, Any]) -> str:
 
 def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
     settlement = accrual.get("settlement") or {}
+    strategy = (position.get("notes") or {}).get("strategy") or (
+        settlement.get("continued_strategy") or {}
+    )
     quality = (
         "Начисление предварительное: одна или обе funding history еще не "
         "опубликованы, использована ставка на входе."
@@ -256,6 +380,7 @@ def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
         f"<b>{tg(position['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(position['long_venue'])}</code> / "
         f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
+        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
         "Funding settlement начислен, позиция остается открытой: "
         "арбитражное окно все еще положительное.\n"
         f"Settlement PnL: <b>{format_money(accrual.get('funding_pnl_delta'))}</b>\n"
@@ -269,6 +394,7 @@ def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
 
 def close_message(position: dict[str, Any], close: dict[str, Any]) -> str:
     settlement = close.get("settlement") or {}
+    strategy = (position.get("notes") or {}).get("strategy") or {}
     quality = (
         "Качество PnL: предварительный расчет. Одна или обе биржи еще не "
         "опубликовали funding history, поэтому пока использованы ставки на входе. "
@@ -283,6 +409,7 @@ def close_message(position: dict[str, Any], close: dict[str, Any]) -> str:
         f"<b>{tg(position['canonical_asset'])}</b>\n"
         f"LONG <code>{tg(position['long_venue'])}</code> / "
         f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
+        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
         f"Причина закрытия: {tg(close_reason_message(close.get('close_reason')))}\n"
         f"{tg(window)}\n"
         f"{details}\n\n"
@@ -354,10 +481,8 @@ def funding_leg_compact_line(leg: dict[str, Any]) -> str:
     side = str(leg.get("side") or "").upper()
     venue = leg.get("venue")
     symbol = leg.get("symbol")
-    interval = format_interval_hours(leg.get("funding_interval_hours"))
-    hourly = optional_float(leg.get("funding_rate"))
-    iv = max(1.0, float(leg.get("funding_interval_hours") or 1.0))
-    interval_rate = hourly * iv if hourly is not None else None
+    interval_rate, display_interval = leg_display_rate(leg)
+    interval = format_interval_hours(display_interval)
     return (
         f"{tg(side)} <code>{tg(venue)} {tg(symbol)}</code> "
         f"{format_rate(interval_rate)}/{interval}, "
@@ -443,6 +568,11 @@ def reprice_message(position: dict[str, Any], payload: dict[str, Any]) -> str:
 
 
 def close_reason_message(value: Any) -> str:
+    raw = str(value or "")
+    if raw.startswith("price_stop_loss"):
+        return "цена ушла от входа сильнее stop-loss порога; обе ноги закрыты одновременно"
+    if raw.startswith("spread_stop_loss"):
+        return "basis/spread ушел против позиции сильнее stop-loss порога"
     return {
         "arbitrage_window_closed_live_net_non_positive": (
             "арбитражное окно закрылось, live net стал неположительным"
@@ -468,7 +598,7 @@ def close_reason_message(value: Any) -> str:
         "arbitrage_window_unverifiable": (
             "продолжение окна не подтверждено"
         ),
-    }.get(str(value or ""), str(value or "продолжение окна не подтверждено"))
+    }.get(raw, raw or "продолжение окна не подтверждено")
 
 
 def close_window_message(close: dict[str, Any]) -> str:

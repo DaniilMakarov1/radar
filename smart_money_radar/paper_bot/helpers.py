@@ -68,9 +68,12 @@ def tg(value: Any) -> str:
 def format_seconds(value: Any) -> str:
     if value is None:
         return "-"
-    seconds = max(0, int(float(value)))
+    raw_seconds = float(value)
+    overdue = raw_seconds < 0
+    seconds = int(abs(raw_seconds))
     minutes, rest = divmod(seconds, 60)
-    return f"{minutes}m {rest}s"
+    label = f"{minutes}m {rest}s"
+    return f"просрочено {label}" if overdue else label
 
 
 def format_datetime_utc(value: Any) -> str:
@@ -150,8 +153,23 @@ def route_data_age_seconds(route: dict[str, Any], now: datetime) -> float | None
 
 def status_route_sort_key(route: dict[str, Any]) -> tuple[float, float]:
     evidence = route.get("evidence") or {}
-    live_net = optional_float(evidence.get("current_nowcast_net")) or 0.0
-    threshold = optional_float(evidence.get("actionable_profit_threshold")) or 0.0
+    selected = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
+    ) or {}
+    live_net = (
+        optional_float(selected.get("expected_net_pnl"))
+        if selected
+        else None
+    )
+    if live_net is None:
+        live_net = optional_float(evidence.get("current_nowcast_net")) or 0.0
+    threshold = (
+        optional_float(selected.get("actionable_profit_threshold"))
+        if selected
+        else None
+    )
+    if threshold is None:
+        threshold = optional_float(evidence.get("actionable_profit_threshold")) or 0.0
     return live_net, live_net - threshold
 
 

@@ -82,6 +82,16 @@ def decision_mode(route: dict[str, Any] | None) -> str:
 
 def decision_net_profit(route: dict[str, Any]) -> float:
     evidence = route.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
+    ) or {}
+    if selected:
+        return float(
+            selected.get("expected_net_pnl")
+            if selected.get("expected_net_pnl") is not None
+            else evidence.get("current_nowcast_net")
+            or 0.0
+        )
     if decision_mode(route) == "settlement_capture":
         return float(evidence.get("current_nowcast_net") or 0.0)
     return float(route.get("expected_net_profit") or 0.0)
