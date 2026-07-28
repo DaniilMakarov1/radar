@@ -36,7 +36,9 @@ def route_entry_key(route: dict[str, Any]) -> str:
     short_leg = leg_by_side(legs, "short") or {}
     return ":".join(
         [
-            str(route.get("route_key") or ""),
+            str(route.get("canonical_asset") or ""),
+            str(long_leg.get("venue") or route.get("long_venue") or ""),
+            str(short_leg.get("venue") or route.get("short_venue") or ""),
             str(long_leg.get("next_funding_at") or ""),
             str(short_leg.get("next_funding_at") or ""),
         ]

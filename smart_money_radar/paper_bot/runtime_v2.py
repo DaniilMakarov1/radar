@@ -46,7 +46,10 @@ from smart_money_radar.paper_bot.risk import (
     hard_risk_triggered,
 )
 from smart_money_radar.paper_bot.settlement import (
+    REALIZED_FUNDING_RATE_SOURCES,
     build_settlement_crossing_rows,
+    funding_rate_semantics,
+    funding_rate_semantics_source,
     reconcile_leg,
     realized_public_funding_rate,
 )
@@ -54,6 +57,7 @@ from smart_money_radar.storage import SQLiteStore
 
 OBSERVATION_MIN_COUNT = 10
 OBSERVATION_MIN_SPAN_SECONDS = 20.0
+ENTRY_OBSERVATION_TTL_SECONDS = 900.0
 POST_SETTLEMENT_NORMAL_EXIT_DELAY_SECONDS = 20.0
 POST_SETTLEMENT_HOLD_DECISION_SECONDS = 30.0
 POST_SETTLEMENT_PROBE_START_SECONDS = 5.0
@@ -113,11 +117,7 @@ def _leg_mark(leg: dict[str, Any]) -> float:
 
 
 def _leg_rate(leg: dict[str, Any]) -> float:
-    return float(
-        optional_float(leg.get("normalized_next_funding_rate"))
-        if optional_float(leg.get("normalized_next_funding_rate")) is not None
-        else optional_float(leg.get("funding_rate")) or 0.0
-    )
+    return float(optional_float(leg.get("normalized_next_funding_rate")) or 0.0)
 
 
 def _leg_fee_rate(leg: dict[str, Any]) -> float:
@@ -138,6 +138,37 @@ def _observation_bucket(route_key: str, phase: str, cycle_id: str) -> str:
     if phase == "entry":
         return route_key
     return f"{route_key}:{phase}:{cycle_id}"
+
+
+def _observation_timestamp_match(
+    observation: dict[str, Any],
+    route: dict[str, Any],
+) -> bool:
+    legs = route.get("legs") or []
+    long_leg = leg_by_side(legs, "long") or {}
+    short_leg = leg_by_side(legs, "short") or {}
+    observed_long = parse_time(observation.get("long_next_funding_at"))
+    observed_short = parse_time(observation.get("short_next_funding_at"))
+    current_long = parse_time(long_leg.get("next_funding_at"))
+    current_short = parse_time(short_leg.get("next_funding_at"))
+    if (
+        observed_long is None
+        or observed_short is None
+        or current_long is None
+        or current_short is None
+    ):
+        return False
+    return (
+        abs((observed_long - current_long).total_seconds()) <= 1.0
+        and abs((observed_short - current_short).total_seconds()) <= 1.0
+        and abs((observed_long - observed_short).total_seconds()) <= 1.0
+    )
+
+
+def _position_attempt_id(position: dict[str, Any]) -> str | None:
+    config = position.get("config") or {}
+    attempt_id = config.get("entry_attempt_id") or config.get("attempt_id")
+    return str(attempt_id) if attempt_id else None
 
 
 def build_focused_observation(
@@ -190,14 +221,22 @@ def build_focused_observation(
     )
     evidence = route.get("evidence") or {}
     capability_reasons = list(evidence.get("capability_rejections") or [])
-    capabilities_passed = bool(evidence.get("synchronized_capability_passed")) and not capability_reasons
+    targeted_refresh = evidence.get("targeted_refresh") or {}
+    capabilities_passed = (
+        bool(evidence.get("synchronized_capability_passed"))
+        or (phase == "hold" and targeted_refresh.get("quality") == "FRESH")
+    ) and not capability_reasons
     long_open = optional_float(long_leg.get("open_vwap")) or optional_float(long_leg.get("vwap"))
     short_open = optional_float(short_leg.get("open_vwap")) or optional_float(short_leg.get("vwap"))
     long_close = optional_float(long_leg.get("close_vwap")) or optional_float(long_leg.get("best_bid"))
     short_close = optional_float(short_leg.get("close_vwap")) or optional_float(short_leg.get("best_ask"))
+    long_book_executable = long_close is not None if phase == "hold" else long_open is not None and long_close is not None
+    short_book_executable = short_close is not None if phase == "hold" else short_open is not None and short_close is not None
     raw = {
         "phase": phase,
         "observed_at": now.astimezone(UTC).isoformat(),
+        "route_snapshot_id": targeted_refresh.get("snapshot_id"),
+        "route_snapshot_quality": targeted_refresh.get("quality"),
         "long_response_received_at": long_response.isoformat() if long_response else None,
         "short_response_received_at": short_response.isoformat() if short_response else None,
         "long_age_seconds": long_age,
@@ -223,8 +262,8 @@ def build_focused_observation(
             else None
         ),
         "paper_net_if_exit_now": None,
-        "long_book_executable": long_open is not None and long_close is not None,
-        "short_book_executable": short_open is not None and short_close is not None,
+        "long_book_executable": long_book_executable,
+        "short_book_executable": short_book_executable,
         "capabilities_passed": capabilities_passed,
     }
     validation = validate_focused_observation(raw, now=now)
@@ -277,6 +316,7 @@ class SynchronizedFundingRuntimeV2:
         long_price_pnl: float,
         short_price_pnl: float,
         payload: dict[str, Any],
+        attempt_id: str | None = None,
     ) -> None:
         for side, venue, value in (
             ("long", long_venue, float(long_price_pnl)),
@@ -286,15 +326,62 @@ class SynchronizedFundingRuntimeV2:
                 continue
             self._record_ledger_entry(
                 make_ledger_entry(
-                    price_pnl_event_key(position_id, venue),
+                    price_pnl_event_key(position_id, venue, attempt_id=attempt_id),
                     position_id=position_id,
                     cycle_id=cycle_id,
                     venue=venue,
                     event_type="price_pnl",
                     cash_delta=value,
-                    payload={**payload, "side": side, "price_pnl": value},
+                    payload={
+                        **payload,
+                        "side": side,
+                        "price_pnl": value,
+                        "attempt_id": attempt_id,
+                    },
                 )
             )
+
+    def mark_position_data_quality(
+        self,
+        position: dict[str, Any],
+        *,
+        state: str,
+        now: datetime,
+        refresh_result: dict[str, Any] | None = None,
+        last_valid_route: dict[str, Any] | None = None,
+        executable_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        position_id = str(position["position_id"])
+        current_position = (
+            self.store.funding_capture_position_by_id(position_id)
+            if self.store is not None
+            else None
+        )
+        config = dict((current_position or position).get("config") or {})
+        data_quality = dict(config.get("data_quality") or {})
+        now_iso = now.astimezone(UTC).isoformat()
+        data_quality["state"] = state
+        if refresh_result is not None:
+            data_quality["last_refresh_attempt_at"] = now_iso
+            data_quality["refresh_attempt_count"] = int(
+                data_quality.get("refresh_attempt_count") or 0
+            ) + 1
+        if state == "HEALTHY":
+            data_quality.pop("first_degraded_at", None)
+        else:
+            data_quality.setdefault("first_degraded_at", now_iso)
+        if refresh_result is not None:
+            data_quality["last_refresh_quality"] = refresh_result.get("quality")
+            data_quality["last_refresh_reason"] = refresh_result.get("reason")
+            data_quality["last_refresh_snapshot_id"] = refresh_result.get("snapshot_id")
+        config["data_quality"] = data_quality
+        if last_valid_route is not None:
+            config["last_valid_executable_route"] = last_valid_route
+        if executable_snapshot is not None:
+            config["last_valid_executable_snapshot"] = executable_snapshot
+        position["config"] = config
+        self.store.update_funding_capture_position_config(position_id, config, now)
+        return config
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -355,6 +442,26 @@ class SynchronizedFundingRuntimeV2:
 
             public_rate = optional_float(row.get("confirmed_funding_rate"))
             public_event: dict[str, Any] | None = None
+            if public_rate is not None:
+                stored_event = (row.get("evidence") or {}).get("public_event") or {}
+                semantics = funding_rate_semantics(stored_event)
+                semantics_source = funding_rate_semantics_source(stored_event)
+                if (semantics, semantics_source) not in REALIZED_FUNDING_RATE_SOURCES:
+                    self._update_reconciliation_row(
+                        row,
+                        status="PENDING",
+                        confirmed_funding_rate=public_rate,
+                        rate_status="UNACCEPTED_SEMANTICS",
+                        mark_status=row.get("mark_status"),
+                        evidence_update={
+                            "ignored_public_event": {
+                                "rate_semantics": semantics,
+                                "rate_semantics_source": semantics_source,
+                                "source": "stored_confirmed_rate",
+                            }
+                        },
+                    )
+                    public_rate = None
             if public_rate is None:
                 public_event = provider.get_public_funding_event(
                     venue=venue,
@@ -377,6 +484,9 @@ class SynchronizedFundingRuntimeV2:
                                     "rate_semantics": public_event.get("rate_semantics")
                                     or public_event.get("funding_rate_semantics")
                                     or "unclear",
+                                    "rate_semantics_source": public_event.get("rate_semantics_source")
+                                    or public_event.get("funding_rate_semantics_source")
+                                    or "unknown",
                                     "published_at": public_event.get("published_at"),
                                     "skew_seconds": public_event.get("skew_seconds"),
                                     "source": public_event.get("source"),
@@ -428,6 +538,9 @@ class SynchronizedFundingRuntimeV2:
                             "rate_semantics": public_event.get("rate_semantics")
                             if public_event
                             else "stored_confirmed_rate",
+                            "rate_semantics_source": public_event.get("rate_semantics_source")
+                            if public_event
+                            else None,
                             "published_at": public_event.get("published_at")
                             if public_event
                             else None,
@@ -463,6 +576,9 @@ class SynchronizedFundingRuntimeV2:
                         "rate_semantics": public_event.get("rate_semantics")
                         if public_event
                         else "stored_confirmed_rate",
+                        "rate_semantics_source": public_event.get("rate_semantics_source")
+                        if public_event
+                        else None,
                         "published_at": public_event.get("published_at")
                         if public_event
                         else None,
@@ -483,7 +599,14 @@ class SynchronizedFundingRuntimeV2:
 
             if leg_result["status"] == "RATE_AND_MARK_RECONCILED":
                 funding_pnl = float(leg_result["funding_pnl"] or 0.0)
-                event_key = funding_event_key(position_id, venue, scheduled_at_str)
+                position = self.store.funding_capture_position_by_id(position_id) or {}
+                attempt_id = _position_attempt_id(position)
+                event_key = funding_event_key(
+                    position_id,
+                    venue,
+                    scheduled_at_str,
+                    attempt_id=attempt_id,
+                )
                 self._record_ledger_entry(
                     make_ledger_entry(
                         event_key,
@@ -499,6 +622,10 @@ class SynchronizedFundingRuntimeV2:
                             "rate_semantics": public_event.get("rate_semantics")
                             if public_event
                             else "stored_confirmed_rate",
+                            "rate_semantics_source": public_event.get("rate_semantics_source")
+                            if public_event
+                            else None,
+                            "attempt_id": attempt_id,
                             "reconciliation_quality": mark_snapshot.get("reconciliation_quality")
                             or "UNKNOWN",
                         },
@@ -689,7 +816,26 @@ class SynchronizedFundingRuntimeV2:
             }
         )
         if snapshot.get("quality") != "EXECUTABLE_FULL_DEPTH":
+            self.mark_position_data_quality(
+                position,
+                state="DEGRADED",
+                now=now,
+                executable_snapshot=snapshot,
+            )
             return {"decision": "skipped", **snapshot}
+        snapshot_for_config = {
+            **snapshot,
+            "observed_at": observed_at,
+            "position_id": position_id,
+            "cycle_id": cycle_id,
+        }
+        self.mark_position_data_quality(
+            position,
+            state="HEALTHY",
+            now=now,
+            last_valid_route=route,
+            executable_snapshot=snapshot_for_config,
+        )
         self.store.update_funding_capture_position_state(
             position_id,
             str(position.get("state") or "OPEN"),
@@ -881,11 +1027,19 @@ class SynchronizedFundingRuntimeV2:
 
     def _reserved_collateral_amount(self, position_id: str, venue: str) -> float:
         reserve_key = collateral_reserve_event_key(position_id, venue)
+        amount = 0.0
         for row in self.store.paper_event_ledger_rows(position_id):
-            if str(row.get("event_key") or "") != reserve_key:
+            if str(row.get("venue") or "") != str(venue):
                 continue
-            return float(optional_float((row.get("payload") or {}).get("amount")) or 0.0)
-        return 0.0
+            if str(row.get("event_type") or "") != "collateral_reserve":
+                continue
+            if (
+                str(row.get("event_key") or "") != reserve_key
+                and not str(row.get("event_key") or "").startswith("collateral_reserve:")
+            ):
+                continue
+            amount = float(optional_float((row.get("payload") or {}).get("amount")) or amount)
+        return amount
 
     def _leg_margin_snapshot(
         self,
@@ -1138,13 +1292,16 @@ class SynchronizedFundingRuntimeV2:
         existing_open = self.store.funding_capture_open_position_by_route_key(route_key)
         if existing_open is not None:
             return {"opened": False, "reason": "route_already_open", "position_id": existing_open["position_id"]}
+        guard = self._opportunity_guard(capture_id)
+        if not guard["allowed"]:
+            return {"opened": False, **guard}
         self._ensure_discovered_or_armed(route, capture_id, settlement_at, lead, now)
         missing_data = self._missing_required_route_data(route)
         if missing_data:
             return {"opened": False, "reason": "required_route_data_missing", "missing": missing_data}
         observation = build_focused_observation(route, now=now)
         self._store_observation(route, capture_id, settlement_at, observation, phase="entry")
-        observations = self._valid_observations(route_key, now, phase="entry", cycle_id=f"{capture_id}:1")
+        observations = self._valid_observations(route, now, phase="entry", cycle_id=f"{capture_id}:1")
         underwriting = entry_underwriting(observations, now=now)
         if not underwriting["eligible"]:
             return {
@@ -1165,8 +1322,11 @@ class SynchronizedFundingRuntimeV2:
             return {"opened": False, "reason": account_check["reason"], "account_check": account_check}
         execution = self._execute_entry(route, capture_id, settlement_at, now)
         if execution["state"] != "OPEN":
+            if execution.get("attempt_id"):
+                self.close_entry_observation_bucket(route, capture_id=capture_id)
             return {"opened": False, "reason": "entry_execution_failed", "execution": execution}
         self._mark_open(route, capture_id, settlement_at, economics, execution, now)
+        self.close_entry_observation_bucket(route, capture_id=capture_id)
         return {
             "opened": True,
             "position_id": capture_id,
@@ -1175,6 +1335,93 @@ class SynchronizedFundingRuntimeV2:
             "execution": execution,
             "underwriting": underwriting,
         }
+
+    def _opportunity_guard(self, capture_id: str) -> dict[str, Any]:
+        existing = self.store.funding_capture_position_by_id(capture_id)
+        if existing is None:
+            return {"allowed": True}
+        state = str(existing.get("state") or "")
+        config = existing.get("config") or {}
+        if state in {"OPEN", "HOLDING_NEXT_CYCLE", "SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION"}:
+            return {"allowed": False, "reason": "opportunity_already_open", "position_id": capture_id}
+        if config.get("entry_attempt_submitted"):
+            return {
+                "allowed": False,
+                "reason": "opportunity_attempt_already_submitted",
+                "position_id": capture_id,
+                "attempt_id": config.get("entry_attempt_id"),
+                "state": state,
+            }
+        if state in {"FAILED", "REJECTED_AFTER_SUBMISSION", "CLOSED_PENDING_RECONCILIATION", "RECONCILED", "UNRECONCILED"}:
+            return {
+                "allowed": False,
+                "reason": "opportunity_terminal",
+                "position_id": capture_id,
+                "state": state,
+            }
+        return {"allowed": True}
+
+    def _new_attempt_id(self, capture_id: str, decision_at: datetime) -> str:
+        stamp = decision_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        digest = hashlib.sha256(f"{capture_id}:{stamp}".encode("utf-8")).hexdigest()[:12]
+        return f"{capture_id}:attempt:{stamp}:{digest}"
+
+    def _mark_entry_attempt_submitted(
+        self,
+        *,
+        capture_id: str,
+        route: dict[str, Any],
+        attempt_id: str,
+        settlement_at: datetime,
+        decision_at: datetime,
+    ) -> None:
+        position = self.store.funding_capture_position_by_id(capture_id)
+        config = dict((position or {}).get("config") or {})
+        attempts = list(config.get("entry_attempts") or [])
+        attempts.append(
+            {
+                "attempt_id": attempt_id,
+                "opportunity_id": capture_id,
+                "route_entry_key": route_entry_key(route),
+                "settlement_at": settlement_at.astimezone(UTC).isoformat(),
+                "submitted_at": decision_at.astimezone(UTC).isoformat(),
+                "state": "ENTRY_SUBMITTED",
+            }
+        )
+        config["opportunity_id"] = capture_id
+        config["entry_attempt_id"] = attempt_id
+        config["entry_attempt_submitted"] = True
+        config["entry_attempt_submitted_at"] = decision_at.astimezone(UTC).isoformat()
+        config["entry_attempts"] = attempts
+        self.store.update_funding_capture_position_config(capture_id, config, decision_at)
+
+    def _mark_entry_attempt_terminal(
+        self,
+        *,
+        capture_id: str,
+        attempt_id: str,
+        state: str,
+        now: datetime,
+        reason: str | None = None,
+    ) -> None:
+        position = self.store.funding_capture_position_by_id(capture_id)
+        if position is None:
+            return
+        config = dict(position.get("config") or {})
+        config["entry_attempt_state"] = state
+        if reason:
+            config["entry_attempt_terminal_reason"] = reason
+        attempts = []
+        for attempt in list(config.get("entry_attempts") or []):
+            item = dict(attempt)
+            if item.get("attempt_id") == attempt_id:
+                item["state"] = state
+                item["terminal_at"] = now.astimezone(UTC).isoformat()
+                if reason:
+                    item["reason"] = reason
+            attempts.append(item)
+        config["entry_attempts"] = attempts
+        self.store.update_funding_capture_position_config(capture_id, config, now)
 
     def _ensure_discovered_or_armed(
         self,
@@ -1236,11 +1483,17 @@ class SynchronizedFundingRuntimeV2:
         route_key = str(route.get("route_key") or "")
         resolved_cycle_id = cycle_id or f"{capture_id}:1"
         observation_phase = phase or observation.get("phase") or "entry"
-        bucket = _observation_bucket(route_key, observation_phase, resolved_cycle_id)
+        bucket_key = route_entry_key(route) if observation_phase == "entry" else route_key
+        bucket = _observation_bucket(bucket_key, observation_phase, resolved_cycle_id)
         observations = self.observations_by_route.setdefault(bucket, [])
         observations.append(observation)
-        if len(observations) > 120:
-            del observations[:-120]
+        self._cleanup_observation_bucket(
+            bucket,
+            now=parse_time(observation.get("observed_at")) or self.clock.now(),
+            settlement_at=settlement_at,
+            phase=observation_phase,
+        )
+        observations = self.observations_by_route.setdefault(bucket, [])
         self.store.upsert_funding_capture_observation(
             {
                 **observation,
@@ -1253,20 +1506,60 @@ class SynchronizedFundingRuntimeV2:
 
     def _valid_observations(
         self,
-        route_key: str,
+        route: dict[str, Any],
         now: datetime,
         *,
         phase: str,
         cycle_id: str,
     ) -> list[dict[str, Any]]:
-        bucket = _observation_bucket(route_key, phase, cycle_id)
+        bucket_key = route_entry_key(route) if phase == "entry" else str(route.get("route_key") or "")
+        bucket = _observation_bucket(bucket_key, phase, cycle_id)
         valid = []
         for row in self.observations_by_route.get(bucket, []):
             if str(row.get("phase") or phase) != phase:
                 continue
+            if not _observation_timestamp_match(row, route):
+                continue
             if validate_focused_observation(row, now=now)["valid"]:
                 valid.append(row)
         return valid
+
+    def _cleanup_observation_bucket(
+        self,
+        bucket: str,
+        *,
+        now: datetime,
+        settlement_at: datetime,
+        phase: str,
+    ) -> None:
+        observations = self.observations_by_route.get(bucket)
+        if not observations:
+            return
+        now_utc = now.astimezone(UTC)
+        settlement_utc = settlement_at.astimezone(UTC)
+        cleaned: list[dict[str, Any]] = []
+        for row in observations:
+            observed_at = parse_time(row.get("observed_at"))
+            if observed_at is None:
+                continue
+            age = (now_utc - observed_at.astimezone(UTC)).total_seconds()
+            if age > ENTRY_OBSERVATION_TTL_SECONDS:
+                continue
+            if phase == "entry" and observed_at.astimezone(UTC) > settlement_utc:
+                continue
+            cleaned.append(row)
+        if len(cleaned) > 120:
+            cleaned = cleaned[-120:]
+        self.observations_by_route[bucket] = cleaned
+
+    def close_entry_observation_bucket(
+        self,
+        route: dict[str, Any],
+        *,
+        capture_id: str,
+    ) -> None:
+        bucket = _observation_bucket(route_entry_key(route), "entry", f"{capture_id}:1")
+        self.observations_by_route.pop(bucket, None)
 
     def _initial_economics(
         self,
@@ -1486,7 +1779,13 @@ class SynchronizedFundingRuntimeV2:
                 }
         return {"passed": True, "reason": None}
 
-    def _reserve_collateral(self, capture_id: str, route: dict[str, Any]) -> None:
+    def _reserve_collateral(
+        self,
+        capture_id: str,
+        route: dict[str, Any],
+        *,
+        attempt_id: str | None = None,
+    ) -> None:
         legs = route.get("legs") or []
         leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
         reserve_fraction = float(getattr(self.config, "collateral_reserve_fraction", 0.25))
@@ -1500,7 +1799,7 @@ class SynchronizedFundingRuntimeV2:
             if leg_notional <= 0:
                 continue
             amount = leg_notional / leverage + leg_notional * reserve_fraction
-            event_key = collateral_reserve_event_key(capture_id, venue)
+            event_key = collateral_reserve_event_key(capture_id, venue, attempt_id=attempt_id)
             reserved = self._record_ledger_entry(
                 make_ledger_entry(
                     event_key,
@@ -1508,25 +1807,37 @@ class SynchronizedFundingRuntimeV2:
                     venue=venue,
                     event_type="collateral_reserve",
                     cash_delta=0.0,
-                    payload={"amount": amount},
+                    payload={"amount": amount, "attempt_id": attempt_id},
                 )
             )
             if reserved is not None:
                 self.store.update_funding_paper_account_reserved(venue, amount)
 
-    def _release_collateral(self, capture_id: str, route: dict[str, Any]) -> None:
+    def _release_collateral(
+        self,
+        capture_id: str,
+        route: dict[str, Any],
+        *,
+        attempt_id: str | None = None,
+    ) -> None:
         legs = route.get("legs") or []
         for leg in legs:
             venue = str(leg.get("venue") or "")
             if not venue:
                 continue
-            reserve_key = collateral_reserve_event_key(capture_id, venue)
-            release_key = collateral_release_event_key(capture_id, venue)
+            reserve_key = collateral_reserve_event_key(capture_id, venue, attempt_id=attempt_id)
+            release_key = collateral_release_event_key(capture_id, venue, attempt_id=attempt_id)
             existing_reserve = self.store.paper_event_ledger_rows(capture_id)
             reserve_row = next(
                 (row for row in existing_reserve if row["event_key"] == reserve_key),
                 None,
             )
+            if reserve_row is None and attempt_id is not None:
+                legacy_key = collateral_reserve_event_key(capture_id, venue)
+                reserve_row = next(
+                    (row for row in existing_reserve if row["event_key"] == legacy_key),
+                    None,
+                )
             if reserve_row is None:
                 continue
             already_released = any(r["event_key"] == release_key for r in existing_reserve)
@@ -1542,7 +1853,7 @@ class SynchronizedFundingRuntimeV2:
                     venue=venue,
                     event_type="collateral_release",
                     cash_delta=0.0,
-                    payload={"amount": amount},
+                    payload={"amount": amount, "attempt_id": attempt_id},
                 )
             )
             if released is not None:
@@ -1627,8 +1938,16 @@ class SynchronizedFundingRuntimeV2:
                     "long_entry_price": 0.0, "short_entry_price": 0.0, "paper_open_fees": 0.0,
                     "filled_at": decision_at.isoformat(), "deadline_ok": False,
                     "long_fill_ratio": 0.0, "short_fill_ratio": 0.0, "quantity_mismatch_fraction": 0.0}
+        attempt_id = self._new_attempt_id(capture_id, decision_at)
+        self._mark_entry_attempt_submitted(
+            capture_id=capture_id,
+            route=route,
+            attempt_id=attempt_id,
+            settlement_at=settlement_at,
+            decision_at=decision_at,
+        )
         self.store.update_funding_capture_position_state(capture_id, "ENTRY_SUBMITTED", decision_at)
-        self._reserve_collateral(capture_id, route)
+        self._reserve_collateral(capture_id, route, attempt_id=attempt_id)
         submitted_at = decision_at + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
         deadline_ok = t20_deadline_passed(filled_at, settlement_at, self.config.entry_fill_deadline_lead_seconds)
@@ -1649,7 +1968,7 @@ class SynchronizedFundingRuntimeV2:
             ("long", long_leg, long_fill, long_fee),
             ("short", short_leg, short_fill, short_fee),
         ):
-            order_id = f"{capture_id}:entry:{side}"
+            order_id = f"{attempt_id}:entry:{side}"
             self.store.upsert_funding_paper_order(
                 {
                     "paper_order_id": order_id,
@@ -1667,7 +1986,7 @@ class SynchronizedFundingRuntimeV2:
                     "average_fill_price": fill["average_fill_price"],
                     "fee": fee,
                     "state": "FILLED" if fill["unfilled_quantity"] <= 1e-12 else "PARTIALLY_FILLED",
-                    "payload": fill,
+                    "payload": {**fill, "attempt_id": attempt_id},
                 }
             )
             self._record_ledger_entry(
@@ -1678,7 +1997,7 @@ class SynchronizedFundingRuntimeV2:
                     venue=leg.get("venue"),
                     event_type="order_fee",
                     cash_delta=-fee,
-                    payload={"order_id": order_id},
+                    payload={"order_id": order_id, "attempt_id": attempt_id},
                 )
             )
         if state in ("PARTIALLY_HEDGED", "FAILED") and (long_fill["filled_quantity"] > 0 or short_fill["filled_quantity"] > 0):
@@ -1693,9 +2012,18 @@ class SynchronizedFundingRuntimeV2:
                 short_fee=short_fee,
                 decision_at=decision_at,
                 now=filled_at,
+                attempt_id=attempt_id,
+            )
+            self._mark_entry_attempt_terminal(
+                capture_id=capture_id,
+                attempt_id=attempt_id,
+                state="REJECTED_AFTER_SUBMISSION",
+                now=filled_at,
+                reason="partial_or_late_fill_unwound",
             )
             return {
                 "state": "FAILED",
+                "attempt_id": attempt_id,
                 "quantity": 0.0,
                 "target_quantity": q,
                 "long_entry_price": long_fill["average_fill_price"],
@@ -1707,7 +2035,14 @@ class SynchronizedFundingRuntimeV2:
                 **fill_state,
             }
         if state == "FAILED":
-            self._release_collateral(capture_id, route)
+            self._release_collateral(capture_id, route, attempt_id=attempt_id)
+            self._mark_entry_attempt_terminal(
+                capture_id=capture_id,
+                attempt_id=attempt_id,
+                state="FAILED",
+                now=filled_at,
+                reason="entry_fill_failed",
+            )
             self.store.update_funding_capture_position_state(
                 capture_id,
                 "FAILED",
@@ -1719,6 +2054,7 @@ class SynchronizedFundingRuntimeV2:
             )
         return {
             "state": state,
+            "attempt_id": attempt_id,
             "quantity": min(long_fill["filled_quantity"], short_fill["filled_quantity"]),
             "target_quantity": q,
             "long_entry_price": long_fill["average_fill_price"],
@@ -1741,6 +2077,7 @@ class SynchronizedFundingRuntimeV2:
         short_fee: float,
         decision_at: datetime,
         now: datetime,
+        attempt_id: str,
     ) -> dict[str, Any]:
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
@@ -1769,7 +2106,7 @@ class SynchronizedFundingRuntimeV2:
         ):
             if qty <= 0:
                 continue
-            order_id = f"{capture_id}:unwind:{side}"
+            order_id = f"{attempt_id}:unwind:{side}"
             self.store.upsert_funding_paper_order(
                 {
                     "paper_order_id": order_id,
@@ -1788,6 +2125,7 @@ class SynchronizedFundingRuntimeV2:
                     "fee": fee,
                     "state": "FILLED",
                     "payload": {
+                        "attempt_id": attempt_id,
                         "adverse_penalty_bps": 100.0,
                         "adverse_price_impact_bps": 100.0,
                         "adverse_price_impact_usd": (
@@ -1805,7 +2143,7 @@ class SynchronizedFundingRuntimeV2:
                     venue=leg.get("venue"),
                     event_type="order_fee",
                     cash_delta=-fee,
-                    payload={"order_id": order_id, "intent": "unwind"},
+                    payload={"order_id": order_id, "intent": "unwind", "attempt_id": attempt_id},
                 )
             )
         self._record_price_pnl_entries(
@@ -1815,6 +2153,7 @@ class SynchronizedFundingRuntimeV2:
             short_venue=str(short_leg.get("venue") or ""),
             long_price_pnl=long_price_pnl,
             short_price_pnl=short_price_pnl,
+            attempt_id=attempt_id,
             payload={
                 "reason": "partial_entry_unwind",
                 "pricing_quality": "partial_entry_unwind_100bps",
@@ -1824,7 +2163,7 @@ class SynchronizedFundingRuntimeV2:
         )
         self._record_ledger_entry(
             make_ledger_entry(
-                f"emergency_unwind:{capture_id}:partial_entry:diagnostic",
+                f"emergency_unwind:{attempt_id}:partial_entry:diagnostic",
                 position_id=capture_id,
                 cycle_id=cycle_id,
                 venue=str(long_leg.get("venue") or short_leg.get("venue") or ""),
@@ -1836,10 +2175,11 @@ class SynchronizedFundingRuntimeV2:
                     "adverse_price_impact_bps": 100.0,
                     "adverse_price_impact_usd": adverse_impact_usd,
                     "cash_cost_policy": "penalty_in_fill_price_once",
+                    "attempt_id": attempt_id,
                 },
             )
         )
-        self._release_collateral(capture_id, route)
+        self._release_collateral(capture_id, route, attempt_id=attempt_id)
         self.store.update_funding_capture_position_state(
             capture_id,
             "FAILED",
@@ -1877,6 +2217,9 @@ class SynchronizedFundingRuntimeV2:
         short_leg = dict(leg_by_side(legs, "short") or {})
         long_leg["entry_fill_price"] = execution["long_entry_price"]
         short_leg["entry_fill_price"] = execution["short_entry_price"]
+        attempt_id = str(execution.get("attempt_id") or "")
+        existing = self.store.funding_capture_position_by_id(capture_id) or {}
+        existing_config = dict(existing.get("config") or {})
         self.store.upsert_funding_capture_position(
             {
                 "position_id": capture_id,
@@ -1895,6 +2238,12 @@ class SynchronizedFundingRuntimeV2:
                 "paper_open_fees": float(execution["paper_open_fees"]),
                 "paper_net_pnl_estimated": economics.get("initial_expected_net_pnl"),
                 "config": {
+                    **existing_config,
+                    "opportunity_id": capture_id,
+                    "attempt_id": attempt_id,
+                    "entry_attempt_id": attempt_id,
+                    "entry_attempt_submitted": True,
+                    "entry_attempt_state": "OPEN",
                     "route_key": route.get("route_key"),
                     "route_entry_key": route_entry_key(route),
                     "entry_legs": [long_leg, short_leg],
@@ -1979,11 +2328,51 @@ class SynchronizedFundingRuntimeV2:
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
+        long_response = _leg_response_time(long_leg)
+        short_response = _leg_response_time(short_leg)
+        now_utc = now.astimezone(UTC)
+        long_age = (
+            (now_utc - long_response).total_seconds()
+            if long_response is not None
+            else math.inf
+        )
+        short_age = (
+            (now_utc - short_response).total_seconds()
+            if short_response is not None
+            else math.inf
+        )
+        cross_skew = (
+            abs((long_response - short_response).total_seconds())
+            if long_response is not None and short_response is not None
+            else math.inf
+        )
+        long_next = parse_time(long_leg.get("next_funding_at"))
+        short_next = parse_time(short_leg.get("next_funding_at"))
+        timestamps_aligned = settlement_alignment_passed(long_next, short_next)
+        targeted = (route.get("evidence") or {}).get("targeted_refresh") or {}
+        snapshot_id = targeted.get("snapshot_id")
+        fresh = (
+            long_age <= 2.0
+            and short_age <= 2.0
+            and cross_skew <= 1.0
+            and optional_float(long_leg.get("normalized_next_funding_rate")) is not None
+            and optional_float(short_leg.get("normalized_next_funding_rate")) is not None
+            and timestamps_aligned
+            and targeted.get("quality") == "FRESH"
+            and bool(snapshot_id)
+        )
         probe = {
             "observed_at": now.astimezone(UTC).isoformat(),
             "long_next_funding_at": long_leg.get("next_funding_at"),
             "short_next_funding_at": short_leg.get("next_funding_at"),
-            "fresh": True,
+            "fresh": fresh,
+            "long_response_age_seconds": long_age,
+            "short_response_age_seconds": short_age,
+            "cross_venue_skew_seconds": cross_skew,
+            "route_snapshot_id": snapshot_id,
+            "invalid_reason": None
+            if fresh
+            else "schedule_probe_not_fresh_targeted_snapshot",
         }
         probe_state = self._probe_state(position)
         probes = list(probe_state.get("probes") or [])
@@ -2094,6 +2483,45 @@ class SynchronizedFundingRuntimeV2:
                 continue
             changes.append(max(0.0, (current_spread - previous_spread) / reference * 10_000.0))
         return changes
+
+    def _p95_abs_mark_return_1s_from_observations(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> float | None:
+        dated: list[tuple[datetime, float, float]] = []
+        for row in observations:
+            observed_at = parse_time(row.get("observed_at"))
+            long_mark = optional_float(row.get("long_mark"))
+            short_mark = optional_float(row.get("short_mark"))
+            if (
+                observed_at is None
+                or long_mark is None
+                or short_mark is None
+                or long_mark <= 0
+                or short_mark <= 0
+            ):
+                continue
+            dated.append((observed_at.astimezone(UTC), float(long_mark), float(short_mark)))
+        dated.sort(key=lambda item: item[0])
+        values: list[float] = []
+        for idx, (current_time, current_long, current_short) in enumerate(dated):
+            previous_candidates = [
+                item
+                for item in dated[:idx]
+                if (current_time - item[0]).total_seconds() >= 1.0
+            ]
+            if not previous_candidates:
+                continue
+            previous_time, previous_long, previous_short = previous_candidates[-1]
+            if (current_time - previous_time).total_seconds() > 2.0:
+                continue
+            long_return = abs(current_long / previous_long - 1.0) * 10_000.0
+            short_return = abs(current_short / previous_short - 1.0) * 10_000.0
+            values.append(max(long_return, short_return))
+        if len(values) < 10:
+            return None
+        from smart_money_radar.funding.strategy_synchronized_funding import percentile_95
+        return percentile_95(values)
 
     def next_cycle_hold_or_close_decision(
         self,
@@ -2222,12 +2650,11 @@ class SynchronizedFundingRuntimeV2:
                 "seconds_after_settlement": seconds_after,
             }
 
-        route_key = str((position.get("config") or {}).get("route_key") or route.get("route_key") or "")
         cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
         long_leg = leg_by_side(route.get("legs") or [], "long") or {}
         short_leg = leg_by_side(route.get("legs") or [], "short") or {}
 
-        observations = self._valid_observations(route_key, now, phase="hold", cycle_id=cycle_id)
+        observations = self._valid_observations(route, now, phase="hold", cycle_id=cycle_id)
         observation_decision = next_cycle_observation_decision(observations=observations, now=now)
         if not observation_decision["eligible"]:
             return {
@@ -2254,7 +2681,7 @@ class SynchronizedFundingRuntimeV2:
         if entry_basis_reserve_bps <= 0:
             entry_basis_reserve_bps = 30.0
         adverse_basis_changes = self._adverse_basis_changes_from_observations(observations)
-        p95_mark_return = None
+        p95_mark_return = self._p95_abs_mark_return_1s_from_observations(observations)
         wait_seconds = float(
             probe_decision.get("seconds_to_next_cycle")
             or schedule_seconds_to_next(probe_decision, now)
@@ -2387,6 +2814,7 @@ class SynchronizedFundingRuntimeV2:
     ) -> dict[str, Any]:
         position_id = str(position["position_id"])
         cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
+        attempt_id = _position_attempt_id(position)
         quantity = float(position.get("quantity") or 0.0)
         route_legs = route.get("legs") if route else None
         long_route_leg = leg_by_side(route_legs or [], "long") or {}
@@ -2465,7 +2893,7 @@ class SynchronizedFundingRuntimeV2:
             ("long", long_route_leg or long_entry_leg, long_exit, long_fee),
             ("short", short_route_leg or short_entry_leg, short_exit, short_fee),
         ):
-            order_id = f"{position_id}:exit:{cycle_id}:{side}"
+            order_id = f"{attempt_id or position_id}:exit:{cycle_id}:{side}"
             self.store.upsert_funding_paper_order(
                 {
                     "paper_order_id": order_id,
@@ -2483,7 +2911,7 @@ class SynchronizedFundingRuntimeV2:
                     "average_fill_price": fill["average_fill_price"],
                     "fee": fee,
                     "state": "FILLED" if fill["unfilled_quantity"] <= 1e-12 else "PARTIALLY_FILLED",
-                    "payload": fill,
+                    "payload": {**fill, "attempt_id": attempt_id},
                 }
             )
             self._record_ledger_entry(
@@ -2494,7 +2922,7 @@ class SynchronizedFundingRuntimeV2:
                     venue=leg.get("venue"),
                     event_type="order_fee",
                     cash_delta=-fee,
-                    payload={"order_id": order_id, "reason": reason},
+                    payload={"order_id": order_id, "reason": reason, "attempt_id": attempt_id},
                 )
             )
 
@@ -2579,7 +3007,7 @@ class SynchronizedFundingRuntimeV2:
                     "residual_side": side,
                     "pricing_quality": diagnostic.get("pricing_quality"),
                 }
-            residual_order_id = f"{position_id}:residual:{cycle_id}:{side}"
+            residual_order_id = f"{attempt_id or position_id}:residual:{cycle_id}:{side}"
             residual_notional = residual_qty * price
             residual_fee = residual_notional * fee_rate
             self.store.upsert_funding_paper_order(
@@ -2604,6 +3032,7 @@ class SynchronizedFundingRuntimeV2:
                         "reason": reason,
                         "residual_quantity": residual_qty,
                         "cash_cost_policy": "penalty_in_fill_price_once",
+                        "attempt_id": attempt_id,
                     },
                 }
             )
@@ -2615,7 +3044,12 @@ class SynchronizedFundingRuntimeV2:
                     venue=leg.get("venue"),
                     event_type="order_fee",
                     cash_delta=-residual_fee,
-                    payload={"order_id": residual_order_id, "reason": reason, "intent": "residual_unwind"},
+                    payload={
+                        "order_id": residual_order_id,
+                        "reason": reason,
+                        "intent": "residual_unwind",
+                        "attempt_id": attempt_id,
+                    },
                 )
             )
             close_fees_by_side[side] += residual_fee
@@ -2670,6 +3104,7 @@ class SynchronizedFundingRuntimeV2:
             short_venue=str((short_route_leg or short_entry_leg).get("venue") or ""),
             long_price_pnl=long_price_pnl,
             short_price_pnl=short_price_pnl,
+            attempt_id=attempt_id,
             payload={
                 "reason": reason,
                 "pricing_quality": pricing_quality,
@@ -2680,7 +3115,7 @@ class SynchronizedFundingRuntimeV2:
         if emergency or residual_diagnostics:
             self._record_ledger_entry(
                 make_ledger_entry(
-                    f"emergency_unwind:{position_id}:close:diagnostic",
+                    f"emergency_unwind:{attempt_id or position_id}:close:diagnostic",
                     position_id=position_id,
                     cycle_id=cycle_id,
                     venue=str((long_route_leg or long_entry_leg).get("venue") or ""),
@@ -2691,10 +3126,11 @@ class SynchronizedFundingRuntimeV2:
                         "pricing_quality": pricing_quality,
                         "residual_diagnostics": residual_diagnostics,
                         "cash_cost_policy": "penalty_in_fill_price_once",
+                        "attempt_id": attempt_id,
                     },
                 )
             )
-        self._release_collateral(position_id, route or {"legs": entry_legs})
+        self._release_collateral(position_id, route or {"legs": entry_legs}, attempt_id=attempt_id)
         final_state = "CLOSED_PENDING_RECONCILIATION"
         self.store.update_funding_capture_position_state(
             position_id,
@@ -2705,6 +3141,14 @@ class SynchronizedFundingRuntimeV2:
             paper_emergency_unwind_cost=emergency_cost,
             paper_net_pnl_estimated=pnl["paper_net_if_exit_now"],
         )
+        if attempt_id:
+            self._mark_entry_attempt_terminal(
+                capture_id=position_id,
+                attempt_id=attempt_id,
+                state="CLOSED",
+                now=now,
+                reason=reason,
+            )
         return {
             "decision": "closed",
             "reason": reason,

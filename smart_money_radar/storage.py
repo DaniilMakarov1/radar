@@ -6555,13 +6555,20 @@ class SQLiteStore:
         prepared_rows: list[tuple[Any, ...]] = []
         for row in rows:
             raw_payload = dict(row.get("raw", {}) or {})
-            raw_payload.setdefault(
-                "rate_semantics",
+            explicit_semantics = (
                 row.get("rate_semantics")
+                or row.get("funding_rate_semantics")
                 or raw_payload.get("rate_semantics")
                 or raw_payload.get("funding_rate_semantics")
-                or "realized_settlement",
             )
+            raw_payload["rate_semantics"] = str(explicit_semantics or "unclear")
+            explicit_source = (
+                row.get("rate_semantics_source")
+                or row.get("funding_rate_semantics_source")
+                or raw_payload.get("rate_semantics_source")
+                or raw_payload.get("funding_rate_semantics_source")
+            )
+            raw_payload["rate_semantics_source"] = str(explicit_source or "unknown")
             prepared_rows.append(
                 (
                     row["venue"],
@@ -8338,15 +8345,81 @@ class SQLiteStore:
                     """
                 ).fetchone()
             )
+            v2_rows = connection.execute(
+                """
+                SELECT p.*, p.config_json
+                FROM funding_capture_positions p
+                WHERE p.state IN (
+                    'OPEN', 'SETTLEMENT_CROSSED', 'POST_SETTLEMENT_EVALUATION',
+                    'HOLDING_NEXT_CYCLE', 'EXIT_SCHEDULED', 'EXIT_SUBMITTED',
+                    'PARTIALLY_CLOSED', 'EMERGENCY_UNWIND'
+                )
+                """
+            ).fetchall()
+            v2_unrealized_price_pnl = 0.0
+            v2_estimated_close_fees = 0.0
+            v2_net_liquidation_pnl = 0.0
+            v2_confirmed_funding_pnl = 0.0
+            v2_last_valid_net_liquidation_pnl = 0.0
+            equity_quality = "FRESH"
+            for raw_position in v2_rows:
+                position = dict(raw_position)
+                config = json.loads(position.get("config_json") or "{}")
+                data_quality = config.get("data_quality") or {}
+                snapshot = config.get("last_valid_executable_snapshot") or {}
+                if data_quality.get("state") != "HEALTHY" or not snapshot:
+                    equity_quality = "INVALID_STALE"
+                    last_value = snapshot.get("paper_price_pnl")
+                    close_fees = snapshot.get("paper_close_fees")
+                    if last_value is not None and close_fees is not None:
+                        v2_last_valid_net_liquidation_pnl += (
+                            float(last_value) - float(close_fees)
+                        )
+                    continue
+                observed = _parse_iso_datetime(snapshot.get("observed_at"))
+                now_dt = _parse_iso_datetime(now) or datetime.now(UTC)
+                if observed is None or (now_dt - observed).total_seconds() > 2.0:
+                    equity_quality = "INVALID_STALE"
+                    if snapshot.get("paper_price_pnl") is not None and snapshot.get("paper_close_fees") is not None:
+                        v2_last_valid_net_liquidation_pnl += (
+                            float(snapshot["paper_price_pnl"])
+                            - float(snapshot["paper_close_fees"])
+                        )
+                    continue
+                price_pnl = float(snapshot.get("paper_price_pnl") or 0.0)
+                close_fees = float(snapshot.get("paper_close_fees") or 0.0)
+                v2_unrealized_price_pnl += price_pnl
+                v2_estimated_close_fees += close_fees
+                v2_net_liquidation_pnl += price_pnl - close_fees
+                v2_confirmed_funding_pnl += float(
+                    snapshot.get("paper_confirmed_funding_pnl") or 0.0
+                )
+            legacy_open_count = int(counts["open_position_count"] or 0)
+            v2_open_count = len(v2_rows)
+            total_cash = float(account["total_cash"] or 0.0)
+            total_reserved_margin = float(account["total_reserved_margin"] or 0.0)
             snapshot = {
                 "observed_at": now,
-                "total_cash": float(account["total_cash"] or 0.0),
-                "total_reserved_margin": float(
-                    account["total_reserved_margin"] or 0.0
-                ),
-                "total_equity": float(account["total_cash"] or 0.0),
+                "legacy_open_position_count": legacy_open_count,
+                "v2_open_position_count": v2_open_count,
+                "total_open_position_count": legacy_open_count + v2_open_count,
+                "total_cash": total_cash,
+                "total_reserved_margin": total_reserved_margin,
+                "available_cash": total_cash - total_reserved_margin,
+                "v2_unrealized_price_pnl": v2_unrealized_price_pnl,
+                "v2_estimated_close_fees": v2_estimated_close_fees,
+                "v2_net_liquidation_pnl": v2_net_liquidation_pnl
+                if equity_quality == "FRESH"
+                else None,
+                "v2_last_valid_net_liquidation_pnl": v2_last_valid_net_liquidation_pnl
+                if equity_quality == "INVALID_STALE"
+                else None,
+                "v2_confirmed_funding_pnl": v2_confirmed_funding_pnl,
+                "total_equity": total_cash
+                + (v2_net_liquidation_pnl if equity_quality == "FRESH" else 0.0),
+                "equity_quality": equity_quality,
                 "realized_pnl": float(account["realized_pnl"] or 0.0),
-                "open_position_count": int(counts["open_position_count"] or 0),
+                "open_position_count": legacy_open_count + v2_open_count,
                 "closed_position_count": int(counts["closed_position_count"] or 0),
             }
             connection.execute(

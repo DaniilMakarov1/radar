@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+from smart_money_radar.funding.trader import CaptureRouteRefreshResult, PaperBot, PaperBotConfig
 from smart_money_radar.paper_bot.accounting import (
     collateral_reserve_event_key,
     funding_event_key,
@@ -86,7 +86,10 @@ def _seed_instrument(store, venue="binance", symbol="BTCUSDT", canonical_asset="
             "contract_multiplier": 1.0,
             "status": "trading",
             "observed_at": NOW_BEFORE.isoformat(),
-            "raw": {},
+            "raw": {
+                "rate_semantics": "realized_settlement",
+                "rate_semantics_source": "adapter_explicit",
+            },
         }
     ])
 
@@ -607,7 +610,10 @@ def test_stored_provider_uses_funding_history_and_market_snapshots(tmp_path):
             "hourly_funding_rate": 0.001 / 8.0,
             "mark_price": 100.0,
             "observed_at": SCHEDULED,
-            "raw": {},
+            "raw": {
+                "rate_semantics": "realized_settlement",
+                "rate_semantics_source": "adapter_explicit",
+            },
         }
     ])
     scan_id = store.start_funding_scan({"scan_mode": "test"})
@@ -774,6 +780,20 @@ def test_open_position_poll_records_current_executable_pnl(tmp_path):
             },
         ],
     }
+    refreshed_route = {
+        **bot.hot_routes[route_key],
+        "evidence": {
+            "targeted_refresh": {
+                "quality": "FRESH",
+                "snapshot_id": "test-current-pnl-refresh",
+            }
+        },
+    }
+    bot.refresh_open_capture_route = lambda position, now: CaptureRouteRefreshResult(
+        quality="FRESH",
+        route=refreshed_route,
+        snapshot_id="test-current-pnl-refresh",
+    )
     outcomes = bot.process_synchronized_open_positions()
     assert outcomes == []
     position = store.funding_capture_position_by_id(pid)

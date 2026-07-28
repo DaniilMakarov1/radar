@@ -14,6 +14,10 @@ RECONCILIATION_STATES = (
 
 RECONCILIATION_TOLERANCE_SECONDS = 120.0
 REALIZED_FUNDING_RATE_SEMANTICS = {"realized_settlement", "account_transaction"}
+REALIZED_FUNDING_RATE_SOURCES = {
+    ("realized_settlement", "adapter_explicit"),
+    ("account_transaction", "account_ledger"),
+}
 
 
 def settlement_reconciliation_key(position_id: Any, venue: str, scheduled_funding_at: str) -> tuple[Any, str, str]:
@@ -89,11 +93,26 @@ def funding_rate_semantics(event: dict[str, Any] | None) -> str:
     )
 
 
+def funding_rate_semantics_source(event: dict[str, Any] | None) -> str:
+    if not event:
+        return "unknown"
+    raw = _raw_payload(event)
+    return str(
+        event.get("rate_semantics_source")
+        or event.get("funding_rate_semantics_source")
+        or raw.get("rate_semantics_source")
+        or raw.get("funding_rate_semantics_source")
+        or "unknown"
+    )
+
+
 def realized_public_funding_rate(event: dict[str, Any] | None) -> float | None:
     """Return a cashflow-eligible realized funding rate, preserving valid zero."""
     if event is None:
         return None
-    if funding_rate_semantics(event) not in REALIZED_FUNDING_RATE_SEMANTICS:
+    semantics = funding_rate_semantics(event)
+    source = funding_rate_semantics_source(event)
+    if (semantics, source) not in REALIZED_FUNDING_RATE_SOURCES:
         return None
     if "funding_rate" not in event or event.get("funding_rate") is None:
         return None
@@ -286,7 +305,8 @@ class StoredFundingSettlementDataProvider:
         target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
         for row in rows:
             semantics = funding_rate_semantics(row)
-            if semantics not in REALIZED_FUNDING_RATE_SEMANTICS:
+            semantics_source = funding_rate_semantics_source(row)
+            if (semantics, semantics_source) not in REALIZED_FUNDING_RATE_SOURCES:
                 continue
             rate = _optional_float(row.get("funding_rate"))
             if rate is None:
@@ -306,6 +326,7 @@ class StoredFundingSettlementDataProvider:
                 best = {
                     "funding_rate": rate,
                     "rate_semantics": semantics,
+                    "rate_semantics_source": semantics_source,
                     "published_at": published_at.isoformat(),
                     "skew_seconds": skew,
                     "source": "funding_rate_history",
@@ -427,9 +448,13 @@ class FakeFundingSettlementDataProvider:
                 best_skew = skew
                 rate = _optional_float(event.get("funding_rate"))
                 semantics = str(event.get("rate_semantics") or "realized_settlement")
+                semantics_source = str(
+                    event.get("rate_semantics_source") or "adapter_explicit"
+                )
                 best = {
                     "funding_rate": rate,
                     "rate_semantics": semantics,
+                    "rate_semantics_source": semantics_source,
                     "published_at": event_time.isoformat(),
                     "skew_seconds": skew,
                 }

@@ -1595,22 +1595,28 @@ def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) ->
 
 
 def test_next_sleep_uses_three_speed_monitoring(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
     trader = PaperBot(
-        SQLiteStore(tmp_path / "radar.sqlite"),
+        store,
         config=PaperBotConfig(
             scan_interval_seconds=300,
             monitor_interval_seconds=120,
             hot_interval_seconds=6,
         ),
     )
+    trader._last_lightweight_discovery_monotonic = trader.clock.monotonic()
+    trader.last_full_scan_monotonic = trader.clock.monotonic()
 
-    assert trader.next_sleep_seconds({"hot_route_count": 0}) == 300
+    assert trader.next_sleep_seconds({"hot_route_count": 0}) <= 30
+    assert trader.next_sleep_seconds({"hot_route_count": 0}) == pytest.approx(30, abs=0.01)
     assert trader.next_sleep_seconds({"hot_route_count": 1}) == 120
     assert (
         trader.next_sleep_seconds({"hot_route_count": 1, "urgent_route_count": 1})
         == 6
     )
-    assert trader.next_sleep_seconds({"pending_count": 1}) == 6
+    trader.last_reconciliation_monotonic = trader.clock.monotonic() - 4
+    assert trader.next_sleep_seconds({"pending_count": 1}) == pytest.approx(6, abs=0.01)
     assert trader.next_sleep_seconds({"open_position_count": 1}) == 6
 
 
@@ -2038,6 +2044,8 @@ class LightweightFundingClient:
             "collateral_asset": "USDT",
             "contract_type": "linear_perpetual",
             "contract_kind": "linear_perpetual",
+            "supports_perpetuals": True,
+            "is_linear_contract": True,
             "supports_discrete_funding": True,
             "contract_multiplier": 0.01,
             "status": "active",
@@ -2063,6 +2071,16 @@ class LightweightFundingClient:
             "quantity_step": 0.01,
             "min_notional_usd": 5.0,
             "taker_fee_rate": 0.0005,
+            "contract_kind": "linear_perpetual",
+            "supports_perpetuals": True,
+            "is_linear_contract": True,
+            "supports_discrete_funding": True,
+            "collateral_asset": "USDT",
+            "quote_asset": "USDT",
+            "position_inclusion_rule": "perp_position_at_settlement",
+            "entry_safety_buffer_seconds": 20,
+            "exit_safety_buffer_seconds": 20,
+            "timing_policy_source": f"adapter_{self.venue}_test",
             "observed_at": observed_at,
         }
         return [instrument], [market], []

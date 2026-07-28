@@ -62,26 +62,47 @@ def order_fee_event_key(order_id: str) -> str:
     return f"order_fee:{order_id}"
 
 
-def price_pnl_event_key(position_id: str, venue: str | None = None) -> str:
+def price_pnl_event_key(
+    position_id: str,
+    venue: str | None = None,
+    *,
+    attempt_id: str | None = None,
+) -> str:
+    identity = str(attempt_id or position_id)
     if venue:
-        return f"price_pnl:{position_id}:{venue}:close"
-    return f"price_pnl:{position_id}:close"
+        return f"price_pnl:{identity}:{venue}:close"
+    return f"price_pnl:{identity}:close"
 
 
-def collateral_reserve_event_key(position_id: str, venue: str) -> str:
-    return f"collateral_reserve:{position_id}:{venue}"
+def collateral_reserve_event_key(
+    position_id: str,
+    venue: str,
+    *,
+    attempt_id: str | None = None,
+) -> str:
+    identity = str(attempt_id or position_id)
+    return f"collateral_reserve:{identity}:{venue}"
 
 
-def collateral_release_event_key(position_id: str, venue: str) -> str:
-    return f"collateral_release:{position_id}:{venue}"
+def collateral_release_event_key(
+    position_id: str,
+    venue: str,
+    *,
+    attempt_id: str | None = None,
+) -> str:
+    identity = str(attempt_id or position_id)
+    return f"collateral_release:{identity}:{venue}"
 
 
 def funding_event_key(
     position_id: str,
     venue: str,
     scheduled_funding_at: str,
+    *,
+    attempt_id: str | None = None,
 ) -> str:
-    return f"funding:{position_id}:{venue}:{scheduled_funding_at}"
+    identity = str(attempt_id or position_id)
+    return f"funding:{identity}:{venue}:{scheduled_funding_at}"
 
 
 def make_ledger_entry(

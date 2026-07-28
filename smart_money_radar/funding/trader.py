@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import signal
 import sqlite3
 import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
@@ -69,6 +70,7 @@ from smart_money_radar.funding.service import (
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
     gross_funding_pnl,
+    settlement_alignment_passed,
     settlement_skew_seconds,
 )
 from smart_money_radar.funding.venue_capabilities import (
@@ -173,6 +175,30 @@ from smart_money_radar.paper_bot.telegram import (
 
 FUNDING_HISTORY_MIN_ROWS_PER_MARKET = 24
 FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
+OPEN_CAPTURE_REFRESH_TIMEOUT_SECONDS = 2.0
+OPEN_CAPTURE_REFRESH_RETRY_COUNT = 3
+OPEN_CAPTURE_REFRESH_RETRY_INTERVAL_SECONDS = 0.5
+OPEN_CAPTURE_DEGRADED_HARD_STALE_SECONDS = 5.0
+LIGHTWEIGHT_DISCOVERY_INTERVAL_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class CaptureRouteRefreshResult:
+    quality: str
+    route: dict[str, Any] | None
+    snapshot_id: str | None
+    reason: str | None = None
+    attempts: int = 1
+    leg_results: dict[str, dict[str, Any]] | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "quality": self.quality,
+            "snapshot_id": self.snapshot_id,
+            "reason": self.reason,
+            "attempts": self.attempts,
+            "leg_results": self.leg_results or {},
+        }
 
 @dataclass(frozen=True)
 class PaperBotConfig:
@@ -458,11 +484,16 @@ class PaperBot:
             observations_by_route=self.v2_observations_by_route,
             settlement_data_provider=resolved_settlement_data_provider,
         )
+        self.focused_executor: ThreadPoolExecutor | None = None
+        self.lightweight_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_future: Future[dict[str, Any]] | None = None
         self.background_full_scan_started_monotonic = 0.0
         self.background_full_scan_cancel_event: Event | None = None
         self.pending_completed_background_full_scan: dict[str, Any] | None = None
+        self.background_full_scan_skip_reasons: dict[str, str] = {}
+        self._foreground_venues: set[str] = set()
+        self._background_venues: set[str] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle: signal handling, sleep, notifications (folded from BaseBot)
@@ -588,6 +619,7 @@ class PaperBot:
             raise
         finally:
             self.shutdown_background_full_scan()
+            self.shutdown_foreground_executors()
             self.restore_signal_handlers(previous_signal_handlers)
 
     def notify_shutdown(
@@ -615,10 +647,11 @@ class PaperBot:
         if completed is not None:
             background_results.append(completed)
 
+        reconciliation = self._maybe_run_reconciliation()
+
         if self.has_open_exposure():
             self.request_background_full_scan_cancel("open_exposure_priority")
             result = self.run_open_position_iteration()
-            reconciliation = self._maybe_run_reconciliation()
             if reconciliation is not None:
                 result["reconciliation"] = reconciliation
             if background_results:
@@ -631,7 +664,6 @@ class PaperBot:
             self.request_background_full_scan_cancel("critical_hot_route_priority")
             result = self.run_hot_iteration()
             result["mode"] = "critical_hot_routes"
-            reconciliation = self._maybe_run_reconciliation()
             if reconciliation is not None:
                 result["reconciliation"] = reconciliation
             if background_results:
@@ -639,8 +671,6 @@ class PaperBot:
             if self.background_full_scan_running():
                 result["background_full_scan_running"] = True
             return result
-
-        reconciliation = self._maybe_run_reconciliation()
 
         if self.hot_routes:
             result = self.run_hot_iteration()
@@ -810,19 +840,40 @@ class PaperBot:
     def shutdown_background_full_scan(self) -> None:
         if self.background_full_scan_executor is None:
             return
-        self.background_full_scan_executor.shutdown(
-            wait=False,
-            cancel_futures=True,
-        )
+        self.background_full_scan_executor.shutdown(wait=False, cancel_futures=True)
         self.background_full_scan_executor = None
         self.background_full_scan_future = None
         self.background_full_scan_cancel_event = None
+
+    def shutdown_foreground_executors(self) -> None:
+        for name in ("focused_executor", "lightweight_executor"):
+            executor = getattr(self, name)
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+                setattr(self, name, None)
+
+    def _ensure_focused_executor(self, *, workers: int | None = None) -> ThreadPoolExecutor:
+        if self.focused_executor is None:
+            self.focused_executor = ThreadPoolExecutor(
+                max_workers=max(2, int(workers or self.config.hot_route_recheck_workers)),
+                thread_name_prefix="funding-focused",
+            )
+        return self.focused_executor
+
+    def _ensure_lightweight_executor(self, *, workers: int) -> ThreadPoolExecutor:
+        if self.lightweight_executor is None:
+            self.lightweight_executor = ThreadPoolExecutor(
+                max_workers=max(1, int(workers)),
+                thread_name_prefix="funding-lightweight",
+            )
+        return self.lightweight_executor
 
     def run_discovery_full_scan(
         self,
         cancel_event: Event | None = None,
     ) -> dict[str, Any]:
         started = self.clock.monotonic()
+        self.background_full_scan_skip_reasons = {}
         clients = self.build_venue_clients() or active_default_funding_clients()
         clients = [
             funding_client_for_venue(str(getattr(client, "venue", "")).lower()) or client
@@ -841,6 +892,7 @@ class PaperBot:
                 observed_at,
                 max_workers=2,
                 cancel_event=cancel_event,
+                work_mode="background_full_scan",
             )
         clients_by_venue = {
             str(getattr(client, "venue", "")).lower(): client
@@ -872,6 +924,7 @@ class PaperBot:
             "screen_reasons": summary.get("rejection_reasons") or {},
             "blocker_summary": [],
             "warnings": warnings,
+            "background_skip_reasons": dict(self.background_full_scan_skip_reasons),
             "cancelled": cancelled,
             "started_monotonic": started,
             "completed_monotonic": self.clock.monotonic(),
@@ -1257,31 +1310,31 @@ class PaperBot:
                 if route_key in refreshed_by_key
             ]
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(self.focused_recheck_route, route): (route_key, route)
-                for route_key, route in route_items
-            }
-            for future in as_completed(futures):
-                route_key, route = futures[future]
-                try:
-                    fresh = future.result()
-                except Exception as exc:
-                    self.record_event(
-                        "focused_recheck_failed",
-                        (
-                            "Paper Bot focused recheck failed\n"
-                            f"{route.get('canonical_asset')}: "
-                            f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
-                            f"Error: {type(exc).__name__}: {exc}"
-                        ),
-                        {"route": route_summary(route), "error": str(exc)},
-                        route_key=route.get("route_key"),
-                        notify=False,
-                        severity="warning",
-                    )
-                    fresh = None
-                handle_result(route_key, route, fresh)
+        executor = self._ensure_focused_executor(workers=workers)
+        futures = {
+            executor.submit(self.focused_recheck_route, route): (route_key, route)
+            for route_key, route in route_items
+        }
+        for future in as_completed(futures):
+            route_key, route = futures[future]
+            try:
+                fresh = future.result()
+            except Exception as exc:
+                self.record_event(
+                    "focused_recheck_failed",
+                    (
+                        "Paper Bot focused recheck failed\n"
+                        f"{route.get('canonical_asset')}: "
+                        f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
+                        f"Error: {type(exc).__name__}: {exc}"
+                    ),
+                    {"route": route_summary(route), "error": str(exc)},
+                    route_key=route.get("route_key"),
+                    notify=False,
+                    severity="warning",
+                )
+                fresh = None
+            handle_result(route_key, route, fresh)
         return [
             refreshed_by_key[route_key]
             for route_key, _route in route_items
@@ -1428,20 +1481,20 @@ class PaperBot:
             "paper_execution_count": 0,
         }
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                market_futures = {
-                    executor.submit(
-                        self.fresh_market_for_route_leg,
-                        route,
-                        side,
-                        observed_at,
-                    ): side
-                    for side in ("long", "short")
-                }
-                fresh_markets = {
-                    side: future.result()
-                    for future, side in market_futures.items()
-                }
+            executor = self._ensure_focused_executor(workers=2)
+            market_futures = {
+                executor.submit(
+                    self.fresh_market_for_route_leg,
+                    route,
+                    side,
+                    observed_at,
+                ): side
+                for side in ("long", "short")
+            }
+            fresh_markets = {
+                side: future.result()
+                for future, side in market_futures.items()
+            }
             long_market, long_client = fresh_markets["long"]
             short_market, short_client = fresh_markets["short"]
             markets = [long_market, short_market]
@@ -1462,31 +1515,12 @@ class PaperBot:
                 list(books.values()),
                 include_raw_json=settings.store_diagnostic_raw_json,
             )
-            observed_datetime = datetime.fromisoformat(
-                observed_at.replace("Z", "+00:00")
-            )
-            if observed_datetime.tzinfo is None:
-                observed_datetime = observed_datetime.replace(tzinfo=UTC)
-            history_start = observed_datetime.astimezone(UTC) - timedelta(
-                days=settings.history_days
-            )
             history_keys = [
                 (str(long_market["venue"]), str(long_market["symbol"])),
                 (str(short_market["venue"]), str(short_market["symbol"])),
             ]
-            history = {
-                key: self.store.funding_history_rows(
-                    key[0],
-                    key[1],
-                    since=history_start.isoformat(),
-                )
-                for key in history_keys
-            }
-            book_sequences = self.store.funding_orderbook_sequences(
-                history_keys,
-                limit_per_market=settings.liquidity_sequence_limit,
-                before_at=observed_at,
-            )
+            history = {key: [] for key in history_keys}
+            book_sequences: dict[tuple[str, str], list[dict[str, Any]]] = {}
             for key, book in books.items():
                 market = long_market if key[0] == long_market["venue"] else short_market
                 book["_history"] = normalize_stored_orderbook_units(
@@ -1584,6 +1618,12 @@ class PaperBot:
             "funding_rate_unit",
             "funding_sign_convention",
             "supports_discrete_funding",
+            "supports_perpetuals",
+            "is_linear_contract",
+            "position_inclusion_rule",
+            "entry_safety_buffer_seconds",
+            "exit_safety_buffer_seconds",
+            "timing_policy_source",
             "normalization_evidence",
         ):
             if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
@@ -1599,8 +1639,6 @@ class PaperBot:
         market.setdefault("request_started_at", request_started_at)
         market.setdefault("response_received_at", response_received_at)
         market.setdefault("normalized_at", response_received_at)
-        if market.get("normalized_next_funding_rate") is None:
-            market["normalized_next_funding_rate"] = market.get("funding_rate")
         market = apply_declared_venue_capability_contract(market)
         market.setdefault("normalization_evidence", {"source": "adapter_market_snapshot"})
         return market, client
@@ -1611,42 +1649,79 @@ class PaperBot:
         observed_at: str,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         books: dict[tuple[str, str], dict[str, Any]] = {}
-        with ThreadPoolExecutor(max_workers=max(1, len(markets_and_clients))) as executor:
-            futures = {
-                executor.submit(
-                    client.orderbook,
-                    str(market["symbol"]),
-                    observed_at,
-                    100,
-                ): (market, client, self.clock.now().isoformat())
-                for market, client in markets_and_clients
-            }
-            for future in as_completed(futures):
-                market, _client, request_started_at = futures[future]
-                key = (str(market["venue"]), str(market["symbol"]))
-                book = normalize_orderbook_canonical_units(
-                    future.result(),
-                    float(market.get("canonical_unit_multiplier") or 1.0),
-                )
-                response_received_at = self.clock.now().isoformat()
-                book.setdefault("request_started_at", request_started_at)
-                book.setdefault("response_received_at", response_received_at)
-                book.setdefault("orderbook_event_time", response_received_at)
-                books[key] = book
+        executor = self._ensure_focused_executor(workers=max(2, len(markets_and_clients)))
+        futures = {
+            executor.submit(
+                client.orderbook,
+                str(market["symbol"]),
+                observed_at,
+                100,
+            ): (market, client, self.clock.now().isoformat())
+            for market, client in markets_and_clients
+        }
+        for future in as_completed(futures):
+            market, _client, request_started_at = futures[future]
+            key = (str(market["venue"]), str(market["symbol"]))
+            book = normalize_orderbook_canonical_units(
+                future.result(),
+                float(market.get("canonical_unit_multiplier") or 1.0),
+            )
+            response_received_at = self.clock.now().isoformat()
+            book.setdefault("request_started_at", request_started_at)
+            book.setdefault("response_received_at", response_received_at)
+            book.setdefault("orderbook_event_time", response_received_at)
+            books[key] = book
         return books
 
     def next_sleep_seconds(self, result: dict[str, Any]) -> float:
-        if result.get("background_full_scan_running"):
-            return self.config.hot_interval_seconds
-        if int(result.get("open_position_count") or 0) > 0:
-            return self.config.hot_interval_seconds
-        if int(result.get("pending_count") or 0) > 0:
-            return self.config.hot_interval_seconds
-        if int(result.get("urgent_route_count") or 0) > 0:
-            return self.config.hot_interval_seconds
-        if int(result.get("hot_route_count") or 0) > 0:
-            return self.config.monitor_interval_seconds
-        return self.config.scan_interval_seconds
+        now_monotonic = self.clock.monotonic()
+        deadlines: list[float] = []
+        try:
+            has_open_exposure = self.has_open_exposure()
+        except sqlite3.Error:
+            has_open_exposure = False
+        has_open = int(result.get("open_position_count") or 0) > 0 or has_open_exposure
+        has_hot = int(result.get("hot_route_count") or 0) > 0 or bool(self.hot_routes)
+        has_urgent = int(result.get("urgent_route_count") or 0) > 0 or self.critical_entry_recheck_active()
+        try:
+            has_pending_reconciliation = bool(self.store.pending_reconciliation_rows())
+        except sqlite3.Error:
+            has_pending_reconciliation = False
+        if has_open:
+            deadlines.append(float(self.config.hot_interval_seconds))
+        if int(result.get("pending_count") or 0) > 0 or has_pending_reconciliation:
+            elapsed = (
+                now_monotonic - self.last_reconciliation_monotonic
+                if self.last_reconciliation_monotonic > 0
+                else 10.0
+            )
+            deadlines.append(max(0.0, 10.0 - elapsed))
+        if has_urgent:
+            deadlines.append(float(self.config.hot_interval_seconds))
+        if has_hot:
+            deadlines.append(float(self.config.monitor_interval_seconds))
+        if not has_open and not has_hot:
+            last_light = float(getattr(self, "_last_lightweight_discovery_monotonic", 0.0) or 0.0)
+            lightweight_due_in = (
+                0.0
+                if last_light <= 0
+                else max(0.0, last_light + LIGHTWEIGHT_DISCOVERY_INTERVAL_SECONDS - now_monotonic)
+            )
+            deadlines.append(lightweight_due_in)
+            full_due_in = (
+                0.0
+                if self.last_full_scan_monotonic <= 0
+                else max(
+                    0.0,
+                    self.last_full_scan_monotonic
+                    + float(self.config.scan_interval_seconds)
+                    - now_monotonic,
+                )
+            )
+            deadlines.append(full_due_in)
+        if result.get("background_full_scan_running") or self.background_full_scan_running():
+            deadlines.append(float(self.config.hot_interval_seconds))
+        return max(0.0, min(deadlines)) if deadlines else float(self.config.scan_interval_seconds)
 
     def process_entry_candidates(
         self,
@@ -2049,7 +2124,6 @@ class PaperBot:
         """Lightweight discovery: market snapshots + next funding only, no full orderbooks."""
         if (
             self.hot_routes
-            or self.background_full_scan_running()
             or self.store.funding_capture_open_positions()
             or self.store.funding_paper_open_positions()
         ):
@@ -2058,7 +2132,7 @@ class PaperBot:
         if not lightweight_discovery_due(
             last_discovery_monotonic=getattr(self, "_last_lightweight_discovery_monotonic", 0.0),
             now_monotonic=now_monotonic,
-            interval_seconds=30.0,
+            interval_seconds=LIGHTWEIGHT_DISCOVERY_INTERVAL_SECONDS,
         ):
             return None
         self._last_lightweight_discovery_monotonic = now_monotonic
@@ -2121,6 +2195,7 @@ class PaperBot:
         *,
         max_workers: int | None = None,
         cancel_event: Event | None = None,
+        work_mode: str = "foreground_lightweight",
     ) -> tuple[list[dict[str, Any]], list[str]]:
         catalog_results: dict[
             str,
@@ -2128,12 +2203,34 @@ class PaperBot:
         ] = {}
         warnings: list[str] = []
         worker_count = max(1, min(int(max_workers or len(clients) or 1), len(clients) or 1))
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {}
+        if work_mode == "background_full_scan":
+            executor = ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="funding-background-venue",
+            )
+        else:
+            executor = self._ensure_lightweight_executor(workers=worker_count)
+        futures = {}
+        foreground_venues: set[str] = set()
+        try:
             for client in clients:
                 if cancel_event is not None and cancel_event.is_set():
                     break
                 venue = str(getattr(client, "venue", "")).lower()
+                if (
+                    work_mode == "background_full_scan"
+                    and not bool(getattr(client, "thread_safe", False))
+                    and venue in self._foreground_venues
+                ):
+                    reason = "foreground_venue_work_active"
+                    self.background_full_scan_skip_reasons[venue] = reason
+                    warnings.append(f"{venue} background catalog skipped: {reason}")
+                    continue
+                if work_mode != "background_full_scan":
+                    self._foreground_venues.add(venue)
+                    foreground_venues.add(venue)
+                else:
+                    self._background_venues.add(venue)
                 request_started_at = self.clock.now().isoformat()
                 futures[
                     executor.submit(
@@ -2164,6 +2261,14 @@ class PaperBot:
                     request_started_at,
                     response_received_at,
                 )
+        finally:
+            for venue in foreground_venues:
+                self._foreground_venues.discard(venue)
+            if work_mode == "background_full_scan":
+                for client in clients:
+                    self._background_venues.discard(str(getattr(client, "venue", "")).lower())
+            if work_mode == "background_full_scan":
+                executor.shutdown(wait=False, cancel_futures=True)
 
         instruments: list[dict[str, Any]] = []
         markets: list[dict[str, Any]] = []
@@ -2200,8 +2305,6 @@ class PaperBot:
             row.setdefault("request_started_at", started_at)
             row.setdefault("response_received_at", received_at)
             row.setdefault("normalized_at", received_at)
-            if row.get("normalized_next_funding_rate") is None:
-                row["normalized_next_funding_rate"] = row.get("funding_rate")
             row = apply_declared_venue_capability_contract(row)
             row.setdefault(
                 "normalization_evidence",
@@ -2495,7 +2598,9 @@ class PaperBot:
             "funding_rate": market.get("funding_rate"),
             "raw_funding_rate": market.get("raw_funding_rate", market.get("funding_rate")),
             "raw_funding_rate_unit": market.get("raw_funding_rate_unit"),
-            "normalized_next_funding_rate": market.get("normalized_next_funding_rate"),
+            "normalized_next_funding_rate": market.get(
+                "normalized_next_funding_rate"
+            ),
             "funding_rate_unit": market.get("funding_rate_unit"),
             "funding_sign_convention": market.get("funding_sign_convention"),
             "normalization_evidence": market.get("normalization_evidence"),
@@ -2531,7 +2636,339 @@ class PaperBot:
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
             "min_notional_usd": min_notional,
+            "position_inclusion_rule": market.get("position_inclusion_rule"),
+            "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
+            "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
+            "timing_policy_source": market.get("timing_policy_source"),
         }
+
+    def refresh_open_capture_route(
+        self,
+        position: dict[str, Any],
+        now: datetime,
+    ) -> CaptureRouteRefreshResult:
+        position_id = str(position.get("position_id") or "")
+        canonical_asset = str(position.get("canonical_asset") or "").upper()
+        leg_specs = {
+            "long": {
+                "venue": str(position.get("long_venue") or "").lower(),
+                "symbol": str(position.get("long_symbol") or ""),
+            },
+            "short": {
+                "venue": str(position.get("short_venue") or "").lower(),
+                "symbol": str(position.get("short_symbol") or ""),
+            },
+        }
+        if (
+            not position_id
+            or not canonical_asset
+            or not leg_specs["long"]["venue"]
+            or not leg_specs["long"]["symbol"]
+            or not leg_specs["short"]["venue"]
+            or not leg_specs["short"]["symbol"]
+        ):
+            return CaptureRouteRefreshResult(
+                quality="UNAVAILABLE",
+                route=None,
+                snapshot_id=None,
+                reason="position_leg_identity_missing",
+            )
+
+        observed_at = now.astimezone(UTC).isoformat()
+        snapshot_id = (
+            "open-refresh:"
+            f"{position_id}:"
+            f"{hashlib.sha256(observed_at.encode('utf-8')).hexdigest()[:12]}"
+        )
+        executor = self._ensure_focused_executor(workers=2)
+        for spec in leg_specs.values():
+            self._foreground_venues.add(str(spec["venue"]))
+        futures = {
+            executor.submit(
+                self._refresh_open_capture_leg,
+                side,
+                canonical_asset,
+                spec["venue"],
+                spec["symbol"],
+                observed_at,
+                position,
+            ): side
+            for side, spec in leg_specs.items()
+        }
+        done, pending = wait(futures, timeout=OPEN_CAPTURE_REFRESH_TIMEOUT_SECONDS)
+        leg_results: dict[str, dict[str, Any]] = {}
+        try:
+            for future in pending:
+                side = futures[future]
+                future.cancel()
+                leg_results[side] = {
+                    "status": "timeout",
+                    "reason": "venue_refresh_timeout_2s",
+                }
+            for future in done:
+                side = futures[future]
+                try:
+                    leg_results[side] = future.result()
+                except Exception as exc:
+                    leg_results[side] = {
+                        "status": "error",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+        finally:
+            for spec in leg_specs.values():
+                self._foreground_venues.discard(str(spec["venue"]))
+
+        long_result = leg_results.get("long") or {}
+        short_result = leg_results.get("short") or {}
+        long_leg = dict(long_result.get("leg") or {})
+        short_leg = dict(short_result.get("leg") or {})
+        if not long_leg and not short_leg:
+            return CaptureRouteRefreshResult(
+                quality="UNAVAILABLE",
+                route=None,
+                snapshot_id=snapshot_id,
+                reason="both_venue_refreshes_unavailable",
+                leg_results=leg_results,
+            )
+
+        route = {
+            "route_key": str((position.get("config") or {}).get("route_key") or ""),
+            "route_type": "perp_perp",
+            "canonical_asset": canonical_asset,
+            "venue_scope": "+".join(sorted([leg_specs["long"]["venue"], leg_specs["short"]["venue"]])),
+            "long_venue": leg_specs["long"]["venue"],
+            "long_symbol": leg_specs["long"]["symbol"],
+            "short_venue": leg_specs["short"]["venue"],
+            "short_symbol": leg_specs["short"]["symbol"],
+            "status": "watch",
+            "target_notional": float(position.get("target_notional") or self.config.target_notional_per_leg),
+            "observed_at": observed_at,
+            "next_funding_at": long_leg.get("next_funding_at"),
+            "legs": [long_leg, short_leg],
+            "evidence": {
+                "targeted_refresh": {
+                    "mode": "open_capture_route_refresh_v1",
+                    "snapshot_id": snapshot_id,
+                    "quality": None,
+                    "observed_at": observed_at,
+                    "position_id": position_id,
+                    "venues": [leg_specs["long"]["venue"], leg_specs["short"]["venue"]],
+                }
+            },
+        }
+        quality, reason = self._open_capture_route_quality(route, now, leg_results)
+        route["evidence"]["targeted_refresh"]["quality"] = quality
+        route["evidence"]["targeted_refresh"]["reason"] = reason
+        route["evidence"]["targeted_refresh"]["leg_results"] = {
+            side: {k: v for k, v in result.items() if k != "leg"}
+            for side, result in leg_results.items()
+        }
+        return CaptureRouteRefreshResult(
+            quality=quality,
+            route=route if quality == "FRESH" else None,
+            snapshot_id=snapshot_id,
+            reason=reason,
+            leg_results=leg_results,
+        )
+
+    def _refresh_open_capture_leg(
+        self,
+        side: str,
+        canonical_asset: str,
+        venue: str,
+        symbol: str,
+        observed_at: str,
+        position: dict[str, Any],
+    ) -> dict[str, Any]:
+        client = self._client_for_open_refresh_venue(venue)
+        if client is None:
+            return {"status": "unavailable", "reason": "venue_client_missing"}
+        entry_legs = (position.get("config") or {}).get("entry_legs") or []
+        previous = leg_by_side(entry_legs, side) or {}
+        snapshot_method = getattr(client, "market_snapshot", None)
+        request_started_at = self.clock.now().isoformat()
+        if callable(snapshot_method):
+            market = snapshot_method(symbol, canonical_asset, observed_at, previous)
+        else:
+            _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+            market = next(
+                (
+                    row
+                    for row in markets
+                    if str(row.get("venue") or "").lower() == venue
+                    and str(row.get("symbol") or "") == symbol
+                ),
+                None,
+            )
+            if market is None:
+                return {"status": "unavailable", "reason": "market_snapshot_missing"}
+        market = dict(market)
+        market.setdefault("venue", venue)
+        market.setdefault("symbol", symbol)
+        market.setdefault("canonical_asset", canonical_asset)
+        market_response_at = self.clock.now().isoformat()
+        for field in (
+            "base_asset",
+            "quote_asset",
+            "collateral_asset",
+            "contract_type",
+            "contract_kind",
+            "contract_multiplier",
+            "canonical_unit_multiplier",
+            "quantity_step",
+            "min_quantity",
+            "min_notional",
+            "min_notional_usd",
+            "maker_fee_rate",
+            "taker_fee_rate",
+            "fee_rate",
+            "funding_rate_semantics",
+            "funding_rate_unit",
+            "funding_sign_convention",
+            "supports_discrete_funding",
+            "supports_perpetuals",
+            "is_linear_contract",
+            "position_inclusion_rule",
+            "entry_safety_buffer_seconds",
+            "exit_safety_buffer_seconds",
+            "timing_policy_source",
+            "normalization_evidence",
+        ):
+            if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
+                market[field] = previous[field]
+        book = client.orderbook(symbol, observed_at, 100)
+        book = normalize_orderbook_canonical_units(
+            book,
+            float(market.get("canonical_unit_multiplier") or 1.0),
+        )
+        orderbook_response_at = self.clock.now().isoformat()
+        fee_rate = optional_float(market.get("fee_rate"))
+        if fee_rate is None:
+            fee_rate = optional_float(market.get("taker_fee_rate"))
+        min_notional = optional_float(market.get("min_notional"))
+        if min_notional is None:
+            min_notional = optional_float(market.get("min_notional_usd"))
+        leg = {
+            "side": side,
+            "venue": venue,
+            "symbol": symbol,
+            "funding_rate": market.get("funding_rate"),
+            "raw_funding_rate": market.get("raw_funding_rate", market.get("funding_rate")),
+            "raw_funding_rate_unit": market.get("raw_funding_rate_unit"),
+            "normalized_next_funding_rate": market.get(
+                "normalized_next_funding_rate"
+            ),
+            "funding_rate_unit": market.get("funding_rate_unit"),
+            "funding_sign_convention": market.get("funding_sign_convention"),
+            "normalization_evidence": market.get("normalization_evidence"),
+            "funding_interval_hours": market.get("funding_interval_hours"),
+            "hourly_funding_rate": market.get("hourly_funding_rate"),
+            "funding_rate_kind": market.get("funding_rate_kind"),
+            "next_funding_at": market.get("next_funding_at"),
+            "market_request_started_at": request_started_at,
+            "market_response_received_at": market.get("response_received_at") or market_response_at,
+            "response_received_at": book.get("response_received_at") or orderbook_response_at,
+            "normalized_at": market.get("normalized_at") or market_response_at,
+            "venue_server_time": market.get("venue_server_time") or book.get("venue_server_time"),
+            "source_event_at": market.get("source_event_at") or book.get("orderbook_event_time"),
+            "orderbook_request_started_at": book.get("request_started_at") or request_started_at,
+            "orderbook_response_received_at": book.get("response_received_at") or orderbook_response_at,
+            "orderbook_event_time": book.get("orderbook_event_time") or orderbook_response_at,
+            "mark_price": market.get("mark_price"),
+            "index_price": market.get("index_price"),
+            "best_bid": book.get("best_bid"),
+            "best_ask": book.get("best_ask"),
+            "bids": book.get("bids") or [],
+            "asks": book.get("asks") or [],
+            "fee_rate": fee_rate,
+            "taker_fee_rate": fee_rate,
+            "maker_fee_rate": market.get("maker_fee_rate"),
+            "quantity_step": market.get("quantity_step") or market.get("contract_multiplier"),
+            "min_quantity": market.get("min_quantity"),
+            "min_notional": min_notional,
+            "min_notional_usd": min_notional,
+            "quote_asset": market.get("quote_asset"),
+            "collateral_asset": market.get("collateral_asset"),
+            "contract_type": market.get("contract_type"),
+            "contract_kind": market.get("contract_kind"),
+            "contract_multiplier": market.get("contract_multiplier"),
+            "canonical_unit_multiplier": market.get("canonical_unit_multiplier"),
+            "contract_status": market.get("contract_status") or market.get("status"),
+            "status": market.get("status") or market.get("contract_status"),
+            "position_inclusion_rule": market.get("position_inclusion_rule"),
+            "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
+            "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
+            "timing_policy_source": market.get("timing_policy_source"),
+        }
+        return {"status": "success", "leg": leg}
+
+    def _client_for_open_refresh_venue(self, venue: str) -> FundingVenueClient | None:
+        configured = self.build_venue_clients()
+        for client in configured or []:
+            if str(getattr(client, "venue", "")).lower() == str(venue).lower():
+                if (
+                    not bool(getattr(client, "thread_safe", False))
+                    and str(venue).lower() in self._background_venues
+                ):
+                    break
+                return client
+        return funding_client_for_venue(
+            str(venue).lower(),
+            fast=True,
+            timeout_seconds=OPEN_CAPTURE_REFRESH_TIMEOUT_SECONDS,
+        )
+
+    def _open_capture_route_quality(
+        self,
+        route: dict[str, Any],
+        now: datetime,
+        leg_results: dict[str, dict[str, Any]],
+    ) -> tuple[str, str | None]:
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        if not long_leg or not short_leg:
+            return "PARTIAL", "one_or_more_legs_missing"
+        missing: list[str] = []
+        for side, leg in (("long", long_leg), ("short", short_leg)):
+            if leg_results.get(side, {}).get("status") != "success":
+                missing.append(f"{side}_refresh_failed")
+            if optional_float(leg.get("mark_price")) is None:
+                missing.append(f"{side}_mark_missing")
+            if optional_float(leg.get("index_price")) is None:
+                missing.append(f"{side}_index_missing")
+            if optional_float(leg.get("normalized_next_funding_rate")) is None:
+                missing.append(f"{side}_normalized_next_funding_rate_missing")
+            if parse_iso(leg.get("next_funding_at")) is None:
+                missing.append(f"{side}_next_funding_at_missing")
+            if optional_float(leg.get("fee_rate")) is None and optional_float(leg.get("taker_fee_rate")) is None:
+                missing.append(f"{side}_taker_fee_missing")
+            if not (leg.get("status") or leg.get("contract_status")):
+                missing.append(f"{side}_contract_status_missing")
+            close_book = leg.get("bids") if side == "long" else leg.get("asks")
+            if not close_book:
+                missing.append(f"{side}_executable_close_book_missing")
+        long_response = parse_iso(long_leg.get("response_received_at"))
+        short_response = parse_iso(short_leg.get("response_received_at"))
+        if long_response is None:
+            missing.append("long_response_received_at_missing")
+        if short_response is None:
+            missing.append("short_response_received_at_missing")
+        if missing:
+            return "PARTIAL", ",".join(sorted(set(missing)))
+        now_utc = now.astimezone(UTC)
+        long_age = (now_utc - long_response).total_seconds()
+        short_age = (now_utc - short_response).total_seconds()
+        cross_skew = abs((long_response - short_response).total_seconds())
+        if long_age > 2.0 or short_age > 2.0 or cross_skew > 1.0:
+            return "STALE", "response_stale_or_skewed"
+        if not settlement_alignment_passed(
+            parse_iso(long_leg.get("next_funding_at")),
+            parse_iso(short_leg.get("next_funding_at")),
+            tolerance_seconds=float(self.config.settlement_alignment_tolerance_seconds),
+        ):
+            return "PARTIAL", "settlement_alignment_mismatch"
+        return "FRESH", None
 
     def process_open_positions(self) -> list[str]:
         if synchronized_runtime_enabled(self.config):
@@ -2553,11 +2990,81 @@ class PaperBot:
                 continue
             config_json = position.get("config") or {}
             route_key = str(config_json.get("route_key") or "")
-            live_route = self.hot_routes.get(route_key) or (
-                self.store.latest_funding_route_by_key(route_key)
-                if route_key
-                else None
-            )
+            refreshed: CaptureRouteRefreshResult | None = None
+            for attempt_index in range(OPEN_CAPTURE_REFRESH_RETRY_COUNT + 1):
+                attempt_now = self.clock.now()
+                refreshed = self.refresh_open_capture_route(position, attempt_now)
+                if refreshed.quality == "FRESH":
+                    now = attempt_now
+                    break
+                self.synchronized_runtime.mark_position_data_quality(
+                    position,
+                    state="DEGRADED",
+                    now=attempt_now,
+                    refresh_result={**refreshed.as_dict(), "retry_index": attempt_index},
+                )
+                if attempt_index < OPEN_CAPTURE_REFRESH_RETRY_COUNT:
+                    self.clock.sleep(OPEN_CAPTURE_REFRESH_RETRY_INTERVAL_SECONDS)
+            live_route = refreshed.route if refreshed and refreshed.quality == "FRESH" else None
+            if live_route is not None:
+                if route_key:
+                    self.hot_routes[route_key] = live_route
+                self.synchronized_runtime.mark_position_data_quality(
+                    position,
+                    state="HEALTHY",
+                    now=now,
+                    refresh_result=refreshed.as_dict(),
+                    last_valid_route=live_route,
+                )
+                position = self.store.funding_capture_position_by_id(position_id) or position
+            else:
+                position = self.store.funding_capture_position_by_id(position_id) or position
+                data_quality = (position.get("config") or {}).get("data_quality") or {}
+                first_degraded = parse_iso(data_quality.get("first_degraded_at"))
+                degraded_age = (
+                    (self.clock.now().astimezone(UTC) - first_degraded).total_seconds()
+                    if first_degraded is not None
+                    else 0.0
+                )
+                if degraded_age > OPEN_CAPTURE_DEGRADED_HARD_STALE_SECONDS:
+                    last_valid_route = (position.get("config") or {}).get(
+                        "last_valid_executable_route"
+                    )
+                    if last_valid_route:
+                        close_payload = self.synchronized_runtime.close_position(
+                            position,
+                            last_valid_route,
+                            self.clock.now(),
+                            reason="targeted_refresh_hard_stale",
+                            emergency=True,
+                        )
+                        if close_payload.get("decision") == "closed":
+                            self.record_event(
+                                "close",
+                                (
+                                    f"V2 HARD STALE EXIT {position.get('canonical_asset')} "
+                                    f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                                    "Reason: targeted refresh unavailable >5s; used last valid executable snapshot."
+                                ),
+                                {
+                                    "position": position,
+                                    "refresh": refreshed.as_dict() if refreshed else None,
+                                    "close": close_payload,
+                                },
+                                route_key=route_key,
+                                notify=True,
+                                severity="error",
+                            )
+                            outcomes.append("emergency_unwind")
+                            continue
+                        outcomes.append("close_failed")
+                        continue
+                self.synchronized_runtime.record_current_executable_pnl(
+                    position,
+                    None,
+                    self.clock.now(),
+                )
+                continue
             current_pnl = self.synchronized_runtime.record_current_executable_pnl(
                 position,
                 live_route,
@@ -3077,6 +3584,7 @@ def funding_client_for_venue(
     venue: str,
     *,
     fast: bool = False,
+    timeout_seconds: float | None = None,
 ) -> FundingVenueClient | None:
     if venue.lower() in DEACTIVATED_FUNDING_VENUES:
         return None
@@ -3122,7 +3630,7 @@ def funding_client_for_venue(
     try:
         return factory(
             http=FundingHttpClient(
-                timeout_seconds=3,
+                timeout_seconds=float(timeout_seconds or 3),
                 max_retries=0,
                 min_delay_seconds=0.0,
             )

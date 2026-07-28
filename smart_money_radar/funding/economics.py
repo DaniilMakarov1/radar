@@ -2475,6 +2475,7 @@ def route_leg(
     notional: float,
     next_settlement_at: Any | None = None,
 ) -> dict[str, Any]:
+    has_book_depth = bool(book.get("bids")) and bool(book.get("asks"))
     return {
         "side": side,
         "venue": market["venue"],
@@ -2485,8 +2486,7 @@ def route_leg(
         "raw_funding_rate": market.get("raw_funding_rate", market.get("published_funding_rate", market["funding_rate"])),
         "raw_funding_rate_unit": market.get("raw_funding_rate_unit"),
         "normalized_next_funding_rate": market.get(
-            "normalized_next_funding_rate",
-            market["funding_rate"],
+            "normalized_next_funding_rate"
         ),
         "funding_rate_unit": market.get("funding_rate_unit"),
         "funding_sign_convention": market.get("funding_sign_convention"),
@@ -2517,6 +2517,16 @@ def route_leg(
         "orderbook_request_started_at": book.get("request_started_at"),
         "orderbook_response_received_at": book.get("response_received_at"),
         "orderbook_event_time": book.get("orderbook_event_time"),
+        "orderbook_depth_available": bool(
+            market.get("orderbook_depth_available")
+            or market.get("supports_orderbook_depth")
+            or has_book_depth
+        ),
+        "supports_orderbook_depth": bool(
+            market.get("supports_orderbook_depth")
+            or market.get("orderbook_depth_available")
+            or has_book_depth
+        ),
         "mark_price": market.get("mark_price"),
         "index_price": market.get("index_price"),
         "best_bid": book.get("best_bid"),
@@ -2530,6 +2540,24 @@ def route_leg(
         "close_levels_consumed": close_fill.get("levels_consumed", 0.0),
         "filled_notional": open_fill["filled_notional"],
         "fee_rate": fee_rate,
+        "status": market.get("status"),
+        "contract_status": market.get("contract_status"),
+        "contract_kind": market.get("contract_kind"),
+        "collateral_asset": market.get("collateral_asset"),
+        "quote_asset": market.get("quote_asset"),
+        "supports_perpetuals": market.get("supports_perpetuals"),
+        "is_linear": market.get("is_linear"),
+        "supports_discrete_funding": market.get("supports_discrete_funding"),
+        "quantity_step": market.get("quantity_step"),
+        "min_quantity": market.get("min_quantity"),
+        "min_notional": market.get("min_notional"),
+        "open_interest_usd": market.get("open_interest_usd"),
+        "volume_24h_usd": market.get("volume_24h_usd"),
+        "funding_rate_semantics": market.get("funding_rate_semantics"),
+        "position_inclusion_rule": market.get("position_inclusion_rule"),
+        "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
+        "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
+        "timing_policy_source": market.get("timing_policy_source"),
     }
 
 

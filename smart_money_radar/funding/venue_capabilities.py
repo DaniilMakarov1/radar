@@ -90,6 +90,11 @@ class VenueCapability:
     supports_risk_tiers: bool = False
     supports_funding_history: bool = False
     supports_server_time: bool = False
+    normalized_next_funding_rate_present: bool = False
+    position_inclusion_rule: str | None = None
+    entry_safety_buffer_seconds: float | None = None
+    exit_safety_buffer_seconds: float | None = None
+    timing_policy_source: str | None = None
     reason: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -97,23 +102,14 @@ class VenueCapability:
 
 
 def apply_declared_venue_capability_contract(market: dict[str, Any]) -> dict[str, Any]:
-    """Attach an explicit adapter-level contract; unknown venues stay fail-closed."""
+    """Attach non-authoritative inventory metadata; adapters own eligibility fields."""
     row = dict(market)
     venue = str(row.get("venue") or "").lower()
     contract = DECLARED_NEXT_SETTLEMENT_VENUES.get(venue)
     if not contract:
         return row
-    row.setdefault("contract_kind", "linear_perpetual")
-    row.setdefault("supports_perpetuals", True)
-    row.setdefault("is_linear_contract", True)
-    row.setdefault("supports_discrete_funding", True)
-    row.setdefault("funding_rate_semantics", "next_settlement")
-    row.setdefault("funding_rate_unit", "fraction_of_notional_per_settlement")
-    row.setdefault("funding_sign_convention", "positive_long_pays")
-    row.setdefault("position_inclusion_rule", "perp_position_at_settlement")
-    row.setdefault("entry_safety_buffer_seconds", 20)
-    row.setdefault("exit_safety_buffer_seconds", 20)
-    row.setdefault("timing_policy_source", contract["timing_policy_source"])
+    row.setdefault("declared_next_settlement_venue", True)
+    row.setdefault("declared_timing_policy_source_hint", contract["timing_policy_source"])
     return row
 
 
@@ -178,6 +174,29 @@ def capability_from_market(market: dict[str, Any]) -> VenueCapability:
         ),
         supports_funding_history=bool(market.get("funding_history_available", False)),
         supports_server_time=bool(market.get("server_time")),
+        normalized_next_funding_rate_present=market.get(
+            "normalized_next_funding_rate"
+        ) is not None,
+        position_inclusion_rule=(
+            str(market.get("position_inclusion_rule"))
+            if market.get("position_inclusion_rule") not in (None, "")
+            else None
+        ),
+        entry_safety_buffer_seconds=(
+            float(market["entry_safety_buffer_seconds"])
+            if positive(market.get("entry_safety_buffer_seconds"))
+            else None
+        ),
+        exit_safety_buffer_seconds=(
+            float(market["exit_safety_buffer_seconds"])
+            if positive(market.get("exit_safety_buffer_seconds"))
+            else None
+        ),
+        timing_policy_source=(
+            str(market.get("timing_policy_source"))
+            if market.get("timing_policy_source") not in (None, "")
+            else None
+        ),
         reason=f"funding_rate_kind={funding_kind or 'missing'}",
     )
 
@@ -212,6 +231,16 @@ def synchronized_capability_rejection(capability: VenueCapability) -> list[str]:
         reasons.append("funding_rate_unit_not_fraction_per_settlement")
     if capability.funding_sign_convention != "positive_long_pays":
         reasons.append("funding_sign_convention_not_positive_long_pays")
+    if not capability.normalized_next_funding_rate_present:
+        reasons.append("normalized_next_funding_rate_missing")
+    if capability.position_inclusion_rule != "perp_position_at_settlement":
+        reasons.append("position_inclusion_rule_missing")
+    if capability.entry_safety_buffer_seconds is None:
+        reasons.append("entry_safety_buffer_seconds_missing")
+    if capability.exit_safety_buffer_seconds is None:
+        reasons.append("exit_safety_buffer_seconds_missing")
+    if capability.timing_policy_source is None:
+        reasons.append("timing_policy_source_missing")
     required_flags = {
         "supports_next_funding_timestamp": capability.supports_next_funding_timestamp,
         "supports_mark_price": capability.supports_mark_price,
