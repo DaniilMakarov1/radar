@@ -19,12 +19,12 @@
 
 > Сырые `.jsonl` большие. Для анализа использовать `grep` по ключевым словам + точечное чтение фрагментов, не читать целиком.
 
-## Конфигурация автономии (обновлено 2026-07-27)
+## Конфигурация автономии (обновлено 2026-07-28)
 
-- **Qwen:** project-level `.qwen/settings.json` использует `model.name = "qwen3.8-max-preview"` и `approvalMode = "auto-edit"`. Qwen — исполнитель для scoped-задач, не владелец формул, risk gates, venue eligibility или live trading.
+- **Qwen:** project-level `.qwen/settings.json` использует `model.name = "qwen3.7-plus"`, `approvalMode = "auto"` и sandbox. Qwen — write-capable implementation worker для scoped-задач; он может читать/менять код и запускать тесты внутри репозитория, но не коммитит, не пушит, не читает secrets и не включает live trading.
 - **Codex:** `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, `model_reasoning_effort = "xhigh"` (`~/.codex/config.toml`).
 
-Codex остается архитектором и финальным reviewer. Qwen может выполнять механическую реализацию и тесты внутри заданного scope, но не должен самостоятельно менять торговую логику или коммитить/пушить.
+Codex остается архитектором, владельцем Git-истории и финальным reviewer. Qwen может выполнять implementation pass по заданной задаче, но Codex обязан проверять diff, финансовую логику, тесты и безопасность перед коммитом.
 
 ## Критические уроки из истории сборки (извлечены из сессий Codex)
 

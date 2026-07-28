@@ -1,17 +1,21 @@
 {
   "$version": 4,
   "model": {
-    "name": "qwen3.8-max-preview",
-    "maxWallTimeSeconds": 1200,
-    "maxToolCalls": 120,
+    "name": "qwen3.7-plus",
+    "maxWallTimeSeconds": 3600,
+    "maxToolCalls": 600,
+    "maxSessionTurns": 250,
     "maxSubagentDepth": 1
   },
   "tools": {
-    "approvalMode": "auto-edit"
+    "approvalMode": "auto",
+    "sandbox": true
   },
   "permissions": {
     "allow": [
-      "Read(/**)",
+      "Read(/Users/daniilmakarov/Desktop/radar/**)",
+      "Edit(/Users/daniilmakarov/Desktop/radar/**)",
+      "Write(/Users/daniilmakarov/Desktop/radar/**)",
       "Edit(/smart_money_radar/**)",
       "Edit(/tests/**)",
       "Edit(/docs/**)",
@@ -25,16 +29,30 @@
       "Edit(/.gitignore)",
       "Bash(git status *)",
       "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
       "Bash(PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest *)",
-      "Bash(python3 -m compileall *)"
+      "Bash(python3 -m pytest *)",
+      "Bash(python3 -m compileall *)",
+      "Bash(ruff *)",
+      "Bash(mypy *)",
+      "Bash(pyright *)",
+      "Bash(pre-commit *)",
+      "Bash(python3 -m unittest *)",
+      "Bash(python3 -m pip list *)",
+      "Bash(python3 -m pip show *)"
     ],
     "deny": [
+      "Read(/Users/daniilmakarov/Desktop/radar/.env)",
+      "Read(/Users/daniilmakarov/Desktop/radar/.env.*)",
       "Read(/.env)",
       "Read(/.env.*)",
       "Read(/.git/**)",
       "Read(~/.ssh/**)",
       "Read(~/.aws/**)",
       "Read(~/.config/**)",
+      "Edit(/Users/daniilmakarov/Desktop/radar/.env)",
+      "Edit(/Users/daniilmakarov/Desktop/radar/.env.*)",
       "Edit(/.env)",
       "Edit(/.env.*)",
       "Edit(/.git/**)",
