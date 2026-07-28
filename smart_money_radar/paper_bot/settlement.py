@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol
 
 
 RECONCILIATION_STATES = (
@@ -156,3 +156,230 @@ def build_settlement_crossing_rows(
             "evidence": {},
         },
     ]
+
+
+# ---------------------------------------------------------------------------
+# FundingSettlementDataProvider — injectable interface for reconciliation data
+# ---------------------------------------------------------------------------
+
+class FundingSettlementDataProvider(Protocol):
+    """Injectable interface for reconciliation data lookups."""
+
+    def get_public_funding_event(
+        self,
+        venue: str,
+        symbol: str,
+        scheduled_funding_at: datetime,
+        tolerance_seconds: float,
+    ) -> dict[str, Any] | None:
+        """Return the public funding event for a venue/symbol near the scheduled time.
+
+        Returns dict with at least ``funding_rate`` key, or None if not found.
+        """
+        ...
+
+    def get_nearest_mark_snapshot(
+        self,
+        venue: str,
+        symbol: str,
+        scheduled_funding_at: datetime,
+        max_distance_seconds: float,
+    ) -> dict[str, Any] | None:
+        """Return the nearest mark price snapshot near the scheduled time.
+
+        Returns dict with at least ``mark_price`` key, or None if not found.
+        """
+        ...
+
+
+class StoredFundingSettlementDataProvider:
+    """Production provider using stored funding history and market snapshots.
+
+    Uses only locally stored data — no real API calls.
+    """
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+
+    def get_public_funding_event(
+        self,
+        venue: str,
+        symbol: str,
+        scheduled_funding_at: datetime,
+        tolerance_seconds: float,
+    ) -> dict[str, Any] | None:
+        since = (
+            scheduled_funding_at.astimezone(UTC)
+            - timedelta(seconds=float(tolerance_seconds))
+        ).isoformat()
+        rows = self.store.funding_history_rows(
+            venue=venue,
+            symbol=symbol,
+            since=since,
+        )
+        best: dict[str, Any] | None = None
+        best_skew: float = tolerance_seconds + 1.0
+        target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
+        for row in rows:
+            published_at = _parse_time(
+                row.get("funding_at")
+                or row.get("published_at")
+                or row.get("observed_at")
+            )
+            if published_at is None:
+                continue
+            skew = abs(published_at.astimezone(UTC).timestamp() - target_ts)
+            if skew > tolerance_seconds:
+                continue
+            if skew < best_skew:
+                best_skew = skew
+                rate = float(
+                    row.get("funding_rate")
+                    or row.get("current_funding_rate")
+                    or 0.0
+                )
+                best = {
+                    "funding_rate": rate,
+                    "published_at": published_at.isoformat(),
+                    "skew_seconds": skew,
+                }
+        return best
+
+    def get_nearest_mark_snapshot(
+        self,
+        venue: str,
+        symbol: str,
+        scheduled_funding_at: datetime,
+        max_distance_seconds: float,
+    ) -> dict[str, Any] | None:
+        rows = self.store.funding_market_snapshot_rows(
+            venue=venue,
+            symbol=symbol,
+            limit=200,
+        )
+        best: dict[str, Any] | None = None
+        best_skew: float = max_distance_seconds + 1.0
+        target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
+        for row in rows:
+            observed_at = _parse_time(row.get("observed_at"))
+            if observed_at is None:
+                continue
+            skew = abs(observed_at.astimezone(UTC).timestamp() - target_ts)
+            if skew > max_distance_seconds:
+                continue
+            mark = float(row.get("mark_price") or 0.0)
+            if mark <= 0:
+                continue
+            if skew < best_skew:
+                best_skew = skew
+                best = {
+                    "mark_price": mark,
+                    "observed_at": observed_at.isoformat(),
+                    "skew_seconds": skew,
+                }
+        if best is not None:
+            return best
+
+        since = (
+            scheduled_funding_at.astimezone(UTC)
+            - timedelta(seconds=float(max_distance_seconds))
+        ).isoformat()
+        history_rows = self.store.funding_history_rows(
+            venue=venue,
+            symbol=symbol,
+            since=since,
+        )
+        for row in history_rows:
+            event_at = _parse_time(row.get("funding_at") or row.get("observed_at"))
+            if event_at is None:
+                continue
+            skew = abs(event_at.astimezone(UTC).timestamp() - target_ts)
+            if skew > max_distance_seconds:
+                continue
+            mark = float(row.get("mark_price") or 0.0)
+            if mark <= 0:
+                continue
+            if skew < best_skew:
+                best_skew = skew
+                best = {
+                    "mark_price": mark,
+                    "observed_at": event_at.isoformat(),
+                    "skew_seconds": skew,
+                    "source": "funding_rate_history",
+                }
+        return best
+
+
+class FakeFundingSettlementDataProvider:
+    """Test provider with preloaded public events and mark snapshots."""
+
+    def __init__(
+        self,
+        public_events: list[dict[str, Any]] | None = None,
+        mark_snapshots: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.public_events = list(public_events or [])
+        self.mark_snapshots = list(mark_snapshots or [])
+
+    def get_public_funding_event(
+        self,
+        venue: str,
+        symbol: str,
+        scheduled_funding_at: datetime,
+        tolerance_seconds: float,
+    ) -> dict[str, Any] | None:
+        target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
+        best: dict[str, Any] | None = None
+        best_skew: float = tolerance_seconds + 1.0
+        for event in self.public_events:
+            if str(event.get("venue") or "") != venue:
+                continue
+            if str(event.get("symbol") or "") != symbol:
+                continue
+            event_time = _parse_time(event.get("scheduled_at") or event.get("published_at"))
+            if event_time is None:
+                continue
+            skew = abs(event_time.astimezone(UTC).timestamp() - target_ts)
+            if skew > tolerance_seconds:
+                continue
+            if skew < best_skew:
+                best_skew = skew
+                best = {
+                    "funding_rate": float(event.get("funding_rate", 0.0)),
+                    "published_at": event_time.isoformat(),
+                    "skew_seconds": skew,
+                }
+        return best
+
+    def get_nearest_mark_snapshot(
+        self,
+        venue: str,
+        symbol: str,
+        scheduled_funding_at: datetime,
+        max_distance_seconds: float,
+    ) -> dict[str, Any] | None:
+        target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
+        best: dict[str, Any] | None = None
+        best_skew: float = max_distance_seconds + 1.0
+        for snap in self.mark_snapshots:
+            if str(snap.get("venue") or "") != venue:
+                continue
+            if str(snap.get("symbol") or "") != symbol:
+                continue
+            snap_time = _parse_time(snap.get("observed_at"))
+            if snap_time is None:
+                continue
+            skew = abs(snap_time.astimezone(UTC).timestamp() - target_ts)
+            if skew > max_distance_seconds:
+                continue
+            mark = float(snap.get("mark_price") or 0.0)
+            if mark <= 0:
+                continue
+            if skew < best_skew:
+                best_skew = skew
+                best = {
+                    "mark_price": mark,
+                    "observed_at": snap_time.isoformat(),
+                    "skew_seconds": skew,
+                }
+        return best

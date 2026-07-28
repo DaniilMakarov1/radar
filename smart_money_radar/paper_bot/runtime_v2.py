@@ -21,6 +21,7 @@ from smart_money_radar.paper_bot.accounting import executable_paper_pnl
 from smart_money_radar.paper_bot.accounting import (
     collateral_reserve_event_key,
     collateral_release_event_key,
+    funding_event_key,
     make_ledger_entry,
     order_fee_event_key,
     price_pnl_event_key,
@@ -38,7 +39,10 @@ from smart_money_radar.paper_bot.execution import (
 )
 from smart_money_radar.paper_bot.helpers import leg_by_side, optional_float, route_entry_key
 from smart_money_radar.paper_bot.risk import entry_risk_gates, hard_risk_triggered
-from smart_money_radar.paper_bot.settlement import build_settlement_crossing_rows
+from smart_money_radar.paper_bot.settlement import (
+    build_settlement_crossing_rows,
+    reconcile_leg,
+)
 from smart_money_radar.storage import SQLiteStore
 
 OBSERVATION_MIN_COUNT = 10
@@ -203,6 +207,11 @@ def build_focused_observation(
     return raw
 
 
+RECONCILIATION_TIMEOUT_SECONDS = 600.0
+RECONCILIATION_TOLERANCE_SECONDS = 120.0
+RECONCILIATION_MARK_MAX_DISTANCE_SECONDS = 2.0
+
+
 class SynchronizedFundingRuntimeV2:
     def __init__(
         self,
@@ -211,11 +220,13 @@ class SynchronizedFundingRuntimeV2:
         config: Any,
         clock: Any,
         observations_by_route: dict[str, list[dict[str, Any]]],
+        settlement_data_provider: Any | None = None,
     ) -> None:
         self.store = store
         self.config = config
         self.clock = clock
         self.observations_by_route = observations_by_route
+        self.settlement_data_provider = settlement_data_provider
 
     def _record_ledger_entry(self, row: dict[str, Any]) -> str | None:
         event_key = self.store.upsert_paper_event_ledger(row)
@@ -225,6 +236,414 @@ class SynchronizedFundingRuntimeV2:
                 float(row.get("cash_delta") or 0.0),
             )
         return event_key
+
+    # ------------------------------------------------------------------
+    # Reconciliation
+    # ------------------------------------------------------------------
+
+    def confirmed_funding_pnl_for_position(self, position_id: str) -> float:
+        """Sum of idempotent reconciled funding ledger entries for a position.
+
+        Only includes RATE_AND_MARK_RECONCILED entries. Excludes PENDING,
+        PUBLIC_RATE_CONFIRMED, expected/provisional funding.
+        """
+        total = 0.0
+        for row in self.store.paper_event_ledger_rows(position_id):
+            if str(row.get("event_type") or "") != "funding":
+                continue
+            total += float(row.get("cash_delta") or 0.0)
+        return total
+
+    def process_pending_reconciliations(self, now: datetime) -> dict[str, Any]:
+        """Process all PENDING reconciliation rows.
+
+        For each PENDING row:
+        - public event missing and age <= 600s: remain PENDING
+        - public event missing and age > 600s: set UNRECONCILED
+        - rate found but nearest mark missing: set PUBLIC_RATE_CONFIRMED, no cashflow
+        - rate + mark found: set RATE_AND_MARK_RECONCILED, calculate funding, ledger entry
+
+        Returns summary dict.
+        """
+        provider = self.settlement_data_provider
+        if provider is None:
+            return {"processed": 0, "reason": "no_settlement_data_provider"}
+
+        pending_rows = self.store.pending_reconciliation_rows()
+        if not pending_rows:
+            return {"processed": 0}
+
+        processed = 0
+        timed_out = 0
+        rate_confirmed = 0
+        reconciled = 0
+        now_utc = now.astimezone(UTC)
+
+        for row in pending_rows:
+            position_id = str(row["position_id"])
+            venue = str(row["venue"])
+            symbol = str(row["symbol"])
+            side = str(row["side"])
+            scheduled_at_str = str(row["scheduled_funding_at"])
+            cycle_id = str(row.get("cycle_id") or "")
+            quantity = self._position_quantity(position_id)
+
+            scheduled_at = parse_time(scheduled_at_str)
+            if scheduled_at is None:
+                continue
+
+            age_seconds = (now_utc - scheduled_at.astimezone(UTC)).total_seconds()
+
+            public_rate = optional_float(row.get("confirmed_funding_rate"))
+            if public_rate is None:
+                public_event = provider.get_public_funding_event(
+                    venue=venue,
+                    symbol=symbol,
+                    scheduled_funding_at=scheduled_at.astimezone(UTC),
+                    tolerance_seconds=RECONCILIATION_TOLERANCE_SECONDS,
+                )
+                if public_event is not None:
+                    public_rate = float(public_event.get("funding_rate") or 0.0)
+
+            if public_rate is None:
+                if age_seconds > RECONCILIATION_TIMEOUT_SECONDS:
+                    self._update_reconciliation_row(
+                        row, status="UNRECONCILED",
+                        rate_status="MISSING", mark_status="MISSING",
+                    )
+                    timed_out += 1
+                    processed += 1
+                    self._maybe_finalize_cycle_after_reconciliation(position_id, cycle_id)
+                    self._maybe_finalize_position_after_reconciliation(position_id)
+                continue
+
+            mark_snapshot = provider.get_nearest_mark_snapshot(
+                venue=venue,
+                symbol=symbol,
+                scheduled_funding_at=scheduled_at.astimezone(UTC),
+                max_distance_seconds=RECONCILIATION_MARK_MAX_DISTANCE_SECONDS,
+            )
+
+            if mark_snapshot is None:
+                if age_seconds > RECONCILIATION_TIMEOUT_SECONDS:
+                    self._update_reconciliation_row(
+                        row,
+                        status="UNRECONCILED",
+                        confirmed_funding_rate=public_rate,
+                        rate_status="CONFIRMED",
+                        mark_status="MISSING",
+                    )
+                    timed_out += 1
+                    processed += 1
+                    self._maybe_finalize_cycle_after_reconciliation(position_id, cycle_id)
+                    self._maybe_finalize_position_after_reconciliation(position_id)
+                    continue
+                self._update_reconciliation_row(
+                    row,
+                    status="PUBLIC_RATE_CONFIRMED",
+                    confirmed_funding_rate=public_rate,
+                    rate_status="CONFIRMED",
+                    mark_status="MISSING",
+                )
+                rate_confirmed += 1
+                continue
+
+            mark_price = float(mark_snapshot.get("mark_price") or 0.0)
+            leg_result = reconcile_leg(
+                public_rate=public_rate,
+                public_mark=mark_price,
+                side=side,
+                quantity=quantity,
+            )
+
+            self._update_reconciliation_row(
+                row,
+                status=leg_result["status"],
+                confirmed_funding_rate=leg_result.get("confirmed_funding_rate"),
+                settlement_mark_price=leg_result.get("settlement_mark_price"),
+                funding_pnl=leg_result.get("funding_pnl"),
+                rate_status=leg_result.get("rate_status"),
+                mark_status=leg_result.get("mark_status"),
+            )
+
+            if leg_result["status"] == "RATE_AND_MARK_RECONCILED":
+                funding_pnl = float(leg_result["funding_pnl"] or 0.0)
+                event_key = funding_event_key(position_id, venue, scheduled_at_str)
+                self._record_ledger_entry(
+                    make_ledger_entry(
+                        event_key,
+                        position_id=position_id,
+                        cycle_id=cycle_id,
+                        venue=venue,
+                        event_type="funding",
+                        cash_delta=funding_pnl,
+                        payload={
+                            "confirmed_rate": public_rate,
+                            "settlement_mark": mark_price,
+                            "side": side,
+                        },
+                    )
+                )
+                reconciled += 1
+            processed += 1
+            self._maybe_finalize_cycle_after_reconciliation(position_id, cycle_id)
+            self._maybe_finalize_position_after_reconciliation(position_id)
+
+        return {
+            "processed": processed,
+            "timed_out": timed_out,
+            "rate_confirmed": rate_confirmed,
+            "reconciled": reconciled,
+        }
+
+    def _position_quantity(self, position_id: str) -> float:
+        position = self.store.funding_capture_position_by_id(position_id)
+        if position is None:
+            return 0.0
+        return float(position.get("quantity") or 0.0)
+
+    def _update_reconciliation_row(
+        self,
+        row: dict[str, Any],
+        *,
+        status: str,
+        confirmed_funding_rate: float | None = None,
+        settlement_mark_price: float | None = None,
+        funding_pnl: float | None = None,
+        rate_status: str | None = None,
+        mark_status: str | None = None,
+    ) -> None:
+        updated = dict(row)
+        updated["status"] = status
+        if confirmed_funding_rate is not None:
+            updated["confirmed_funding_rate"] = confirmed_funding_rate
+        if settlement_mark_price is not None:
+            updated["settlement_mark_price"] = settlement_mark_price
+        if funding_pnl is not None:
+            updated["funding_pnl"] = funding_pnl
+        if rate_status is not None:
+            updated["rate_status"] = rate_status
+        if mark_status is not None:
+            updated["mark_status"] = mark_status
+        self.store.upsert_funding_settlement_reconciliation(updated)
+
+    def _maybe_finalize_cycle_after_reconciliation(
+        self,
+        position_id: str,
+        cycle_id: str,
+    ) -> None:
+        if not cycle_id:
+            return
+        leg_rows = self.store.funding_settlement_reconciliation_rows(
+            position_id, cycle_id=cycle_id,
+        )
+        if not leg_rows:
+            return
+        all_resolved = all(
+            str(r.get("status") or "") in {
+                "RATE_AND_MARK_RECONCILED", "PUBLIC_RATE_CONFIRMED", "UNRECONCILED",
+            }
+            for r in leg_rows
+        )
+        if not all_resolved:
+            return
+        has_unreconciled = any(
+            str(r.get("status") or "") == "UNRECONCILED" for r in leg_rows
+        )
+        if has_unreconciled:
+            self.store.update_funding_capture_cycle_state(
+                cycle_id, "UNRECONCILED", reconciliation_status="UNRECONCILED",
+            )
+            return
+        all_reconciled = all(
+            str(r.get("status") or "") == "RATE_AND_MARK_RECONCILED"
+            for r in leg_rows
+        )
+        if all_reconciled:
+            total_funding = sum(float(r.get("funding_pnl") or 0.0) for r in leg_rows)
+            self.store.update_funding_capture_cycle_state(
+                cycle_id,
+                "RECONCILED",
+                reconciliation_status="RATE_AND_MARK_RECONCILED",
+                reconciled_funding_pnl=total_funding,
+            )
+
+    def _maybe_finalize_position_after_reconciliation(
+        self,
+        position_id: str,
+    ) -> None:
+        position = self.store.funding_capture_position_by_id(position_id)
+        if position is None:
+            return
+        state = str(position.get("state") or "")
+        if state not in ("CLOSED_PENDING_RECONCILIATION",):
+            return
+        cycles = self.store.funding_capture_cycles_for_position(position_id)
+        if not cycles:
+            return
+        captured_cycles = [
+            c for c in cycles
+            if str(c.get("state") or "") in {
+                "RECONCILED", "UNRECONCILED", "SETTLEMENT_CROSSED",
+            }
+        ]
+        if not captured_cycles:
+            return
+        all_settled = all(
+            str(c.get("state") or "") in {"RECONCILED", "UNRECONCILED"}
+            for c in captured_cycles
+        )
+        if not all_settled:
+            return
+        has_unreconciled = any(
+            str(c.get("state") or "") == "UNRECONCILED" for c in captured_cycles
+        )
+        if has_unreconciled:
+            self.store.update_funding_capture_position_state(
+                position_id, "UNRECONCILED",
+            )
+            return
+        total_reconciled_funding = sum(
+            float(c.get("reconciled_funding_pnl") or 0.0) for c in captured_cycles
+        )
+        price_pnl = 0.0
+        total_fees = float(position.get("paper_open_fees") or 0.0) + float(position.get("paper_close_fees") or 0.0)
+        emergency_cost = float(position.get("paper_emergency_unwind_cost") or 0.0)
+        for ledger_row in self.store.paper_event_ledger_rows(position_id):
+            if str(ledger_row.get("event_type") or "") == "price_pnl":
+                price_pnl += float(ledger_row.get("cash_delta") or 0.0)
+        reconciled_net = price_pnl + total_reconciled_funding - total_fees - emergency_cost
+        self.store.update_funding_capture_position_state(
+            position_id, "RECONCILED",
+            paper_net_pnl_reconciled=reconciled_net,
+        )
+
+    def record_current_executable_pnl(
+        self,
+        position: dict[str, Any],
+        route: dict[str, Any] | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Store executable PnL for an open synchronized position.
+
+        This is the runtime poll value used by risk/hold logic. It includes
+        confirmed reconciled funding only and never includes expected funding
+        or spread-convergence assumptions.
+        """
+        if route is None:
+            return {"decision": "skipped", "reason": "route_missing"}
+        position_id = str(position["position_id"])
+        cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
+        quantity = float(position.get("quantity") or 0.0)
+        if quantity <= 0:
+            return {"decision": "skipped", "reason": "quantity_missing"}
+
+        legs = route.get("legs") or []
+        long_route_leg = leg_by_side(legs, "long") or {}
+        short_route_leg = leg_by_side(legs, "short") or {}
+        entry_legs = (position.get("config") or {}).get("entry_legs") or []
+        long_entry_leg = leg_by_side(entry_legs, "long") or {}
+        short_entry_leg = leg_by_side(entry_legs, "short") or {}
+        long_entry_price = float(
+            optional_float(long_entry_leg.get("entry_fill_price"))
+            or optional_float(long_entry_leg.get("vwap"))
+            or 0.0
+        )
+        short_entry_price = float(
+            optional_float(short_entry_leg.get("entry_fill_price"))
+            or optional_float(short_entry_leg.get("vwap"))
+            or 0.0
+        )
+        prices = self._current_close_prices(route)
+        long_exit_price = float(prices.get("long_exit_price") or 0.0)
+        short_exit_price = float(prices.get("short_exit_price") or 0.0)
+        if min(long_entry_price, short_entry_price, long_exit_price, short_exit_price) <= 0:
+            return {
+                "decision": "skipped",
+                "reason": "current_executable_price_missing",
+                "long_entry_price": long_entry_price,
+                "short_entry_price": short_entry_price,
+                "long_exit_price": long_exit_price,
+                "short_exit_price": short_exit_price,
+            }
+        long_fee_rate = float(
+            optional_float(long_route_leg.get("fee_rate"))
+            or optional_float(long_entry_leg.get("fee_rate"))
+            or 0.0
+        )
+        short_fee_rate = float(
+            optional_float(short_route_leg.get("fee_rate"))
+            or optional_float(short_entry_leg.get("fee_rate"))
+            or 0.0
+        )
+        pnl = executable_paper_pnl(
+            quantity=quantity,
+            long_entry_price=long_entry_price,
+            long_exit_price=long_exit_price,
+            short_entry_price=short_entry_price,
+            short_exit_price=short_exit_price,
+            long_taker_fee=long_fee_rate,
+            short_taker_fee=short_fee_rate,
+            confirmed_funding_pnl=self.confirmed_funding_pnl_for_position(position_id),
+            paper_open_fees=float(position.get("paper_open_fees") or 0.0),
+            emergency_unwind_costs_already_incurred=float(
+                position.get("paper_emergency_unwind_cost") or 0.0
+            ),
+        )
+        observed_at = now.astimezone(UTC).isoformat()
+        long_seen_at = (
+            parse_time(long_route_leg.get("orderbook_response_received_at"))
+            or parse_time(long_route_leg.get("response_received_at"))
+            or parse_time(long_route_leg.get("observed_at"))
+            or now
+        ).astimezone(UTC)
+        short_seen_at = (
+            parse_time(short_route_leg.get("orderbook_response_received_at"))
+            or parse_time(short_route_leg.get("response_received_at"))
+            or parse_time(short_route_leg.get("observed_at"))
+            or now
+        ).astimezone(UTC)
+        self.store.upsert_funding_capture_observation(
+            {
+                "observation_id": f"{cycle_id}:current_pnl:{observed_at}",
+                "position_id": position_id,
+                "cycle_id": cycle_id,
+                "phase": "current_pnl",
+                "observed_at": observed_at,
+                "long_response_received_at": long_seen_at.isoformat(),
+                "short_response_received_at": short_seen_at.isoformat(),
+                "cross_venue_skew_ms": abs(
+                    (long_seen_at - short_seen_at).total_seconds()
+                ) * 1000.0,
+                "long_mark": optional_float(long_route_leg.get("mark_price")),
+                "short_mark": optional_float(short_route_leg.get("mark_price")),
+                "long_index": optional_float(long_route_leg.get("index_price")),
+                "short_index": optional_float(short_route_leg.get("index_price")),
+                "long_next_funding_at": long_route_leg.get("next_funding_at"),
+                "short_next_funding_at": short_route_leg.get("next_funding_at"),
+                "long_next_funding_rate": optional_float(
+                    long_route_leg.get("normalized_next_funding_rate")
+                    or long_route_leg.get("funding_rate")
+                ),
+                "short_next_funding_rate": optional_float(
+                    short_route_leg.get("normalized_next_funding_rate")
+                    or short_route_leg.get("funding_rate")
+                ),
+                "gross_funding_pnl": None,
+                "long_close_vwap": long_exit_price,
+                "short_close_vwap": short_exit_price,
+                "current_exit_spread": short_exit_price - long_exit_price,
+                "paper_net_if_exit_now": pnl["paper_net_if_exit_now"],
+                "snapshot_valid": True,
+            }
+        )
+        self.store.update_funding_capture_position_state(
+            position_id,
+            str(position.get("state") or "OPEN"),
+            now,
+            paper_net_pnl_estimated=pnl["paper_net_if_exit_now"],
+        )
+        return {"decision": "recorded", **pnl}
 
     def consider_route(
         self,
@@ -1292,7 +1711,7 @@ class SynchronizedFundingRuntimeV2:
             short_exit_price=float(short_exit["average_fill_price"] or short_exit_price or 0.0),
             long_taker_fee=long_fee_rate,
             short_taker_fee=short_fee_rate,
-            confirmed_funding_pnl=0.0,
+            confirmed_funding_pnl=self.confirmed_funding_pnl_for_position(position_id),
             paper_open_fees=float(position.get("paper_open_fees") or 0.0),
             emergency_unwind_costs_already_incurred=emergency_cost,
         )

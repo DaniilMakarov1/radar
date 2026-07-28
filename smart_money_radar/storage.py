@@ -395,6 +395,73 @@ class SQLiteStore:
             output.append(item)
         return output
 
+    def pending_reconciliation_rows(self) -> list[dict[str, Any]]:
+        """Return unresolved reconciliation rows that can still progress."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM funding_settlement_reconciliations
+                WHERE status IN ('PENDING', 'PUBLIC_RATE_CONFIRMED')
+                ORDER BY scheduled_funding_at, venue
+                """
+            ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            output.append(item)
+        return output
+
+    def funding_capture_cycles_for_position(
+        self,
+        position_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return all capture cycles for a position, ordered by cycle_number."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM funding_capture_cycles
+                WHERE position_id = ?
+                ORDER BY cycle_number
+                """,
+                (position_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def funding_capture_position_by_id(
+        self,
+        position_id: str,
+    ) -> dict[str, Any] | None:
+        """Return a single capture position by ID with its latest cycle."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT p.*, c.cycle_id AS current_cycle_id,
+                       c.cycle_number AS current_cycle_number,
+                       c.scheduled_funding_at AS current_cycle_scheduled_funding_at,
+                       c.state AS current_cycle_state,
+                       c.conservative_funding_gross AS current_cycle_conservative_funding_gross,
+                       c.conservative_funding_edge_bps AS current_cycle_conservative_funding_edge_bps
+                FROM funding_capture_positions p
+                LEFT JOIN funding_capture_cycles c
+                  ON c.position_id = p.position_id
+                 AND c.cycle_number = (
+                    SELECT MAX(c2.cycle_number)
+                    FROM funding_capture_cycles c2
+                    WHERE c2.position_id = p.position_id
+                 )
+                WHERE p.position_id = ?
+                """,
+                (position_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["config"] = json.loads(item.pop("config_json") or "{}")
+        return item
+
     def funding_capture_position_rows(
         self,
         *,
@@ -6035,6 +6102,35 @@ class SQLiteStore:
             }
         )
         return item
+
+    def funding_market_snapshot_rows(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT venue, symbol, canonical_asset, funding_rate,
+                       funding_interval_hours, hourly_funding_rate,
+                       funding_rate_kind, next_funding_at, mark_price,
+                       index_price, open_interest_usd, volume_24h_usd,
+                       observed_at, raw_json
+                FROM funding_market_snapshots
+                WHERE venue = ? AND symbol = ?
+                ORDER BY observed_at DESC, funding_market_snapshot_id DESC
+                LIMIT ?
+                """,
+                (str(venue), str(symbol), int(limit)),
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["raw"] = json.loads(item.pop("raw_json") or "{}")
+            output.append(item)
+        return output
 
     def insert_funding_orderbooks(
         self,

@@ -118,6 +118,7 @@ from smart_money_radar.paper_bot.runtime_v2 import (
     SynchronizedFundingRuntimeV2,
     synchronized_runtime_enabled,
 )
+from smart_money_radar.paper_bot.settlement import StoredFundingSettlementDataProvider
 from smart_money_radar.paper_bot.risk import (
     common_price_move_telemetry,
     dynamic_basis_risk_budget_bps,
@@ -375,6 +376,7 @@ class PaperBot:
         config: PaperBotConfig | None = None,
         notifier: TelegramNotifier | None = None,
         clock: Any | None = None,
+        settlement_data_provider: Any | None = None,
     ) -> None:
         cfg = (config or PaperBotConfig()).validated()
         self.iterations = cfg.iterations
@@ -396,14 +398,19 @@ class PaperBot:
         self.last_full_scan_monotonic = 0.0
         self.last_status_report_monotonic = 0.0
         self.last_retention_monotonic = 0.0
+        self.last_reconciliation_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
         self.price_move_alerted_positions: set[tuple[int, str]] = set()
         self.v2_observations_by_route: dict[str, list[dict[str, Any]]] = {}
+        resolved_settlement_data_provider = (
+            settlement_data_provider or StoredFundingSettlementDataProvider(self.store)
+        )
         self.synchronized_runtime = SynchronizedFundingRuntimeV2(
             store=self.store,
             config=self.config,
             clock=self.clock,
             observations_by_route=self.v2_observations_by_route,
+            settlement_data_provider=resolved_settlement_data_provider,
         )
         self.background_full_scan_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_future: Future[dict[str, Any]] | None = None
@@ -583,6 +590,10 @@ class PaperBot:
         discovery = self._run_lightweight_discovery()
         if discovery is not None:
             result["lightweight_discovery"] = discovery
+        # --- Reconciliation worker on 10-second cadence ---
+        reconciliation = self._maybe_run_reconciliation()
+        if reconciliation is not None:
+            result["reconciliation"] = reconciliation
         return result
 
     def should_run_hot_iteration(self) -> bool:
@@ -1836,6 +1847,19 @@ class PaperBot:
 
         return None
 
+    def _maybe_run_reconciliation(self) -> dict[str, Any] | None:
+        """Run reconciliation worker on a 10-second cadence."""
+        now_monotonic = self.clock.monotonic()
+        reconciliation_interval = 10.0
+        if (
+            self.last_reconciliation_monotonic > 0
+            and now_monotonic - self.last_reconciliation_monotonic < reconciliation_interval
+        ):
+            return None
+        self.last_reconciliation_monotonic = now_monotonic
+        now = self.clock.now()
+        return self.synchronized_runtime.process_pending_reconciliations(now)
+
     def _run_lightweight_discovery(self) -> dict[str, Any] | None:
         """Lightweight discovery: market snapshots + next funding only, no full orderbooks."""
         now_monotonic = time.monotonic()
@@ -1884,6 +1908,16 @@ class PaperBot:
                 if route_key
                 else None
             )
+            current_pnl = self.synchronized_runtime.record_current_executable_pnl(
+                position,
+                live_route,
+                now,
+            )
+            if current_pnl.get("decision") == "recorded":
+                position = {
+                    **position,
+                    "paper_net_pnl_estimated": current_pnl.get("paper_net_if_exit_now"),
+                }
             legacy_like = self._legacy_like_position_from_capture(position)
             risk_exit = self._poll_position_risk(legacy_like, live_route, now)
             if risk_exit is not None:
