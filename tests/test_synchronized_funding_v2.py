@@ -351,3 +351,199 @@ def test_capability_contract_happy_path() -> None:
             decision_mode="settlement_capture",
         )["coverage_ratio"]
     )
+
+
+def test_close_decision_enforces_max_settlements(tmp_path) -> None:
+    from smart_money_radar.paper_bot.position import close_decision
+    from smart_money_radar.funding.trader import PaperBotConfig
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    config = PaperBotConfig(
+        max_settlements_per_position=2,
+        max_position_age_seconds=86_400,
+    ).validated()
+    now = datetime(2026, 7, 19, 13, 0, 1, tzinfo=UTC)
+    position = {
+        "funding_paper_position_id": 1,
+        "route_key": "BTC:binance:bybit",
+        "canonical_asset": "BTC",
+        "long_venue": "binance",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "bybit",
+        "short_symbol": "BTCUSDT",
+        "base_quantity": 0.01,
+        "target_notional": 500.0,
+        "long_notional": 500.0,
+        "short_notional": 500.0,
+        "long_settlement_at": "2026-07-19T13:00:00+00:00",
+        "short_settlement_at": "2026-07-19T13:00:00+00:00",
+        "max_settlement_at": "2026-07-19T13:00:00+00:00",
+        "opened_at": "2026-07-19T12:00:00+00:00",
+        "expected_execution_cost": 1.0,
+        "expected_live_net": 5.0,
+        "expected_live_gross": 6.0,
+        "entry_legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T13:00:00+00:00", "funding_rate": 0.001, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T13:00:00+00:00", "funding_rate": 0.004, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.004},
+        ],
+        "entry_evidence": {},
+        "notes": {
+            "accrued_settlement_count": 2,
+            "accrued_funding_pnl": 3.0,
+        },
+    }
+    result = close_decision(position, now, store, config)
+    assert result["status"] == "close"
+    assert result["close"]["close_reason"] == "max_settlements_reached"
+    assert result["close"]["actual_funding_pnl"] == 3.0
+    assert result["close"]["settlement"]["current_funding_pnl"] == 0.0
+    assert not result["close"]["settlement"]["current_settlement_funding_included"]
+
+
+def test_close_decision_enforces_max_position_age(tmp_path) -> None:
+    from smart_money_radar.paper_bot.position import close_decision
+    from smart_money_radar.funding.trader import PaperBotConfig
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    config = PaperBotConfig(
+        max_settlements_per_position=10,
+        max_position_age_seconds=3600,
+    ).validated()
+    now = datetime(2026, 7, 19, 14, 0, 1, tzinfo=UTC)
+    position = {
+        "funding_paper_position_id": 1,
+        "route_key": "BTC:binance:bybit",
+        "canonical_asset": "BTC",
+        "long_venue": "binance",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "bybit",
+        "short_symbol": "BTCUSDT",
+        "base_quantity": 0.01,
+        "target_notional": 500.0,
+        "long_notional": 500.0,
+        "short_notional": 500.0,
+        "long_settlement_at": "2026-07-19T14:00:00+00:00",
+        "short_settlement_at": "2026-07-19T14:00:00+00:00",
+        "max_settlement_at": "2026-07-19T14:00:00+00:00",
+        "opened_at": "2026-07-19T12:00:00+00:00",
+        "expected_execution_cost": 1.0,
+        "expected_live_net": 5.0,
+        "expected_live_gross": 6.0,
+        "entry_legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T14:00:00+00:00", "funding_rate": 0.001, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T14:00:00+00:00", "funding_rate": 0.004, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.004},
+        ],
+        "entry_evidence": {},
+        "notes": {
+            "accrued_settlement_count": 1,
+            "accrued_funding_pnl": 1.5,
+        },
+    }
+    result = close_decision(position, now, store, config)
+    assert result["status"] == "close"
+    assert result["close"]["close_reason"] == "max_position_age_reached"
+    assert result["close"]["actual_funding_pnl"] == 1.5
+    assert result["close"]["settlement"]["current_funding_pnl"] == 0.0
+    assert not result["close"]["settlement"]["current_settlement_funding_included"]
+
+
+def test_position_hold_decision_detects_interval_mismatch() -> None:
+    from smart_money_radar.paper_bot.position import position_hold_decision
+    from smart_money_radar.funding.trader import PaperBotConfig
+    config = PaperBotConfig().validated()
+    now = datetime(2026, 7, 19, 12, 30, tzinfo=UTC)
+    position = {
+        "funding_paper_position_id": 1,
+        "route_key": "BTC:binance:bybit",
+        "opened_at": "2026-07-19T12:00:00+00:00",
+        "notes": {},
+    }
+    route = {
+        "status": "paper_candidate",
+        "risk_flags": [],
+        "observed_at": "2026-07-19T12:29:59+00:00",
+        "legs": [
+            {
+                "side": "long",
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "next_funding_at": "2026-07-19T13:00:00+00:00",
+                "funding_interval_hours": 1.0,
+                "hourly_funding_rate": 0.001,
+                "funding_rate": 0.001,
+            },
+            {
+                "side": "short",
+                "venue": "bybit",
+                "symbol": "BTCUSDT",
+                "next_funding_at": "2026-07-19T16:00:00+00:00",
+                "funding_interval_hours": 4.0,
+                "hourly_funding_rate": 0.0005,
+                "funding_rate": 0.002,
+            },
+        ],
+        "evidence": {
+            "selected_strategy": {
+                "selection_model": "opportunity_engine_v1",
+                "strategy_name": "synchronized_funding_capture",
+                "eligible": True,
+                "expected_net_pnl": 5.0,
+                "funding_pnl_component": 5.0,
+                "edge_type": "funding_led",
+            },
+        },
+    }
+    result = position_hold_decision(position, route, now, config)
+    assert not result["hold"]
+    assert "funding_interval_mismatch" in result["reasons"]
+    assert result["close_reason"] == "funding_interval_mismatch_close"
+
+
+def test_time_based_retention_prunes_old_history(tmp_path) -> None:
+    from datetime import timedelta
+    from smart_money_radar.funding.retention import (
+        count_old_funding_history_by_age,
+        prune_funding_history_by_age,
+    )
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    now = datetime.now(UTC)
+    old_date = (now - timedelta(days=30)).isoformat(timespec="seconds")
+    recent_date = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+    observed = now.isoformat(timespec="seconds")
+    with store.connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO funding_instruments
+            (venue, symbol, canonical_asset, base_asset, quote_asset,
+             collateral_asset, contract_type, status, observed_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("binance", "BTCUSDT", "BTC", "BTC", "USDT", "USDT",
+             "perpetual", "active", observed, observed),
+        )
+        conn.execute(
+            """
+            INSERT INTO funding_rate_history
+            (venue, symbol, funding_at, funding_rate, funding_interval_hours,
+             hourly_funding_rate, observed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("binance", "BTCUSDT", old_date, 0.001, 8.0, 0.000125, observed),
+        )
+        conn.execute(
+            """
+            INSERT INTO funding_rate_history
+            (venue, symbol, funding_at, funding_rate, funding_interval_hours,
+             hourly_funding_rate, observed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("binance", "BTCUSDT", recent_date, 0.002, 8.0, 0.00025, observed),
+        )
+    with store.connect() as conn:
+        old_count = count_old_funding_history_by_age(conn, keep_older_than_seconds=7 * 86_400)
+        assert old_count >= 1
+        deleted = prune_funding_history_by_age(conn, keep_older_than_seconds=7 * 86_400)
+        assert deleted >= 1
+        remaining = conn.execute("SELECT COUNT(*) FROM funding_rate_history").fetchone()[0]
+        assert remaining >= 1

@@ -61,7 +61,7 @@ from smart_money_radar.storage import SQLiteStore, utc_now_iso
 
 
 FUNDING_SCAN_RETENTION = 1
-FUNDING_HISTORY_RETENTION_PER_MARKET = 24
+FUNDING_HISTORY_MIN_ROWS_PER_MARKET = 24
 RETENTION_SCAN_MODES = {"auto", "watch"}
 
 
@@ -529,7 +529,7 @@ def run_funding_scan(
             apply_funding_retention_plan(
                 store,
                 keep_latest_scans=FUNDING_SCAN_RETENTION,
-                keep_latest_history_per_market=FUNDING_HISTORY_RETENTION_PER_MARKET,
+                keep_latest_history_per_market=FUNDING_HISTORY_MIN_ROWS_PER_MARKET,
             )
         return {
             "funding_scan_id": scan_id,
@@ -764,7 +764,7 @@ def backfill_funding_history(
     retention = apply_funding_retention_plan(
         store,
         keep_latest_scans=FUNDING_SCAN_RETENTION,
-        keep_latest_history_per_market=FUNDING_HISTORY_RETENTION_PER_MARKET,
+        keep_latest_history_per_market=FUNDING_HISTORY_MIN_ROWS_PER_MARKET,
     )
     warnings.extend(
         f"{venue} {symbol} history skipped: {error}"

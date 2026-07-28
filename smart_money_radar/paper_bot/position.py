@@ -530,6 +530,62 @@ def close_decision(
         return {"status": "settlement_pending", "reason": "missing_max_settlement_at"}
     close_route = store.latest_funding_route_by_key(str(position["route_key"]))
     hold = position_hold_decision(position, close_route, now, config)
+
+    notes = position.get("notes") or {}
+    accrued_count = int(notes.get("accrued_settlement_count") or 0)
+    opened_at = parse_iso(position.get("opened_at"))
+
+    if accrued_count >= config.max_settlements_per_position:
+        close = build_close_payload(
+            position,
+            {"long": None, "short": None},
+            close_route,
+            use_entry_estimate_for_missing=False,
+            close_reason="max_settlements_reached",
+            hold_decision={
+                "hold": False,
+                "close_reason": "max_settlements_reached",
+                "current_settlement_funding_included": False,
+                "reasons": [
+                    f"accrued_settlements={accrued_count}",
+                    f"max_settlements={config.max_settlements_per_position}",
+                ],
+            },
+            include_current_settlement_funding=False,
+        )
+        return {"status": "close", "close": close}
+
+    if opened_at is not None:
+        position_age = (now - opened_at).total_seconds()
+        if position_age >= config.max_position_age_seconds:
+            include_current = now >= max_settlement + timedelta(
+                seconds=config.settlement_grace_seconds
+            )
+            settlement = (
+                settlement_rates_for_position(position, store)
+                if include_current
+                else {"long": None, "short": None}
+            )
+            missing = [side for side, row in settlement.items() if row is None]
+            close = build_close_payload(
+                position,
+                settlement,
+                close_route,
+                use_entry_estimate_for_missing=bool(missing) if include_current else False,
+                close_reason="max_position_age_reached",
+                hold_decision={
+                    "hold": False,
+                    "close_reason": "max_position_age_reached",
+                    "current_settlement_funding_included": include_current,
+                    "reasons": [
+                        f"position_age_seconds={position_age:.0f}",
+                        f"max_position_age_seconds={config.max_position_age_seconds}",
+                    ],
+                },
+                include_current_settlement_funding=include_current,
+            )
+            return {"status": "close", "close": close}
+
     if now < max_settlement + timedelta(seconds=config.settlement_grace_seconds):
         pre_settlement_exit_reasons = {
             "live_net_not_positive",
@@ -565,6 +621,7 @@ def close_decision(
 
     settlement = settlement_rates_for_position(position, store)
     missing = [side for side, row in settlement.items() if row is None]
+
     if hold["hold"]:
         accrual = build_settlement_accrual_payload(
             position,
@@ -660,6 +717,14 @@ def position_hold_decision(
             and funding_sensitive
         ):
             reasons.append("funding_rate_inverted")
+        long_interval = optional_float(long_leg.get("funding_interval_hours"))
+        short_interval = optional_float(short_leg.get("funding_interval_hours"))
+        if (
+            long_interval is not None
+            and short_interval is not None
+            and abs(float(long_interval) - float(short_interval)) > 0.01
+        ):
+            reasons.append("funding_interval_mismatch")
     close_reason = close_reason_from_hold_reasons(reasons)
     return {
         "hold": not reasons,
@@ -678,6 +743,8 @@ def position_hold_decision(
 def close_reason_from_hold_reasons(reasons: list[str]) -> str:
     if "live_net_not_positive" in reasons:
         return "arbitrage_window_closed_live_net_non_positive"
+    if "funding_interval_mismatch" in reasons:
+        return "funding_interval_mismatch_close"
     if "data_quality_issue" in reasons:
         return "arbitrage_window_data_quality_issue"
     if (

@@ -8,6 +8,7 @@ from smart_money_radar.funding.retention import (
     apply_funding_retention_plan,
     build_funding_retention_plan,
     delete_funding_routes,
+    refresh_funding_history_sync_state,
 )
 from smart_money_radar.storage import SQLiteStore
 
@@ -402,15 +403,79 @@ class FundingRetentionTest(unittest.TestCase):
         self.assertEqual(remaining_routes, ["protected-route"])
         self.assertIsNone(detached_event["funding_route_id"])
 
-    def test_prunes_funding_rate_history_to_latest_rows_per_market(self) -> None:
+    def test_prunes_funding_rate_history_by_age_with_latest_floor(self) -> None:
         with self.store.connect() as connection:
             seed_instrument(connection)
-            seed_funding_history(connection, row_count=5)
+            now = datetime.now(UTC)
+            rows = []
+            for index in range(3):
+                funding_at = (
+                    now - timedelta(days=30, hours=3 - index)
+                ).isoformat(timespec="seconds")
+                rows.append(
+                    (
+                        "binance",
+                        "BTCUSDT",
+                        funding_at,
+                        0.0001,
+                        1.0,
+                        0.0001,
+                        funding_at,
+                        "{}",
+                    )
+                )
+            for index in range(5):
+                funding_at = (
+                    now - timedelta(hours=5 - index)
+                ).isoformat(timespec="seconds")
+                rows.append(
+                    (
+                        "binance",
+                        "BTCUSDT",
+                        funding_at,
+                        0.0001,
+                        1.0,
+                        0.0001,
+                        funding_at,
+                        "{}",
+                    )
+                )
+            connection.executemany(
+                """
+                INSERT INTO funding_rate_history (
+                    venue, symbol, funding_at, funding_rate,
+                    funding_interval_hours, hourly_funding_rate, observed_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            sorted_funding_at = sorted(row[2] for row in rows)
+            connection.execute(
+                """
+                INSERT INTO funding_history_sync_state (
+                    venue, symbol, requested_start_at, fetched_at, row_count,
+                    earliest_funding_at, latest_funding_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "binance",
+                    "BTCUSDT",
+                    sorted_funding_at[0],
+                    now.isoformat(timespec="seconds"),
+                    len(rows),
+                    sorted_funding_at[0],
+                    sorted_funding_at[-1],
+                ),
+            )
+            refresh_funding_history_sync_state(connection)
 
         plan = build_funding_retention_plan(
             self.store,
             keep_latest_scans=20,
             keep_latest_history_per_market=2,
+            keep_history_older_than_seconds=7 * 86_400,
         )
 
         self.assertEqual(plan.rows_by_table["funding_rate_history"], 3)
@@ -419,6 +484,7 @@ class FundingRetentionTest(unittest.TestCase):
             self.store,
             keep_latest_scans=20,
             keep_latest_history_per_market=2,
+            keep_history_older_than_seconds=7 * 86_400,
         )
 
         self.assertEqual(result["deleted_rows"]["funding_rate_history"], 3)
@@ -443,14 +509,9 @@ class FundingRetentionTest(unittest.TestCase):
                 ).fetchone()
             )
 
-        self.assertEqual(
-            remaining,
-            [
-                "2026-01-01T03:00:00+00:00",
-                "2026-01-01T04:00:00+00:00",
-            ],
-        )
-        self.assertEqual(sync_row["row_count"], 2)
+        self.assertEqual(len(remaining), 5)
+        self.assertTrue(all(funding_at > (datetime.now(UTC) - timedelta(days=7)).isoformat(timespec="seconds") for funding_at in remaining))
+        self.assertEqual(sync_row["row_count"], 5)
         self.assertEqual(sync_row["earliest_funding_at"], remaining[0])
         self.assertEqual(sync_row["latest_funding_at"], remaining[-1])
 

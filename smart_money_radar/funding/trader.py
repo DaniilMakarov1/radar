@@ -136,7 +136,7 @@ from smart_money_radar.paper_bot.telegram import (
     status_route_line,
 )
 
-FUNDING_HISTORY_RETENTION_PER_MARKET = 24
+FUNDING_HISTORY_MIN_ROWS_PER_MARKET = 24
 FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 
 @dataclass(frozen=True)
@@ -884,7 +884,7 @@ class PaperBot:
             apply_funding_retention_plan(
                 self.store,
                 keep_latest_scans=keep_latest_scans,
-                keep_latest_history_per_market=FUNDING_HISTORY_RETENTION_PER_MARKET,
+                keep_latest_history_per_market=FUNDING_HISTORY_MIN_ROWS_PER_MARKET,
             )
             self.last_retention_monotonic = time.monotonic()
         except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:

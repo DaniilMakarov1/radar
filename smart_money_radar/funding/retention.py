@@ -34,6 +34,7 @@ ROUTINE_PAPER_EVENT_TYPES = (
 DEFAULT_KEEP_LATEST_ROUTINE_PAPER_EVENTS = 200
 DEFAULT_KEEP_LATEST_EQUITY_SNAPSHOTS = 300
 DEFAULT_STALE_RUNNING_SCAN_SECONDS = 900
+DEFAULT_KEEP_HISTORY_OLDER_THAN_SECONDS = 7 * 86_400
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class FundingRetentionPlan:
     delete_scan_count: int
     delete_route_count: int
     keep_latest_history_per_market: int
+    keep_history_older_than_seconds: int
     rows_by_table: dict[str, int]
     delete_scan_ids: list[int]
     protected_scan_ids: list[int]
@@ -56,6 +58,7 @@ class FundingRetentionPlan:
             "delete_scan_count": self.delete_scan_count,
             "delete_route_count": self.delete_route_count,
             "keep_latest_history_per_market": self.keep_latest_history_per_market,
+            "keep_history_older_than_seconds": self.keep_history_older_than_seconds,
             "rows_by_table": self.rows_by_table,
             "delete_scan_ids": self.delete_scan_ids,
             "protected_scan_ids": self.protected_scan_ids,
@@ -69,6 +72,7 @@ def build_funding_retention_plan(
     keep_latest_routine_paper_events: int = DEFAULT_KEEP_LATEST_ROUTINE_PAPER_EVENTS,
     keep_latest_equity_snapshots: int = DEFAULT_KEEP_LATEST_EQUITY_SNAPSHOTS,
     stale_running_scan_seconds: int = DEFAULT_STALE_RUNNING_SCAN_SECONDS,
+    keep_history_older_than_seconds: int = DEFAULT_KEEP_HISTORY_OLDER_THAN_SECONDS,
 ) -> FundingRetentionPlan:
     retained = max(1, int(keep_latest_scans))
     retained_history = max(1, int(keep_latest_history_per_market))
@@ -115,8 +119,9 @@ def build_funding_retention_plan(
         }
         rows_by_table["funding_routes"] = len(delete_route_ids)
         rows_by_table["funding_scans"] = len(delete_scan_ids)
-        rows_by_table["funding_rate_history"] = count_old_funding_history_rows(
+        rows_by_table["funding_rate_history"] = count_old_funding_history_by_age(
             connection,
+            max(1, int(keep_history_older_than_seconds)),
             retained_history,
         )
         rows_by_table["funding_paper_events"] = count_old_routine_paper_events(
@@ -133,6 +138,7 @@ def build_funding_retention_plan(
         delete_scan_count=len(delete_scan_ids),
         delete_route_count=len(delete_route_ids),
         keep_latest_history_per_market=retained_history,
+        keep_history_older_than_seconds=max(1, int(keep_history_older_than_seconds)),
         rows_by_table=rows_by_table,
         delete_scan_ids=delete_scan_ids,
         protected_scan_ids=sorted(protected_scan_ids, reverse=True),
@@ -146,6 +152,7 @@ def apply_funding_retention_plan(
     keep_latest_routine_paper_events: int = DEFAULT_KEEP_LATEST_ROUTINE_PAPER_EVENTS,
     keep_latest_equity_snapshots: int = DEFAULT_KEEP_LATEST_EQUITY_SNAPSHOTS,
     stale_running_scan_seconds: int = DEFAULT_STALE_RUNNING_SCAN_SECONDS,
+    keep_history_older_than_seconds: int = DEFAULT_KEEP_HISTORY_OLDER_THAN_SECONDS,
 ) -> dict[str, Any]:
     stale_running_marked = mark_stale_running_funding_scans(
         store,
@@ -158,6 +165,7 @@ def apply_funding_retention_plan(
         keep_latest_routine_paper_events=keep_latest_routine_paper_events,
         keep_latest_equity_snapshots=keep_latest_equity_snapshots,
         stale_running_scan_seconds=stale_running_scan_seconds,
+        keep_history_older_than_seconds=keep_history_older_than_seconds,
     )
     deleted_rows = {key: 0 for key in plan.rows_by_table}
     if not plan.delete_scan_ids and all(
@@ -245,8 +253,9 @@ def _apply_retention_deletes(
                 "funding_scan_id",
                 scan_ids,
             )
-        deleted_rows["funding_rate_history"] = prune_funding_rate_history(
+        deleted_rows["funding_rate_history"] = prune_funding_history_by_age(
             connection,
+            plan.keep_history_older_than_seconds,
             plan.keep_latest_history_per_market,
         )
         deleted_rows["funding_paper_events"] = prune_routine_paper_events(
@@ -623,78 +632,201 @@ def count_rows_for_scans(
     return total
 
 
-def count_old_funding_history_rows(
+def count_old_funding_history_by_age(
     connection: sqlite3.Connection,
-    keep_latest_per_market: int,
+    keep_older_than_seconds: int,
+    keep_latest_per_market: int = 0,
 ) -> int:
+    cutoff = (
+        datetime.now(UTC) - timedelta(seconds=max(1, int(keep_older_than_seconds)))
+    ).isoformat(timespec="seconds")
+    floor = max(0, int(keep_latest_per_market))
+    if floor > 0:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT ROW_NUMBER() OVER (
+                        PARTITION BY venue, symbol
+                        ORDER BY funding_at DESC
+                    ) AS row_number,
+                    funding_at
+                    FROM funding_rate_history
+                )
+                WHERE funding_at < ? AND row_number > ?
+                """,
+                (cutoff, floor),
+            ).fetchone()[0]
+        )
     return int(
         connection.execute(
             """
             SELECT COUNT(*)
-            FROM (
-                SELECT ROW_NUMBER() OVER (
-                    PARTITION BY venue, symbol
-                    ORDER BY funding_at DESC
-                ) AS row_number
-                FROM funding_rate_history
-            )
-            WHERE row_number > ?
+            FROM funding_rate_history
+            WHERE funding_at < ?
             """,
-            (max(1, int(keep_latest_per_market)),),
+            (cutoff,),
         ).fetchone()[0]
     )
 
 
-def prune_funding_rate_history(
+def prune_funding_history_by_age(
     connection: sqlite3.Connection,
-    keep_latest_per_market: int,
+    keep_older_than_seconds: int,
+    keep_latest_per_market: int = 0,
 ) -> int:
-    keep = max(1, int(keep_latest_per_market))
-    connection.execute("DROP TABLE IF EXISTS temp.funding_history_prune_keys")
-    connection.execute(
-        """
-        CREATE TEMP TABLE funding_history_prune_keys (
-            venue TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            funding_at TEXT NOT NULL,
-            PRIMARY KEY (venue, symbol, funding_at)
-        )
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO funding_history_prune_keys (venue, symbol, funding_at)
-        SELECT venue, symbol, funding_at
-        FROM (
-            SELECT venue, symbol, funding_at,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY venue, symbol
-                       ORDER BY funding_at DESC
-                   ) AS row_number
-            FROM funding_rate_history
-        )
-        WHERE row_number > ?
-        """,
-        (keep,),
-    )
-    deleted = int(
+    cutoff = (
+        datetime.now(UTC) - timedelta(seconds=max(1, int(keep_older_than_seconds)))
+    ).isoformat(timespec="seconds")
+    floor = max(0, int(keep_latest_per_market))
+    protected_keys = paper_linked_funding_history_keys(connection)
+    if floor > 0:
+        connection.execute("DROP TABLE IF EXISTS temp.funding_age_prune_keys")
         connection.execute(
             """
-            DELETE FROM funding_rate_history
-            WHERE EXISTS (
-                SELECT 1
-                FROM funding_history_prune_keys old
-                WHERE old.venue = funding_rate_history.venue
-                  AND old.symbol = funding_rate_history.symbol
-                  AND old.funding_at = funding_rate_history.funding_at
+            CREATE TEMP TABLE funding_age_prune_keys (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                funding_at TEXT NOT NULL,
+                PRIMARY KEY (venue, symbol, funding_at)
             )
             """
-        ).rowcount
-        or 0
-    )
-    refresh_funding_history_sync_state(connection)
-    connection.execute("DROP TABLE IF EXISTS temp.funding_history_prune_keys")
+        )
+        connection.execute(
+            """
+            INSERT INTO funding_age_prune_keys (venue, symbol, funding_at)
+            SELECT venue, symbol, funding_at
+            FROM (
+                SELECT venue, symbol, funding_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY venue, symbol
+                           ORDER BY funding_at DESC
+                       ) AS row_number
+                FROM funding_rate_history
+            )
+            WHERE funding_at < ? AND row_number > ?
+            """,
+            (cutoff, floor),
+        )
+        if protected_keys:
+            connection.execute("DROP TABLE IF EXISTS temp.funding_history_protected")
+            connection.execute(
+                """
+                CREATE TEMP TABLE funding_history_protected (
+                    venue TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    funding_at TEXT NOT NULL,
+                    PRIMARY KEY (venue, symbol, funding_at)
+                )
+                """
+            )
+            for chunk in chunks(sorted(protected_keys), 500):
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO funding_history_protected
+                    (venue, symbol, funding_at) VALUES (?, ?, ?)
+                    """,
+                    chunk,
+                )
+            cursor = connection.execute(
+                """
+                DELETE FROM funding_rate_history
+                WHERE EXISTS (
+                    SELECT 1 FROM funding_age_prune_keys old
+                    WHERE old.venue = funding_rate_history.venue
+                      AND old.symbol = funding_rate_history.symbol
+                      AND old.funding_at = funding_rate_history.funding_at
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM funding_history_protected p
+                    WHERE p.venue = funding_rate_history.venue
+                      AND p.symbol = funding_rate_history.symbol
+                      AND p.funding_at = funding_rate_history.funding_at
+                )
+                """
+            )
+            connection.execute("DROP TABLE IF EXISTS temp.funding_history_protected")
+        else:
+            cursor = connection.execute(
+                """
+                DELETE FROM funding_rate_history
+                WHERE EXISTS (
+                    SELECT 1 FROM funding_age_prune_keys old
+                    WHERE old.venue = funding_rate_history.venue
+                      AND old.symbol = funding_rate_history.symbol
+                      AND old.funding_at = funding_rate_history.funding_at
+                )
+                """
+            )
+        connection.execute("DROP TABLE IF EXISTS temp.funding_age_prune_keys")
+    elif protected_keys:
+        connection.execute("DROP TABLE IF EXISTS temp.funding_history_protected")
+        connection.execute(
+            """
+            CREATE TEMP TABLE funding_history_protected (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                funding_at TEXT NOT NULL,
+                PRIMARY KEY (venue, symbol, funding_at)
+            )
+            """
+        )
+        for chunk in chunks(sorted(protected_keys), 500):
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO funding_history_protected
+                (venue, symbol, funding_at) VALUES (?, ?, ?)
+                """,
+                chunk,
+            )
+        cursor = connection.execute(
+            """
+            DELETE FROM funding_rate_history
+            WHERE funding_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM funding_history_protected p
+                  WHERE p.venue = funding_rate_history.venue
+                    AND p.symbol = funding_rate_history.symbol
+                    AND p.funding_at = funding_rate_history.funding_at
+              )
+            """,
+            (cutoff,),
+        )
+        connection.execute("DROP TABLE IF EXISTS temp.funding_history_protected")
+    else:
+        cursor = connection.execute(
+            "DELETE FROM funding_rate_history WHERE funding_at < ?",
+            (cutoff,),
+        )
+    deleted = int(cursor.rowcount or 0)
+    if deleted > 0:
+        refresh_funding_history_sync_state(connection)
     return deleted
+
+
+def paper_linked_funding_history_keys(
+    connection: sqlite3.Connection,
+) -> list[tuple[str, str, str]]:
+    keys: list[tuple[str, str, str]] = []
+    for row in connection.execute(
+        """
+        SELECT long_venue, long_symbol, long_settlement_at,
+               short_venue, short_symbol, short_settlement_at
+        FROM funding_paper_positions
+        WHERE status IN ('open', 'settlement_pending')
+        """
+    ):
+        for venue_col, symbol_col, settlement_col in (
+            ("long_venue", "long_symbol", "long_settlement_at"),
+            ("short_venue", "short_symbol", "short_settlement_at"),
+        ):
+            venue = row[venue_col]
+            symbol = row[symbol_col]
+            settlement = row[settlement_col]
+            if venue and symbol and settlement:
+                keys.append((str(venue), str(symbol), str(settlement)))
+    return keys
 
 
 def refresh_funding_history_sync_state(connection: sqlite3.Connection) -> None:
@@ -753,5 +885,5 @@ def delete_by_ids(
     return deleted
 
 
-def chunks(items: list[int], size: int) -> list[list[int]]:
+def chunks(items: list[Any], size: int) -> list[list[Any]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
