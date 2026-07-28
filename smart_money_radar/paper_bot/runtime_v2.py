@@ -27,9 +27,11 @@ from smart_money_radar.paper_bot.accounting import (
     price_pnl_event_key,
 )
 from smart_money_radar.paper_bot.cycle_manager import (
+    evaluate_hold_history_reliability,
     next_cycle_observation_decision,
     next_cycle_schedule_decision,
     post_settlement_probe_decision,
+    wait_bucket_for_seconds,
 )
 from smart_money_radar.paper_bot.execution import (
     EXECUTION_HAIRCUT_FRACTION,
@@ -1995,6 +1997,104 @@ class SynchronizedFundingRuntimeV2:
         self._save_probe_state(position, probe_state)
         return probe_state
 
+    def _route_collateral_asset(self, position: dict[str, Any], route: dict[str, Any] | None) -> str:
+        candidates: list[str] = []
+        for leg in (route or {}).get("legs") or []:
+            if leg.get("collateral_asset"):
+                candidates.append(str(leg.get("collateral_asset")).upper())
+        config = position.get("config") or {}
+        if config.get("collateral_asset"):
+            candidates.append(str(config.get("collateral_asset")).upper())
+        for leg in config.get("entry_legs") or []:
+            if leg.get("collateral_asset"):
+                candidates.append(str(leg.get("collateral_asset")).upper())
+        unique = {value for value in candidates if value}
+        if len(unique) == 1:
+            return next(iter(unique))
+        return "UNKNOWN"
+
+    def _hold_history_reliability(
+        self,
+        *,
+        position: dict[str, Any],
+        route: dict[str, Any],
+        now: datetime,
+        wait_seconds: float,
+    ) -> dict[str, Any]:
+        since = (
+            now.astimezone(UTC)
+            - timedelta(days=int(getattr(self.config, "hold_history_window_days", 30)))
+        ).isoformat()
+        collateral = self._route_collateral_asset(position, route)
+        history_rows = self.store.reconciled_funding_capture_hold_cycles(
+            canonical_asset=str(position.get("canonical_asset") or route.get("canonical_asset") or ""),
+            long_venue=str(position.get("long_venue") or route.get("long_venue") or ""),
+            short_venue=str(position.get("short_venue") or route.get("short_venue") or ""),
+            collateral_asset=collateral,
+            wait_bucket=wait_bucket_for_seconds(wait_seconds),
+            since=since,
+            exclude_position_id=str(position.get("position_id") or ""),
+            limit=int(getattr(self.config, "hold_history_max_cycles", 20)),
+        )
+        reliability = evaluate_hold_history_reliability(
+            history_rows,
+            min_cycles_for_gate=int(getattr(self.config, "hold_history_min_cycles_for_gate", 8)),
+            insufficient_multiplier=float(getattr(self.config, "hold_history_insufficient_multiplier", 0.75)),
+            min_positive_realization_rate=float(
+                getattr(self.config, "hold_history_min_positive_realization_rate", 0.70)
+            ),
+            min_p25_realization_ratio=float(
+                getattr(self.config, "hold_history_min_p25_realization_ratio", 0.50)
+            ),
+            max_extra_cycles_when_insufficient=int(
+                getattr(self.config, "hold_history_max_extra_cycles_when_insufficient", 1)
+            ),
+        )
+        return {
+            **reliability.as_dict(),
+            "collateral_asset": collateral,
+            "wait_bucket": wait_bucket_for_seconds(wait_seconds),
+        }
+
+    def _adverse_basis_changes_from_observations(
+        self,
+        observations: list[dict[str, Any]],
+        *,
+        window_seconds: float = 30.0,
+    ) -> list[float]:
+        dated: list[tuple[datetime, float, float]] = []
+        for row in observations:
+            observed_at = parse_time(row.get("observed_at"))
+            spread = optional_float(row.get("current_exit_spread"))
+            long_mark = optional_float(row.get("long_mark"))
+            short_mark = optional_float(row.get("short_mark"))
+            if (
+                observed_at is None
+                or spread is None
+                or long_mark is None
+                or short_mark is None
+                or long_mark <= 0
+                or short_mark <= 0
+            ):
+                continue
+            reference = (float(long_mark) + float(short_mark)) / 2.0
+            dated.append((observed_at.astimezone(UTC), float(spread), reference))
+        dated.sort(key=lambda item: item[0])
+        changes: list[float] = []
+        for idx, (current_time, current_spread, reference) in enumerate(dated):
+            previous_candidates = [
+                item
+                for item in dated[:idx]
+                if (current_time - item[0]).total_seconds() >= window_seconds
+            ]
+            if not previous_candidates:
+                continue
+            previous_time, previous_spread, _previous_reference = previous_candidates[-1]
+            if (current_time - previous_time).total_seconds() > window_seconds * 2:
+                continue
+            changes.append(max(0.0, (current_spread - previous_spread) / reference * 10_000.0))
+        return changes
+
     def next_cycle_hold_or_close_decision(
         self,
         position: dict[str, Any],
@@ -2137,35 +2237,52 @@ class SynchronizedFundingRuntimeV2:
             }
 
         quantity = float(position.get("quantity") or 0.0)
-        close_prices = self._current_close_prices(route)
-        current_close_fees = self._close_fee_estimate(route, quantity, close_prices)
+        current_pnl_snapshot = self.record_current_executable_pnl(position, route, now)
+        if current_pnl_snapshot.get("quality") != "EXECUTABLE_FULL_DEPTH":
+            return {
+                "decision": "close",
+                "reason": "current_executable_pnl_unavailable",
+                "current_executable_pnl": current_pnl_snapshot,
+            }
+        current_close_fees = float(current_pnl_snapshot.get("paper_close_fees") or 0.0)
         reference_notional = min(
-            quantity * max(0.0, float(close_prices.get("long_exit_price") or 0.0)),
-            quantity * max(0.0, float(close_prices.get("short_exit_price") or 0.0)),
+            quantity * max(0.0, float(current_pnl_snapshot.get("long_exit_price") or 0.0)),
+            quantity * max(0.0, float(current_pnl_snapshot.get("short_exit_price") or 0.0)),
         )
         entry_economics = (position.get("config") or {}).get("entry_economics") or {}
         entry_basis_reserve_bps = float(entry_economics.get("entry_basis_reserve_bps") or 0.0)
         if entry_basis_reserve_bps <= 0:
             entry_basis_reserve_bps = 30.0
-        entry_observations = self._valid_observations(
-            route_key, now, phase="entry", cycle_id=f"{position_id}:1",
-        )
-        adverse_basis_changes = [
-            abs(float(obs.get("current_exit_spread") or 0.0))
-            for obs in entry_observations
-            if obs.get("current_exit_spread") is not None
-        ]
+        adverse_basis_changes = self._adverse_basis_changes_from_observations(observations)
         p95_mark_return = None
+        wait_seconds = float(
+            probe_decision.get("seconds_to_next_cycle")
+            or schedule_seconds_to_next(probe_decision, now)
+            or 0.0
+        )
+        unadjusted_next_conservative = float(observation_decision["conservative_funding_gross"])
+        hold_history = self._hold_history_reliability(
+            position=position,
+            route=route,
+            now=now,
+            wait_seconds=wait_seconds,
+        )
+        history_adjusted_next_funding = unadjusted_next_conservative * float(
+            hold_history["history_multiplier"]
+        )
         hold = hold_economics(
-            next_conservative_funding_gross=float(observation_decision["conservative_funding_gross"]),
+            next_conservative_funding_gross=history_adjusted_next_funding,
             current_close_fees=current_close_fees,
             reference_notional=reference_notional,
-            wait_seconds=float(probe_decision.get("seconds_to_next_cycle") or schedule_seconds_to_next(probe_decision, now) or 0.0),
+            wait_seconds=wait_seconds,
             entry_basis_reserve_bps=entry_basis_reserve_bps,
             adverse_basis_change_30s_bps=adverse_basis_changes if len(adverse_basis_changes) >= 10 else None,
             p95_abs_mark_return_1s_bps=p95_mark_return,
         )
-        current_executable_pnl = float(position.get("paper_net_pnl_estimated") or 0.0)
+        hold["unadjusted_next_conservative_funding_gross"] = unadjusted_next_conservative
+        hold["history_adjusted_next_funding"] = history_adjusted_next_funding
+        hold["hold_history"] = hold_history
+        current_executable_pnl = float(current_pnl_snapshot["paper_net_if_exit_now"])
         projected_total = current_executable_pnl + float(
             hold["incremental_hold_net_pnl"]
         )
@@ -2182,7 +2299,15 @@ class SynchronizedFundingRuntimeV2:
         reasons: list[str] = []
         if not bool(getattr(self.config, "hold_enabled", True)):
             reasons.append("hold_disabled")
-        if float(observation_decision["conservative_funding_gross"]) < max(2.50, reference * 0.005):
+        if not bool(hold_history.get("hold_history_gate_passed")):
+            reasons.extend(list(hold_history.get("reasons") or []))
+        if (
+            hold_history.get("history_status") == "INSUFFICIENT"
+            and max(0, settlements_count - 1)
+            >= int(hold_history.get("hold_history_max_extra_cycles_when_insufficient") or 0)
+        ):
+            reasons.append("hold_history_insufficient_extra_cycle_limit")
+        if history_adjusted_next_funding < max(2.50, reference * 0.005):
             reasons.append("next_conservative_funding_below_minimum")
         if float(hold["incremental_hold_net_pnl"]) < max(1.00, reference * 0.002):
             reasons.append("incremental_hold_net_below_minimum")
@@ -2201,6 +2326,7 @@ class SynchronizedFundingRuntimeV2:
                 "reasons": reasons,
                 "observation_decision": observation_decision,
                 "hold_economics": hold,
+                "current_executable_pnl": current_pnl_snapshot,
                 "projected_total_after_next_cycle": projected_total,
                 "projected_position_age_at_next_exit": projected_age,
             }
@@ -2246,6 +2372,7 @@ class SynchronizedFundingRuntimeV2:
             "cycle_number": next_cycle_number,
             "observation_decision": observation_decision,
             "hold_economics": hold,
+            "current_executable_pnl": current_pnl_snapshot,
             "projected_total_after_next_cycle": projected_total,
         }
 

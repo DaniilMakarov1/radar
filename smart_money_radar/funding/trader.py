@@ -203,6 +203,15 @@ class PaperBotConfig:
     post_settlement_schedule_probe_seconds: int = 5
     post_settlement_hold_decision_seconds: int = 30
     hold_enabled: bool = True
+    entry_history_required: bool = False
+    entry_history_mode: str = "disabled"
+    hold_history_window_days: int = 30
+    hold_history_max_cycles: int = 20
+    hold_history_min_cycles_for_gate: int = 8
+    hold_history_insufficient_multiplier: float = 0.75
+    hold_history_min_positive_realization_rate: float = 0.70
+    hold_history_min_p25_realization_ratio: float = 0.50
+    hold_history_max_extra_cycles_when_insufficient: int = 1
     max_settlements_per_position: int = 4
     max_position_age_seconds: int = 14_700
     min_next_settlement_wait_seconds: int = 300
@@ -298,6 +307,30 @@ class PaperBotConfig:
                 min(int(self.post_settlement_hold_decision_seconds), 900),
             ),
             hold_enabled=bool(self.hold_enabled),
+            entry_history_required=False,
+            entry_history_mode="disabled",
+            hold_history_window_days=max(1, min(int(self.hold_history_window_days), 365)),
+            hold_history_max_cycles=max(1, min(int(self.hold_history_max_cycles), 1_000)),
+            hold_history_min_cycles_for_gate=max(
+                1,
+                min(int(self.hold_history_min_cycles_for_gate), 1_000),
+            ),
+            hold_history_insufficient_multiplier=max(
+                0.0,
+                min(float(self.hold_history_insufficient_multiplier), 1.0),
+            ),
+            hold_history_min_positive_realization_rate=max(
+                0.0,
+                min(float(self.hold_history_min_positive_realization_rate), 1.0),
+            ),
+            hold_history_min_p25_realization_ratio=max(
+                0.0,
+                min(float(self.hold_history_min_p25_realization_ratio), 10.0),
+            ),
+            hold_history_max_extra_cycles_when_insufficient=max(
+                0,
+                min(int(self.hold_history_max_extra_cycles_when_insufficient), 24),
+            ),
             max_settlements_per_position=max(
                 1,
                 min(int(self.max_settlements_per_position), 24),

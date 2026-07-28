@@ -30,6 +30,7 @@ from smart_money_radar.funding.venue_capabilities import (
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.funding.service import active_default_funding_clients
 from smart_money_radar.paper_bot.accounting import executable_paper_pnl
+from smart_money_radar.paper_bot.cycle_manager import evaluate_hold_history_reliability
 from smart_money_radar.paper_bot.execution import entry_fill_state
 from smart_money_radar.paper_bot.risk import common_price_move_telemetry, hard_risk_triggered
 from smart_money_radar.paper_bot.settlement import (
@@ -1600,6 +1601,16 @@ def _install_fresh_hot_route(bot, route: dict, *, next_lead_seconds: float = 360
     return fresh
 
 
+def _boost_next_cycle_funding(route: dict, *, long_rate: float = -0.018, short_rate: float = 0.020) -> dict:
+    long_leg = next(leg for leg in route["legs"] if leg["side"] == "long")
+    short_leg = next(leg for leg in route["legs"] if leg["side"] == "short")
+    for leg, rate in ((long_leg, long_rate), (short_leg, short_rate)):
+        leg["funding_rate"] = rate
+        leg["normalized_next_funding_rate"] = rate
+        leg["hourly_funding_rate"] = rate / float(leg.get("funding_interval_hours") or 1.0)
+    return route
+
+
 def test_paperbot_v2_entry_uses_new_runtime_not_legacy_open(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, _bot, _route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
@@ -1657,6 +1668,7 @@ def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp
             next_lead_seconds=(next_settlement - current).total_seconds(),
         )
         next_route["route_key"] = route["route_key"]
+        _boost_next_cycle_funding(next_route)
         bot.hot_routes[route["route_key"]] = next_route
         outcomes = bot.process_open_positions()
 
@@ -1753,6 +1765,7 @@ def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tm
         next_route["route_key"] = route["route_key"]
         next_route["legs"][0]["funding_interval_hours"] = 1.0
         next_route["legs"][1]["funding_interval_hours"] = 4.0
+        _boost_next_cycle_funding(next_route)
         bot.hot_routes[route["route_key"]] = next_route
         outcomes = bot.process_open_positions()
 
@@ -1764,6 +1777,15 @@ def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tm
 def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    for idx in range(8):
+        _seed_reconciled_hold_history_cycle(
+            store,
+            position_id=f"good-history-{idx}",
+            created_at=f"2026-07-27T0{idx}:00:30+00:00",
+            scheduled_at=f"2026-07-27T0{idx + 1}:00:00+00:00",
+            predicted=10.0,
+            realized=10.0,
+        )
     settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
     _install_fresh_hot_route(bot, route)
@@ -2080,6 +2102,139 @@ def test_open_fees_sunk_in_hold_economics() -> None:
     # reserve_usd=500*60/10000=3.0, incremental_cost=0.2+3.0=3.2
     # incremental_net=10-3.2=6.8
     assert economics["incremental_hold_net_pnl"] == pytest.approx(6.8)
+
+
+def test_hold_history_insufficient_haircut_no_veto() -> None:
+    reliability = evaluate_hold_history_reliability([])
+
+    assert reliability.status == "INSUFFICIENT"
+    assert reliability.gate_passed
+    assert reliability.history_multiplier == pytest.approx(0.75)
+    assert reliability.adjusted_funding(10.0) == pytest.approx(7.5)
+    assert reliability.max_extra_cycles_when_insufficient == 1
+
+
+def test_hold_history_positive_rate_fail() -> None:
+    cycles = [
+        {"predicted_gross": 10.0, "realized_gross": value}
+        for value in [1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0]
+    ]
+
+    reliability = evaluate_hold_history_reliability(cycles)
+
+    assert reliability.status == "FAILED"
+    assert not reliability.gate_passed
+    assert "hold_history_positive_realization_rate_failed" in reliability.reasons
+
+
+def test_hold_history_p25_fail() -> None:
+    cycles = [
+        {"predicted_gross": 10.0, "realized_gross": value}
+        for value in [4.0, 4.0, 4.0, 6.0, 7.0, 8.0, 8.0, 8.0]
+    ]
+
+    reliability = evaluate_hold_history_reliability(cycles)
+
+    assert reliability.status == "FAILED"
+    assert reliability.p25_realization_ratio == pytest.approx(0.4)
+    assert "hold_history_p25_realization_ratio_failed" in reliability.reasons
+
+
+def test_good_hold_history_applies_p25_haircut() -> None:
+    cycles = [{"predicted_gross": 10.0, "realized_gross": 8.0} for _ in range(8)]
+
+    reliability = evaluate_hold_history_reliability(cycles)
+
+    assert reliability.status == "PASSED"
+    assert reliability.gate_passed
+    assert reliability.history_multiplier == pytest.approx(0.8)
+    assert reliability.adjusted_funding(10.0) == pytest.approx(8.0)
+
+
+def test_good_hold_history_cannot_override_negative_current_funding() -> None:
+    cycles = [{"predicted_gross": 10.0, "realized_gross": 10.0} for _ in range(8)]
+
+    reliability = evaluate_hold_history_reliability(cycles)
+
+    assert reliability.status == "PASSED"
+    assert reliability.adjusted_funding(-5.0) == pytest.approx(-5.0)
+
+
+def _seed_reconciled_hold_history_cycle(
+    store: SQLiteStore,
+    *,
+    position_id: str,
+    canonical_asset: str = "BTC",
+    long_venue: str = "binance",
+    short_venue: str = "bybit",
+    collateral_asset: str = "USDT",
+    state: str = "RECONCILED",
+    reconciliation_status: str = "RATE_AND_MARK_RECONCILED",
+    predicted: float = 10.0,
+    realized: float = 8.0,
+    created_at: str = "2026-07-28T16:00:30+00:00",
+    scheduled_at: str = "2026-07-28T17:00:00+00:00",
+) -> None:
+    store.upsert_funding_capture_position({
+        "position_id": position_id,
+        "canonical_asset": canonical_asset,
+        "long_venue": long_venue,
+        "long_symbol": f"{canonical_asset}USDT",
+        "short_venue": short_venue,
+        "short_symbol": f"{canonical_asset}USDT",
+        "quantity": 5.0,
+        "target_notional": 500.0,
+        "state": "RECONCILED",
+        "opened_at": "2026-07-28T15:59:30+00:00",
+        "closed_at": scheduled_at,
+        "config": {
+            "route_key": f"{canonical_asset}:{long_venue}:{short_venue}",
+            "entry_legs": [
+                {"side": "long", "venue": long_venue, "collateral_asset": collateral_asset},
+                {"side": "short", "venue": short_venue, "collateral_asset": collateral_asset},
+            ],
+        },
+    })
+    store.upsert_funding_capture_cycle({
+        "position_id": position_id,
+        "cycle_number": 2,
+        "scheduled_funding_at": scheduled_at,
+        "conservative_funding_gross": predicted,
+        "incremental_hold_net_pnl": predicted - 1.0,
+        "decision": "HOLD",
+        "state": state,
+        "reconciliation_status": reconciliation_status,
+        "reconciled_funding_pnl": realized,
+        "created_at": created_at,
+    })
+
+
+def test_hold_history_query_uses_local_reconciled_same_scope_only(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    _seed_reconciled_hold_history_cycle(store, position_id="match")
+    _seed_reconciled_hold_history_cycle(store, position_id="reverse", long_venue="bybit", short_venue="binance")
+    _seed_reconciled_hold_history_cycle(store, position_id="other-collateral", collateral_asset="USDC")
+    _seed_reconciled_hold_history_cycle(
+        store,
+        position_id="unreconciled",
+        state="UNRECONCILED",
+        reconciliation_status="UNRECONCILED",
+    )
+
+    rows = store.reconciled_funding_capture_hold_cycles(
+        canonical_asset="BTC",
+        long_venue="binance",
+        short_venue="bybit",
+        collateral_asset="USDT",
+        wait_bucket="<=1h",
+        since="2026-06-28T00:00:00+00:00",
+        limit=20,
+    )
+
+    assert [row["position_id"] for row in rows] == ["match"]
+    assert rows[0]["predicted_gross"] == pytest.approx(10.0)
+    assert rows[0]["realized_gross"] == pytest.approx(8.0)
 
 
 def test_risk_helper_called_by_paperbot_runtime(tmp_path, monkeypatch) -> None:

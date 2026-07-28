@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import floor
 from typing import Any
 
 from smart_money_radar.funding.strategy_synchronized_funding import (
@@ -36,6 +38,108 @@ CAPTURE_STATES = (
 PRE_ENTRY_STATES = {"DISCOVERED", "ARMED"}
 LIVE_STATES = {"OPEN", "SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION", "HOLDING_NEXT_CYCLE"}
 TERMINAL_STATES = {"CLOSED_PENDING_RECONCILIATION", "RECONCILED", "FAILED"}
+
+
+def wait_bucket_for_seconds(wait_seconds: float) -> str:
+    wait = max(0.0, float(wait_seconds))
+    if wait <= 3_600.0:
+        return "<=1h"
+    if wait <= 7_200.0:
+        return ">1h<=2h"
+    return ">2h<=4h"
+
+
+def percentile_25(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    index = min(len(ordered) - 1, max(0, floor((len(ordered) - 1) * 0.25)))
+    return ordered[index]
+
+
+@dataclass(frozen=True)
+class HoldHistoryReliability:
+    status: str
+    gate_passed: bool
+    valid_cycle_count: int
+    positive_realization_rate: float | None
+    p25_realization_ratio: float | None
+    history_multiplier: float
+    max_extra_cycles_when_insufficient: int
+    reasons: tuple[str, ...] = ()
+
+    def adjusted_funding(self, next_conservative_funding_gross: float) -> float:
+        return float(next_conservative_funding_gross) * float(self.history_multiplier)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "history_status": self.status,
+            "hold_history_gate_passed": self.gate_passed,
+            "valid_cycle_count": self.valid_cycle_count,
+            "positive_realization_rate": self.positive_realization_rate,
+            "p25_realization_ratio": self.p25_realization_ratio,
+            "history_multiplier": self.history_multiplier,
+            "hold_history_max_extra_cycles_when_insufficient": self.max_extra_cycles_when_insufficient,
+            "reasons": list(self.reasons),
+        }
+
+
+def evaluate_hold_history_reliability(
+    cycles: list[dict[str, Any]],
+    *,
+    min_cycles_for_gate: int = 8,
+    insufficient_multiplier: float = 0.75,
+    min_positive_realization_rate: float = 0.70,
+    min_p25_realization_ratio: float = 0.50,
+    max_extra_cycles_when_insufficient: int = 1,
+) -> HoldHistoryReliability:
+    valid: list[tuple[float, float]] = []
+    for cycle in cycles:
+        predicted = cycle.get("predicted_gross")
+        if predicted is None:
+            predicted = cycle.get("conservative_funding_gross")
+        realized = cycle.get("realized_gross")
+        if realized is None:
+            realized = cycle.get("reconciled_funding_pnl")
+        try:
+            predicted_value = float(predicted)
+            realized_value = float(realized)
+        except (TypeError, ValueError):
+            continue
+        if predicted_value <= 0:
+            continue
+        valid.append((predicted_value, realized_value))
+    if len(valid) < int(min_cycles_for_gate):
+        return HoldHistoryReliability(
+            status="INSUFFICIENT",
+            gate_passed=True,
+            valid_cycle_count=len(valid),
+            positive_realization_rate=None,
+            p25_realization_ratio=None,
+            history_multiplier=float(insufficient_multiplier),
+            max_extra_cycles_when_insufficient=int(max_extra_cycles_when_insufficient),
+            reasons=("insufficient_reconciled_hold_history",),
+        )
+    realized_values = [realized for _predicted, realized in valid]
+    ratios = [realized / predicted for predicted, realized in valid]
+    positive_rate = sum(1 for value in realized_values if value > 0) / len(realized_values)
+    p25_ratio = percentile_25(ratios)
+    reasons: list[str] = []
+    if positive_rate < float(min_positive_realization_rate):
+        reasons.append("hold_history_positive_realization_rate_failed")
+    if p25_ratio < float(min_p25_realization_ratio):
+        reasons.append("hold_history_p25_realization_ratio_failed")
+    multiplier = min(1.0, max(0.50, p25_ratio))
+    return HoldHistoryReliability(
+        status="PASSED" if not reasons else "FAILED",
+        gate_passed=not reasons,
+        valid_cycle_count=len(valid),
+        positive_realization_rate=positive_rate,
+        p25_realization_ratio=p25_ratio,
+        history_multiplier=multiplier,
+        max_extra_cycles_when_insufficient=int(max_extra_cycles_when_insufficient),
+        reasons=tuple(reasons),
+    )
 
 
 def next_cycle_schedule_decision(

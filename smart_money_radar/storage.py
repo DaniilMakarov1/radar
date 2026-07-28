@@ -38,6 +38,27 @@ def funding_unit_multiplier(row: dict[str, Any]) -> float:
     return 1.0
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _funding_wait_bucket(wait_seconds: float) -> str:
+    wait = max(0.0, float(wait_seconds))
+    if wait <= 3_600.0:
+        return "<=1h"
+    if wait <= 7_200.0:
+        return ">1h<=2h"
+    return ">2h<=4h"
+
+
 def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
@@ -429,6 +450,82 @@ class SQLiteStore:
                 (position_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def reconciled_funding_capture_hold_cycles(
+        self,
+        *,
+        canonical_asset: str,
+        long_venue: str,
+        short_venue: str,
+        collateral_asset: str,
+        wait_bucket: str,
+        since: str,
+        exclude_position_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return local reconciled hold-cycle history for reliability scoring.
+
+        This query intentionally uses only our compact reconciled cycle records,
+        not raw exchange funding history.
+        """
+        query = """
+            SELECT c.*, p.canonical_asset, p.long_venue, p.short_venue,
+                   p.config_json
+            FROM funding_capture_cycles c
+            JOIN funding_capture_positions p
+              ON p.position_id = c.position_id
+            WHERE p.canonical_asset = ?
+              AND p.long_venue = ?
+              AND p.short_venue = ?
+              AND c.cycle_number > 1
+              AND c.decision = 'HOLD'
+              AND c.state = 'RECONCILED'
+              AND c.reconciliation_status = 'RATE_AND_MARK_RECONCILED'
+              AND c.conservative_funding_gross IS NOT NULL
+              AND c.conservative_funding_gross > 0
+              AND c.reconciled_funding_pnl IS NOT NULL
+              AND c.created_at >= ?
+        """
+        params: list[Any] = [canonical_asset, long_venue, short_venue, since]
+        if exclude_position_id is not None:
+            query += " AND c.position_id != ?"
+            params.append(exclude_position_id)
+        query += " ORDER BY c.created_at DESC LIMIT ?"
+        params.append(max(1, int(limit) * 5))
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            config = json.loads(item.pop("config_json") or "{}")
+            entry_legs = config.get("entry_legs") or []
+            collateral_values = {
+                str(leg.get("collateral_asset") or "").upper()
+                for leg in entry_legs
+                if leg.get("collateral_asset")
+            }
+            row_collateral = (
+                str(config.get("collateral_asset") or "").upper()
+                or (next(iter(collateral_values)) if len(collateral_values) == 1 else "")
+                or "UNKNOWN"
+            )
+            if row_collateral != str(collateral_asset or "UNKNOWN").upper():
+                continue
+            scheduled_at = _parse_iso_datetime(item.get("scheduled_funding_at"))
+            created_at = _parse_iso_datetime(item.get("created_at"))
+            if scheduled_at is None or created_at is None:
+                continue
+            wait_seconds = (scheduled_at - created_at).total_seconds()
+            if _funding_wait_bucket(wait_seconds) != wait_bucket:
+                continue
+            item["wait_seconds"] = wait_seconds
+            item["wait_bucket"] = wait_bucket
+            item["predicted_gross"] = item.get("conservative_funding_gross")
+            item["realized_gross"] = item.get("reconciled_funding_pnl")
+            output.append(item)
+            if len(output) >= int(limit):
+                break
+        return output
 
     def funding_capture_position_by_id(
         self,
