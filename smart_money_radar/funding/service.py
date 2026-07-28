@@ -56,6 +56,9 @@ from smart_money_radar.funding.scanner import (
     rank_perp_pairs,
     scan_ranked_pairs,
 )
+from smart_money_radar.funding.venue_capabilities import (
+    apply_declared_venue_capability_contract,
+)
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
 
@@ -244,6 +247,14 @@ def run_funding_scan(
                     venue_instruments,
                     venue_markets,
                 )
+            venue_instruments = [
+                apply_declared_venue_capability_contract(row)
+                for row in venue_instruments
+            ]
+            venue_markets = [
+                apply_declared_venue_capability_contract(row)
+                for row in venue_markets
+            ]
             instruments.extend(venue_instruments)
             markets.extend(venue_markets)
             warnings.extend(venue_warnings)

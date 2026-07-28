@@ -598,6 +598,7 @@ def test_build_strategy_evaluation_not_called_by_synchronized_scanner(tmp_path, 
         "canonical_asset": "BTC",
         "hourly_funding_rate": 0.0001,
         "funding_rate": 0.0008,
+        "normalized_next_funding_rate": 0.0008,
         "funding_interval_hours": 8.0,
         "next_funding_at": "2026-07-28T16:00:00+00:00",
         "mark_price": 100_000.0,
@@ -608,7 +609,11 @@ def test_build_strategy_evaluation_not_called_by_synchronized_scanner(tmp_path, 
         "quantity_step": 0.001,
         "min_notional_usd": 5.0,
         "funding_rate_kind": "published_next_estimate",
-        "contract_type": "linear_perpetual",
+        "contract_kind": "linear_perpetual",
+        "supports_discrete_funding": True,
+        "funding_rate_semantics": "next_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
         "collateral_asset": "USDT",
         "quote_asset": "USDT",
         "observed_at": "2026-07-28T15:59:30+00:00",
@@ -619,6 +624,7 @@ def test_build_strategy_evaluation_not_called_by_synchronized_scanner(tmp_path, 
         "canonical_asset": "BTC",
         "hourly_funding_rate": 0.0004,
         "funding_rate": 0.0032,
+        "normalized_next_funding_rate": 0.0032,
         "funding_interval_hours": 8.0,
         "next_funding_at": "2026-07-28T16:00:00+00:00",
         "mark_price": 100_000.0,
@@ -629,7 +635,11 @@ def test_build_strategy_evaluation_not_called_by_synchronized_scanner(tmp_path, 
         "quantity_step": 0.001,
         "min_notional_usd": 5.0,
         "funding_rate_kind": "published_next_estimate",
-        "contract_type": "linear_perpetual",
+        "contract_kind": "linear_perpetual",
+        "supports_discrete_funding": True,
+        "funding_rate_semantics": "next_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
         "collateral_asset": "USDT",
         "quote_asset": "USDT",
         "observed_at": "2026-07-28T15:59:30+00:00",
@@ -681,6 +691,32 @@ def test_zero_funding_positive_spread_not_paper_candidate() -> None:
     assert "conservative_funding_below_minimum" in candidate["reasons"]
 
 
+def test_settlement_capture_sizing_uses_funding_only_net_not_spread() -> None:
+    from smart_money_radar.funding.economics import select_live_sizing_row
+
+    funding_led = {
+        "fill_complete": True,
+        "current_nowcast_net": 2.0,
+        "current_basis_stress_net_profit": 1.5,
+        "current_opportunity_net": 2.0,
+        "current_opportunity_basis_stress_net": 1.5,
+        "notional": 500.0,
+    }
+    spread_inflated = {
+        "fill_complete": True,
+        "current_nowcast_net": 1.25,
+        "current_basis_stress_net_profit": 0.75,
+        "current_opportunity_net": 10.0,
+        "current_opportunity_basis_stress_net": 9.0,
+        "notional": 500.0,
+    }
+
+    assert select_live_sizing_row(
+        [funding_led, spread_inflated],
+        [funding_led, spread_inflated],
+    ) is funding_led
+
+
 def test_capability_fail_closed_missing_semantics() -> None:
     capability = VenueCapability(
         venue="unknown",
@@ -718,6 +754,37 @@ def test_capability_fail_closed_missing_unit_and_sign() -> None:
     )
     assert "funding_rate_unit_not_fraction_per_settlement" in synchronized_capability_rejection(capability)
     assert "funding_sign_convention_not_positive_long_pays" in synchronized_capability_rejection(capability)
+    assert not synchronized_paper_eligible(capability)
+
+
+def test_capability_from_market_does_not_infer_critical_contract_fields() -> None:
+    capability = capability_from_market(
+        {
+            "venue": "optimistic",
+            "funding_rate_kind": "published_next_estimate",
+            "contract_type": "linear_perpetual",
+            "is_linear_contract": True,
+            "collateral_asset": "USDT",
+            "quote_asset": "USDT",
+            "next_funding_at": "2026-07-19T12:00:00+00:00",
+            "mark_price": 100.0,
+            "index_price": 100.0,
+            "volume_24h_usd": 25_000_000.0,
+            "open_interest_usd": 10_000_000.0,
+            "taker_fee_rate": 0.0005,
+            "quantity_step": 0.001,
+            "min_notional_usd": 5.0,
+            "orderbook_response_received_at": "2026-07-19T11:59:58+00:00",
+            "orderbook_depth_available": True,
+        }
+    )
+
+    rejections = synchronized_capability_rejection(capability)
+    assert "contract_kind_not_linear_perpetual" in rejections
+    assert "continuous_or_unclear_funding" in rejections
+    assert "funding_semantics_not_next_settlement" in rejections
+    assert "funding_rate_unit_not_fraction_per_settlement" in rejections
+    assert "funding_sign_convention_not_positive_long_pays" in rejections
     assert not synchronized_paper_eligible(capability)
 
 
@@ -2470,6 +2537,8 @@ class _LightweightDiscoveryClient:
             "quote_asset": "USDT",
             "collateral_asset": "USDT",
             "contract_type": "linear_perpetual",
+            "contract_kind": "linear_perpetual",
+            "supports_discrete_funding": True,
             "contract_multiplier": 0.01,
             "status": "active",
             "observed_at": observed_at,
@@ -2480,6 +2549,7 @@ class _LightweightDiscoveryClient:
             "canonical_asset": self.asset,
             "funding_rate": self.funding_rate,
             "normalized_next_funding_rate": self.funding_rate,
+            "funding_rate_semantics": "next_settlement",
             "funding_rate_unit": "fraction_of_notional_per_settlement",
             "funding_sign_convention": "positive_long_pays",
             "funding_interval_hours": self.interval_hours,

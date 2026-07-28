@@ -6,6 +6,30 @@ from typing import Any
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 
 PAPER_COLLATERAL_ASSETS = {"USDT", "USDC", "USD"}
+DECLARED_NEXT_SETTLEMENT_VENUES = {
+    "aevo": {"timing_policy_source": "adapter_aevo_next_hour"},
+    "apex": {"timing_policy_source": "adapter_apex_hourly"},
+    "aster": {"timing_policy_source": "adapter_aster_next_funding_time"},
+    "backpack": {"timing_policy_source": "adapter_backpack_next_funding_timestamp"},
+    "binance": {"timing_policy_source": "adapter_binance_next_funding_time"},
+    "bitget": {"timing_policy_source": "adapter_bitget_next_funding_time"},
+    "bybit": {"timing_policy_source": "adapter_bybit_next_funding_time"},
+    "deribit": {"timing_policy_source": "adapter_deribit_next_hour_prediction"},
+    "dydx": {"timing_policy_source": "adapter_dydx_next_funding_rate"},
+    "edgex": {"timing_policy_source": "adapter_edgex_next_funding_time"},
+    "ethereal": {"timing_policy_source": "adapter_ethereal_projected_hour"},
+    "extended": {"timing_policy_source": "adapter_extended_current_hour"},
+    "gate": {"timing_policy_source": "adapter_gate_next_funding_time"},
+    "grvt": {"timing_policy_source": "adapter_grvt_current_interval"},
+    "hyperliquid": {"timing_policy_source": "adapter_hyperliquid_predicted_or_next_hour"},
+    "kraken": {"timing_policy_source": "adapter_kraken_next_hour_prediction"},
+    "kucoin": {"timing_policy_source": "adapter_kucoin_next_funding_time"},
+    "lighter": {"timing_policy_source": "adapter_lighter_current_hour"},
+    "mexc": {"timing_policy_source": "adapter_mexc_next_settle_time"},
+    "okx": {"timing_policy_source": "adapter_okx_next_funding_time"},
+    "paradex": {"timing_policy_source": "adapter_paradex_projected_hour"},
+    "risex": {"timing_policy_source": "adapter_risex_next_funding_time"},
+}
 NEXT_SETTLEMENT_RATE_KINDS = {
     "published_next_estimate",
     "published_current_estimate",
@@ -25,15 +49,19 @@ CONTINUOUS_OR_UNCLEAR_RATE_KINDS = {
 VALID_FUNDING_RATE_UNITS = {
     "fraction_of_notional_per_settlement",
     "fraction_of_notional_per_hour",
+    "unclear",
 }
 VALID_FUNDING_SIGN_CONVENTIONS = {
     "positive_long_pays",
     "positive_short_pays",
+    "unclear",
 }
 VALID_CONTRACT_KINDS = {
     "linear_perpetual",
     "inverse_perpetual",
-    "quanto_perpetual",
+    "delivery",
+    "pre_market",
+    "unknown",
 }
 
 
@@ -68,34 +96,52 @@ class VenueCapability:
         return asdict(self)
 
 
+def apply_declared_venue_capability_contract(market: dict[str, Any]) -> dict[str, Any]:
+    """Attach an explicit adapter-level contract; unknown venues stay fail-closed."""
+    row = dict(market)
+    venue = str(row.get("venue") or "").lower()
+    contract = DECLARED_NEXT_SETTLEMENT_VENUES.get(venue)
+    if not contract:
+        return row
+    row.setdefault("contract_kind", "linear_perpetual")
+    row.setdefault("supports_perpetuals", True)
+    row.setdefault("is_linear_contract", True)
+    row.setdefault("supports_discrete_funding", True)
+    row.setdefault("funding_rate_semantics", "next_settlement")
+    row.setdefault("funding_rate_unit", "fraction_of_notional_per_settlement")
+    row.setdefault("funding_sign_convention", "positive_long_pays")
+    row.setdefault("position_inclusion_rule", "perp_position_at_settlement")
+    row.setdefault("entry_safety_buffer_seconds", 20)
+    row.setdefault("exit_safety_buffer_seconds", 20)
+    row.setdefault("timing_policy_source", contract["timing_policy_source"])
+    return row
+
+
 def capability_from_market(market: dict[str, Any]) -> VenueCapability:
     venue = str(market.get("venue") or "").lower()
     funding_kind = str(market.get("funding_rate_kind") or "")
     collateral = normalized_asset(market.get("collateral_asset"))
     quote = normalized_asset(market.get("quote_asset"))
-    semantics = "next_settlement" if funding_kind in NEXT_SETTLEMENT_RATE_KINDS else "unclear"
-    discrete = funding_kind not in CONTINUOUS_OR_UNCLEAR_RATE_KINDS
+    semantics = str(market.get("funding_rate_semantics") or "unclear").strip().lower()
+    if semantics not in {"next_settlement", "last_settlement", "continuous", "unclear"}:
+        semantics = "unclear"
     contract_type = str(market.get("contract_type") or "").strip().lower()
-    contract_kind = str(market.get("contract_kind") or "").strip() or None
-    funding_rate_unit = str(market.get("funding_rate_unit") or "").strip() or None
-    funding_sign_convention = str(market.get("funding_sign_convention") or "").strip() or None
-    if contract_kind is None and contract_type == "linear_perpetual":
-        contract_kind = "linear_perpetual"
-    if contract_kind is None and bool(market.get("is_linear_contract")):
-        contract_kind = "linear_perpetual"
-    if funding_rate_unit is None and semantics == "next_settlement":
-        funding_rate_unit = "fraction_of_notional_per_settlement"
-    if funding_sign_convention is None and semantics == "next_settlement":
-        funding_sign_convention = "positive_long_pays"
-    supports_perpetuals = (
-        "perpetual" in contract_type
-        or (contract_kind is not None and "perpetual" in contract_kind)
-    )
-    is_linear = (
-        bool(market.get("is_linear_contract"))
-        or contract_kind == "linear_perpetual"
-        or (collateral is not None and collateral == quote)
-    )
+    contract_kind = str(market.get("contract_kind") or "unknown").strip().lower()
+    if contract_kind not in VALID_CONTRACT_KINDS:
+        contract_kind = "unknown"
+    funding_rate_unit = str(market.get("funding_rate_unit") or "unclear").strip().lower()
+    if funding_rate_unit not in VALID_FUNDING_RATE_UNITS:
+        funding_rate_unit = "unclear"
+    funding_sign_convention = str(
+        market.get("funding_sign_convention") or "unclear"
+    ).strip().lower()
+    if funding_sign_convention not in VALID_FUNDING_SIGN_CONVENTIONS:
+        funding_sign_convention = "unclear"
+    supports_perpetuals = bool(market.get("supports_perpetuals"))
+    is_linear = bool(market.get("is_linear_contract"))
+    if contract_kind == "linear_perpetual":
+        supports_perpetuals = True
+        is_linear = True
     return VenueCapability(
         venue=venue,
         supports_perpetuals=supports_perpetuals,
@@ -103,7 +149,7 @@ def capability_from_market(market: dict[str, Any]) -> VenueCapability:
         contract_kind=contract_kind,
         collateral_asset=collateral,
         quote_asset=quote,
-        supports_discrete_funding=discrete,
+        supports_discrete_funding=bool(market.get("supports_discrete_funding")),
         funding_rate_semantics=semantics,
         funding_rate_unit=funding_rate_unit,
         funding_sign_convention=funding_sign_convention,
@@ -114,14 +160,22 @@ def capability_from_market(market: dict[str, Any]) -> VenueCapability:
             market.get("orderbook_response_received_at")
             or market.get("orderbook_event_time")
         ),
-        supports_orderbook_depth=bool(market.get("orderbook_depth_available")),
+        supports_orderbook_depth=bool(
+            market.get("supports_orderbook_depth")
+            or market.get("orderbook_depth_available")
+        ),
         supports_24h_quote_volume=positive(market.get("volume_24h_usd")),
         supports_open_interest=positive(market.get("open_interest_usd")),
-        supports_taker_fee=market.get("taker_fee_rate") is not None,
+        supports_taker_fee=(
+            market.get("taker_fee_rate") is not None
+            or market.get("fee_rate") is not None
+        ),
         supports_quantity_step=positive(market.get("quantity_step")) or positive(
             market.get("contract_multiplier")
         ),
-        supports_min_notional=positive(market.get("min_notional_usd")),
+        supports_min_notional=positive(market.get("min_notional_usd")) or positive(
+            market.get("min_notional")
+        ),
         supports_funding_history=bool(market.get("funding_history_available", False)),
         supports_server_time=bool(market.get("server_time")),
         reason=f"funding_rate_kind={funding_kind or 'missing'}",

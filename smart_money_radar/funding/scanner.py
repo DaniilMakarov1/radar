@@ -944,8 +944,8 @@ def route_opportunity_sort_net(route: dict[str, Any]) -> float:
     selected = evidence.get("selected_strategy") or {}
     for value in (
         selected.get("expected_net_pnl"),
-        evidence.get("current_opportunity_net"),
         evidence.get("current_nowcast_net"),
+        evidence.get("current_opportunity_net"),
         route.get("expected_net_profit"),
     ):
         try:

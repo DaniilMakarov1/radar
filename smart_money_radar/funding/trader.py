@@ -72,6 +72,7 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
     settlement_skew_seconds,
 )
 from smart_money_radar.funding.venue_capabilities import (
+    apply_declared_venue_capability_contract,
     capability_from_market,
     synchronized_route_capability_check,
 )
@@ -1580,8 +1581,10 @@ class PaperBot:
             "maker_fee_rate",
             "taker_fee_rate",
             "fee_rate",
+            "funding_rate_semantics",
             "funding_rate_unit",
             "funding_sign_convention",
+            "supports_discrete_funding",
             "normalization_evidence",
         ):
             if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
@@ -1597,9 +1600,9 @@ class PaperBot:
         market.setdefault("request_started_at", request_started_at)
         market.setdefault("response_received_at", response_received_at)
         market.setdefault("normalized_at", response_received_at)
-        market.setdefault("normalized_next_funding_rate", market.get("funding_rate"))
-        market.setdefault("funding_rate_unit", "fraction_of_notional_per_settlement")
-        market.setdefault("funding_sign_convention", "positive_long_pays")
+        if market.get("normalized_next_funding_rate") is None:
+            market["normalized_next_funding_rate"] = market.get("funding_rate")
+        market = apply_declared_venue_capability_contract(market)
         market.setdefault("normalization_evidence", {"source": "adapter_market_snapshot"})
         return market, client
 
@@ -2198,9 +2201,9 @@ class PaperBot:
             row.setdefault("request_started_at", started_at)
             row.setdefault("response_received_at", received_at)
             row.setdefault("normalized_at", received_at)
-            row.setdefault("normalized_next_funding_rate", row.get("funding_rate"))
-            row.setdefault("funding_rate_unit", "fraction_of_notional_per_settlement")
-            row.setdefault("funding_sign_convention", "positive_long_pays")
+            if row.get("normalized_next_funding_rate") is None:
+                row["normalized_next_funding_rate"] = row.get("funding_rate")
+            row = apply_declared_venue_capability_contract(row)
             row.setdefault(
                 "normalization_evidence",
                 {"source": "lightweight_market_snapshot"},

@@ -204,7 +204,7 @@ def evaluate_perp_route(
         row
         for row in sizing_rows
         if row["fill_complete"]
-        and row["current_opportunity_net"] > 0
+        and row["current_nowcast_net"] > 0
     ]
     selected_size = (
         select_live_sizing_row(sizing_rows, live_passing_sizes)
@@ -466,13 +466,13 @@ def evaluate_perp_route(
     if large_basis:
         if (
             decision_mode == "settlement_capture"
-            and not meets_live_opportunity_basis_coverage_gate
+            and not meets_live_basis_coverage_gate
         ):
             advise(
                 "basis_not_covered_by_live_funding",
-                f"Текущий total opportunity не покрывает basis stress "
-                f"и полные расходы: live stress PnL "
-                f"${current_opportunity_basis_stress_net:,.2f}. "
+                f"Текущий funding-only net не покрывает basis stress "
+                f"и полные расходы: funding stress PnL "
+                f"${current_basis_stress_net_profit:,.2f}. "
                 f"Это warning для stop-loss, не veto для live opportunity.",
             )
         elif decision_mode != "settlement_capture" and not meets_basis_coverage_gate:
@@ -491,20 +491,20 @@ def evaluate_perp_route(
             "basis_divergence",
             "Executable basis выше 2 000 bps; вероятна ошибка identity или единиц контракта.",
         )
-    if decision_mode == "settlement_capture" and current_opportunity_net < 0:
+    if decision_mode == "settlement_capture" and current_nowcast_net < 0:
         block(
             "live_net_pnl_not_positive",
-            f"Текущий total opportunity net PnL "
-            f"${current_opportunity_net:,.2f} отрицательный.",
+            f"Текущий funding-only net PnL "
+            f"${current_nowcast_net:,.2f} отрицательный.",
         )
     elif (
         decision_mode == "settlement_capture"
-        and current_opportunity_net < actionable_profit_threshold
+        and current_nowcast_net < actionable_profit_threshold
     ):
         block(
             "live_net_pnl_below_actionable_threshold",
-            f"Текущий total opportunity net PnL "
-            f"${current_opportunity_net:,.2f} ниже минимально "
+            f"Текущий funding-only net PnL "
+            f"${current_nowcast_net:,.2f} ниже минимально "
             f"значимой прибыли ${actionable_profit_threshold:,.2f}.",
         )
     if expected_net_profit <= 0:
@@ -701,7 +701,7 @@ def evaluate_perp_route(
             f"coverage {basis_coverage_ratio:.2f}x."
         ),
         (
-            f"Settlement-capture gate использует полный opportunity net "
+            f"Settlement-capture gate использует funding-only net "
             f"({decision_edge_label}); сейчас ${decision_net_profit:,.2f}. "
             f"Минимально значимая прибыль "
             f"${actionable_profit_threshold:,.2f} используется как warning, не veto. "
@@ -1265,6 +1265,8 @@ def build_strategy_evaluation(
     basis_model = dict(row.get("basis_model") or {})
     signed_entry_basis = float(basis_model.get("signed_entry_basis") or 0.0)
     spread_convergence = funding_notional * signed_entry_basis
+    if str(decision_mode) == "settlement_capture":
+        spread_convergence = 0.0
     total_with_spread = current_funding_gross + spread_convergence - execution_cost
     threshold = max(0.0, float(actionable_profit_threshold or 0.0))
     operational_blockers = [
@@ -1555,8 +1557,8 @@ def select_live_sizing_row(
     return max(
         eligible,
         key=lambda row: (
-            float(row["current_opportunity_net"]),
-            float(row["current_opportunity_basis_stress_net"]),
+            float(row["current_nowcast_net"]),
+            float(row["current_basis_stress_net_profit"]),
             float(row["notional"]),
         ),
     )
