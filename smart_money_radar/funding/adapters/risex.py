@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import urllib.parse
+import os
 from datetime import UTC, datetime
 from typing import Any
 
@@ -15,6 +16,7 @@ from smart_money_radar.funding.normalization import (
     normalize_orderbook,
     parse_timestamp,
 )
+from smart_money_radar.funding.adapter_contracts import USD_MAJOR_STABLE
 
 
 RISEX_API_URL = "https://api.testnet.rise.trade"
@@ -32,9 +34,11 @@ class RiseXFundingClient:
         self,
         http: FundingHttpClient | None = None,
         base_url: str = RISEX_API_URL,
+        environment: str | None = None,
     ) -> None:
         self.http = http or FundingHttpClient(min_delay_seconds=0.08)
         self.base_url = base_url.rstrip("/")
+        self.environment = risex_environment(environment, self.base_url)
         self._markets_by_symbol: dict[str, dict[str, Any]] = {}
         self._markets_by_id: dict[str, dict[str, Any]] = {}
 
@@ -77,8 +81,15 @@ class RiseXFundingClient:
                     "base_asset": asset,
                     "quote_asset": "USDC",
                     "collateral_asset": "USDC",
+                    "environment": self.environment,
                     "contract_type": "linear_perpetual",
                     "contract_multiplier": 1.0,
+                    "contract_kind": "linear_perpetual",
+                    "price_quote_currency": "USDC",
+                    "settlement_collateral": "USDC",
+                    "collateral_family": USD_MAJOR_STABLE,
+                    "supports_perpetuals": True,
+                    "is_linear_contract": True,
                     "status": "active",
                     "source_url": f"https://rise.trade/market/{market_id}",
                     "observed_at": observed_at,
@@ -94,6 +105,10 @@ class RiseXFundingClient:
                     "funding_interval_hours": interval_hours,
                     "hourly_funding_rate": hourly_funding_rate,
                     "funding_rate_kind": "published_current_interval_rate",
+                    "normalized_next_funding_rate": funding_rate,
+                    "funding_rate_semantics": "next_settlement",
+                    "funding_rate_unit": "fraction_of_notional_per_settlement",
+                    "funding_sign_convention": "positive_long_pays",
                     "published_funding_rate": published_funding_rate,
                     "published_funding_interval_hours": 8.0,
                     "funding_display_note": "published 8h equivalent; cashflow 1h",
@@ -102,11 +117,34 @@ class RiseXFundingClient:
                     "index_price": as_float(raw.get("index_price")) or None,
                     "open_interest_usd": risex_open_interest_usd(raw),
                     "volume_24h_usd": as_float(raw.get("quote_volume_24h")) or None,
+                    "quantity_step": risex_quantity_step(raw),
+                    "min_quantity": risex_min_quantity(raw),
+                    "min_notional_usd": risex_min_notional(raw),
                     "maker_fee_rate": RISEX_MAKER_FEE_RATE,
                     "taker_fee_rate": RISEX_TAKER_FEE_RATE,
                     "fee_source": "venue_public_tier1",
                     "funding_rate_cap": 0.04 * interval_hours,
                     "funding_rate_floor": -0.04 * interval_hours,
+                    "environment": self.environment,
+                    "contract_kind": "linear_perpetual",
+                    "price_quote_currency": "USDC",
+                    "settlement_collateral": "USDC",
+                    "collateral_family": USD_MAJOR_STABLE,
+                    "supports_perpetuals": True,
+                    "is_linear_contract": True,
+                    "supports_discrete_funding": True,
+                    "supports_public_shadow_mode": True,
+                    "position_inclusion_rule": raw.get("position_inclusion_rule"),
+                    "entry_safety_buffer_seconds": raw.get("entry_safety_buffer_seconds"),
+                    "exit_safety_buffer_seconds": raw.get("exit_safety_buffer_seconds"),
+                    "timing_policy_source": raw.get(
+                        "timing_policy_source",
+                        "adapter_risex_next_funding_time",
+                    ),
+                    "realized_history_semantics": raw.get(
+                        "realized_history_semantics",
+                        "generic_history_unverified",
+                    ),
                     "observed_at": observed_at,
                     "raw": {
                         "market": raw,
@@ -324,6 +362,40 @@ def risex_interval_hours(value: Any) -> float:
     if seconds <= 0:
         return RISEX_DEFAULT_FUNDING_INTERVAL_HOURS
     return seconds / 3600.0
+
+
+def risex_environment(value: str | None, base_url: str) -> str:
+    configured = str(value or os.environ.get("RISEX_ENVIRONMENT") or "").strip().lower()
+    if configured in {"mainnet", "testnet"}:
+        return configured
+    return "testnet" if "testnet" in str(base_url).lower() else "mainnet"
+
+
+def risex_quantity_step(row: dict[str, Any]) -> float | None:
+    config = row.get("config") if isinstance(row.get("config"), dict) else {}
+    for key in ("quantity_step", "min_order_increment", "order_size_increment", "lot_size"):
+        value = as_float(row.get(key), as_float(config.get(key)))
+        if value > 0:
+            return value
+    return None
+
+
+def risex_min_quantity(row: dict[str, Any]) -> float | None:
+    config = row.get("config") if isinstance(row.get("config"), dict) else {}
+    for key in ("min_quantity", "min_order_size", "minimum_order_size"):
+        value = as_float(row.get(key), as_float(config.get(key)))
+        if value > 0:
+            return value
+    return None
+
+
+def risex_min_notional(row: dict[str, Any]) -> float | None:
+    config = row.get("config") if isinstance(row.get("config"), dict) else {}
+    for key in ("min_notional", "min_notional_usd", "minimum_notional"):
+        value = as_float(row.get(key), as_float(config.get(key)))
+        if value > 0:
+            return value
+    return None
 
 
 def market_funding_looks_implausible(

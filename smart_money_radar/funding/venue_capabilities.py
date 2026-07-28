@@ -166,9 +166,7 @@ def capability_from_market(market: dict[str, Any]) -> VenueCapability:
             market.get("taker_fee_rate") is not None
             or market.get("fee_rate") is not None
         ),
-        supports_quantity_step=positive(market.get("quantity_step")) or positive(
-            market.get("contract_multiplier")
-        ),
+        supports_quantity_step=positive(market.get("quantity_step")),
         supports_min_notional=positive(market.get("min_notional_usd")) or positive(
             market.get("min_notional")
         ),
@@ -312,7 +310,7 @@ def venue_inventory_rows(
             continue
         market = sample_by_venue.get(venue)
         if not market:
-            rows.append({"venue": venue, "status": "REGISTERED", "reason": "no_sample_market"})
+            rows.append({"venue": venue, "status": "UNAVAILABLE", "reason": "no_sample_market"})
             continue
         capability = capability_from_market(market)
         rejections = synchronized_capability_rejection(capability)
@@ -320,7 +318,7 @@ def venue_inventory_rows(
             rows.append(
                 {
                     "venue": venue,
-                    "status": "ACTIVE_RESEARCH_ONLY",
+                    "status": "RESEARCH_ONLY",
                     "reason": ",".join(rejections),
                     "capability": capability.as_dict(),
                 }
@@ -329,7 +327,7 @@ def venue_inventory_rows(
             rows.append(
                 {
                     "venue": venue,
-                    "status": "ACTIVE_PAPER_ELIGIBLE",
+                    "status": "PAPER_ELIGIBLE",
                     "reason": "all_synchronized_funding_gates_passed",
                     "capability": capability.as_dict(),
                 }

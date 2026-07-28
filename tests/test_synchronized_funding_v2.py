@@ -78,7 +78,7 @@ def test_active_incompatible_venue_stays_research_only() -> None:
         ],
     )
 
-    assert rows[0]["status"] == "ACTIVE_RESEARCH_ONLY"
+    assert rows[0]["status"] == "RESEARCH_ONLY"
     assert "continuous_or_unclear_funding" in rows[0]["reason"]
 
 
@@ -3088,7 +3088,7 @@ def test_hard_stale_no_fresh_book_uses_emergency_fallback(tmp_path) -> None:
     bot.refresh_open_capture_route = unavailable_refresh
     outcomes = bot.process_open_positions()
     assert "emergency_unwind" in outcomes
-    assert refresh_calls == 4
+    assert refresh_calls == 1
     positions = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})
     assert len(positions) == 1
     ledger = store.paper_event_ledger_rows(position_id)
@@ -3098,7 +3098,7 @@ def test_hard_stale_no_fresh_book_uses_emergency_fallback(tmp_path) -> None:
     assert payload.get("reason") == "targeted_refresh_hard_stale"
     assert payload.get("pricing_quality") == "executable_book"
     updated = store.funding_capture_position_by_id(position_id)
-    assert updated["config"]["data_quality"]["refresh_attempt_count"] == 4
+    assert updated["config"]["data_quality"]["refresh_attempt_count"] == 1
 
 
 def test_partial_entry_unwinds_and_releases_collateral(tmp_path, monkeypatch) -> None:
@@ -3811,8 +3811,8 @@ def test_targeted_refresh_failure_records_degraded_metadata(tmp_path, monkeypatc
     quality = store.funding_capture_position_by_id(capture_id)["config"]["data_quality"]
     assert quality["state"] == "DEGRADED"
     assert quality["first_degraded_at"] == now.isoformat()
-    assert quality["last_refresh_attempt_at"] == (now + timedelta(seconds=1.5)).isoformat()
-    assert quality["refresh_attempt_count"] == 4
+    assert quality["last_refresh_attempt_at"] == now.isoformat()
+    assert quality["refresh_attempt_count"] == 1
     assert quality["last_refresh_quality"] == "UNAVAILABLE"
 
 
@@ -3832,6 +3832,24 @@ def test_next_sleep_honors_30_second_light_discovery(tmp_path) -> None:
 
     assert bot.next_sleep_seconds({}) <= 30.0
     assert bot.next_sleep_seconds({}) == pytest.approx(30.0)
+
+
+def test_next_sleep_uses_adaptive_light_discovery_cadence(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    bot = _lightweight_bot(
+        tmp_path,
+        now,
+        [
+            _LightweightDiscoveryClient("venue_a", funding_rate=-0.004, next_funding_at=settlement),
+            _LightweightDiscoveryClient("venue_b", funding_rate=0.004, next_funding_at=settlement),
+        ],
+    )
+    bot._last_lightweight_discovery_monotonic = bot.clock.monotonic()
+    bot.last_full_scan_monotonic = bot.clock.monotonic()
+    bot._last_lightweight_nearest_settlement_seconds = 90.0
+
+    assert bot.next_sleep_seconds({}) == pytest.approx(5.0)
 
 
 def test_background_full_scan_does_not_suppress_light_discovery(tmp_path) -> None:
@@ -4469,9 +4487,9 @@ def test_adapter_capability_inventory_reports_paper_research_and_deactivated() -
     )
     by_venue = {row["venue"]: row for row in rows}
 
-    assert by_venue["paperx"]["status"] == "ACTIVE_PAPER_ELIGIBLE"
+    assert by_venue["paperx"]["status"] == "PAPER_ELIGIBLE"
     assert by_venue["paperx"]["reason"] == "all_synchronized_funding_gates_passed"
-    assert by_venue["unknownx"]["status"] == "ACTIVE_RESEARCH_ONLY"
+    assert by_venue["unknownx"]["status"] == "RESEARCH_ONLY"
     assert "contract_kind_not_linear_perpetual" in by_venue["unknownx"]["reason"]
     assert by_venue["bingx"] == {"venue": "bingx", "status": "DEACTIVATED", "reason": "user_deactivated"}
 

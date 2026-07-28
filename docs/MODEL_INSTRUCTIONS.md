@@ -193,6 +193,13 @@ Legacy `position.py` accounting and `funding_paper_positions` remain for old
 profiles and old reports. They are not the source of truth for
 `synchronized_funding_capture_v2`.
 
+`funding-shadow-monitor` is a separate read-only mode, not a paper runtime. It
+stores only `funding_shadow_*` rows, sends `SHADOW FUNDING` Telegram messages,
+and must not call paper entry, paper order creation, collateral reservation,
+settlement hold/close, account balance mutation, private exchange endpoints, or
+live execution. Shadow observations include an `environment` field; `mainnet` and
+`testnet` rows cannot be joined into one opportunity or statistic.
+
 The intended runtime cadence is unchanged:
 
 - P0 open v2/legacy positions: cancel background full scan, refresh involved
@@ -217,7 +224,11 @@ Cadence:
 Full market scan can run in the background while hot rechecks continue. It must
 not call blocking `run_full_iteration()` from the scheduler, must not wait on an
 unfinished future, must not clear hot routes, and must not overwrite a newer
-focused snapshot.
+focused snapshot. Broad funding discovery uses adaptive cadence: 30 seconds when
+the nearest relevant settlement is more than 10 minutes away, 10 seconds inside
+2-10 minutes, 5 seconds inside 60-120 seconds, and 1-second focused observation
+for known routes under 60 seconds. Slow venue fetches must return partial results
+after the venue deadline instead of blocking the loop.
 
 ## 7. Scanner, Watch, and Entry Lifecycle
 
@@ -236,7 +247,10 @@ Entry can happen only through `SynchronizedFundingRuntimeV2.consider_route`.
 Required conditions:
 
 1. Both venues pass the fail-closed capability contract.
-2. Collateral and quote assets match and are one of `USDT`, `USDC`, or `USD`.
+2. Paper entry still requires collateral/quote compatibility owned by the paper
+   risk model. Shadow discovery may structurally allow native USDC/USDT routes
+   through a common USD numeraire, but cross-stable paper entry remains disabled
+   until the stablecoin price and accounting contracts are wired into entry.
 3. Both legs publish a normalized next-settlement funding rate with
    `positive_long_pays` sign convention.
 4. Both `next_funding_at` timestamps align within 1 second.
@@ -460,6 +474,26 @@ Funding bot must use funding Telegram credentials:
 - `FUNDING_TELEGRAM_CHAT_ID`.
 
 Prediction or other bots must not send funding status messages.
+
+Telegram CLI commands support `--scope default`, `--scope funding`, and
+`--scope shadow`. Shadow resolves credentials as
+`FUNDING_SHADOW_TELEGRAM_* -> FUNDING_TELEGRAM_* -> not configured` and must not
+fall back to generic `TELEGRAM_*`. Telegram tokens must never be printed; HTTP
+errors containing `/bot<TOKEN>/` must be redacted to `/bot<redacted>/`.
+
+USDC and USDT are compatible for route discovery through `numeraire = USD`, but
+they are not accounting-identical. Cross-stable routes require a
+`StablecoinPriceProvider`; paper-grade evaluation needs at least two fresh
+independent sources per stable, <=5 bps cross-source disagreement, current basis
+<=30 bps, and reserve <=50 bps. The reserve is
+`max(10, current_basis_bps + 3 * p95_adverse_1m_bps)` with a 10 bps fallback
+when fewer than 10 one-minute observations exist. USDe, DAI, USDT0, bridged
+USDC, yield-bearing stables, and synthetic dollars require separate families and
+risk models.
+
+Points and incentives are metadata only. They must never be added to expected
+trading net PnL; they can only be displayed separately or used as a tie-breaker
+between routes that already have positive trading economics.
 
 ## 13. Testing Requirements
 

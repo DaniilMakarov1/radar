@@ -10,6 +10,7 @@ Older Prediction, Dune/local analytics, wallet research, and on-chain Radar modu
 
 - `smart_money_radar/funding/` — venue adapters, route construction, funding economics, liquidity, forecasts.
 - `smart_money_radar/paper_bot/` — paper entry, hold, settlement, close, spread monitoring, Telegram messages.
+- `smart_money_radar/funding/shadow_monitor.py` — read-only shadow funding observation and Telegram alerts.
 - `smart_money_radar/dashboard.py` and `smart_money_radar/web/index.html` — local Funding dashboard.
 - `smart_money_radar/cli.py` — commands for scan, paper bot, reports, export, dashboard.
 - `scripts/` — local launch helpers for dashboard and paper bot.
@@ -55,6 +56,12 @@ Run the paper bot:
 python3 -m smart_money_radar.cli funding-paper-trader
 ```
 
+Run the read-only shadow monitor:
+
+```bash
+python3 -m smart_money_radar.cli funding-shadow-monitor --profile dex_shadow --db data/radar-shadow.sqlite --duration-seconds 180
+```
+
 Export paper trades:
 
 ```bash
@@ -75,6 +82,9 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 ## Runtime Rules
 
 - Paper-only. No live execution.
+- `funding-shadow-monitor` is read-only: it uses public market data, opens no
+  paper positions, creates no paper orders, reserves no collateral, and never
+  changes paper account balances.
 - Default paper strategy: `synchronized_funding_capture_v2`.
 - Scanner output is not final entry authorization: synchronized routes are
   `watch` until focused observations pass underwriting.
@@ -109,6 +119,19 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 - Open v2 positions and critical hot routes have priority over discovery. A
   background full scan must not delay open-position polling, entry rechecks,
   emergency close, or reconciliation.
+- Broad funding discovery uses adaptive cadence: 30s when settlements are more
+  than 10 minutes away, 10s inside 2-10 minutes, 5s inside 60-120 seconds, then
+  focused 1s observation for known routes under 60 seconds.
+- The DEX-heavy shadow matrix is RiseX, Hyperliquid, Paradex, Extended, EdgeX,
+  Ethereal, GRVT, Lighter, dYdX, plus Binance, Bybit, and OKX as CEX benchmarks.
+- USDC and USDT routes are compatible through USD numeraire, but balances are
+  not accounting-identical. Cross-stable routes carry a separate stablecoin
+  reserve; USDe, DAI, USDT0, bridged USDC, yield-bearing stables, and synthetic
+  dollars are not automatically `USD_MAJOR_STABLE`.
+- Points and incentives are metadata only. They can break ties between routes
+  that already have positive trading economics; they never add to trading PnL.
+- RiseX observations carry `mainnet` or `testnet`; the two environments cannot
+  be merged into one opportunity.
 - A position can capture at most 4 settlements and live about 4 hours 5 minutes.
 - A common 10% price move is telemetry and a fresh-risk warning, not an automatic stop-loss.
 - Negative-PnL routes are not shown as candidates.
@@ -136,6 +159,13 @@ The system keeps paper trade history for analysis, but scan diagnostics are prun
 Telegram is configured through environment variables. Do not commit tokens or `.env` files.
 
 ```bash
-python3 -m smart_money_radar.cli telegram-chat-id
-python3 -m smart_money_radar.cli telegram-test
+python3 -m smart_money_radar.cli telegram-chat-id --scope default
+python3 -m smart_money_radar.cli telegram-chat-id --scope funding
+python3 -m smart_money_radar.cli telegram-chat-id --scope shadow
+python3 -m smart_money_radar.cli telegram-test --scope shadow
 ```
+
+Funding uses `FUNDING_TELEGRAM_BOT_TOKEN` and `FUNDING_TELEGRAM_CHAT_ID`.
+Shadow uses `FUNDING_SHADOW_TELEGRAM_*` when present and otherwise falls back to
+the funding bot. It does not fall back to generic `TELEGRAM_*` credentials.
+Tokens belong only in local `.env` and are redacted from Telegram HTTP errors.

@@ -338,6 +338,7 @@ python3 -m smart_money_radar.cli funding-history-backfill --venue paradex --limi
 python3 -m smart_money_radar.cli funding-report
 python3 -m smart_money_radar.cli funding-watch --interval-seconds 60
 python3 -m smart_money_radar.cli funding-paper-trader --target-notional 500
+python3 -m smart_money_radar.cli funding-shadow-monitor --profile dex_shadow --db data/radar-shadow.sqlite --duration-seconds 180
 python3 -m smart_money_radar.cli funding-paper-report
 python3 -m smart_money_radar.cli funding-paper-export
 python3 -m smart_money_radar.cli dashboard
@@ -368,9 +369,33 @@ in `.env`. After
 sending any message to the bot, run:
 
 ```bash
-python3 -m smart_money_radar.cli telegram-chat-id
-python3 -m smart_money_radar.cli telegram-test
+python3 -m smart_money_radar.cli telegram-chat-id --scope funding
+python3 -m smart_money_radar.cli telegram-test --scope funding
+python3 -m smart_money_radar.cli telegram-chat-id --scope shadow
+python3 -m smart_money_radar.cli telegram-test --scope shadow
 ```
+
+Shadow Telegram uses `FUNDING_SHADOW_TELEGRAM_BOT_TOKEN` and
+`FUNDING_SHADOW_TELEGRAM_CHAT_ID` when present, otherwise it reuses the funding
+bot. It never falls back to generic `TELEGRAM_*` variables and never prints bot
+tokens. Every shadow message starts with `SHADOW FUNDING` and includes `NO
+POSITION OPENED`.
+
+`funding-shadow-monitor` is separate from the paper trader. It reads public
+funding, mark/index, volume/open-interest, contract status, latency, points
+metadata, and stablecoin-normalized economics into `funding_shadow_*` tables. It
+does not create `funding_capture_positions`, `funding_paper_orders`, ledger
+cashflow, collateral reservations, paper win-rate rows, or account balance
+changes.
+
+The default `dex_shadow` matrix is RiseX, Hyperliquid, Paradex, Extended, EdgeX,
+Ethereal, GRVT, Lighter, dYdX, Binance, Bybit, and OKX. Other registered
+adapters remain in inventory as `RESEARCH_ONLY`, `DEACTIVATED`, or `UNAVAILABLE`
+until their contract proves more.
+
+USDC and USDT are route-compatible through USD numeraire but not identical
+balances. Cross-stable routes show stablecoin basis and reserve separately;
+points/incentives are metadata and never change trading PnL.
 
 Open `http://127.0.0.1:8787`; `Funding` is the default view. The main table contains
 only routes that pass every economic and data-quality gate. Rejected positive or

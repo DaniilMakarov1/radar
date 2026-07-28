@@ -1565,6 +1565,94 @@ CREATE TABLE IF NOT EXISTS funding_settlement_reconciliations (
 CREATE INDEX IF NOT EXISTS idx_funding_settlement_reconciliations_position
     ON funding_settlement_reconciliations (position_id, scheduled_funding_at);
 
+CREATE TABLE IF NOT EXISTS funding_shadow_opportunities (
+    opportunity_key TEXT PRIMARY KEY,
+    environment TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    canonical_asset TEXT NOT NULL,
+    status TEXT NOT NULL,
+    long_venue TEXT NOT NULL,
+    long_symbol TEXT,
+    short_venue TEXT NOT NULL,
+    short_symbol TEXT,
+    settlement_at TEXT,
+    settlement_skew_seconds REAL,
+    seconds_until_settlement REAL,
+    preliminary_gross_funding REAL NOT NULL DEFAULT 0,
+    funding_net_excluding_points REAL NOT NULL DEFAULT 0,
+    stablecoin_risk_json TEXT NOT NULL DEFAULT '{}',
+    capability_status_json TEXT NOT NULL DEFAULT '{}',
+    blockers_json TEXT NOT NULL DEFAULT '[]',
+    points_metadata_json TEXT NOT NULL DEFAULT '{}',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_shadow_opportunities_status
+    ON funding_shadow_opportunities (
+        environment, status, last_observed_at DESC
+    );
+
+CREATE TABLE IF NOT EXISTS funding_shadow_observations (
+    funding_shadow_observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_key TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    symbol TEXT,
+    canonical_asset TEXT NOT NULL,
+    side TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    next_funding_at TEXT,
+    normalized_next_funding_rate REAL,
+    mark_price REAL,
+    index_price REAL,
+    volume_24h_usd REAL,
+    open_interest_usd REAL,
+    response_received_at TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (opportunity_key)
+        REFERENCES funding_shadow_opportunities(opportunity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_shadow_observations_time
+    ON funding_shadow_observations (
+        environment, venue, symbol, observed_at DESC
+    );
+
+CREATE TABLE IF NOT EXISTS funding_shadow_alerts (
+    funding_shadow_alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_key TEXT NOT NULL UNIQUE,
+    opportunity_key TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT NOT NULL,
+    telegram_status TEXT NOT NULL DEFAULT 'not_configured',
+    telegram_error TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (opportunity_key)
+        REFERENCES funding_shadow_opportunities(opportunity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_shadow_alerts_created
+    ON funding_shadow_alerts (environment, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS funding_shadow_venue_health (
+    venue TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    status TEXT NOT NULL,
+    latency_ms REAL,
+    last_error TEXT,
+    observed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (venue, environment)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_shadow_venue_health_status
+    ON funding_shadow_venue_health (environment, status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS paper_event_ledger (
     ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL UNIQUE,

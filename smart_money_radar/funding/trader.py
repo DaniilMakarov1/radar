@@ -68,6 +68,9 @@ from smart_money_radar.funding.service import (
     active_default_funding_clients,
     run_funding_scan,
 )
+from smart_money_radar.funding.shadow_monitor import (
+    adaptive_broad_sweep_interval_seconds,
+)
 from smart_money_radar.funding.strategy_synchronized_funding import (
     gross_funding_pnl,
     settlement_alignment_passed,
@@ -176,10 +179,7 @@ from smart_money_radar.paper_bot.telegram import (
 FUNDING_HISTORY_MIN_ROWS_PER_MARKET = 24
 FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 OPEN_CAPTURE_REFRESH_TIMEOUT_SECONDS = 2.0
-OPEN_CAPTURE_REFRESH_RETRY_COUNT = 3
-OPEN_CAPTURE_REFRESH_RETRY_INTERVAL_SECONDS = 0.5
 OPEN_CAPTURE_DEGRADED_HARD_STALE_SECONDS = 5.0
-LIGHTWEIGHT_DISCOVERY_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -494,6 +494,8 @@ class PaperBot:
         self.background_full_scan_skip_reasons: dict[str, str] = {}
         self._foreground_venues: set[str] = set()
         self._background_venues: set[str] = set()
+        self._last_lightweight_nearest_settlement_seconds: float | None = None
+        self._lightweight_pending_futures: dict[Future[Any], str] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle: signal handling, sleep, notifications (folded from BaseBot)
@@ -1702,10 +1704,11 @@ class PaperBot:
             deadlines.append(float(self.config.monitor_interval_seconds))
         if not has_open and not has_hot:
             last_light = float(getattr(self, "_last_lightweight_discovery_monotonic", 0.0) or 0.0)
+            lightweight_interval = self.lightweight_discovery_interval_seconds(result)
             lightweight_due_in = (
                 0.0
                 if last_light <= 0
-                else max(0.0, last_light + LIGHTWEIGHT_DISCOVERY_INTERVAL_SECONDS - now_monotonic)
+                else max(0.0, last_light + lightweight_interval - now_monotonic)
             )
             deadlines.append(lightweight_due_in)
             full_due_in = (
@@ -1722,6 +1725,18 @@ class PaperBot:
         if result.get("background_full_scan_running") or self.background_full_scan_running():
             deadlines.append(float(self.config.hot_interval_seconds))
         return max(0.0, min(deadlines)) if deadlines else float(self.config.scan_interval_seconds)
+
+    def lightweight_discovery_interval_seconds(
+        self,
+        result: dict[str, Any] | None = None,
+    ) -> float:
+        nearest = None
+        if result is not None:
+            discovery = result.get("lightweight_discovery") or {}
+            nearest = discovery.get("nearest_settlement_seconds")
+        if nearest is None:
+            nearest = self._last_lightweight_nearest_settlement_seconds
+        return adaptive_broad_sweep_interval_seconds(nearest)
 
     def process_entry_candidates(
         self,
@@ -2132,7 +2147,7 @@ class PaperBot:
         if not lightweight_discovery_due(
             last_discovery_monotonic=getattr(self, "_last_lightweight_discovery_monotonic", 0.0),
             now_monotonic=now_monotonic,
-            interval_seconds=LIGHTWEIGHT_DISCOVERY_INTERVAL_SECONDS,
+            interval_seconds=self.lightweight_discovery_interval_seconds(),
         ):
             return None
         self._last_lightweight_discovery_monotonic = now_monotonic
@@ -2172,6 +2187,9 @@ class PaperBot:
             markets,
             clients_by_venue,
             now,
+        )
+        self._last_lightweight_nearest_settlement_seconds = summary.get(
+            "nearest_settlement_seconds"
         )
         for route in routes:
             route_key = str(route.get("route_key") or "")
@@ -2213,10 +2231,22 @@ class PaperBot:
         futures = {}
         foreground_venues: set[str] = set()
         try:
+            if work_mode != "background_full_scan":
+                for pending_future, pending_venue in list(
+                    self._lightweight_pending_futures.items()
+                ):
+                    if pending_future.done() or pending_future.cancelled():
+                        self._lightweight_pending_futures.pop(pending_future, None)
+                inflight_venues = set(self._lightweight_pending_futures.values())
+            else:
+                inflight_venues = set()
             for client in clients:
                 if cancel_event is not None and cancel_event.is_set():
                     break
                 venue = str(getattr(client, "venue", "")).lower()
+                if venue in inflight_venues:
+                    warnings.append(f"{venue} lightweight catalog skipped: request_in_flight")
+                    continue
                 if (
                     work_mode == "background_full_scan"
                     and not bool(getattr(client, "thread_safe", False))
@@ -2243,8 +2273,21 @@ class PaperBot:
                     venue,
                     request_started_at,
                 )
-            for future in as_completed(futures):
+            if work_mode != "background_full_scan":
+                for future, (venue, _request_started_at) in futures.items():
+                    self._lightweight_pending_futures[future] = venue
+            done, pending = wait(
+                futures,
+                timeout=2.0,
+            )
+            for future in pending:
+                venue, _request_started_at = futures[future]
+                future.cancel()
+                warnings.append(f"{venue} lightweight catalog skipped: venue_deadline_2s")
+            for future in done:
                 venue, request_started_at = futures[future]
+                if work_mode != "background_full_scan":
+                    self._lightweight_pending_futures.pop(future, None)
                 if cancel_event is not None and cancel_event.is_set():
                     future.cancel()
                     continue
@@ -2330,6 +2373,7 @@ class PaperBot:
         now: datetime,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rejection_reasons: dict[str, int] = {}
+        nearest_settlement_seconds: float | None = None
 
         def reject(reason: str) -> None:
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
@@ -2346,6 +2390,12 @@ class PaperBot:
                 reject("next_funding_at_missing")
                 continue
             seconds_to_settlement = (settlement - now).total_seconds()
+            if seconds_to_settlement >= 0:
+                nearest_settlement_seconds = (
+                    seconds_to_settlement
+                    if nearest_settlement_seconds is None
+                    else min(nearest_settlement_seconds, seconds_to_settlement)
+                )
             if seconds_to_settlement < 55 or seconds_to_settlement > 600:
                 reject("outside_lightweight_settlement_window")
                 continue
@@ -2437,6 +2487,7 @@ class PaperBot:
             "routes_structurally_matched": structurally_matched,
             "watch_routes_added": len(routes_by_key),
             "research_only_routes": research_only_routes,
+            "nearest_settlement_seconds": nearest_settlement_seconds,
             "rejection_reasons": dict(sorted(rejection_reasons.items())),
         }
 
@@ -2632,7 +2683,7 @@ class PaperBot:
             "fee_rate": fee_rate,
             "taker_fee_rate": fee_rate,
             "maker_fee_rate": market.get("maker_fee_rate"),
-            "quantity_step": market.get("quantity_step") or market.get("contract_multiplier"),
+            "quantity_step": market.get("quantity_step"),
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
             "min_notional_usd": min_notional,
@@ -2883,7 +2934,7 @@ class PaperBot:
             "fee_rate": fee_rate,
             "taker_fee_rate": fee_rate,
             "maker_fee_rate": market.get("maker_fee_rate"),
-            "quantity_step": market.get("quantity_step") or market.get("contract_multiplier"),
+            "quantity_step": market.get("quantity_step"),
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
             "min_notional_usd": min_notional,
@@ -2990,21 +3041,20 @@ class PaperBot:
                 continue
             config_json = position.get("config") or {}
             route_key = str(config_json.get("route_key") or "")
-            refreshed: CaptureRouteRefreshResult | None = None
-            for attempt_index in range(OPEN_CAPTURE_REFRESH_RETRY_COUNT + 1):
-                attempt_now = self.clock.now()
-                refreshed = self.refresh_open_capture_route(position, attempt_now)
-                if refreshed.quality == "FRESH":
-                    now = attempt_now
-                    break
+            attempt_now = self.clock.now()
+            refreshed = self.refresh_open_capture_route(position, attempt_now)
+            if refreshed.quality != "FRESH":
                 self.synchronized_runtime.mark_position_data_quality(
                     position,
                     state="DEGRADED",
                     now=attempt_now,
-                    refresh_result={**refreshed.as_dict(), "retry_index": attempt_index},
+                    refresh_result={
+                        **refreshed.as_dict(),
+                        "retry_mode": "across_iterations",
+                    },
                 )
-                if attempt_index < OPEN_CAPTURE_REFRESH_RETRY_COUNT:
-                    self.clock.sleep(OPEN_CAPTURE_REFRESH_RETRY_INTERVAL_SECONDS)
+            else:
+                now = attempt_now
             live_route = refreshed.route if refreshed and refreshed.quality == "FRESH" else None
             if live_route is not None:
                 if route_key:

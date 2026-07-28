@@ -8269,6 +8269,171 @@ class SQLiteStore:
                 (str(status), error, int(event_id)),
             )
 
+    def upsert_funding_shadow_opportunity(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        key = str(row["opportunity_key"])
+        observed_at = str(row.get("observed_at") or now)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_shadow_opportunities (
+                    opportunity_key, environment, profile, canonical_asset,
+                    status, long_venue, long_symbol, short_venue, short_symbol,
+                    settlement_at, settlement_skew_seconds,
+                    seconds_until_settlement, preliminary_gross_funding,
+                    funding_net_excluding_points, stablecoin_risk_json,
+                    capability_status_json, blockers_json,
+                    points_metadata_json, payload_json, first_observed_at,
+                    last_observed_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(opportunity_key) DO UPDATE SET
+                    status = excluded.status,
+                    settlement_at = excluded.settlement_at,
+                    settlement_skew_seconds = excluded.settlement_skew_seconds,
+                    seconds_until_settlement = excluded.seconds_until_settlement,
+                    preliminary_gross_funding = excluded.preliminary_gross_funding,
+                    funding_net_excluding_points = excluded.funding_net_excluding_points,
+                    stablecoin_risk_json = excluded.stablecoin_risk_json,
+                    capability_status_json = excluded.capability_status_json,
+                    blockers_json = excluded.blockers_json,
+                    points_metadata_json = excluded.points_metadata_json,
+                    payload_json = excluded.payload_json,
+                    last_observed_at = excluded.last_observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    row.get("environment", "mainnet"),
+                    row.get("profile", "dex_shadow"),
+                    row["canonical_asset"],
+                    row["status"],
+                    row["long_venue"],
+                    row.get("long_symbol"),
+                    row["short_venue"],
+                    row.get("short_symbol"),
+                    row.get("settlement_at"),
+                    row.get("settlement_skew_seconds"),
+                    row.get("seconds_until_settlement"),
+                    float(row.get("preliminary_gross_funding") or 0.0),
+                    float(row.get("funding_net_excluding_points") or 0.0),
+                    json.dumps(row.get("stablecoin_risk") or {}, sort_keys=True),
+                    json.dumps(row.get("capability_status") or {}, sort_keys=True),
+                    json.dumps(row.get("blockers") or [], sort_keys=True),
+                    json.dumps(row.get("points_metadata") or {}, sort_keys=True),
+                    json.dumps(row, sort_keys=True),
+                    observed_at,
+                    observed_at,
+                    now,
+                ),
+            )
+        return key
+
+    def insert_funding_shadow_observation(self, row: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO funding_shadow_observations (
+                    opportunity_key, environment, venue, symbol,
+                    canonical_asset, side, observed_at, next_funding_at,
+                    normalized_next_funding_rate, mark_price, index_price,
+                    volume_24h_usd, open_interest_usd,
+                    response_received_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["opportunity_key"],
+                    row.get("environment", "mainnet"),
+                    row["venue"],
+                    row.get("symbol"),
+                    row["canonical_asset"],
+                    row["side"],
+                    row["observed_at"],
+                    row.get("next_funding_at"),
+                    row.get("normalized_next_funding_rate"),
+                    row.get("mark_price"),
+                    row.get("index_price"),
+                    row.get("volume_24h_usd"),
+                    row.get("open_interest_usd"),
+                    row.get("response_received_at"),
+                    json.dumps(row.get("payload") or {}, sort_keys=True),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def insert_funding_shadow_alert(self, row: dict[str, Any]) -> int | None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO funding_shadow_alerts (
+                    alert_key, opportunity_key, environment, status,
+                    message, telegram_status, telegram_error,
+                    payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["alert_key"],
+                    row["opportunity_key"],
+                    row.get("environment", "mainnet"),
+                    row["status"],
+                    row["message"],
+                    row.get("telegram_status") or "not_configured",
+                    row.get("telegram_error"),
+                    json.dumps(row.get("payload") or {}, sort_keys=True),
+                    row.get("created_at") or now,
+                ),
+            )
+        return int(cursor.lastrowid) if cursor.lastrowid else None
+
+    def upsert_funding_shadow_venue_health(self, row: dict[str, Any]) -> None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_shadow_venue_health (
+                    venue, environment, status, latency_ms, last_error,
+                    observed_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue, environment) DO UPDATE SET
+                    status = excluded.status,
+                    latency_ms = excluded.latency_ms,
+                    last_error = excluded.last_error,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    row["venue"],
+                    row.get("environment", "mainnet"),
+                    row.get("status", "unknown"),
+                    row.get("latency_ms"),
+                    row.get("last_error"),
+                    row.get("observed_at") or now,
+                    now,
+                ),
+            )
+
+    def funding_shadow_counts(self) -> dict[str, int]:
+        tables = {
+            "opportunities": "funding_shadow_opportunities",
+            "observations": "funding_shadow_observations",
+            "alerts": "funding_shadow_alerts",
+            "venue_health": "funding_shadow_venue_health",
+            "paper_positions": "funding_capture_positions",
+            "paper_orders": "funding_paper_orders",
+            "paper_accounts": "funding_paper_accounts",
+        }
+        with self.connect() as connection:
+            return {
+                name: int(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
+                for name, table in tables.items()
+            }
+
     def funding_paper_pending_reprice_events(
         self,
         limit: int = 20,

@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from smart_money_radar.config import DEFAULT_DB_PATH, api_key_status
 from smart_money_radar.funding.adapters import FundingDataError
@@ -20,10 +21,16 @@ from smart_money_radar.funding.retention import (
     apply_funding_retention_plan,
     build_funding_retention_plan,
 )
+from smart_money_radar.funding.adapter_contracts import PRIMARY_SHADOW_VENUES
 from smart_money_radar.funding.service import (
+    active_default_funding_clients,
     backfill_funding_history,
     run_funding_scan,
     watch_funding_markets,
+)
+from smart_money_radar.funding.shadow_monitor import (
+    FundingShadowConfig,
+    FundingShadowMonitor,
 )
 from smart_money_radar.funding.trader import (
     PaperBot,
@@ -41,7 +48,9 @@ from smart_money_radar.dashboard import (
     run_dashboard,
 )
 from smart_money_radar.notifications import (
+    TelegramScope,
     TelegramNotifier,
+    resolve_telegram_credentials,
     telegram_update_chat_ids,
 )
 from smart_money_radar.storage import SQLiteStore
@@ -417,6 +426,28 @@ def main(argv: list[str] | None = None) -> int:
             trader.run_loop()
             return 0
 
+        if args.command == "funding-shadow-monitor":
+            store.init_db()
+            clients = shadow_monitor_clients(args)
+            monitor = FundingShadowMonitor(
+                store,
+                clients,
+                config=funding_shadow_config(args),
+                notifier=(
+                    TelegramNotifier(scope=TelegramScope.SHADOW)
+                    if not args.no_telegram
+                    else None
+                ),
+            )
+            result = monitor.run(duration_seconds=args.duration_seconds)
+            print("Funding shadow monitor")
+            print(f"  profile: {args.profile}")
+            print(f"  duration_seconds: {args.duration_seconds}")
+            print(f"  iterations: {result['iterations']}")
+            print("  paper_positions_opened: 0")
+            print("  paper_orders_created: 0")
+            return 0
+
         if args.command == "funding-paper-report":
             store.init_db()
             report = filter_deactivated_funding_paper_payload(
@@ -459,14 +490,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "telegram-chat-id":
-            chats = telegram_update_chat_ids()
+            chats = telegram_update_chat_ids(scope=args.scope)
             if not chats:
+                credentials = resolve_telegram_credentials(args.scope)
+                if not credentials.token:
+                    print(
+                        "No Telegram token configured for scope "
+                        f"{args.scope}: {credentials.token_env_var} missing."
+                    )
+                    return 1
                 print(
                     "No Telegram chats found yet. Send any message to the bot, "
                     "then run this command again."
                 )
                 return 1
-            print("Telegram chats found:")
+            print(f"Telegram chats found for scope {args.scope}:")
             for chat in chats:
                 label = (
                     chat.get("username")
@@ -481,7 +519,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "telegram-test":
-            result = TelegramNotifier().send("Smart Money Radar Telegram test: ok")
+            result = TelegramNotifier(scope=args.scope).send(
+                f"Smart Money Radar Telegram test ({args.scope}): ok"
+            )
             print(f"Telegram test: {result.status}")
             if result.error:
                 print(f"  error: {result.error}")
@@ -799,6 +839,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     funding_paper_trader.add_argument("--no-spread-monitoring", action="store_true")
 
+    funding_shadow_monitor = subparsers.add_parser(
+        "funding-shadow-monitor",
+        help="Run read-only synchronized funding shadow monitor.",
+    )
+    funding_shadow_monitor.add_argument(
+        "--profile",
+        choices=("dex_shadow",),
+        default="dex_shadow",
+    )
+    funding_shadow_monitor.add_argument(
+        "--environment",
+        choices=("mainnet", "testnet"),
+        default="mainnet",
+    )
+    funding_shadow_monitor.add_argument(
+        "--db",
+        default=argparse.SUPPRESS,
+        help="SQLite database path for shadow observations.",
+    )
+    funding_shadow_monitor.add_argument("--target-notional", type=float, default=500.0)
+    funding_shadow_monitor.add_argument(
+        "--duration-seconds",
+        type=float,
+        default=180.0,
+        help="Bounded run duration. The command never starts a permanent service.",
+    )
+    funding_shadow_monitor.add_argument("--no-telegram", action="store_true")
+
     funding_paper_report = subparsers.add_parser(
         "funding-paper-report",
         help="Print local funding paper trader balances and open positions.",
@@ -814,14 +882,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="exports/funding_paper",
     )
 
-    subparsers.add_parser(
+    telegram_chat_id = subparsers.add_parser(
         "telegram-chat-id",
         help="Print Telegram chat IDs from bot getUpdates.",
     )
+    telegram_chat_id.add_argument(
+        "--scope",
+        choices=tuple(scope.value for scope in TelegramScope),
+        default=TelegramScope.DEFAULT.value,
+    )
 
-    subparsers.add_parser(
+    telegram_test = subparsers.add_parser(
         "telegram-test",
         help="Send a small Telegram test message using .env settings.",
+    )
+    telegram_test.add_argument(
+        "--scope",
+        choices=tuple(scope.value for scope in TelegramScope),
+        default=TelegramScope.DEFAULT.value,
     )
 
     sqlite_maintenance = subparsers.add_parser(
@@ -1028,6 +1106,32 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         ),
         spread_monitoring_enabled=not getattr(args, "no_spread_monitoring", False),
     ).validated()
+
+
+def funding_shadow_config(args: argparse.Namespace) -> FundingShadowConfig:
+    return FundingShadowConfig(
+        profile=args.profile,
+        environment=args.environment,
+        target_notional=args.target_notional,
+        telegram_enabled=not args.no_telegram,
+    ).validated()
+
+
+def shadow_monitor_clients(args: argparse.Namespace) -> list[Any]:
+    if args.profile == "dex_shadow":
+        return [
+            client
+            for client in (
+                funding_client_for_venue(
+                    venue,
+                    fast=True,
+                    timeout_seconds=2.0,
+                )
+                for venue in PRIMARY_SHADOW_VENUES
+            )
+            if client is not None
+        ]
+    return active_default_funding_clients()
 
 
 def print_status(store: SQLiteStore) -> None:
