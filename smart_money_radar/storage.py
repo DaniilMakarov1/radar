@@ -6455,6 +6455,29 @@ class SQLiteStore:
         return dict(row) if row else {}
 
     def upsert_funding_history(self, rows: list[dict[str, Any]]) -> int:
+        prepared_rows: list[tuple[Any, ...]] = []
+        for row in rows:
+            raw_payload = dict(row.get("raw", {}) or {})
+            raw_payload.setdefault(
+                "rate_semantics",
+                row.get("rate_semantics")
+                or raw_payload.get("rate_semantics")
+                or raw_payload.get("funding_rate_semantics")
+                or "realized_settlement",
+            )
+            prepared_rows.append(
+                (
+                    row["venue"],
+                    row["symbol"],
+                    row["funding_at"],
+                    row["funding_rate"],
+                    row["funding_interval_hours"],
+                    row["hourly_funding_rate"],
+                    row.get("mark_price"),
+                    row["observed_at"],
+                    json.dumps(raw_payload, sort_keys=True),
+                )
+            )
         with self.connect() as connection:
             connection.executemany(
                 """
@@ -6472,20 +6495,7 @@ class SQLiteStore:
                     observed_at = excluded.observed_at,
                     raw_json = excluded.raw_json
                 """,
-                [
-                    (
-                        row["venue"],
-                        row["symbol"],
-                        row["funding_at"],
-                        row["funding_rate"],
-                        row["funding_interval_hours"],
-                        row["hourly_funding_rate"],
-                        row.get("mark_price"),
-                        row["observed_at"],
-                        json.dumps(row.get("raw", {}), sort_keys=True),
-                    )
-                    for row in rows
-                ],
+                prepared_rows,
             )
         return len(rows)
 
@@ -6498,7 +6508,7 @@ class SQLiteStore:
         query = """
             SELECT venue, symbol, funding_at, funding_rate,
                    funding_interval_hours, hourly_funding_rate,
-                   mark_price, observed_at
+                   mark_price, observed_at, raw_json
             FROM funding_rate_history
             WHERE venue = ? AND symbol = ?
         """
@@ -6509,7 +6519,12 @@ class SQLiteStore:
         query += " ORDER BY funding_at"
         with self.connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["raw"] = json.loads(item.pop("raw_json") or "{}")
+            output.append(item)
+        return output
 
     def insert_funding_routes(
         self,

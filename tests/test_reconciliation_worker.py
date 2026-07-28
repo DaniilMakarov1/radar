@@ -412,6 +412,158 @@ def test_rate_confirmed_without_mark_no_cashflow(tmp_path):
         assert row["funding_pnl"] is None
 
 
+def test_predicted_rate_near_settlement_is_ignored(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    _seed_closed_pending_position(store)
+    provider = FakeFundingSettlementDataProvider(
+        public_events=[
+            {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": 0.001,
+                "rate_semantics": "predicted_next",
+            },
+            {
+                "venue": "bybit",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": 0.001,
+                "rate_semantics": "predicted_next",
+            },
+        ],
+        mark_snapshots=[
+            {"venue": "binance", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+            {"venue": "bybit", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+        ],
+    )
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30), provider)
+
+    result = runtime.process_pending_reconciliations(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    assert result["processed"] == 0
+    assert result["reconciled"] == 0
+    assert len([r for r in store.paper_event_ledger_rows("fc-recon-test") if r["event_type"] == "funding"]) == 0
+    for row in store.funding_settlement_reconciliation_rows("fc-recon-test"):
+        assert row["status"] == "PENDING"
+        assert row["rate_status"] == "UNACCEPTED_SEMANTICS"
+        assert row["evidence"]["ignored_public_event"]["rate_semantics"] == "predicted_next"
+
+
+def test_current_rate_is_not_realized_fallback(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    _seed_closed_pending_position(store)
+    provider = FakeFundingSettlementDataProvider(
+        public_events=[
+            {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": 0.001,
+                "rate_semantics": "current_estimate",
+            },
+            {
+                "venue": "bybit",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": 0.001,
+                "rate_semantics": "current_estimate",
+            },
+        ],
+        mark_snapshots=[
+            {"venue": "binance", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+            {"venue": "bybit", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+        ],
+    )
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30), provider)
+
+    result = runtime.process_pending_reconciliations(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    assert result["processed"] == 0
+    assert result["reconciled"] == 0
+    assert all(row["status"] == "PENDING" for row in store.funding_settlement_reconciliation_rows("fc-recon-test"))
+    assert len([r for r in store.paper_event_ledger_rows("fc-recon-test") if r["event_type"] == "funding"]) == 0
+
+
+def test_missing_rate_remains_pending_not_zero(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    _seed_closed_pending_position(store)
+    provider = FakeFundingSettlementDataProvider(
+        public_events=[
+            {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "rate_semantics": "realized_settlement",
+            },
+            {
+                "venue": "bybit",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": None,
+                "rate_semantics": "realized_settlement",
+            },
+        ],
+        mark_snapshots=[
+            {"venue": "binance", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+            {"venue": "bybit", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+        ],
+    )
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30), provider)
+
+    result = runtime.process_pending_reconciliations(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    assert result["processed"] == 0
+    assert result["reconciled"] == 0
+    for row in store.funding_settlement_reconciliation_rows("fc-recon-test"):
+        assert row["status"] == "PENDING"
+        assert row["rate_status"] == "MISSING"
+        assert row["confirmed_funding_rate"] is None
+
+
+def test_realized_zero_rate_reconciles_as_zero(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    _seed_closed_pending_position(store, quantity=5.0)
+    provider = FakeFundingSettlementDataProvider(
+        public_events=[
+            {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": 0.0,
+                "rate_semantics": "realized_settlement",
+            },
+            {
+                "venue": "bybit",
+                "symbol": "BTCUSDT",
+                "scheduled_at": SCHEDULED,
+                "funding_rate": 0.0,
+                "rate_semantics": "realized_settlement",
+            },
+        ],
+        mark_snapshots=[
+            {"venue": "binance", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+            {"venue": "bybit", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+        ],
+    )
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30), provider)
+
+    result = runtime.process_pending_reconciliations(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    assert result["reconciled"] == 2
+    for row in store.funding_settlement_reconciliation_rows("fc-recon-test"):
+        assert row["status"] == "RATE_AND_MARK_RECONCILED"
+        assert row["confirmed_funding_rate"] == pytest.approx(0.0)
+        assert row["funding_pnl"] == pytest.approx(0.0)
+    funding_rows = [r for r in store.paper_event_ledger_rows("fc-recon-test") if r["event_type"] == "funding"]
+    assert len(funding_rows) == 2
+    assert sum(float(r["cash_delta"]) for r in funding_rows) == pytest.approx(0.0)
+
+
 def test_public_rate_confirmed_retries_with_stored_rate_when_mark_arrives(tmp_path):
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
@@ -488,6 +640,32 @@ def test_stored_provider_uses_funding_history_and_market_snapshots(tmp_path):
     assert event["funding_rate"] == pytest.approx(0.001)
     assert mark is not None
     assert mark["mark_price"] == pytest.approx(101.0)
+    assert mark["reconciliation_quality"] == "INGESTION_TIME_FALLBACK"
+
+
+def test_stored_provider_ignores_predicted_history_rate(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    _seed_instrument(store)
+    store.upsert_funding_history([
+        {
+            "venue": "binance",
+            "symbol": "BTCUSDT",
+            "funding_at": SCHEDULED,
+            "funding_rate": 0.001,
+            "funding_interval_hours": 8.0,
+            "hourly_funding_rate": 0.001 / 8.0,
+            "mark_price": 100.0,
+            "observed_at": SCHEDULED,
+            "raw": {"rate_semantics": "predicted_next"},
+        }
+    ])
+    provider = StoredFundingSettlementDataProvider(store)
+    scheduled = datetime.fromisoformat(SCHEDULED)
+
+    event = provider.get_public_funding_event("binance", "BTCUSDT", scheduled, 120.0)
+
+    assert event is None
 
 
 def test_stored_provider_falls_back_to_funding_history_mark(tmp_path):

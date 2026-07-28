@@ -46,6 +46,7 @@ from smart_money_radar.paper_bot.risk import (
 from smart_money_radar.paper_bot.settlement import (
     build_settlement_crossing_rows,
     reconcile_leg,
+    realized_public_funding_rate,
 )
 from smart_money_radar.storage import SQLiteStore
 
@@ -351,6 +352,7 @@ class SynchronizedFundingRuntimeV2:
             age_seconds = (now_utc - scheduled_at.astimezone(UTC)).total_seconds()
 
             public_rate = optional_float(row.get("confirmed_funding_rate"))
+            public_event: dict[str, Any] | None = None
             if public_rate is None:
                 public_event = provider.get_public_funding_event(
                     venue=venue,
@@ -359,7 +361,26 @@ class SynchronizedFundingRuntimeV2:
                     tolerance_seconds=RECONCILIATION_TOLERANCE_SECONDS,
                 )
                 if public_event is not None:
-                    public_rate = float(public_event.get("funding_rate") or 0.0)
+                    public_rate = realized_public_funding_rate(public_event)
+                    if public_rate is None:
+                        self._update_reconciliation_row(
+                            row,
+                            status="PENDING",
+                            rate_status="UNACCEPTED_SEMANTICS"
+                            if public_event.get("funding_rate") is not None
+                            else "MISSING",
+                            mark_status=row.get("mark_status"),
+                            evidence_update={
+                                "ignored_public_event": {
+                                    "rate_semantics": public_event.get("rate_semantics")
+                                    or public_event.get("funding_rate_semantics")
+                                    or "unclear",
+                                    "published_at": public_event.get("published_at"),
+                                    "skew_seconds": public_event.get("skew_seconds"),
+                                    "source": public_event.get("source"),
+                                }
+                            },
+                        )
 
             if public_rate is None:
                 if age_seconds > RECONCILIATION_TIMEOUT_SECONDS:
@@ -400,11 +421,26 @@ class SynchronizedFundingRuntimeV2:
                     confirmed_funding_rate=public_rate,
                     rate_status="CONFIRMED",
                     mark_status="MISSING",
+                    evidence_update={
+                        "public_event": {
+                            "rate_semantics": public_event.get("rate_semantics")
+                            if public_event
+                            else "stored_confirmed_rate",
+                            "published_at": public_event.get("published_at")
+                            if public_event
+                            else None,
+                            "skew_seconds": public_event.get("skew_seconds")
+                            if public_event
+                            else None,
+                        }
+                    },
                 )
                 rate_confirmed += 1
                 continue
 
-            mark_price = float(mark_snapshot.get("mark_price") or 0.0)
+            mark_price = optional_float(mark_snapshot.get("mark_price"))
+            if mark_price is None:
+                continue
             leg_result = reconcile_leg(
                 public_rate=public_rate,
                 public_mark=mark_price,
@@ -420,6 +456,27 @@ class SynchronizedFundingRuntimeV2:
                 funding_pnl=leg_result.get("funding_pnl"),
                 rate_status=leg_result.get("rate_status"),
                 mark_status=leg_result.get("mark_status"),
+                evidence_update={
+                    "public_event": {
+                        "rate_semantics": public_event.get("rate_semantics")
+                        if public_event
+                        else "stored_confirmed_rate",
+                        "published_at": public_event.get("published_at")
+                        if public_event
+                        else None,
+                        "skew_seconds": public_event.get("skew_seconds")
+                        if public_event
+                        else None,
+                    },
+                    "mark_snapshot": {
+                        "observed_at": mark_snapshot.get("observed_at"),
+                        "skew_seconds": mark_snapshot.get("skew_seconds"),
+                        "source": mark_snapshot.get("source"),
+                        "timestamp_source": mark_snapshot.get("timestamp_source"),
+                        "reconciliation_quality": mark_snapshot.get("reconciliation_quality")
+                        or "UNKNOWN",
+                    },
+                },
             )
 
             if leg_result["status"] == "RATE_AND_MARK_RECONCILED":
@@ -437,6 +494,11 @@ class SynchronizedFundingRuntimeV2:
                             "confirmed_rate": public_rate,
                             "settlement_mark": mark_price,
                             "side": side,
+                            "rate_semantics": public_event.get("rate_semantics")
+                            if public_event
+                            else "stored_confirmed_rate",
+                            "reconciliation_quality": mark_snapshot.get("reconciliation_quality")
+                            or "UNKNOWN",
                         },
                     )
                 )
@@ -468,6 +530,7 @@ class SynchronizedFundingRuntimeV2:
         funding_pnl: float | None = None,
         rate_status: str | None = None,
         mark_status: str | None = None,
+        evidence_update: dict[str, Any] | None = None,
     ) -> None:
         updated = dict(row)
         updated["status"] = status
@@ -481,6 +544,10 @@ class SynchronizedFundingRuntimeV2:
             updated["rate_status"] = rate_status
         if mark_status is not None:
             updated["mark_status"] = mark_status
+        if evidence_update:
+            evidence = dict(updated.get("evidence") or {})
+            evidence.update(evidence_update)
+            updated["evidence"] = evidence
         self.store.upsert_funding_settlement_reconciliation(updated)
 
     def _maybe_finalize_cycle_after_reconciliation(

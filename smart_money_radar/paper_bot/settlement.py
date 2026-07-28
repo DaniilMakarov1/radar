@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -12,6 +13,7 @@ RECONCILIATION_STATES = (
 )
 
 RECONCILIATION_TOLERANCE_SECONDS = 120.0
+REALIZED_FUNDING_RATE_SEMANTICS = {"realized_settlement", "account_transaction"}
 
 
 def settlement_reconciliation_key(position_id: Any, venue: str, scheduled_funding_at: str) -> tuple[Any, str, str]:
@@ -49,6 +51,68 @@ def _parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _raw_payload(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        return raw
+    raw_json = row.get("raw_json")
+    if not raw_json:
+        return {}
+    try:
+        decoded = json.loads(str(raw_json))
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def funding_rate_semantics(event: dict[str, Any] | None) -> str:
+    if not event:
+        return "unclear"
+    raw = _raw_payload(event)
+    return str(
+        event.get("rate_semantics")
+        or event.get("funding_rate_semantics")
+        or raw.get("rate_semantics")
+        or raw.get("funding_rate_semantics")
+        or "unclear"
+    )
+
+
+def realized_public_funding_rate(event: dict[str, Any] | None) -> float | None:
+    """Return a cashflow-eligible realized funding rate, preserving valid zero."""
+    if event is None:
+        return None
+    if funding_rate_semantics(event) not in REALIZED_FUNDING_RATE_SEMANTICS:
+        return None
+    if "funding_rate" not in event or event.get("funding_rate") is None:
+        return None
+    return _optional_float(event.get("funding_rate"))
+
+
+def _event_time_with_quality(row: dict[str, Any], *, fallback_key: str) -> tuple[datetime | None, str, str]:
+    raw = _raw_payload(row)
+    for key in ("source_event_at", "venue_server_time", "response_received_at"):
+        parsed = _parse_time(row.get(key) or raw.get(key))
+        if parsed is not None:
+            return parsed, key, "PRIMARY"
+    parsed = _parse_time(row.get(fallback_key) or raw.get(fallback_key))
+    if parsed is not None:
+        return parsed, fallback_key, "INGESTION_TIME_FALLBACK"
+    parsed = _parse_time(row.get("observed_at") or raw.get("observed_at"))
+    if parsed is not None:
+        return parsed, "observed_at", "INGESTION_TIME_FALLBACK"
+    return None, "missing", "MISSING"
 
 
 def settlement_schedule_matches(
@@ -221,6 +285,12 @@ class StoredFundingSettlementDataProvider:
         best_skew: float = tolerance_seconds + 1.0
         target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
         for row in rows:
+            semantics = funding_rate_semantics(row)
+            if semantics not in REALIZED_FUNDING_RATE_SEMANTICS:
+                continue
+            rate = _optional_float(row.get("funding_rate"))
+            if rate is None:
+                continue
             published_at = _parse_time(
                 row.get("funding_at")
                 or row.get("published_at")
@@ -233,15 +303,12 @@ class StoredFundingSettlementDataProvider:
                 continue
             if skew < best_skew:
                 best_skew = skew
-                rate = float(
-                    row.get("funding_rate")
-                    or row.get("current_funding_rate")
-                    or 0.0
-                )
                 best = {
                     "funding_rate": rate,
+                    "rate_semantics": semantics,
                     "published_at": published_at.isoformat(),
                     "skew_seconds": skew,
+                    "source": "funding_rate_history",
                 }
         return best
 
@@ -261,21 +328,28 @@ class StoredFundingSettlementDataProvider:
         best_skew: float = max_distance_seconds + 1.0
         target_ts = scheduled_funding_at.astimezone(UTC).timestamp()
         for row in rows:
-            observed_at = _parse_time(row.get("observed_at"))
-            if observed_at is None:
+            event_at, timestamp_source, quality = _event_time_with_quality(
+                row,
+                fallback_key="observed_at",
+            )
+            if event_at is None:
                 continue
-            skew = abs(observed_at.astimezone(UTC).timestamp() - target_ts)
+            skew = abs(event_at.astimezone(UTC).timestamp() - target_ts)
             if skew > max_distance_seconds:
                 continue
-            mark = float(row.get("mark_price") or 0.0)
+            mark = _optional_float(row.get("mark_price"))
+            if mark is None:
+                continue
             if mark <= 0:
                 continue
             if skew < best_skew:
                 best_skew = skew
                 best = {
                     "mark_price": mark,
-                    "observed_at": observed_at.isoformat(),
+                    "observed_at": event_at.isoformat(),
                     "skew_seconds": skew,
+                    "timestamp_source": timestamp_source,
+                    "reconciliation_quality": quality,
                 }
         if best is not None:
             return best
@@ -290,13 +364,18 @@ class StoredFundingSettlementDataProvider:
             since=since,
         )
         for row in history_rows:
-            event_at = _parse_time(row.get("funding_at") or row.get("observed_at"))
+            event_at, timestamp_source, quality = _event_time_with_quality(
+                row,
+                fallback_key="funding_at",
+            )
             if event_at is None:
                 continue
             skew = abs(event_at.astimezone(UTC).timestamp() - target_ts)
             if skew > max_distance_seconds:
                 continue
-            mark = float(row.get("mark_price") or 0.0)
+            mark = _optional_float(row.get("mark_price"))
+            if mark is None:
+                continue
             if mark <= 0:
                 continue
             if skew < best_skew:
@@ -306,6 +385,8 @@ class StoredFundingSettlementDataProvider:
                     "observed_at": event_at.isoformat(),
                     "skew_seconds": skew,
                     "source": "funding_rate_history",
+                    "timestamp_source": timestamp_source,
+                    "reconciliation_quality": quality,
                 }
         return best
 
@@ -344,8 +425,11 @@ class FakeFundingSettlementDataProvider:
                 continue
             if skew < best_skew:
                 best_skew = skew
+                rate = _optional_float(event.get("funding_rate"))
+                semantics = str(event.get("rate_semantics") or "realized_settlement")
                 best = {
-                    "funding_rate": float(event.get("funding_rate", 0.0)),
+                    "funding_rate": rate,
+                    "rate_semantics": semantics,
                     "published_at": event_time.isoformat(),
                     "skew_seconds": skew,
                 }
@@ -372,7 +456,9 @@ class FakeFundingSettlementDataProvider:
             skew = abs(snap_time.astimezone(UTC).timestamp() - target_ts)
             if skew > max_distance_seconds:
                 continue
-            mark = float(snap.get("mark_price") or 0.0)
+            mark = _optional_float(snap.get("mark_price"))
+            if mark is None:
+                continue
             if mark <= 0:
                 continue
             if skew < best_skew:
@@ -381,5 +467,9 @@ class FakeFundingSettlementDataProvider:
                     "mark_price": mark,
                     "observed_at": snap_time.isoformat(),
                     "skew_seconds": skew,
+                    "timestamp_source": str(snap.get("timestamp_source") or "observed_at"),
+                    "reconciliation_quality": str(
+                        snap.get("reconciliation_quality") or "INGESTION_TIME_FALLBACK"
+                    ),
                 }
         return best
