@@ -1712,7 +1712,7 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     assert len(store.funding_paper_order_rows(capture_id)) == 4
     ledger_types = [row["event_type"] for row in store.paper_event_ledger_rows(capture_id)]
     assert ledger_types.count("order_fee") == 4
-    assert ledger_types.count("price_pnl") == 1
+    assert ledger_types.count("price_pnl") == 2
     assert "funding" not in ledger_types
 
 
@@ -2719,12 +2719,15 @@ def test_partial_entry_unwinds_and_releases_collateral(tmp_path, monkeypatch) ->
     orders = store.funding_paper_order_rows(capture_id)
     unwind_orders = [o for o in orders if o["order_intent"] == "UNWIND"]
     assert len(unwind_orders) >= 1
-    # Ledger has fees, price_pnl, emergency cost
+    # Ledger has fees, venue-level price_pnl, and zero-cash emergency diagnostics.
     ledger = store.paper_event_ledger_rows(capture_id)
     event_types = [r["event_type"] for r in ledger]
     assert "order_fee" in event_types
-    assert "price_pnl" in event_types
+    assert event_types.count("price_pnl") == 2
     assert "emergency_unwind_cost" in event_types
+    emergency_rows = [row for row in ledger if row["event_type"] == "emergency_unwind_cost"]
+    assert sum(float(row["cash_delta"]) for row in emergency_rows) == pytest.approx(0.0)
+    assert failed[0]["paper_emergency_unwind_cost"] == pytest.approx(0.0)
 
 
 def test_missing_entry_book_rejects(tmp_path, monkeypatch) -> None:
@@ -2921,3 +2924,231 @@ def test_collateral_reserved_on_entry_and_released_on_close(tmp_path, monkeypatc
     ledger = store.paper_event_ledger_rows(capture_id)
     reserve_events = [r for r in ledger if r["event_type"] == "collateral_reserve"]
     assert len(reserve_events) == 2  # one per venue
+
+
+def test_partial_unwind_penalty_is_embedded_in_fill_price_once(tmp_path, monkeypatch) -> None:
+    """Partial entry 100 bps unwind affects price PnL once and has zero separate emergency cash cost."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+    import smart_money_radar.funding.trader as trader_module
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    route = _v2_runtime_route(now)
+    for leg in route["legs"]:
+        leg["open_vwap"] = 100.0
+        if leg["side"] == "long":
+            leg["asks"] = [[100.0, 20.0]]
+        else:
+            leg["bids"] = [[100.0, 11.25]]
+    capture_id = capture_position_id_for_route(route)
+    settlement_at = now + timedelta(seconds=30)
+    config = PaperBotConfig(
+        telegram_enabled=False,
+        focused_recheck_enabled=False,
+        venue_starting_balance=10_000.0,
+        target_notional_per_leg=500.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    bot.v2_observations_by_route[route["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
+
+    assert bot.process_entry_candidates([route], recheck_before_open=False) == []
+
+    failed = store.funding_capture_position_rows(states={"FAILED"})[0]
+    assert failed["paper_emergency_unwind_cost"] == pytest.approx(0.0)
+    unwind_orders = [order for order in store.funding_paper_order_rows(capture_id) if order["order_intent"] == "UNWIND"]
+    assert {order["leg_side"] for order in unwind_orders} == {"long", "short"}
+    long_unwind = next(order for order in unwind_orders if order["leg_side"] == "long")
+    short_unwind = next(order for order in unwind_orders if order["leg_side"] == "short")
+    assert long_unwind["filled_quantity"] == pytest.approx(5.0)
+    assert long_unwind["average_fill_price"] == pytest.approx(99.0)
+    assert short_unwind["filled_quantity"] == pytest.approx(4.5)
+    assert short_unwind["average_fill_price"] == pytest.approx(101.0)
+    price_rows = [row for row in store.paper_event_ledger_rows(capture_id) if row["event_type"] == "price_pnl"]
+    assert {row["venue"] for row in price_rows} == {"binance", "bybit"}
+    assert sum(float(row["cash_delta"]) for row in price_rows) == pytest.approx(-9.5)
+    emergency_rows = [row for row in store.paper_event_ledger_rows(capture_id) if row["event_type"] == "emergency_unwind_cost"]
+    assert sum(float(row["cash_delta"]) for row in emergency_rows) == pytest.approx(0.0)
+
+
+def test_emergency_300_bps_fallback_penalty_once(tmp_path) -> None:
+    """Emergency fallback mark pricing embeds 300 bps in fills and records no separate cash cost."""
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    config = dict(position["config"] or {})
+    config["entry_legs"] = [
+        {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "entry_fill_price": 100.0, "vwap": 100.0, "fee_rate": 0.0},
+        {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "entry_fill_price": 100.0, "vwap": 100.0, "fee_rate": 0.0},
+    ]
+    store.update_funding_capture_position_config(position_id, config)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route_no_book = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "mark_price": 100.0, "fee_rate": 0.0},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "mark_price": 100.0, "fee_rate": 0.0},
+        ],
+    }
+
+    close = runtime.close_position(position, route_no_book, now, reason="hard_stale", emergency=True)
+
+    assert close["decision"] == "closed"
+    assert close["pricing_quality"] == "fallback_mark_300bps"
+    assert close["paper_long_price_pnl"] == pytest.approx(-15.0)
+    assert close["paper_short_price_pnl"] == pytest.approx(-15.0)
+    assert close["paper_price_pnl"] == pytest.approx(-30.0)
+    assert close["paper_emergency_unwind_cost"] == pytest.approx(0.0)
+    emergency_rows = [row for row in store.paper_event_ledger_rows(position_id) if row["event_type"] == "emergency_unwind_cost"]
+    assert sum(float(row["cash_delta"]) for row in emergency_rows) == pytest.approx(0.0)
+
+
+def test_residual_unwind_creates_explicit_orders_and_closes_exposure(tmp_path) -> None:
+    """Partial close IOC must create RESIDUAL_UNWIND orders before final CLOSED_PENDING_RECONCILIATION."""
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "bids": [[99.0, 5.0]], "fee_rate": 0.0},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "asks": [[101.0, 5.0]], "fee_rate": 0.0},
+        ],
+    }
+
+    close = runtime.close_position(position, route, now, reason="residual_test")
+
+    assert close["decision"] == "closed"
+    assert close["long_closed_quantity"] == pytest.approx(5.0)
+    assert close["short_closed_quantity"] == pytest.approx(5.0)
+    assert close["paper_emergency_unwind_cost"] == pytest.approx(0.0)
+    orders = store.funding_paper_order_rows(position_id)
+    residual_orders = [order for order in orders if order["order_intent"] == "RESIDUAL_UNWIND"]
+    assert len(residual_orders) == 2
+    assert {order["state"] for order in residual_orders} == {"FILLED"}
+    assert store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]["position_id"] == position_id
+
+
+def test_position_cannot_close_with_unpriced_residual(tmp_path) -> None:
+    """If residual cannot be priced, exposure stays actionable in EMERGENCY_UNWIND."""
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "bids": [[0.0, 5.0]], "fee_rate": 0.0},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "asks": [[101.0, 20.0]], "fee_rate": 0.0},
+        ],
+    }
+
+    close = runtime.close_position(position, route, now, reason="bad_residual")
+
+    assert close["decision"] == "failed"
+    assert close["state"] == "EMERGENCY_UNWIND"
+    assert store.funding_capture_position_by_id(position_id)["state"] == "EMERGENCY_UNWIND"
+    assert store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"}) == []
+
+
+def test_collateral_release_uses_original_reserve_amount(tmp_path) -> None:
+    """Release must exactly match the reserve event payload, not current route prices."""
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "bids": [[200.0, 20.0]], "fee_rate": 0.0},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "asks": [[200.0, 20.0]], "fee_rate": 0.0},
+        ],
+    }
+
+    assert runtime.close_position(position, route, now, reason="release_test")["decision"] == "closed"
+
+    ledger = store.paper_event_ledger_rows(position_id)
+    for venue in ("binance", "bybit"):
+        reserve = next(row for row in ledger if row["event_type"] == "collateral_reserve" and row["venue"] == venue)
+        release = next(row for row in ledger if row["event_type"] == "collateral_release" and row["venue"] == venue)
+        assert release["payload"]["amount"] == pytest.approx(reserve["payload"]["amount"])
+    accounts = {row["venue"]: row for row in store.funding_paper_account_rows()}
+    assert accounts["binance"]["reserved_margin"] == pytest.approx(0.0)
+    assert accounts["bybit"]["reserved_margin"] == pytest.approx(0.0)
+
+
+def test_venue_cash_matches_venue_ledger_delta_after_close(tmp_path) -> None:
+    """For every venue, cash balance delta equals idempotent cash ledger delta."""
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "bids": [[101.0, 20.0]], "fee_rate": 0.0005},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "asks": [[99.0, 20.0]], "fee_rate": 0.0005},
+        ],
+    }
+
+    close = runtime.close_position(position, route, now, reason="cash_invariant")
+
+    assert close["decision"] == "closed"
+    accounts = {row["venue"]: row for row in store.funding_paper_account_rows()}
+    ledger = store.paper_event_ledger_rows(position_id)
+    for venue in ("binance", "bybit"):
+        ledger_delta = sum(float(row["cash_delta"]) for row in ledger if row["venue"] == venue)
+        account_delta = float(accounts[venue]["cash_balance"]) - float(accounts[venue]["starting_balance"])
+        assert account_delta == pytest.approx(ledger_delta, abs=1e-8)
+    price_rows = [row for row in ledger if row["event_type"] == "price_pnl"]
+    assert {row["venue"] for row in price_rows} == {"binance", "bybit"}
+    assert sum(float(row["cash_delta"]) for row in price_rows) == pytest.approx(close["paper_price_pnl"])

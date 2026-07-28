@@ -62,7 +62,9 @@ def order_fee_event_key(order_id: str) -> str:
     return f"order_fee:{order_id}"
 
 
-def price_pnl_event_key(position_id: str) -> str:
+def price_pnl_event_key(position_id: str, venue: str | None = None) -> str:
+    if venue:
+        return f"price_pnl:{position_id}:{venue}:close"
     return f"price_pnl:{position_id}:close"
 
 

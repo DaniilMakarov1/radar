@@ -2547,6 +2547,32 @@ class PaperBot:
                     reason=str(risk_exit.get("close_reason") or "hard_risk"),
                     emergency=True,
                 )
+                if close_payload.get("decision") != "closed":
+                    self.store.update_funding_capture_position_state(
+                        position_id,
+                        "EMERGENCY_UNWIND",
+                        now,
+                    )
+                    self.record_event(
+                        "close_failed",
+                        (
+                            f"V2 RISK EXIT FAILED {position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            f"Risk reason: {risk_exit['close_reason']}\n"
+                            f"Close reason: {close_payload.get('reason')}\n"
+                            "Position remains actionable for retry."
+                        ),
+                        {
+                            "position": position,
+                            "risk_engine": risk_exit,
+                            "close": close_payload,
+                        },
+                        route_key=route_key,
+                        notify=True,
+                        severity="error",
+                    )
+                    outcomes.append("close_failed")
+                    continue
                 self.record_event(
                     "close",
                     (

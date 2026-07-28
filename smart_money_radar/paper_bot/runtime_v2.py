@@ -34,7 +34,6 @@ from smart_money_radar.paper_bot.cycle_manager import (
 from smart_money_radar.paper_bot.execution import (
     EXECUTION_HAIRCUT_FRACTION,
     entry_fill_state,
-    residual_adverse_penalty,
     simulate_marketable_ioc,
     t20_deadline_passed,
 )
@@ -249,6 +248,10 @@ class SynchronizedFundingRuntimeV2:
         self.settlement_data_provider = settlement_data_provider
 
     def _record_ledger_entry(self, row: dict[str, Any]) -> str | None:
+        if float(row.get("cash_delta") or 0.0) != 0.0 and not row.get("venue"):
+            raise ValueError(
+                f"cash-affecting paper ledger entry requires venue: {row.get('event_key')}"
+            )
         event_key = self.store.upsert_paper_event_ledger(row)
         if event_key is not None and row.get("venue") and float(row.get("cash_delta") or 0.0) != 0.0:
             self.store.update_funding_paper_account_cash(
@@ -256,6 +259,35 @@ class SynchronizedFundingRuntimeV2:
                 float(row.get("cash_delta") or 0.0),
             )
         return event_key
+
+    def _record_price_pnl_entries(
+        self,
+        *,
+        position_id: str,
+        cycle_id: str,
+        long_venue: str,
+        short_venue: str,
+        long_price_pnl: float,
+        short_price_pnl: float,
+        payload: dict[str, Any],
+    ) -> None:
+        for side, venue, value in (
+            ("long", long_venue, float(long_price_pnl)),
+            ("short", short_venue, float(short_price_pnl)),
+        ):
+            if abs(value) <= 1e-12:
+                continue
+            self._record_ledger_entry(
+                make_ledger_entry(
+                    price_pnl_event_key(position_id, venue),
+                    position_id=position_id,
+                    cycle_id=cycle_id,
+                    venue=venue,
+                    event_type="price_pnl",
+                    cash_delta=value,
+                    payload={**payload, "side": side, "price_pnl": value},
+                )
+            )
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -1056,9 +1088,6 @@ class SynchronizedFundingRuntimeV2:
 
     def _release_collateral(self, capture_id: str, route: dict[str, Any]) -> None:
         legs = route.get("legs") or []
-        leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
-        reserve_fraction = float(getattr(self.config, "collateral_reserve_fraction", 0.25))
-        quantity = float(self._target_quantity(route) or 0.0)
         for leg in legs:
             venue = str(leg.get("venue") or "")
             if not venue:
@@ -1066,26 +1095,18 @@ class SynchronizedFundingRuntimeV2:
             reserve_key = collateral_reserve_event_key(capture_id, venue)
             release_key = collateral_release_event_key(capture_id, venue)
             existing_reserve = self.store.paper_event_ledger_rows(capture_id)
-            if not any(r["event_key"] == reserve_key for r in existing_reserve):
+            reserve_row = next(
+                (row for row in existing_reserve if row["event_key"] == reserve_key),
+                None,
+            )
+            if reserve_row is None:
                 continue
             already_released = any(r["event_key"] == release_key for r in existing_reserve)
             if already_released:
                 continue
-            price = float(leg.get("open_vwap") or leg.get("vwap") or leg.get("mark_price") or 0.0)
-            leg_notional = quantity * price
-            if leg_notional <= 0:
-                payload_amount = optional_float(
-                    next(
-                        (
-                            row.get("payload", {}).get("amount")
-                            for row in existing_reserve
-                            if row["event_key"] == reserve_key
-                        ),
-                        None,
-                    )
-                )
-                leg_notional = float(payload_amount or 0.0) / (1.0 / leverage + reserve_fraction)
-            amount = leg_notional / leverage + leg_notional * reserve_fraction
+            amount = float(optional_float((reserve_row.get("payload") or {}).get("amount")) or 0.0)
+            if amount <= 0:
+                continue
             released = self._record_ledger_entry(
                 make_ledger_entry(
                     release_key,
@@ -1307,10 +1328,10 @@ class SynchronizedFundingRuntimeV2:
         total_price_pnl = long_price_pnl + short_price_pnl
         long_unwind_fee = long_unwind_qty * long_exit_price * _leg_fee_rate(long_leg)
         short_unwind_fee = short_unwind_qty * short_exit_price * _leg_fee_rate(short_leg)
-        emergency_cost = (
-            long_unwind_qty * long_entry_price * 100.0 / 10_000.0
-            + short_unwind_qty * short_entry_price * 100.0 / 10_000.0
-        )
+        long_adverse_impact_usd = max(0.0, long_unwind_qty * (long_entry_price - long_exit_price))
+        short_adverse_impact_usd = max(0.0, short_unwind_qty * (short_exit_price - short_entry_price))
+        adverse_impact_usd = long_adverse_impact_usd + short_adverse_impact_usd
+        emergency_cost = 0.0
         self.store.update_funding_capture_position_state(capture_id, "EMERGENCY_UNWIND", now)
         submitted_at = now + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
@@ -1338,7 +1359,14 @@ class SynchronizedFundingRuntimeV2:
                     "average_fill_price": price,
                     "fee": fee,
                     "state": "FILLED",
-                    "payload": {"adverse_penalty_bps": 100.0},
+                    "payload": {
+                        "adverse_penalty_bps": 100.0,
+                        "adverse_price_impact_bps": 100.0,
+                        "adverse_price_impact_usd": (
+                            long_adverse_impact_usd if side == "long" else short_adverse_impact_usd
+                        ),
+                        "pricing_quality": "partial_entry_unwind_100bps",
+                    },
                 }
             )
             self._record_ledger_entry(
@@ -1352,30 +1380,37 @@ class SynchronizedFundingRuntimeV2:
                     payload={"order_id": order_id, "intent": "unwind"},
                 )
             )
-        if total_price_pnl != 0.0:
-            self._record_ledger_entry(
-                make_ledger_entry(
-                    price_pnl_event_key(capture_id),
-                    position_id=capture_id,
-                    cycle_id=cycle_id,
-                    venue=None,
-                    event_type="price_pnl",
-                    cash_delta=total_price_pnl,
-                    payload={"reason": "partial_entry_unwind", "price_pnl": total_price_pnl},
-                )
+        self._record_price_pnl_entries(
+            position_id=capture_id,
+            cycle_id=cycle_id,
+            long_venue=str(long_leg.get("venue") or ""),
+            short_venue=str(short_leg.get("venue") or ""),
+            long_price_pnl=long_price_pnl,
+            short_price_pnl=short_price_pnl,
+            payload={
+                "reason": "partial_entry_unwind",
+                "pricing_quality": "partial_entry_unwind_100bps",
+                "adverse_price_impact_bps": 100.0,
+                "adverse_price_impact_usd": adverse_impact_usd,
+            },
+        )
+        self._record_ledger_entry(
+            make_ledger_entry(
+                f"emergency_unwind:{capture_id}:partial_entry:diagnostic",
+                position_id=capture_id,
+                cycle_id=cycle_id,
+                venue=str(long_leg.get("venue") or short_leg.get("venue") or ""),
+                event_type="emergency_unwind_cost",
+                cash_delta=0.0,
+                payload={
+                    "reason": "partial_entry_unwind",
+                    "pricing_quality": "partial_entry_unwind_100bps",
+                    "adverse_price_impact_bps": 100.0,
+                    "adverse_price_impact_usd": adverse_impact_usd,
+                    "cash_cost_policy": "penalty_in_fill_price_once",
+                },
             )
-        if emergency_cost > 0:
-            self._record_ledger_entry(
-                make_ledger_entry(
-                    f"emergency_unwind:{capture_id}:partial_entry",
-                    position_id=capture_id,
-                    cycle_id=cycle_id,
-                    venue=None,
-                    event_type="emergency_unwind_cost",
-                    cash_delta=-emergency_cost,
-                    payload={"reason": "partial_entry_unwind"},
-                )
-            )
+        )
         self._release_collateral(capture_id, route)
         self.store.update_funding_capture_position_state(
             capture_id,
@@ -1392,8 +1427,12 @@ class SynchronizedFundingRuntimeV2:
             "long_exit_price": long_exit_price,
             "short_exit_price": short_exit_price,
             "price_pnl": total_price_pnl,
+            "long_price_pnl": long_price_pnl,
+            "short_price_pnl": short_price_pnl,
             "unwind_fees": long_unwind_fee + short_unwind_fee,
             "emergency_cost": emergency_cost,
+            "adverse_price_impact_bps": 100.0,
+            "adverse_price_impact_usd": adverse_impact_usd,
         }
 
     def _mark_open(
@@ -1809,11 +1848,10 @@ class SynchronizedFundingRuntimeV2:
             short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0
         )
         pricing_quality = "executable_book"
-        penalty_bps = 0.0
         long_has_book = bool(long_route_leg.get("bids"))
         short_has_book = bool(short_route_leg.get("asks"))
-        if emergency:
-            self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+        if quantity <= 0:
+            return {"decision": "rejected", "reason": "zero_open_quantity", "state": str(position.get("state") or "")}
         if not emergency:
             if not long_has_book or not short_has_book:
                 return {
@@ -1824,65 +1862,52 @@ class SynchronizedFundingRuntimeV2:
                     "missing_short_asks": not short_has_book,
                 }
         else:
-            if not long_has_book or not short_has_book:
-                long_mark = float(long_route_leg.get("mark_price") or long_entry_leg.get("entry_fill_price") or long_entry_leg.get("vwap") or 0.0)
-                short_mark = float(short_route_leg.get("mark_price") or short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0)
-                if long_mark > 0 and short_mark > 0:
-                    pricing_quality = "fallback_mark_300bps"
-                    penalty_bps = 300.0
-                else:
-                    return {
-                        "decision": "rejected",
-                        "reason": "emergency_pricing_unavailable",
-                        "state": "EMERGENCY_UNWIND",
-                    }
-        long_exit_price = float(
-            optional_float(long_route_leg.get("close_vwap"))
-            or optional_float(long_route_leg.get("best_bid"))
-            or optional_float(long_route_leg.get("mark_price"))
-            or 0.0
-        )
-        short_exit_price = float(
-            optional_float(short_route_leg.get("close_vwap"))
-            or optional_float(short_route_leg.get("best_ask"))
-            or optional_float(short_route_leg.get("mark_price"))
-            or 0.0
-        )
-        if emergency and penalty_bps > 0:
-            long_exit_price = float(long_route_leg.get("mark_price") or long_entry_leg.get("entry_fill_price") or long_entry_leg.get("vwap") or 0.0)
-            short_exit_price = float(short_route_leg.get("mark_price") or short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0)
-            long_exit_price = long_exit_price * (1.0 - penalty_bps / 10_000.0) if long_exit_price > 0 else 0.0
-            short_exit_price = short_exit_price * (1.0 + penalty_bps / 10_000.0) if short_exit_price > 0 else 0.0
-            long_levels = _synthetic_levels(long_exit_price, quantity) if long_exit_price > 0 else []
-            short_levels = _synthetic_levels(short_exit_price, quantity) if short_exit_price > 0 else []
-        else:
-            long_levels = long_route_leg.get("bids") or []
-            short_levels = short_route_leg.get("asks") or []
+            self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+
+        def fallback_reference(leg: dict[str, Any], entry_leg: dict[str, Any]) -> tuple[float, str]:
+            mark = optional_float(leg.get("mark_price")) or optional_float(entry_leg.get("mark_price"))
+            if mark is not None and mark > 0:
+                return float(mark), "fallback_mark_300bps"
+            entry_price = optional_float(entry_leg.get("entry_fill_price")) or optional_float(entry_leg.get("vwap"))
+            if entry_price is not None and entry_price > 0:
+                return float(entry_price), "fallback_entry_300bps"
+            return 0.0, "emergency_pricing_unavailable"
+
+        long_levels = list(long_route_leg.get("bids") or [])
+        short_levels = list(short_route_leg.get("asks") or [])
+        if emergency and not long_levels:
+            reference, quality = fallback_reference(long_route_leg, long_entry_leg)
+            if reference <= 0:
+                return {"decision": "rejected", "reason": quality, "state": "EMERGENCY_UNWIND"}
+            pricing_quality = quality
+            long_levels = _synthetic_levels(reference * (1.0 - 300.0 / 10_000.0), quantity)
+        if emergency and not short_levels:
+            reference, quality = fallback_reference(short_route_leg, short_entry_leg)
+            if reference <= 0:
+                return {"decision": "rejected", "reason": quality, "state": "EMERGENCY_UNWIND"}
+            pricing_quality = "fallback_entry_300bps" if quality == "fallback_entry_300bps" else pricing_quality
+            if pricing_quality == "executable_book":
+                pricing_quality = quality
+            short_levels = _synthetic_levels(reference * (1.0 + 300.0 / 10_000.0), quantity)
+
+        self.store.update_funding_capture_position_state(position_id, "EXIT_SUBMITTED", now)
         long_exit = simulate_marketable_ioc(long_levels, "sell", quantity, EXECUTION_HAIRCUT_FRACTION)
         short_exit = simulate_marketable_ioc(short_levels, "buy", quantity, EXECUTION_HAIRCUT_FRACTION)
         long_fee_rate = _leg_fee_rate(long_route_leg) or _leg_fee_rate(long_entry_leg)
         short_fee_rate = _leg_fee_rate(short_route_leg) or _leg_fee_rate(short_entry_leg)
         long_fee = long_exit["notional"] * long_fee_rate
         short_fee = short_exit["notional"] * short_fee_rate
-        residual_quantity = float(long_exit["unfilled_quantity"]) + float(short_exit["unfilled_quantity"])
-        reference_price = (
-            float(long_exit["average_fill_price"] or 0.0)
-            or float(short_exit["average_fill_price"] or 0.0)
-            or long_exit_price
-            or short_exit_price
-        )
-        emergency_cost = (
-            residual_adverse_penalty(residual_quantity, reference_price)
-            if residual_quantity > 0
-            else 0.0
-        )
-        if emergency and penalty_bps > 0:
-            emergency_cost += (
-                quantity * max(long_exit_price, 0.0) * penalty_bps / 10_000.0
-                + quantity * max(short_exit_price, 0.0) * penalty_bps / 10_000.0
-            )
         submitted_at = now + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
+        close_fees_by_side: dict[str, float] = {"long": long_fee, "short": short_fee}
+        close_notional_by_side: dict[str, float] = {
+            "long": float(long_exit["notional"] or 0.0),
+            "short": float(short_exit["notional"] or 0.0),
+        }
+        closed_quantity_by_side: dict[str, float] = {
+            "long": float(long_exit["filled_quantity"] or 0.0),
+            "short": float(short_exit["filled_quantity"] or 0.0),
+        }
         for side, leg, fill, fee in (
             ("long", long_route_leg or long_entry_leg, long_exit, long_fee),
             ("short", short_route_leg or short_entry_leg, short_exit, short_fee),
@@ -1919,39 +1944,201 @@ class SynchronizedFundingRuntimeV2:
                     payload={"order_id": order_id, "reason": reason},
                 )
             )
-        pnl = executable_paper_pnl(
-            quantity=quantity,
-            long_entry_price=long_entry_price,
-            long_exit_price=float(long_exit["average_fill_price"] or long_exit_price or 0.0),
-            short_entry_price=short_entry_price,
-            short_exit_price=float(short_exit["average_fill_price"] or short_exit_price or 0.0),
-            long_taker_fee=long_fee_rate,
-            short_taker_fee=short_fee_rate,
-            confirmed_funding_pnl=self.confirmed_funding_pnl_for_position(position_id),
-            paper_open_fees=float(position.get("paper_open_fees") or 0.0),
-            emergency_unwind_costs_already_incurred=emergency_cost,
+
+        residual_diagnostics: list[dict[str, Any]] = []
+
+        def residual_price(
+            *,
+            side: str,
+            leg: dict[str, Any],
+            entry_leg: dict[str, Any],
+            levels: list[list[float]],
+            residual_qty: float,
+        ) -> tuple[float, dict[str, Any]]:
+            if side == "long":
+                valid_prices = [float(level[0]) for level in levels if len(level) >= 2 and float(level[1]) > 0]
+                if valid_prices:
+                    reference = min(valid_prices)
+                    price = reference * (1.0 - 100.0 / 10_000.0)
+                    quality = "residual_book_100bps"
+                    penalty = 100.0
+                    impact = max(0.0, residual_qty * (reference - price))
+                    return price, {
+                        "pricing_quality": quality,
+                        "adverse_price_impact_bps": penalty,
+                        "adverse_price_impact_usd": impact,
+                        "reference_price": reference,
+                    }
+                reference, quality = fallback_reference(leg, entry_leg)
+                if reference <= 0:
+                    return 0.0, {"pricing_quality": quality}
+                price = reference * (1.0 - 300.0 / 10_000.0)
+                return price, {
+                    "pricing_quality": quality,
+                    "adverse_price_impact_bps": 300.0,
+                    "adverse_price_impact_usd": max(0.0, residual_qty * (reference - price)),
+                    "reference_price": reference,
+                }
+            valid_prices = [float(level[0]) for level in levels if len(level) >= 2 and float(level[1]) > 0]
+            if valid_prices:
+                reference = max(valid_prices)
+                price = reference * (1.0 + 100.0 / 10_000.0)
+                return price, {
+                    "pricing_quality": "residual_book_100bps",
+                    "adverse_price_impact_bps": 100.0,
+                    "adverse_price_impact_usd": max(0.0, residual_qty * (price - reference)),
+                    "reference_price": reference,
+                }
+            reference, quality = fallback_reference(leg, entry_leg)
+            if reference <= 0:
+                return 0.0, {"pricing_quality": quality}
+            price = reference * (1.0 + 300.0 / 10_000.0)
+            return price, {
+                "pricing_quality": quality,
+                "adverse_price_impact_bps": 300.0,
+                "adverse_price_impact_usd": max(0.0, residual_qty * (price - reference)),
+                "reference_price": reference,
+            }
+
+        residual_specs = (
+            ("long", long_route_leg or long_entry_leg, long_entry_leg, long_levels, long_exit, long_fee_rate),
+            ("short", short_route_leg or short_entry_leg, short_entry_leg, short_levels, short_exit, short_fee_rate),
         )
-        self._record_ledger_entry(
-            make_ledger_entry(
-                price_pnl_event_key(position_id),
-                position_id=position_id,
-                cycle_id=cycle_id,
-                venue=None,
-                event_type="price_pnl",
-                cash_delta=float(pnl["paper_price_pnl"]),
-                payload={"reason": reason, "pnl": pnl},
+        if any(float(fill["unfilled_quantity"] or 0.0) > 1e-12 for _, _, _, _, fill, _ in residual_specs):
+            self.store.update_funding_capture_position_state(position_id, "PARTIALLY_CLOSED", now)
+        for side, leg, entry_leg, levels, fill, fee_rate in residual_specs:
+            residual_qty = float(fill["unfilled_quantity"] or 0.0)
+            if residual_qty <= 1e-12:
+                continue
+            price, diagnostic = residual_price(
+                side=side,
+                leg=leg,
+                entry_leg=entry_leg,
+                levels=levels,
+                residual_qty=residual_qty,
             )
-        )
-        if emergency_cost > 0:
+            if price <= 0:
+                self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+                return {
+                    "decision": "failed",
+                    "reason": "residual_pricing_unavailable",
+                    "state": "EMERGENCY_UNWIND",
+                    "residual_side": side,
+                    "pricing_quality": diagnostic.get("pricing_quality"),
+                }
+            residual_order_id = f"{position_id}:residual:{cycle_id}:{side}"
+            residual_notional = residual_qty * price
+            residual_fee = residual_notional * fee_rate
+            self.store.upsert_funding_paper_order(
+                {
+                    "paper_order_id": residual_order_id,
+                    "position_id": position_id,
+                    "cycle_id": cycle_id,
+                    "leg_side": side,
+                    "order_intent": "RESIDUAL_UNWIND",
+                    "venue": leg.get("venue") or "",
+                    "symbol": leg.get("symbol") or "",
+                    "decision_at": now.isoformat(),
+                    "submitted_at": submitted_at.isoformat(),
+                    "acknowledged_at": submitted_at.isoformat(),
+                    "filled_at": filled_at.isoformat(),
+                    "filled_quantity": residual_qty,
+                    "average_fill_price": price,
+                    "fee": residual_fee,
+                    "state": "FILLED",
+                    "payload": {
+                        **diagnostic,
+                        "reason": reason,
+                        "residual_quantity": residual_qty,
+                        "cash_cost_policy": "penalty_in_fill_price_once",
+                    },
+                }
+            )
             self._record_ledger_entry(
                 make_ledger_entry(
-                    f"emergency_unwind:{position_id}:close",
+                    order_fee_event_key(residual_order_id),
                     position_id=position_id,
                     cycle_id=cycle_id,
-                    venue=None,
+                    venue=leg.get("venue"),
+                    event_type="order_fee",
+                    cash_delta=-residual_fee,
+                    payload={"order_id": residual_order_id, "reason": reason, "intent": "residual_unwind"},
+                )
+            )
+            close_fees_by_side[side] += residual_fee
+            close_notional_by_side[side] += residual_notional
+            closed_quantity_by_side[side] += residual_qty
+            residual_diagnostics.append({"side": side, **diagnostic, "residual_quantity": residual_qty})
+
+        if (
+            abs(closed_quantity_by_side["long"] - quantity) > 1e-12
+            or abs(closed_quantity_by_side["short"] - quantity) > 1e-12
+        ):
+            self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+            return {
+                "decision": "failed",
+                "reason": "residual_exposure_remaining",
+                "state": "EMERGENCY_UNWIND",
+                "long_closed_quantity": closed_quantity_by_side["long"],
+                "short_closed_quantity": closed_quantity_by_side["short"],
+                "target_quantity": quantity,
+            }
+
+        long_exit_avg = close_notional_by_side["long"] / closed_quantity_by_side["long"]
+        short_exit_avg = close_notional_by_side["short"] / closed_quantity_by_side["short"]
+        long_price_pnl = quantity * (long_exit_avg - long_entry_price)
+        short_price_pnl = quantity * (short_entry_price - short_exit_avg)
+        price_pnl = long_price_pnl + short_price_pnl
+        confirmed_funding_pnl = self.confirmed_funding_pnl_for_position(position_id)
+        open_fees = float(position.get("paper_open_fees") or 0.0)
+        close_fees = close_fees_by_side["long"] + close_fees_by_side["short"]
+        emergency_cost = float(position.get("paper_emergency_unwind_cost") or 0.0)
+        paper_net_if_exit_now = (
+            price_pnl
+            + confirmed_funding_pnl
+            - open_fees
+            - close_fees
+            - emergency_cost
+        )
+        pnl = {
+            "paper_long_price_pnl": long_price_pnl,
+            "paper_short_price_pnl": short_price_pnl,
+            "paper_price_pnl": price_pnl,
+            "paper_close_fees": close_fees,
+            "paper_confirmed_funding_pnl": confirmed_funding_pnl,
+            "paper_open_fees": open_fees,
+            "paper_emergency_unwind_cost": emergency_cost,
+            "paper_net_if_exit_now": paper_net_if_exit_now,
+        }
+        self._record_price_pnl_entries(
+            position_id=position_id,
+            cycle_id=cycle_id,
+            long_venue=str((long_route_leg or long_entry_leg).get("venue") or ""),
+            short_venue=str((short_route_leg or short_entry_leg).get("venue") or ""),
+            long_price_pnl=long_price_pnl,
+            short_price_pnl=short_price_pnl,
+            payload={
+                "reason": reason,
+                "pricing_quality": pricing_quality,
+                "residual_diagnostics": residual_diagnostics,
+                "pnl": pnl,
+            },
+        )
+        if emergency or residual_diagnostics:
+            self._record_ledger_entry(
+                make_ledger_entry(
+                    f"emergency_unwind:{position_id}:close:diagnostic",
+                    position_id=position_id,
+                    cycle_id=cycle_id,
+                    venue=str((long_route_leg or long_entry_leg).get("venue") or ""),
                     event_type="emergency_unwind_cost",
-                    cash_delta=-emergency_cost,
-                    payload={"reason": reason, "residual_quantity": residual_quantity, "pricing_quality": pricing_quality},
+                    cash_delta=0.0,
+                    payload={
+                        "reason": reason,
+                        "pricing_quality": pricing_quality,
+                        "residual_diagnostics": residual_diagnostics,
+                        "cash_cost_policy": "penalty_in_fill_price_once",
+                    },
                 )
             )
         self._release_collateral(position_id, route or {"legs": entry_legs})
@@ -1961,7 +2148,7 @@ class SynchronizedFundingRuntimeV2:
             final_state,
             now,
             closed_at=now.isoformat(),
-            paper_close_fees=long_fee + short_fee,
+            paper_close_fees=close_fees,
             paper_emergency_unwind_cost=emergency_cost,
             paper_net_pnl_estimated=pnl["paper_net_if_exit_now"],
         )
@@ -1972,7 +2159,12 @@ class SynchronizedFundingRuntimeV2:
             "pricing_quality": pricing_quality,
             "long_exit": long_exit,
             "short_exit": short_exit,
-            "paper_close_fees": long_fee + short_fee,
+            "long_closed_quantity": closed_quantity_by_side["long"],
+            "short_closed_quantity": closed_quantity_by_side["short"],
+            "long_exit_average_price": long_exit_avg,
+            "short_exit_average_price": short_exit_avg,
+            "residual_diagnostics": residual_diagnostics,
+            "paper_close_fees": close_fees,
             "paper_emergency_unwind_cost": emergency_cost,
             **pnl,
         }
