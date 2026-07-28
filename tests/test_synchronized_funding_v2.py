@@ -2250,6 +2250,204 @@ def test_lightweight_discovery_finds_route_between_full_scans() -> None:
     assert capacity_over["entry_forbidden"]
 
 
+class _LightweightDiscoveryClient:
+    def __init__(
+        self,
+        venue: str,
+        *,
+        asset: str = "ABC",
+        funding_rate: float,
+        next_funding_at: datetime,
+        interval_hours: float = 1.0,
+        mark_price: float = 100.0,
+        include_fee: bool = True,
+        include_volume: bool = True,
+    ) -> None:
+        self.venue = venue
+        self.asset = asset
+        self.symbol = f"{asset}USDT"
+        self.funding_rate = funding_rate
+        self.next_funding_at = next_funding_at
+        self.interval_hours = interval_hours
+        self.mark_price = mark_price
+        self.include_fee = include_fee
+        self.include_volume = include_volume
+        self.orderbook_calls = 0
+
+    def catalog_and_markets(self, observed_at: str):
+        instrument = {
+            "venue": self.venue,
+            "symbol": self.symbol,
+            "canonical_asset": self.asset,
+            "base_asset": self.asset,
+            "quote_asset": "USDT",
+            "collateral_asset": "USDT",
+            "contract_type": "linear_perpetual",
+            "contract_multiplier": 0.01,
+            "status": "active",
+            "observed_at": observed_at,
+        }
+        market = {
+            "venue": self.venue,
+            "symbol": self.symbol,
+            "canonical_asset": self.asset,
+            "funding_rate": self.funding_rate,
+            "normalized_next_funding_rate": self.funding_rate,
+            "funding_rate_unit": "fraction_of_notional_per_settlement",
+            "funding_sign_convention": "positive_long_pays",
+            "funding_interval_hours": self.interval_hours,
+            "hourly_funding_rate": self.funding_rate / self.interval_hours,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": self.next_funding_at.isoformat(),
+            "mark_price": self.mark_price,
+            "index_price": self.mark_price,
+            "open_interest_usd": 10_000_000.0,
+            "volume_24h_usd": 30_000_000.0 if self.include_volume else None,
+            "quantity_step": 0.01,
+            "min_notional_usd": 5.0,
+            "observed_at": observed_at,
+        }
+        if self.include_fee:
+            market["taker_fee_rate"] = 0.0005
+        return [instrument], [market], []
+
+    def orderbook(self, symbol: str, observed_at: str, limit: int = 100):
+        self.orderbook_calls += 1
+        raise AssertionError("lightweight discovery must not fetch orderbooks")
+
+    def funding_history(self, symbol: str, start_time_ms: int, interval_hours: float, observed_at: str):
+        raise AssertionError("lightweight discovery must not fetch history")
+
+
+def _lightweight_bot(tmp_path, now: datetime, clients: list[_LightweightDiscoveryClient]):
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    config = PaperBotConfig(
+        telegram_enabled=False,
+        arm_window_seconds=120,
+        scan_interval_seconds=300,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now, monotonic_start=100.0))
+    bot.build_venue_clients = lambda: clients  # type: ignore[method-assign]
+    return bot
+
+
+def test_lightweight_discovery_adds_watch_route_without_orderbook(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    long_client = _LightweightDiscoveryClient(
+        "venue_a",
+        funding_rate=-0.004,
+        next_funding_at=settlement,
+        interval_hours=1.0,
+    )
+    short_client = _LightweightDiscoveryClient(
+        "venue_b",
+        funding_rate=0.004,
+        next_funding_at=settlement,
+        interval_hours=4.0,
+    )
+    bot = _lightweight_bot(tmp_path, now, [long_client, short_client])
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["status"] == "success"
+    assert summary["markets_checked"] == 2
+    assert summary["routes_structurally_matched"] == 2
+    assert summary["watch_routes_added"] == 1
+    assert len(bot.hot_routes) == 1
+    route = next(iter(bot.hot_routes.values()))
+    assert route["status"] == "watch"
+    assert route["status"] != "paper_candidate"
+    assert route["evidence"]["selected_strategy"]["selection_model"] == "lightweight_discovery_v1"
+    assert route["evidence"]["pnl_components"]["spread_convergence_component"] == 0.0
+    assert {leg["funding_interval_hours"] for leg in route["legs"]} == {1.0, 4.0}
+    assert long_client.orderbook_calls == 0
+    assert short_client.orderbook_calls == 0
+
+
+def test_lightweight_discovery_fail_closed_route_is_research_only(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    bot = _lightweight_bot(
+        tmp_path,
+        now,
+        [
+            _LightweightDiscoveryClient(
+                "venue_a",
+                funding_rate=-0.004,
+                next_funding_at=settlement,
+                include_fee=False,
+            ),
+            _LightweightDiscoveryClient(
+                "venue_b",
+                funding_rate=0.004,
+                next_funding_at=settlement,
+            ),
+        ],
+    )
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["watch_routes_added"] == 0
+    assert summary["research_only_routes"] >= 1
+    assert not bot.hot_routes
+    reasons = summary["rejection_reasons"]
+    assert any("taker_fee_missing" in reason for reason in reasons)
+
+
+def test_lightweight_discovery_zero_or_negative_gross_not_watch(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    bot = _lightweight_bot(
+        tmp_path,
+        now,
+        [
+            _LightweightDiscoveryClient("venue_a", funding_rate=0.0, next_funding_at=settlement),
+            _LightweightDiscoveryClient("venue_b", funding_rate=0.0, next_funding_at=settlement),
+        ],
+    )
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["watch_routes_added"] == 0
+    assert not bot.hot_routes
+    assert summary["rejection_reasons"]["preliminary_gross_funding_not_positive"] == 2
+
+
+def test_lightweight_discovery_does_not_call_legacy_strategy_builder(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import smart_money_radar.funding.economics as economics
+
+    def fail(*args, **kwargs):
+        raise AssertionError("legacy build_strategy_evaluation must not be used")
+
+    monkeypatch.setattr(economics, "build_strategy_evaluation", fail)
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    bot = _lightweight_bot(
+        tmp_path,
+        now,
+        [
+            _LightweightDiscoveryClient("venue_a", funding_rate=-0.004, next_funding_at=settlement),
+            _LightweightDiscoveryClient("venue_b", funding_rate=0.004, next_funding_at=settlement),
+        ],
+    )
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["watch_routes_added"] == 1
+
+
 def test_post_settlement_probe_consecutive_agreement() -> None:
     """Post-settlement probes: two consecutive fresh agreements => hold next cycle."""
     from smart_money_radar.paper_bot.cycle_manager import post_settlement_probe_decision

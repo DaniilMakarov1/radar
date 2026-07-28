@@ -50,9 +50,10 @@ from smart_money_radar.funding.adapters import (
     WOOXFundingClient,
 )
 from smart_money_radar.funding.adapters.base import FundingDataError, FundingHttpClient
-from smart_money_radar.funding.economics import evaluate_perp_route
+from smart_money_radar.funding.economics import evaluate_perp_route, perp_route_key
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.normalization import (
+    normalize_catalog_canonical_units,
     normalize_orderbook_canonical_units,
     normalize_stored_orderbook_units,
 )
@@ -61,7 +62,18 @@ from smart_money_radar.funding.presentation import (
     filter_deactivated_funding_paper_payload,
 )
 from smart_money_radar.funding.retention import apply_funding_retention_plan
-from smart_money_radar.funding.service import run_funding_scan
+from smart_money_radar.funding.service import (
+    active_default_funding_clients,
+    run_funding_scan,
+)
+from smart_money_radar.funding.strategy_synchronized_funding import (
+    gross_funding_pnl,
+    settlement_skew_seconds,
+)
+from smart_money_radar.funding.venue_capabilities import (
+    capability_from_market,
+    synchronized_route_capability_check,
+)
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.notifications import TelegramNotifier
 from smart_money_radar.storage import SQLiteStore, utc_now_iso
@@ -1385,7 +1397,7 @@ class PaperBot:
         client = funding_client_for_venue(venue, fast=True)
         if client is None:
             raise FundingDataError(f"No funding client for {venue}")
-        previous = self.store.latest_funding_market_with_instrument(venue, symbol) or {}
+        previous = self.store.latest_funding_market_with_instrument(venue, symbol) or dict(leg)
         snapshot_method = getattr(client, "market_snapshot", None)
         request_started_at = self.clock.now().isoformat()
         if callable(snapshot_method):
@@ -1404,6 +1416,28 @@ class PaperBot:
             if market is None:
                 raise FundingDataError(f"{venue} {symbol} market unavailable")
         response_received_at = self.clock.now().isoformat()
+        for field in (
+            "canonical_asset",
+            "base_asset",
+            "quote_asset",
+            "collateral_asset",
+            "contract_type",
+            "contract_kind",
+            "contract_multiplier",
+            "canonical_unit_multiplier",
+            "quantity_step",
+            "min_quantity",
+            "min_notional",
+            "min_notional_usd",
+            "maker_fee_rate",
+            "taker_fee_rate",
+            "fee_rate",
+            "funding_rate_unit",
+            "funding_sign_convention",
+            "normalization_evidence",
+        ):
+            if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
+                market[field] = previous[field]
         market["canonical_unit_multiplier"] = previous.get(
             "canonical_unit_multiplier",
             market.get("canonical_unit_multiplier", 1.0),
@@ -1862,7 +1896,14 @@ class PaperBot:
 
     def _run_lightweight_discovery(self) -> dict[str, Any] | None:
         """Lightweight discovery: market snapshots + next funding only, no full orderbooks."""
-        now_monotonic = time.monotonic()
+        if (
+            self.hot_routes
+            or self.background_full_scan_running()
+            or self.store.funding_capture_open_positions()
+            or self.store.funding_paper_open_positions()
+        ):
+            return None
+        now_monotonic = self.clock.monotonic()
         if not lightweight_discovery_due(
             last_discovery_monotonic=getattr(self, "_last_lightweight_discovery_monotonic", 0.0),
             now_monotonic=now_monotonic,
@@ -1878,9 +1919,441 @@ class PaperBot:
                 "status": "skipped",
                 "reason": capacity["reason"],
             }
+        clients = self.build_venue_clients() or active_default_funding_clients()
+        clients = [
+            client
+            for client in clients
+            if str(getattr(client, "venue", "")).lower() not in DEACTIVATED_FUNDING_VENUES
+        ]
+        if len(clients) < 2:
+            return {
+                "status": "skipped",
+                "reason": "insufficient_lightweight_venues",
+                "markets_checked": 0,
+                "routes_structurally_matched": 0,
+                "watch_routes_added": 0,
+                "research_only_routes": 0,
+                "rejection_reasons": {"insufficient_lightweight_venues": 1},
+            }
+
+        now = self.clock.now().astimezone(UTC)
+        observed_at = now.isoformat()
+        markets, warnings = self._fetch_lightweight_market_snapshots(clients, observed_at)
+        clients_by_venue = {
+            str(getattr(client, "venue", "")).lower(): client
+            for client in clients
+        }
+        routes, summary = self._build_lightweight_watch_routes(
+            markets,
+            clients_by_venue,
+            now,
+        )
+        for route in routes:
+            route_key = str(route.get("route_key") or "")
+            if not route_key:
+                continue
+            existing = self.hot_routes.get(route_key)
+            if existing is not None and route_is_older_than(route, existing):
+                continue
+            self.hot_routes[route_key] = route
         return {
-            "status": "scheduled",
+            "status": "success",
             "watch_route_count": len(self.hot_routes),
+            "warnings": warnings,
+            **summary,
+        }
+
+    def _fetch_lightweight_market_snapshots(
+        self,
+        clients: list[FundingVenueClient],
+        observed_at: str,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        catalog_results: dict[
+            str,
+            tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], str, str],
+        ] = {}
+        warnings: list[str] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(clients))) as executor:
+            futures = {}
+            for client in clients:
+                venue = str(getattr(client, "venue", "")).lower()
+                request_started_at = self.clock.now().isoformat()
+                futures[executor.submit(client.catalog_and_markets, observed_at)] = (
+                    venue,
+                    request_started_at,
+                )
+            for future in as_completed(futures):
+                venue, request_started_at = futures[future]
+                try:
+                    instruments, markets, venue_warnings = future.result()
+                except FundingDataError as exc:
+                    warnings.append(f"{venue} lightweight catalog skipped: {exc}")
+                    continue
+                response_received_at = self.clock.now().isoformat()
+                catalog_results[venue] = (
+                    instruments,
+                    markets,
+                    venue_warnings,
+                    request_started_at,
+                    response_received_at,
+                )
+
+        instruments: list[dict[str, Any]] = []
+        markets: list[dict[str, Any]] = []
+        request_times: dict[tuple[str, str], tuple[str, str]] = {}
+        for venue, result in catalog_results.items():
+            venue_instruments, venue_markets, venue_warnings, started_at, received_at = result
+            venue_instruments, venue_markets = normalize_catalog_canonical_units(
+                venue_instruments,
+                venue_markets,
+            )
+            warnings.extend(venue_warnings)
+            for row in venue_instruments:
+                key = (str(row.get("venue") or venue).lower(), str(row.get("symbol") or ""))
+                request_times[key] = (started_at, received_at)
+            for row in venue_markets:
+                key = (str(row.get("venue") or venue).lower(), str(row.get("symbol") or ""))
+                request_times.setdefault(key, (started_at, received_at))
+            instruments.extend(venue_instruments)
+            markets.extend(venue_markets)
+
+        instrument_by_key = {
+            (str(row.get("venue") or "").lower(), str(row.get("symbol") or "")): row
+            for row in instruments
+        }
+        enriched_markets: list[dict[str, Any]] = []
+        for market in markets:
+            key = (
+                str(market.get("venue") or "").lower(),
+                str(market.get("symbol") or ""),
+            )
+            instrument = instrument_by_key.get(key, {})
+            row = {**instrument, **market}
+            started_at, received_at = request_times.get(key, (observed_at, observed_at))
+            row.setdefault("request_started_at", started_at)
+            row.setdefault("response_received_at", received_at)
+            row.setdefault("normalized_at", received_at)
+            row.setdefault("normalized_next_funding_rate", row.get("funding_rate"))
+            row.setdefault("funding_rate_unit", "fraction_of_notional_per_settlement")
+            row.setdefault("funding_sign_convention", "positive_long_pays")
+            row.setdefault(
+                "normalization_evidence",
+                {"source": "lightweight_market_snapshot"},
+            )
+            enriched_markets.append(row)
+        return enriched_markets, warnings
+
+    def _build_lightweight_watch_routes(
+        self,
+        markets: list[dict[str, Any]],
+        clients_by_venue: dict[str, FundingVenueClient],
+        now: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        rejection_reasons: dict[str, int] = {}
+
+        def reject(reason: str) -> None:
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+
+        eligible_by_asset: dict[str, list[dict[str, Any]]] = {}
+        markets_checked = 0
+        research_only_routes = 0
+        for market in markets:
+            markets_checked += 1
+            venue = str(market.get("venue") or "").lower()
+            market["venue"] = venue
+            settlement = parse_iso(market.get("next_funding_at"))
+            if settlement is None:
+                reject("next_funding_at_missing")
+                continue
+            seconds_to_settlement = (settlement - now).total_seconds()
+            if seconds_to_settlement < 55 or seconds_to_settlement > 600:
+                reject("outside_lightweight_settlement_window")
+                continue
+            asset = str(market.get("canonical_asset") or "").upper()
+            if not asset:
+                reject("canonical_asset_missing")
+                continue
+            if optional_float(market.get("mark_price")) is None:
+                reject("mark_price_missing")
+                continue
+            if optional_float(market.get("index_price")) is None:
+                reject("index_price_missing")
+                continue
+            if optional_float(market.get("normalized_next_funding_rate")) is None:
+                reject("normalized_next_funding_rate_missing")
+                continue
+            if venue not in clients_by_venue:
+                reject("venue_client_missing")
+                continue
+            eligible_by_asset.setdefault(asset, []).append(market)
+
+        routes_by_key: dict[str, dict[str, Any]] = {}
+        structurally_matched = 0
+        for asset, rows in eligible_by_asset.items():
+            if len({str(row.get("venue") or "") for row in rows}) < 2:
+                continue
+            for long_market in rows:
+                for short_market in rows:
+                    long_venue = str(long_market.get("venue") or "")
+                    short_venue = str(short_market.get("venue") or "")
+                    if not long_venue or not short_venue or long_venue == short_venue:
+                        continue
+                    structurally_matched += 1
+                    skew = settlement_skew_seconds(
+                        long_market.get("next_funding_at"),
+                        short_market.get("next_funding_at"),
+                    )
+                    if skew is None or skew > float(self.config.settlement_alignment_tolerance_seconds):
+                        reject("settlement_alignment_mismatch")
+                        continue
+                    capability = self._lightweight_capability_check(
+                        long_market,
+                        short_market,
+                        clients_by_venue,
+                    )
+                    if not capability["paper_eligible"]:
+                        research_only_routes += 1
+                        for reason in capability["all_reasons"]:
+                            reject(reason)
+                        continue
+                    long_mark = float(optional_float(long_market.get("mark_price")) or 0.0)
+                    short_mark = float(optional_float(short_market.get("mark_price")) or 0.0)
+                    if long_mark <= 0 or short_mark <= 0:
+                        reject("mark_price_missing")
+                        continue
+                    target_notional = float(self.config.target_notional_per_leg)
+                    quantity = min(target_notional / long_mark, target_notional / short_mark)
+                    gross = gross_funding_pnl(
+                        quantity=quantity,
+                        long_mark=long_mark,
+                        short_mark=short_mark,
+                        long_funding_rate=float(long_market["normalized_next_funding_rate"]),
+                        short_funding_rate=float(short_market["normalized_next_funding_rate"]),
+                    )
+                    if gross <= 0:
+                        reject("preliminary_gross_funding_not_positive")
+                        continue
+                    route = self._lightweight_watch_route(
+                        asset,
+                        long_market,
+                        short_market,
+                        quantity,
+                        gross,
+                        capability,
+                        now,
+                    )
+                    route_key = str(route["route_key"])
+                    existing = routes_by_key.get(route_key)
+                    if (
+                        existing is None
+                        or gross > float(
+                            ((existing.get("evidence") or {}).get("current_nowcast_gross") or 0.0)
+                        )
+                    ):
+                        routes_by_key[route_key] = route
+
+        return list(routes_by_key.values()), {
+            "markets_checked": markets_checked,
+            "routes_structurally_matched": structurally_matched,
+            "watch_routes_added": len(routes_by_key),
+            "research_only_routes": research_only_routes,
+            "rejection_reasons": dict(sorted(rejection_reasons.items())),
+        }
+
+    def _lightweight_capability_check(
+        self,
+        long_market: dict[str, Any],
+        short_market: dict[str, Any],
+        clients_by_venue: dict[str, FundingVenueClient],
+    ) -> dict[str, Any]:
+        check = synchronized_route_capability_check(
+            capability_from_market(long_market),
+            capability_from_market(short_market),
+        )
+        allowed_lightweight_missing = {
+            "long_orderbook_timestamp_missing",
+            "long_orderbook_depth_missing",
+            "short_orderbook_timestamp_missing",
+            "short_orderbook_depth_missing",
+        }
+        reasons = [
+            reason
+            for reason in check["all_reasons"]
+            if reason not in allowed_lightweight_missing
+        ]
+        for side, market in (("long", long_market), ("short", short_market)):
+            venue = str(market.get("venue") or "").lower()
+            client = clients_by_venue.get(venue)
+            if client is None or not callable(getattr(client, "orderbook", None)):
+                reasons.append(f"{side}_orderbook_client_missing")
+            if optional_float(market.get("normalized_next_funding_rate")) is None:
+                reasons.append(f"{side}_normalized_next_funding_rate_missing")
+        reasons = list(dict.fromkeys(reasons))
+        return {
+            **check,
+            "paper_eligible": not reasons,
+            "all_reasons": reasons,
+            "lightweight_allowed_missing": sorted(allowed_lightweight_missing),
+        }
+
+    def _lightweight_watch_route(
+        self,
+        asset: str,
+        long_market: dict[str, Any],
+        short_market: dict[str, Any],
+        quantity: float,
+        preliminary_gross: float,
+        capability: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        long_venue = str(long_market["venue"])
+        short_venue = str(short_market["venue"])
+        long_mark = float(long_market["mark_price"])
+        short_mark = float(short_market["mark_price"])
+        target_notional = float(self.config.target_notional_per_leg)
+        selected_strategy = {
+            "selection_model": "lightweight_discovery_v1",
+            "strategy_name": "synchronized_funding_capture",
+            "strategy_class": "synchronized_funding_capture",
+            "strategy_version": "synchronized_funding_capture_v2",
+            "primary_edge": "synchronized_funding",
+            "edge_type": "funding_led",
+            "edge_label": "Lightweight funding watch",
+            "eligible": True,
+            "expected_net_pnl": preliminary_gross,
+            "gross_edge_pnl": preliminary_gross,
+            "funding_pnl_component": preliminary_gross,
+            "spread_pnl_component": 0.0,
+            "signed_spread_pnl_component": 0.0,
+            "expected_spread_convergence_pnl": 0.0,
+            "execution_cost": 0.0,
+            "basis_stress_loss": 0.0,
+            "actionable_profit_threshold": 0.0,
+            "coverage_ratio": None,
+            "reasons": [],
+            "warnings": ["lightweight_only_requires_focused_underwriting"],
+            "thesis": (
+                "Preliminary synchronized funding watch. This is not an "
+                "entry candidate until focused orderbook observations pass."
+            ),
+        }
+        route = {
+            "route_key": perp_route_key(asset, long_venue, short_venue),
+            "route_type": "perp_perp",
+            "canonical_asset": asset,
+            "venue_scope": "+".join(sorted((long_venue, short_venue))),
+            "long_venue": long_venue,
+            "long_symbol": long_market["symbol"],
+            "short_venue": short_venue,
+            "short_symbol": short_market["symbol"],
+            "status": "watch",
+            "target_notional": target_notional,
+            "observed_at": now.astimezone(UTC).isoformat(),
+            "next_funding_at": long_market.get("next_funding_at"),
+            "legs": [
+                self._lightweight_route_leg("long", long_market, quantity, long_mark),
+                self._lightweight_route_leg("short", short_market, quantity, short_mark),
+            ],
+            "rationale": [
+                "Lightweight discovery found aligned next funding timestamps and positive gross funding.",
+                "No orderbooks were fetched; focused underwriting remains mandatory before entry.",
+            ],
+            "risk_flags": ["lightweight_only_requires_focused_underwriting"],
+            "evidence": {
+                "decision_mode": "settlement_capture",
+                "history_is_advisory": True,
+                "lightweight_discovery": {
+                    "observed_at": now.astimezone(UTC).isoformat(),
+                    "preliminary_gross_funding": preliminary_gross,
+                    "target_notional": target_notional,
+                    "quantity": quantity,
+                },
+                "strategy_candidates": [selected_strategy],
+                "selected_strategy": selected_strategy,
+                "strategy_classification": selected_strategy,
+                "pnl_components": {
+                    "funding_pnl_component": preliminary_gross,
+                    "spread_pnl_component": 0.0,
+                    "signed_spread_pnl_component": 0.0,
+                    "spread_convergence_component": 0.0,
+                    "execution_cost": 0.0,
+                    "funding_only_net_pnl": preliminary_gross,
+                    "combined_net_pnl": preliminary_gross,
+                    "opportunity_expected_net_pnl": preliminary_gross,
+                    "positive_edge_pnl": preliminary_gross,
+                    "drag_pnl": 0.0,
+                },
+                "current_nowcast_gross": preliminary_gross,
+                "current_nowcast_net": preliminary_gross,
+                "synchronized_capability_passed": capability["paper_eligible"],
+                "capability_rejections": capability["all_reasons"],
+                "capability_check": capability,
+                "blocking_reasons": [],
+                "blocking_risk_flags": [],
+                "advisory_reasons": ["lightweight_only_requires_focused_underwriting"],
+                "requested_target_notional": target_notional,
+            },
+        }
+        return route
+
+    def _lightweight_route_leg(
+        self,
+        side: str,
+        market: dict[str, Any],
+        quantity: float,
+        mark_price: float,
+    ) -> dict[str, Any]:
+        fee_rate = optional_float(market.get("fee_rate"))
+        if fee_rate is None:
+            fee_rate = optional_float(market.get("taker_fee_rate"))
+        min_notional = optional_float(market.get("min_notional"))
+        if min_notional is None:
+            min_notional = optional_float(market.get("min_notional_usd"))
+        return {
+            "side": side,
+            "venue": market["venue"],
+            "symbol": market["symbol"],
+            "notional": quantity * mark_price,
+            "base_quantity": quantity,
+            "funding_rate": market.get("funding_rate"),
+            "raw_funding_rate": market.get("raw_funding_rate", market.get("funding_rate")),
+            "raw_funding_rate_unit": market.get("raw_funding_rate_unit"),
+            "normalized_next_funding_rate": market.get("normalized_next_funding_rate"),
+            "funding_rate_unit": market.get("funding_rate_unit"),
+            "funding_sign_convention": market.get("funding_sign_convention"),
+            "normalization_evidence": market.get("normalization_evidence"),
+            "funding_interval_hours": market.get("funding_interval_hours"),
+            "hourly_funding_rate": market.get("hourly_funding_rate"),
+            "funding_rate_kind": market.get("funding_rate_kind"),
+            "published_funding_rate": market.get("published_funding_rate", market.get("funding_rate")),
+            "published_funding_interval_hours": market.get(
+                "published_funding_interval_hours",
+                market.get("funding_interval_hours"),
+            ),
+            "next_funding_at": market.get("next_funding_at"),
+            "market_request_started_at": market.get("request_started_at"),
+            "market_response_received_at": market.get("response_received_at"),
+            "response_received_at": market.get("response_received_at"),
+            "normalized_at": market.get("normalized_at"),
+            "venue_server_time": market.get("venue_server_time"),
+            "source_event_at": market.get("source_event_at"),
+            "mark_price": mark_price,
+            "index_price": market.get("index_price"),
+            "quote_asset": market.get("quote_asset"),
+            "collateral_asset": market.get("collateral_asset"),
+            "contract_type": market.get("contract_type"),
+            "contract_kind": market.get("contract_kind"),
+            "contract_multiplier": market.get("contract_multiplier"),
+            "canonical_unit_multiplier": market.get("canonical_unit_multiplier"),
+            "volume_24h_usd": market.get("volume_24h_usd"),
+            "open_interest_usd": market.get("open_interest_usd"),
+            "fee_rate": fee_rate,
+            "taker_fee_rate": fee_rate,
+            "maker_fee_rate": market.get("maker_fee_rate"),
+            "quantity_step": market.get("quantity_step") or market.get("contract_multiplier"),
+            "min_quantity": market.get("min_quantity"),
+            "min_notional": min_notional,
+            "min_notional_usd": min_notional,
         }
 
     def process_open_positions(self) -> list[str]:
