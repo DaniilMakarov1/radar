@@ -546,6 +546,17 @@ def test_open_position_poll_records_current_executable_pnl(tmp_path):
         "scheduled_funding_at": (now + timedelta(minutes=5)).isoformat(),
         "state": "OPEN",
     })
+    for venue in ("binance", "bybit"):
+        amount = 625.0
+        store.upsert_paper_event_ledger(make_ledger_entry(
+            collateral_reserve_event_key(pid, venue),
+            position_id=pid,
+            venue=venue,
+            event_type="collateral_reserve",
+            cash_delta=0.0,
+            payload={"amount": amount},
+        ))
+        store.update_funding_paper_account_reserved(venue, amount)
     clock = FakeClock(now, monotonic_start=100.0)
     bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=clock)
     bot.hot_routes[route_key] = {
@@ -562,8 +573,11 @@ def test_open_position_poll_records_current_executable_pnl(tmp_path):
                 "best_bid": 99.9,
                 "best_ask": 100.1,
                 "close_vwap": 99.9,
+                "bids": [[99.9, 20.0]],
+                "asks": [[100.1, 20.0]],
                 "fee_rate": 0.0005,
-                "observed_at": now.isoformat(),
+                "response_received_at": (now - timedelta(milliseconds=500)).isoformat(),
+                "orderbook_response_received_at": (now - timedelta(milliseconds=500)).isoformat(),
             },
             {
                 "side": "short",
@@ -574,8 +588,11 @@ def test_open_position_poll_records_current_executable_pnl(tmp_path):
                 "best_bid": 99.9,
                 "best_ask": 100.1,
                 "close_vwap": 100.1,
+                "bids": [[99.9, 20.0]],
+                "asks": [[100.1, 20.0]],
                 "fee_rate": 0.0005,
-                "observed_at": now.isoformat(),
+                "response_received_at": now.isoformat(),
+                "orderbook_response_received_at": now.isoformat(),
             },
         ],
     }

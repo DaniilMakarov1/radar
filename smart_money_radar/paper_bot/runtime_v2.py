@@ -38,7 +38,11 @@ from smart_money_radar.paper_bot.execution import (
     t20_deadline_passed,
 )
 from smart_money_radar.paper_bot.helpers import leg_by_side, optional_float, route_entry_key
-from smart_money_radar.paper_bot.risk import entry_risk_gates, hard_risk_triggered
+from smart_money_radar.paper_bot.risk import (
+    dynamic_basis_stop_decision,
+    entry_risk_gates,
+    hard_risk_triggered,
+)
 from smart_money_radar.paper_bot.settlement import (
     build_settlement_crossing_rows,
     reconcile_leg,
@@ -582,13 +586,70 @@ class SynchronizedFundingRuntimeV2:
         confirmed reconciled funding only and never includes expected funding
         or spread-convergence assumptions.
         """
-        if route is None:
-            return {"decision": "skipped", "reason": "route_missing"}
         position_id = str(position["position_id"])
         cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
+        snapshot = self._current_executable_pnl_snapshot(position, route, now)
+        observed_at = now.astimezone(UTC).isoformat()
+        self.store.upsert_funding_capture_observation(
+            {
+                "observation_id": f"{cycle_id}:current_pnl:{observed_at}",
+                "position_id": position_id,
+                "cycle_id": cycle_id,
+                "phase": "current_pnl",
+                "observed_at": observed_at,
+                "long_response_received_at": snapshot.get("long_response_received_at"),
+                "short_response_received_at": snapshot.get("short_response_received_at"),
+                "cross_venue_skew_ms": snapshot.get("cross_venue_skew_ms"),
+                "long_mark": snapshot.get("long_mark"),
+                "short_mark": snapshot.get("short_mark"),
+                "long_index": snapshot.get("long_index"),
+                "short_index": snapshot.get("short_index"),
+                "long_next_funding_at": snapshot.get("long_next_funding_at"),
+                "short_next_funding_at": snapshot.get("short_next_funding_at"),
+                "long_next_funding_rate": snapshot.get("long_next_funding_rate"),
+                "short_next_funding_rate": snapshot.get("short_next_funding_rate"),
+                "gross_funding_pnl": None,
+                "long_close_vwap": snapshot.get("long_exit_price"),
+                "short_close_vwap": snapshot.get("short_exit_price"),
+                "current_exit_spread": snapshot.get("current_exit_spread"),
+                "paper_net_if_exit_now": snapshot.get("paper_net_if_exit_now"),
+                "snapshot_valid": snapshot.get("quality") == "EXECUTABLE_FULL_DEPTH",
+                "invalid_reason": None
+                if snapshot.get("quality") == "EXECUTABLE_FULL_DEPTH"
+                else snapshot.get("quality"),
+            }
+        )
+        if snapshot.get("quality") != "EXECUTABLE_FULL_DEPTH":
+            return {"decision": "skipped", **snapshot}
+        self.store.update_funding_capture_position_state(
+            position_id,
+            str(position.get("state") or "OPEN"),
+            now,
+            paper_net_pnl_estimated=snapshot["paper_net_if_exit_now"],
+        )
+        return {"decision": "recorded", **snapshot}
+
+    def _current_executable_pnl_snapshot(
+        self,
+        position: dict[str, Any],
+        route: dict[str, Any] | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if route is None:
+            return {
+                "quality": "INVALID_MISSING_BOOK",
+                "reason": "route_missing",
+                "snapshot_age_seconds": math.inf,
+                "risk_state": "DEGRADED",
+            }
         quantity = float(position.get("quantity") or 0.0)
         if quantity <= 0:
-            return {"decision": "skipped", "reason": "quantity_missing"}
+            return {
+                "quality": "INVALID_MISSING_BOOK",
+                "reason": "quantity_missing",
+                "snapshot_age_seconds": math.inf,
+                "risk_state": "DEGRADED",
+            }
 
         legs = route.get("legs") or []
         long_route_leg = leg_by_side(legs, "long") or {}
@@ -606,92 +667,390 @@ class SynchronizedFundingRuntimeV2:
             or optional_float(short_entry_leg.get("vwap"))
             or 0.0
         )
-        prices = self._current_close_prices(route)
-        long_exit_price = float(prices.get("long_exit_price") or 0.0)
-        short_exit_price = float(prices.get("short_exit_price") or 0.0)
-        if min(long_entry_price, short_entry_price, long_exit_price, short_exit_price) <= 0:
+        long_response = _leg_response_time(long_route_leg)
+        short_response = _leg_response_time(short_route_leg)
+        now_utc = now.astimezone(UTC)
+        long_age = (
+            (now_utc - long_response).total_seconds()
+            if long_response is not None
+            else math.inf
+        )
+        short_age = (
+            (now_utc - short_response).total_seconds()
+            if short_response is not None
+            else math.inf
+        )
+        cross_skew = (
+            abs((long_response - short_response).total_seconds())
+            if long_response is not None and short_response is not None
+            else math.inf
+        )
+        base = {
+            "long_response_received_at": long_response.isoformat() if long_response else None,
+            "short_response_received_at": short_response.isoformat() if short_response else None,
+            "long_age_seconds": long_age,
+            "short_age_seconds": short_age,
+            "snapshot_age_seconds": max(long_age, short_age),
+            "cross_venue_skew_seconds": cross_skew,
+            "cross_venue_skew_ms": None if not math.isfinite(cross_skew) else cross_skew * 1000.0,
+            "long_mark": optional_float(long_route_leg.get("mark_price")),
+            "short_mark": optional_float(short_route_leg.get("mark_price")),
+            "long_index": optional_float(long_route_leg.get("index_price")),
+            "short_index": optional_float(short_route_leg.get("index_price")),
+            "long_next_funding_at": long_route_leg.get("next_funding_at"),
+            "short_next_funding_at": short_route_leg.get("next_funding_at"),
+            "long_next_funding_rate": optional_float(long_route_leg.get("normalized_next_funding_rate")),
+            "short_next_funding_rate": optional_float(short_route_leg.get("normalized_next_funding_rate")),
+        }
+        if long_age > 2.0 or short_age > 2.0 or cross_skew > 1.0:
             return {
-                "decision": "skipped",
-                "reason": "current_executable_price_missing",
+                **base,
+                "quality": "INVALID_STALE",
+                "reason": "current_snapshot_stale_or_skewed",
+                "risk_state": "DEGRADED",
                 "long_entry_price": long_entry_price,
                 "short_entry_price": short_entry_price,
-                "long_exit_price": long_exit_price,
-                "short_exit_price": short_exit_price,
             }
-        long_fee_rate = float(
-            _leg_fee_rate(long_route_leg) or _leg_fee_rate(long_entry_leg)
-        )
-        short_fee_rate = float(
-            _leg_fee_rate(short_route_leg) or _leg_fee_rate(short_entry_leg)
-        )
+        if long_entry_price <= 0 or short_entry_price <= 0:
+            return {
+                **base,
+                "quality": "INVALID_MISSING_BOOK",
+                "reason": "entry_fill_price_missing",
+                "risk_state": "DEGRADED",
+            }
+        long_fee_source = optional_float(long_route_leg.get("fee_rate"))
+        if long_fee_source is None:
+            long_fee_source = optional_float(long_route_leg.get("taker_fee_rate"))
+        if long_fee_source is None:
+            long_fee_source = optional_float(long_entry_leg.get("fee_rate"))
+        if long_fee_source is None:
+            long_fee_source = optional_float(long_entry_leg.get("taker_fee_rate"))
+        short_fee_source = optional_float(short_route_leg.get("fee_rate"))
+        if short_fee_source is None:
+            short_fee_source = optional_float(short_route_leg.get("taker_fee_rate"))
+        if short_fee_source is None:
+            short_fee_source = optional_float(short_entry_leg.get("fee_rate"))
+        if short_fee_source is None:
+            short_fee_source = optional_float(short_entry_leg.get("taker_fee_rate"))
+        if long_fee_source is None or short_fee_source is None:
+            return {
+                **base,
+                "quality": "INVALID_MISSING_FEE",
+                "reason": "fee_rate_missing",
+                "risk_state": "DEGRADED",
+            }
+        long_levels = long_route_leg.get("bids") or []
+        short_levels = short_route_leg.get("asks") or []
+        if not long_levels or not short_levels:
+            return {
+                **base,
+                "quality": "INVALID_MISSING_BOOK",
+                "reason": "executable_orderbook_missing",
+                "risk_state": "DEGRADED",
+            }
+        long_close = simulate_marketable_ioc(long_levels, "sell", quantity, EXECUTION_HAIRCUT_FRACTION)
+        short_close = simulate_marketable_ioc(short_levels, "buy", quantity, EXECUTION_HAIRCUT_FRACTION)
+        long_ratio = float(long_close["filled_quantity"] or 0.0) / quantity
+        short_ratio = float(short_close["filled_quantity"] or 0.0) / quantity
+        if long_ratio < 0.999 or short_ratio < 0.999:
+            return {
+                **base,
+                "quality": "INVALID_INCOMPLETE_DEPTH",
+                "reason": "full_ioc_depth_unavailable",
+                "risk_state": "DEGRADED",
+                "long_fill_ratio": long_ratio,
+                "short_fill_ratio": short_ratio,
+            }
+        long_exit_price = float(long_close["average_fill_price"] or 0.0)
+        short_exit_price = float(short_close["average_fill_price"] or 0.0)
         pnl = executable_paper_pnl(
             quantity=quantity,
             long_entry_price=long_entry_price,
             long_exit_price=long_exit_price,
             short_entry_price=short_entry_price,
             short_exit_price=short_exit_price,
-            long_taker_fee=long_fee_rate,
-            short_taker_fee=short_fee_rate,
-            confirmed_funding_pnl=self.confirmed_funding_pnl_for_position(position_id),
+            long_taker_fee=float(long_fee_source),
+            short_taker_fee=float(short_fee_source),
+            confirmed_funding_pnl=self.confirmed_funding_pnl_for_position(str(position["position_id"])),
             paper_open_fees=float(position.get("paper_open_fees") or 0.0),
             emergency_unwind_costs_already_incurred=float(
                 position.get("paper_emergency_unwind_cost") or 0.0
             ),
         )
-        observed_at = now.astimezone(UTC).isoformat()
-        long_seen_at = (
-            parse_time(long_route_leg.get("orderbook_response_received_at"))
-            or parse_time(long_route_leg.get("response_received_at"))
-            or parse_time(long_route_leg.get("observed_at"))
-            or now
-        ).astimezone(UTC)
-        short_seen_at = (
-            parse_time(short_route_leg.get("orderbook_response_received_at"))
-            or parse_time(short_route_leg.get("response_received_at"))
-            or parse_time(short_route_leg.get("observed_at"))
-            or now
-        ).astimezone(UTC)
-        self.store.upsert_funding_capture_observation(
-            {
-                "observation_id": f"{cycle_id}:current_pnl:{observed_at}",
-                "position_id": position_id,
-                "cycle_id": cycle_id,
-                "phase": "current_pnl",
-                "observed_at": observed_at,
-                "long_response_received_at": long_seen_at.isoformat(),
-                "short_response_received_at": short_seen_at.isoformat(),
-                "cross_venue_skew_ms": abs(
-                    (long_seen_at - short_seen_at).total_seconds()
-                ) * 1000.0,
-                "long_mark": optional_float(long_route_leg.get("mark_price")),
-                "short_mark": optional_float(short_route_leg.get("mark_price")),
-                "long_index": optional_float(long_route_leg.get("index_price")),
-                "short_index": optional_float(short_route_leg.get("index_price")),
-                "long_next_funding_at": long_route_leg.get("next_funding_at"),
-                "short_next_funding_at": short_route_leg.get("next_funding_at"),
-                "long_next_funding_rate": optional_float(
-                    long_route_leg.get("normalized_next_funding_rate")
-                    or long_route_leg.get("funding_rate")
-                ),
-                "short_next_funding_rate": optional_float(
-                    short_route_leg.get("normalized_next_funding_rate")
-                    or short_route_leg.get("funding_rate")
-                ),
-                "gross_funding_pnl": None,
-                "long_close_vwap": long_exit_price,
-                "short_close_vwap": short_exit_price,
-                "current_exit_spread": short_exit_price - long_exit_price,
-                "paper_net_if_exit_now": pnl["paper_net_if_exit_now"],
-                "snapshot_valid": True,
+        return {
+            **base,
+            **pnl,
+            "quality": "EXECUTABLE_FULL_DEPTH",
+            "reason": None,
+            "risk_state": "HEALTHY",
+            "long_entry_price": long_entry_price,
+            "short_entry_price": short_entry_price,
+            "long_exit_price": long_exit_price,
+            "short_exit_price": short_exit_price,
+            "current_exit_spread": short_exit_price - long_exit_price,
+            "long_fill_ratio": long_ratio,
+            "short_fill_ratio": short_ratio,
+            "long_fee_rate": float(long_fee_source),
+            "short_fee_rate": float(short_fee_source),
+        }
+
+    def _ledger_cash_sum(
+        self,
+        position_id: str,
+        *,
+        venue: str,
+        event_type: str | None = None,
+    ) -> float:
+        total = 0.0
+        for row in self.store.paper_event_ledger_rows(position_id):
+            if str(row.get("venue") or "") != str(venue):
+                continue
+            if event_type is not None and str(row.get("event_type") or "") != event_type:
+                continue
+            total += float(row.get("cash_delta") or 0.0)
+        return total
+
+    def _reserved_collateral_amount(self, position_id: str, venue: str) -> float:
+        reserve_key = collateral_reserve_event_key(position_id, venue)
+        for row in self.store.paper_event_ledger_rows(position_id):
+            if str(row.get("event_key") or "") != reserve_key:
+                continue
+            return float(optional_float((row.get("payload") or {}).get("amount")) or 0.0)
+        return 0.0
+
+    def _leg_margin_snapshot(
+        self,
+        *,
+        position_id: str,
+        side: str,
+        venue: str,
+        quantity: float,
+        entry_price: float,
+        mark: float,
+        fee_rate_source_leg: dict[str, Any],
+    ) -> dict[str, Any]:
+        reserved_collateral = self._reserved_collateral_amount(position_id, venue)
+        confirmed_funding = self._ledger_cash_sum(position_id, venue=venue, event_type="funding")
+        allocated_fees = -self._ledger_cash_sum(position_id, venue=venue, event_type="order_fee")
+        if side == "long":
+            upnl = quantity * (mark - entry_price)
+        else:
+            upnl = quantity * (entry_price - mark)
+        mmr_value = optional_float(fee_rate_source_leg.get("maintenance_margin_rate"))
+        mmr_source = "venue"
+        if mmr_value is None:
+            mmr_value = float(getattr(self.config, "paper_mmr", 0.02) or 0.02)
+            mmr_source = "paper_fallback"
+        mmr = float(mmr_value)
+        maintenance_margin = abs(quantity * mark) * mmr
+        leg_equity = reserved_collateral + upnl + confirmed_funding - allocated_fees
+        margin_safety = leg_equity / maintenance_margin if maintenance_margin > 0 else 0.0
+        q = max(quantity, 1e-12)
+        if side == "long":
+            liquidation_price = (
+                q * entry_price - reserved_collateral - confirmed_funding + allocated_fees
+            ) / max(q * (1.0 - mmr), 1e-12)
+            liquidation_price = max(0.0, liquidation_price)
+            liquidation_distance = max(0.0, (mark - liquidation_price) / max(mark, 1e-12))
+        else:
+            liquidation_price = (
+                reserved_collateral + confirmed_funding - allocated_fees + q * entry_price
+            ) / max(q * (1.0 + mmr), 1e-12)
+            liquidation_distance = max(0.0, (liquidation_price - mark) / max(mark, 1e-12))
+        return {
+            "venue": venue,
+            "side": side,
+            "reserved_collateral": reserved_collateral,
+            "confirmed_funding": confirmed_funding,
+            "allocated_fees": allocated_fees,
+            "upnl": upnl,
+            "leg_equity": leg_equity,
+            "maintenance_margin": maintenance_margin,
+            "maintenance_margin_rate": mmr,
+            "mmr_source": mmr_source,
+            "margin_safety_ratio": margin_safety,
+            "liquidation_price": liquidation_price,
+            "liquidation_distance_fraction": liquidation_distance,
+        }
+
+    def poll_synchronized_position_risk(
+        self,
+        position: dict[str, Any],
+        route: dict[str, Any] | None,
+        current_executable_pnl: dict[str, Any],
+        active_cycle: dict[str, Any] | None,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        position_id = str(position["position_id"])
+        quality = str(current_executable_pnl.get("quality") or "")
+        snapshot_age_value = current_executable_pnl.get("snapshot_age_seconds")
+        snapshot_age = float(snapshot_age_value) if snapshot_age_value is not None else math.inf
+        if quality != "EXECUTABLE_FULL_DEPTH":
+            if snapshot_age > 5.0 or not math.isfinite(snapshot_age):
+                return {
+                    "close_reason": "risk_data_hard_stale",
+                    "reasons": [str(current_executable_pnl.get("reason") or quality)],
+                    "current_executable_pnl": current_executable_pnl,
+                }
+            return None
+
+        quantity = float(position.get("quantity") or 0.0)
+        if quantity <= 0:
+            return {
+                "close_reason": "quantity_missing",
+                "reasons": ["quantity_missing"],
+                "current_executable_pnl": current_executable_pnl,
             }
+        entry_legs = (position.get("config") or {}).get("entry_legs") or []
+        long_entry_leg = leg_by_side(entry_legs, "long") or {}
+        short_entry_leg = leg_by_side(entry_legs, "short") or {}
+        legs = route.get("legs") if route else []
+        long_route_leg = leg_by_side(legs or [], "long") or {}
+        short_route_leg = leg_by_side(legs or [], "short") or {}
+        long_entry_price = float(
+            optional_float(long_entry_leg.get("entry_fill_price"))
+            or optional_float(long_entry_leg.get("vwap"))
+            or 0.0
         )
-        self.store.update_funding_capture_position_state(
-            position_id,
-            str(position.get("state") or "OPEN"),
-            now,
-            paper_net_pnl_estimated=pnl["paper_net_if_exit_now"],
+        short_entry_price = float(
+            optional_float(short_entry_leg.get("entry_fill_price"))
+            or optional_float(short_entry_leg.get("vwap"))
+            or 0.0
         )
-        return {"decision": "recorded", **pnl}
+        long_mark = optional_float(long_route_leg.get("mark_price"))
+        short_mark = optional_float(short_route_leg.get("mark_price"))
+        long_index = optional_float(long_route_leg.get("index_price"))
+        short_index = optional_float(short_route_leg.get("index_price"))
+        if (
+            long_entry_price <= 0
+            or short_entry_price <= 0
+            or long_mark is None
+            or short_mark is None
+            or long_mark <= 0
+            or short_mark <= 0
+        ):
+            return {
+                "close_reason": "risk_mark_or_entry_missing",
+                "reasons": ["risk_mark_or_entry_missing"],
+                "current_executable_pnl": current_executable_pnl,
+            }
+
+        reference_price = (float(long_mark) + float(short_mark)) / 2.0
+        entry_spread = short_entry_price - long_entry_price
+        current_exit_spread = float(current_executable_pnl["short_exit_price"]) - float(
+            current_executable_pnl["long_exit_price"]
+        )
+        edge_bps = optional_float(position.get("current_cycle_conservative_funding_edge_bps"))
+        if edge_bps is None and active_cycle is not None:
+            edge_bps = optional_float(active_cycle.get("conservative_funding_edge_bps"))
+        if edge_bps is None:
+            conservative_gross = optional_float(position.get("current_cycle_conservative_funding_gross"))
+            reference_notional_for_edge = min(quantity * float(long_mark), quantity * float(short_mark))
+            edge_bps = (
+                conservative_gross / reference_notional_for_edge * 10_000.0
+                if conservative_gross is not None and reference_notional_for_edge > 0
+                else 0.0
+            )
+        basis_decision = dynamic_basis_stop_decision(
+            entry_spread=entry_spread,
+            current_exit_spread=current_exit_spread,
+            reference_price=reference_price,
+            active_cycle_conservative_funding_edge_bps=max(0.0, float(edge_bps or 0.0)),
+        )
+        if basis_decision["immediate_hard_exit"]:
+            return {
+                "close_reason": "basis_deterioration",
+                "reasons": [
+                    f"deterioration_{basis_decision['basis_deterioration_bps']:.1f}bps>=budget_{basis_decision['active_risk_budget_bps']:.1f}bps"
+                ],
+                "dynamic_basis": basis_decision,
+                "current_executable_pnl": current_executable_pnl,
+            }
+
+        long_margin = self._leg_margin_snapshot(
+            position_id=position_id,
+            side="long",
+            venue=str(position.get("long_venue") or long_entry_leg.get("venue") or ""),
+            quantity=quantity,
+            entry_price=long_entry_price,
+            mark=float(long_mark),
+            fee_rate_source_leg=long_route_leg,
+        )
+        short_margin = self._leg_margin_snapshot(
+            position_id=position_id,
+            side="short",
+            venue=str(position.get("short_venue") or short_entry_leg.get("venue") or ""),
+            quantity=quantity,
+            entry_price=short_entry_price,
+            mark=float(short_mark),
+            fee_rate_source_leg=short_route_leg,
+        )
+        min_liquidation_distance = min(
+            float(long_margin["liquidation_distance_fraction"]),
+            float(short_margin["liquidation_distance_fraction"]),
+        )
+        min_margin_safety = min(
+            float(long_margin["margin_safety_ratio"]),
+            float(short_margin["margin_safety_ratio"]),
+        )
+        mark_index_bps = 0.0
+        for mark, index in ((long_mark, long_index), (short_mark, short_index)):
+            if mark is None or index is None or index <= 0:
+                return {
+                    "close_reason": "risk_mark_index_missing",
+                    "reasons": ["risk_mark_index_missing"],
+                    "current_executable_pnl": current_executable_pnl,
+                }
+            mark_index_bps = max(mark_index_bps, abs(float(mark) - float(index)) / float(index) * 10_000.0)
+
+        triggered, trigger_reason = hard_risk_triggered(
+            liquidation_distance_fraction=min_liquidation_distance,
+            margin_safety_ratio=min_margin_safety,
+            mark_index_divergence_bps=mark_index_bps,
+            snapshot_age_seconds=snapshot_age,
+        )
+        risk_gates = {
+            "liquidation_distance": min_liquidation_distance,
+            "margin_safety_ratio": min_margin_safety,
+            "mark_index_divergence_bps": mark_index_bps,
+            "long_margin": long_margin,
+            "short_margin": short_margin,
+        }
+        if triggered:
+            return {
+                "close_reason": f"risk_hard_exit:{trigger_reason}",
+                "reasons": [trigger_reason],
+                "risk_gates": risk_gates,
+                "current_executable_pnl": current_executable_pnl,
+            }
+
+        reference_notional = min(quantity * float(long_mark), quantity * float(short_mark))
+        active_budget_usd = reference_notional * float(basis_decision["active_risk_budget_bps"]) / 10_000.0
+        executable_breach = float(current_executable_pnl["paper_net_if_exit_now"]) <= -active_budget_usd
+        config = dict(position.get("config") or {})
+        risk_state = dict(config.get("risk_state") or {})
+        previous_breach = bool(risk_state.get("executable_pnl_breach"))
+        risk_state["executable_pnl_breach"] = executable_breach
+        risk_state["last_checked_at"] = now.astimezone(UTC).isoformat()
+        risk_state["last_paper_net_if_exit_now"] = current_executable_pnl["paper_net_if_exit_now"]
+        risk_state["active_risk_budget_usd"] = active_budget_usd
+        risk_state["last_margin_safety_ratio"] = min_margin_safety
+        risk_state["last_liquidation_distance_fraction"] = min_liquidation_distance
+        risk_state["last_mark_index_divergence_bps"] = mark_index_bps
+        config["risk_state"] = risk_state
+        self.store.update_funding_capture_position_config(position_id, config)
+        if executable_breach and previous_breach:
+            return {
+                "close_reason": "executable_pnl_breach",
+                "reasons": [
+                    f"paper_net_if_exit_now_{current_executable_pnl['paper_net_if_exit_now']:.2f}<=-budget_{active_budget_usd:.2f}"
+                ],
+                "risk_gates": risk_gates,
+                "dynamic_basis": basis_decision,
+                "current_executable_pnl": current_executable_pnl,
+            }
+
+        return None
 
     def consider_route(
         self,

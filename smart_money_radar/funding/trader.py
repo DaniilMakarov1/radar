@@ -1960,8 +1960,9 @@ class PaperBot:
                 current_short, liq_prices["short_liquidation_price"], "short"
             )
             min_liq_dist = min(long_liq_dist, short_liq_dist)
-            total_collateral = long_notional + short_notional
-            margin_safety = total_collateral / max(1.0, long_notional + short_notional) * 100.0
+            total_position_notional = max(1.0, long_notional + short_notional)
+            total_maintenance_margin = total_position_notional * 0.02
+            margin_safety = (long_notional + short_notional) / max(1e-12, total_maintenance_margin)
             mark_index_bps = 0.0
             if route:
                 for leg in route.get("legs") or []:
@@ -2532,8 +2533,13 @@ class PaperBot:
                     **position,
                     "paper_net_pnl_estimated": current_pnl.get("paper_net_if_exit_now"),
                 }
-            legacy_like = self._legacy_like_position_from_capture(position)
-            risk_exit = self._poll_position_risk(legacy_like, live_route, now)
+            risk_exit = self.synchronized_runtime.poll_synchronized_position_risk(
+                position,
+                live_route,
+                current_pnl,
+                None,
+                now,
+            )
             if risk_exit is not None:
                 self.store.update_funding_capture_position_state(
                     position_id,

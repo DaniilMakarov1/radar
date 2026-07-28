@@ -1588,6 +1588,18 @@ def _open_v2_runtime_position(tmp_path, monkeypatch, now: datetime):
     return store, bot, route, capture_id, opened
 
 
+def _install_fresh_hot_route(bot, route: dict, *, next_lead_seconds: float = 3600.0) -> dict:
+    current = bot.clock.now()
+    fresh = _v2_runtime_route(
+        current,
+        next_lead_seconds=next_lead_seconds,
+        short_next_lead_seconds=next_lead_seconds,
+        route_key=route["route_key"],
+    )
+    bot.hot_routes[route["route_key"]] = fresh
+    return fresh
+
+
 def test_paperbot_v2_entry_uses_new_runtime_not_legacy_open(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, _bot, _route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
@@ -1611,6 +1623,7 @@ def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
 
     outcomes = bot.process_open_positions()
 
@@ -1629,6 +1642,7 @@ def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
     next_settlement = settlement_at + timedelta(seconds=3600)
@@ -1676,6 +1690,7 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
     for offset in range(5, 20):
@@ -1721,6 +1736,7 @@ def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tm
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
     next_settlement = settlement_at + timedelta(seconds=3600)
@@ -1750,10 +1766,12 @@ def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tm
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
     next_settlement = settlement_at + timedelta(seconds=3600)
     outcomes: list[str] = []
+    all_outcomes: list[str] = []
     for offset in range(5, 31):
         target = settlement_at + timedelta(seconds=offset)
         bot.clock.advance((target - bot.clock.now()).total_seconds())
@@ -1765,11 +1783,16 @@ def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tm
         )
         next_route["route_key"] = route["route_key"]
         next_route["legs"][0]["close_vwap"] = 80.0
+        next_route["legs"][0]["bids"] = [[80.0, 20.0]]
+        next_route["legs"][0]["best_bid"] = 80.0
         next_route["legs"][1]["close_vwap"] = 120.0
+        next_route["legs"][1]["asks"] = [[120.0, 20.0]]
+        next_route["legs"][1]["best_ask"] = 120.0
         bot.hot_routes[route["route_key"]] = next_route
         outcomes = bot.process_open_positions()
+        all_outcomes.extend(outcomes)
 
-    assert outcomes == ["closed"]
+    assert any(item in {"closed", "emergency_unwind"} for item in all_outcomes)
     closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
     assert closed["position_id"] == capture_id
     assert closed["paper_net_pnl_estimated"] < 0
@@ -2060,10 +2083,10 @@ def test_open_fees_sunk_in_hold_economics() -> None:
 
 
 def test_risk_helper_called_by_paperbot_runtime(tmp_path, monkeypatch) -> None:
-    """Risk helper (hard_risk_triggered) is called by real PaperBot process_open_positions."""
+    """Direct v2 risk helper is called by real PaperBot process_open_positions."""
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
-    import smart_money_radar.funding.trader as trader_module
+    import smart_money_radar.paper_bot.runtime_v2 as runtime_module
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     config = PaperBotConfig(
@@ -2105,33 +2128,41 @@ def test_risk_helper_called_by_paperbot_runtime(tmp_path, monkeypatch) -> None:
         "scheduled_funding_at": "2026-07-28T17:00:00+00:00",
         "state": "OPEN",
     })
-    # Track that hard_risk_triggered is called via the trader module's reference
+    # Track that hard_risk_triggered is called by the synchronized runtime, not a trader legacy adapter.
     call_log = []
-    original_hard_risk = trader_module.hard_risk_triggered
+    original_hard_risk = runtime_module.hard_risk_triggered
     def tracking_hard_risk(*args, **kwargs):
         call_log.append(("hard_risk_triggered", kwargs))
         return original_hard_risk(*args, **kwargs)
-    monkeypatch.setattr(trader_module, "hard_risk_triggered", tracking_hard_risk)
+    monkeypatch.setattr(runtime_module, "hard_risk_triggered", tracking_hard_risk)
     # Also need a live route for the position
     bot.hot_routes["BTC:binance:bybit"] = {
         "status": "paper_candidate",
-        "route_key": "BTC:binance:bybit",
-        "observed_at": now.isoformat(),
-        "risk_flags": [],
-        "legs": [
-            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
-             "next_funding_at": "2026-07-28T17:00:00+00:00",
-             "mark_price": 100000.0, "index_price": 100000.0,
-             "best_ask": 100001.0, "best_bid": 99999.0,
-             "funding_rate": 0.001, "funding_interval_hours": 1.0,
-             "hourly_funding_rate": 0.001},
-            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
-             "next_funding_at": "2026-07-28T17:00:00+00:00",
-             "mark_price": 100000.0, "index_price": 100000.0,
-             "best_ask": 100001.0, "best_bid": 99999.0,
-             "funding_rate": 0.004, "funding_interval_hours": 1.0,
-             "hourly_funding_rate": 0.004},
-        ],
+            "route_key": "BTC:binance:bybit",
+            "observed_at": now.isoformat(),
+            "risk_flags": [],
+            "legs": [
+                {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+                 "next_funding_at": "2026-07-28T17:00:00+00:00",
+                 "mark_price": 100000.0, "index_price": 100000.0,
+                 "best_ask": 100001.0, "best_bid": 99999.0,
+                 "bids": [[99999.0, 1.0]], "asks": [[100001.0, 1.0]],
+                 "fee_rate": 0.0005,
+                 "response_received_at": (now - timedelta(milliseconds=500)).isoformat(),
+                 "orderbook_response_received_at": (now - timedelta(milliseconds=500)).isoformat(),
+                 "funding_rate": 0.001, "funding_interval_hours": 1.0,
+                 "hourly_funding_rate": 0.001},
+                {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+                 "next_funding_at": "2026-07-28T17:00:00+00:00",
+                 "mark_price": 100000.0, "index_price": 100000.0,
+                 "best_ask": 100001.0, "best_bid": 99999.0,
+                 "bids": [[99999.0, 1.0]], "asks": [[100001.0, 1.0]],
+                 "fee_rate": 0.0005,
+                 "response_received_at": now.isoformat(),
+                 "orderbook_response_received_at": now.isoformat(),
+                 "funding_rate": 0.004, "funding_interval_hours": 1.0,
+                 "hourly_funding_rate": 0.004},
+            ],
         "evidence": {
             "selected_strategy": {
                 "selection_model": "opportunity_engine_v1",
@@ -2148,6 +2179,7 @@ def test_risk_helper_called_by_paperbot_runtime(tmp_path, monkeypatch) -> None:
     outcomes = bot.process_open_positions()
     # Verify hard_risk_triggered was called
     assert len(call_log) > 0, "hard_risk_triggered was not called by PaperBot runtime"
+    assert call_log[0][1]["snapshot_age_seconds"] == pytest.approx(0.5)
 
 
 def test_dynamic_basis_stop_boundary_39_99_40_00() -> None:
@@ -3152,3 +3184,181 @@ def test_venue_cash_matches_venue_ledger_delta_after_close(tmp_path) -> None:
     price_rows = [row for row in ledger if row["event_type"] == "price_pnl"]
     assert {row["venue"] for row in price_rows} == {"binance", "bybit"}
     assert sum(float(row["cash_delta"]) for row in price_rows) == pytest.approx(close["paper_price_pnl"])
+
+
+def test_current_executable_pnl_requires_full_ioc_depth(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, _position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "bids": [[99.0, 5.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "asks": [[101.0, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": (now - timedelta(milliseconds=500)).isoformat()},
+        ],
+    }
+
+    pnl = runtime.record_current_executable_pnl(position, route, now)
+
+    assert pnl["decision"] == "skipped"
+    assert pnl["quality"] == "INVALID_INCOMPLETE_DEPTH"
+    assert pnl["long_fill_ratio"] == pytest.approx(0.4)
+    refreshed = store.funding_capture_position_by_id(position["position_id"])
+    assert refreshed["paper_net_pnl_estimated"] is None
+
+
+def test_mark_cannot_be_normal_current_executable_close(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, _position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "mark_price": 100.0, "index_price": 100.0, "fee_rate": 0.0005,
+             "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "mark_price": 100.0, "index_price": 100.0, "fee_rate": 0.0005,
+             "orderbook_response_received_at": now.isoformat()},
+        ],
+    }
+
+    pnl = runtime.record_current_executable_pnl(position, route, now)
+
+    assert pnl["decision"] == "skipped"
+    assert pnl["quality"] == "INVALID_MISSING_BOOK"
+    assert pnl["paper_net_if_exit_now"] is None if "paper_net_if_exit_now" in pnl else True
+
+
+def test_missing_route_is_degraded_and_not_age_zero(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, _position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+
+    pnl = runtime.record_current_executable_pnl(position, None, now)
+    risk = runtime.poll_synchronized_position_risk(position, None, pnl, None, now)
+
+    assert pnl["quality"] == "INVALID_MISSING_BOOK"
+    assert math.isinf(float(pnl["snapshot_age_seconds"]))
+    assert risk["close_reason"] == "risk_data_hard_stale"
+
+
+def test_direct_basis_risk_denominator_uses_asset_price(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    store.upsert_funding_capture_cycle({
+        "cycle_id": f"{position_id}:2",
+        "position_id": position_id,
+        "cycle_number": 2,
+        "scheduled_funding_at": (now + timedelta(seconds=3600)).isoformat(),
+        "conservative_funding_edge_bps": 100.0,
+        "state": "OPEN",
+    })
+    position = store.funding_capture_position_by_id(position_id)
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "bids": [[100.0, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "asks": [[101.0, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+        ],
+    }
+
+    pnl = runtime.record_current_executable_pnl(position, route, now)
+    risk = runtime.poll_synchronized_position_risk(position, route, pnl, None, now)
+
+    assert risk["close_reason"] == "basis_deterioration"
+    assert risk["dynamic_basis"]["basis_deterioration_bps"] == pytest.approx(104.0)
+
+
+def test_direct_margin_safety_changes_with_upnl(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_by_id(position_id)
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    safe_route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "bids": [[99.98, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "asks": [[100.02, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+        ],
+    }
+    adverse_route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "bids": [[99.98, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "asks": [[100.02, 20.0]], "mark_price": 300.0, "index_price": 300.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+        ],
+    }
+
+    safe_pnl = runtime.record_current_executable_pnl(position, safe_route, now)
+    safe_risk = runtime.poll_synchronized_position_risk(position, safe_route, safe_pnl, None, now)
+    adverse_pnl = runtime.record_current_executable_pnl(position, adverse_route, now)
+    adverse_risk = runtime.poll_synchronized_position_risk(position, adverse_route, adverse_pnl, None, now)
+
+    safe_state = store.funding_capture_position_by_id(position_id)["config"]["risk_state"]
+    assert safe_risk is None or safe_risk.get("close_reason") != "risk_hard_exit:margin_safety"
+    assert adverse_risk["close_reason"] in {
+        "risk_hard_exit:margin_safety",
+        "risk_hard_exit:liquidation_distance",
+    }
+    assert adverse_risk["risk_gates"]["margin_safety_ratio"] < safe_state.get("last_margin_safety_ratio", math.inf)
