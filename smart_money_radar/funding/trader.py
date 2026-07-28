@@ -113,6 +113,7 @@ from smart_money_radar.paper_bot.position import (
     spread_stop_loss_triggered,
     status_publishable_candidate,
 )
+from smart_money_radar.paper_bot.risk import common_price_move_telemetry
 from smart_money_radar.paper_bot.telegram import (
     armed_message,
     close_decision_details_message,
@@ -142,23 +143,40 @@ FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 class PaperBotConfig:
     profile_name: str = "default"
     strategy_set: tuple[str, ...] = (
-        "funding_only",
-        "combined",
+        "synchronized_funding_capture",
     )
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
-    entry_min_lead_seconds: int = 0
-    entry_max_lead_seconds: int = 15
-    arm_window_seconds: int = 900
-    final_recheck_freeze_seconds: int = 15
-    max_entry_snapshot_age_seconds: int = 30
-    settlement_grace_seconds: int = 90
+    leverage: float = 1.0
+    margin_mode: str = "isolated"
+    auto_add_margin: bool = False
+    max_open_positions_total: int = 1
+    max_open_positions_per_venue: int = 1
+    max_gross_exposure_usd: float = 1_000.0
+    entry_target_lead_seconds: float = 30.0
+    entry_min_lead_seconds: float = 25.0
+    entry_max_lead_seconds: float = 35.0
+    entry_fill_deadline_lead_seconds: float = 20.0
+    settlement_alignment_tolerance_seconds: float = 1.0
+    arm_window_seconds: int = 120
+    final_recheck_freeze_seconds: int = 0
+    max_entry_snapshot_age_seconds: float = 2.0
+    max_cross_venue_snapshot_skew_seconds: float = 1.0
+    settlement_grace_seconds: int = 30
     max_settlement_publication_lag_seconds: int = 300
-    collateral_reserve_fraction: float = 0.10
+    no_normal_exit_before_settlement_plus_seconds: int = 20
+    post_settlement_schedule_probe_seconds: int = 5
+    post_settlement_hold_decision_seconds: int = 30
+    hold_enabled: bool = True
+    max_settlements_per_position: int = 4
+    max_position_age_seconds: int = 14_700
+    min_next_settlement_wait_seconds: int = 300
+    max_next_settlement_wait_seconds: int = 14_400
+    collateral_reserve_fraction: float = 0.25
     min_live_net_profit: float = 0.0
     scan_interval_seconds: int = 300
-    monitor_interval_seconds: int = 120
-    hot_interval_seconds: int = 6
+    monitor_interval_seconds: float = 2.0
+    hot_interval_seconds: float = 1.0
     hot_route_recheck_workers: int = 6
     status_report_interval_seconds: int = 3_600
     status_report_max_routes: int = 5
@@ -170,7 +188,8 @@ class PaperBotConfig:
     venue_set: tuple[str, ...] | None = None
     spread_arb_enabled: bool = False
     basis_stop_loss_bps: float = 200.0
-    price_stop_loss_fraction: float = 0.10
+    common_price_move_alert_fraction: float = 0.05
+    common_price_move_critical_fraction: float = 0.10
     spread_monitoring_enabled: bool = True
 
     def validated(self) -> "PaperBotConfig":
@@ -184,13 +203,28 @@ class PaperBotConfig:
             strategy_set=tuple(strategies),
             venue_starting_balance=max(100.0, float(self.venue_starting_balance)),
             target_notional_per_leg=max(50.0, float(self.target_notional_per_leg)),
+            leverage=1.0,
+            margin_mode="isolated",
+            auto_add_margin=False,
+            max_open_positions_total=max(1, int(self.max_open_positions_total)),
+            max_open_positions_per_venue=max(1, int(self.max_open_positions_per_venue)),
+            max_gross_exposure_usd=max(0.0, float(self.max_gross_exposure_usd)),
+            entry_target_lead_seconds=max(1.0, float(self.entry_target_lead_seconds)),
             entry_min_lead_seconds=max(
-                0,
-                min(int(self.entry_min_lead_seconds), 300),
+                0.0,
+                min(float(self.entry_min_lead_seconds), 300.0),
             ),
             entry_max_lead_seconds=max(
-                1,
-                min(int(self.entry_max_lead_seconds), 900),
+                1.0,
+                min(float(self.entry_max_lead_seconds), 900.0),
+            ),
+            entry_fill_deadline_lead_seconds=max(
+                0.0,
+                min(float(self.entry_fill_deadline_lead_seconds), 300.0),
+            ),
+            settlement_alignment_tolerance_seconds=max(
+                0.0,
+                min(float(self.settlement_alignment_tolerance_seconds), 60.0),
             ),
             arm_window_seconds=max(
                 60,
@@ -201,16 +235,49 @@ class PaperBotConfig:
                 min(int(self.final_recheck_freeze_seconds), 60),
             ),
             max_entry_snapshot_age_seconds=max(
-                5,
-                min(int(self.max_entry_snapshot_age_seconds), 300),
+                0.1,
+                min(float(self.max_entry_snapshot_age_seconds), 300.0),
+            ),
+            max_cross_venue_snapshot_skew_seconds=max(
+                0.1,
+                min(float(self.max_cross_venue_snapshot_skew_seconds), 60.0),
             ),
             settlement_grace_seconds=max(
-                15,
+                0,
                 min(int(self.settlement_grace_seconds), 1_800),
             ),
             max_settlement_publication_lag_seconds=max(
                 60,
                 min(int(self.max_settlement_publication_lag_seconds), 7_200),
+            ),
+            no_normal_exit_before_settlement_plus_seconds=max(
+                0,
+                min(int(self.no_normal_exit_before_settlement_plus_seconds), 300),
+            ),
+            post_settlement_schedule_probe_seconds=max(
+                0,
+                min(int(self.post_settlement_schedule_probe_seconds), 300),
+            ),
+            post_settlement_hold_decision_seconds=max(
+                1,
+                min(int(self.post_settlement_hold_decision_seconds), 900),
+            ),
+            hold_enabled=bool(self.hold_enabled),
+            max_settlements_per_position=max(
+                1,
+                min(int(self.max_settlements_per_position), 24),
+            ),
+            max_position_age_seconds=max(
+                60,
+                min(int(self.max_position_age_seconds), 86_400),
+            ),
+            min_next_settlement_wait_seconds=max(
+                1,
+                min(int(self.min_next_settlement_wait_seconds), 86_400),
+            ),
+            max_next_settlement_wait_seconds=max(
+                1,
+                min(int(self.max_next_settlement_wait_seconds), 86_400),
             ),
             collateral_reserve_fraction=max(
                 0.0,
@@ -218,8 +285,8 @@ class PaperBotConfig:
             ),
             min_live_net_profit=max(0.0, float(self.min_live_net_profit)),
             scan_interval_seconds=max(10, int(self.scan_interval_seconds)),
-            monitor_interval_seconds=max(10, int(self.monitor_interval_seconds)),
-            hot_interval_seconds=max(5, int(self.hot_interval_seconds)),
+            monitor_interval_seconds=max(1.0, float(self.monitor_interval_seconds)),
+            hot_interval_seconds=max(1.0, float(self.hot_interval_seconds)),
             hot_route_recheck_workers=max(
                 1,
                 min(int(self.hot_route_recheck_workers), 16),
@@ -251,16 +318,20 @@ class PaperBotConfig:
             ),
             spread_arb_enabled=bool(self.spread_arb_enabled),
             basis_stop_loss_bps=max(0.0, float(self.basis_stop_loss_bps)),
-            price_stop_loss_fraction=max(
+            common_price_move_alert_fraction=max(
                 0.0,
-                float(self.price_stop_loss_fraction),
+                float(self.common_price_move_alert_fraction),
+            ),
+            common_price_move_critical_fraction=max(
+                0.0,
+                float(self.common_price_move_critical_fraction),
             ),
             spread_monitoring_enabled=bool(self.spread_monitoring_enabled),
         ).normalized_entry_leads()
 
     def normalized_entry_leads(self) -> "PaperBotConfig":
-        minimum = max(0, int(self.entry_min_lead_seconds))
-        maximum = max(minimum, int(self.entry_max_lead_seconds))
+        minimum = max(0.0, float(self.entry_min_lead_seconds))
+        maximum = max(minimum, float(self.entry_max_lead_seconds))
         minimum = min(minimum, maximum)
         return PaperBotConfig(
             **{
@@ -303,6 +374,7 @@ class PaperBot:
         self.last_status_report_monotonic = 0.0
         self.last_retention_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
+        self.price_move_alerted_positions: set[tuple[int, str]] = set()
         self.background_full_scan_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_future: Future[dict[str, Any]] | None = None
         self.background_full_scan_started_monotonic = 0.0
@@ -338,8 +410,8 @@ class PaperBot:
             raise KeyboardInterrupt
         self.request_stop(reason)
 
-    def sleep_interruptibly(self, seconds: int) -> None:
-        deadline = time.monotonic() + max(0, int(seconds))
+    def sleep_interruptibly(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(seconds))
         while not self.stop_requested:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1318,7 +1390,7 @@ class PaperBot:
                 )
         return books
 
-    def next_sleep_seconds(self, result: dict[str, Any]) -> int:
+    def next_sleep_seconds(self, result: dict[str, Any]) -> float:
         if result.get("background_full_scan_running"):
             return self.config.hot_interval_seconds
         if int(result.get("open_position_count") or 0) > 0:
@@ -1445,55 +1517,39 @@ class PaperBot:
                 else None
             )
             price_snap = compute_price_move_snapshot(position, live_route)
-            price_triggered, price_reason = price_stop_loss_triggered(
-                price_snap, self.config
+            price_telemetry = common_price_move_telemetry(
+                price_snap,
+                alert_fraction=self.config.common_price_move_alert_fraction,
+                critical_fraction=self.config.common_price_move_critical_fraction,
             )
-            if price_triggered:
-                close_payload = build_close_payload(
-                    position,
-                    settlement_rates_for_position(position, self.store),
-                    live_route,
-                    use_entry_estimate_for_missing=True,
-                    close_reason=f"price_stop_loss:{price_reason}",
-                    hold_decision={
-                        "hold": False,
-                        "close_reason": "price_stop_loss",
-                        "reasons": [price_reason],
-                        "price_move_snapshot": price_snap,
-                    },
-                )
-                notes = dict(close_payload.get("notes") or {})
-                notes["price_stop_loss_triggered"] = True
-                notes["price_move_snapshot"] = price_snap
-                notes["simultaneous_close"] = "both_legs_same_live_snapshot"
-                close_payload["notes"] = notes
-                close_payload["price_move_snapshot"] = price_snap
-                self.store.close_funding_paper_position(
-                    position_id, close_payload
-                )
-                self.record_event(
-                    "close",
-                    (
-                        f"PRICE STOP-LOSS {position.get('canonical_asset')} "
-                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
-                        f"Reason: {price_reason}\n"
-                        "Action: long and short closed together from the same live snapshot\n"
-                        f"Long move: {float(price_snap.get('long_move_fraction') or 0.0) * 100:.2f}%\n"
-                        f"Short move: {float(price_snap.get('short_move_fraction') or 0.0) * 100:.2f}%\n"
-                        f"Total PnL: ${float(close_payload.get('actual_total_pnl') or 0.0):.2f}"
-                    ),
-                    {
-                        "position": position_summary(position),
-                        "close": close_payload,
-                        "price_move_snapshot": price_snap,
-                    },
-                    funding_paper_position_id=position_id,
-                    route_key=position.get("route_key"),
-                    notify=True,
-                    severity="warning",
-                )
-                outcomes.append("closed")
-                continue
+            if price_telemetry["level"] in {"warning", "critical"}:
+                alert_key = (position_id, str(price_telemetry["level"]))
+                if alert_key not in self.price_move_alerted_positions:
+                    self.price_move_alerted_positions.add(alert_key)
+                    self.record_event(
+                        "price_move_alert",
+                        (
+                            f"COMMON PRICE MOVE {str(price_telemetry['level']).upper()} "
+                            f"{position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            "Action: no automatic close; fresh risk recalculation required.\n"
+                            f"Long move: {float(price_telemetry.get('long_move_fraction') or 0.0) * 100:.2f}%\n"
+                            f"Short move: {float(price_telemetry.get('short_move_fraction') or 0.0) * 100:.2f}%"
+                        ),
+                        {
+                            "position": position_summary(position),
+                            "price_move_snapshot": price_snap,
+                            "price_move_telemetry": price_telemetry,
+                        },
+                        funding_paper_position_id=position_id,
+                        route_key=position.get("route_key"),
+                        notify=True,
+                        severity=(
+                            "warning"
+                            if price_telemetry["level"] == "warning"
+                            else "error"
+                        ),
+                    )
             if self.config.spread_monitoring_enabled:
                 spread_snap = compute_spread_snapshot(position, live_route)
                 triggered, reason = spread_stop_loss_triggered(

@@ -1,23 +1,64 @@
 {
+  "$version": 4,
   "model": {
-    "name": "qwen3.7-plus"
+    "name": "qwen3.8-max-preview",
+    "maxWallTimeSeconds": 1200,
+    "maxToolCalls": 120,
+    "maxSubagentDepth": 1
   },
   "tools": {
-    "approvalMode": "yolo"
+    "approvalMode": "auto-edit"
   },
-  "hooks": {},
   "permissions": {
     "allow": [
-      "Read(*)",
-      "Glob(*)",
-      "Grep(*)",
-      "Edit(*)",
-      "MultiEdit(*)",
-      "Write(*)",
-      "write_file(*)",
-      "edit(*)",
-      "Bash(*)"
+      "Read(/**)",
+      "Edit(/smart_money_radar/**)",
+      "Edit(/tests/**)",
+      "Edit(/docs/**)",
+      "Edit(/scripts/**)",
+      "Edit(/config/**)",
+      "Edit(/.qwen/**)",
+      "Edit(/.codex/**)",
+      "Edit(/README.md)",
+      "Edit(/QWEN.md)",
+      "Edit(/AGENTS.md)",
+      "Edit(/.gitignore)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest *)",
+      "Bash(python3 -m compileall *)"
+    ],
+    "deny": [
+      "Read(/.env)",
+      "Read(/.env.*)",
+      "Read(/.git/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/**)",
+      "Edit(/.env)",
+      "Edit(/.env.*)",
+      "Edit(/.git/**)",
+      "Bash(git push *)",
+      "Bash(git commit *)",
+      "Bash(git reset *)",
+      "Bash(git checkout *)",
+      "Bash(git clean *)",
+      "Bash(git rebase *)",
+      "Bash(git merge *)",
+      "Bash(git stash *)",
+      "Bash(rm *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(pip install *)",
+      "Bash(npm install *)",
+      "Bash(npx *)",
+      "Bash(pbcopy *)",
+      "Bash(pbpaste *)",
+      "Bash(open *)",
+      "WebFetch"
     ]
   },
-  "$version": 4
+  "privacy": {
+    "usageStatisticsEnabled": false
+  }
 }

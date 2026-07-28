@@ -108,37 +108,45 @@ production gate. If a performance guard is necessary, it must be:
 - tested;
 - not able to silently hide otherwise positive routes.
 
-Candidate status is not "funding is positive" or "spread is positive" by itself.
-The core decision is total expected opportunity:
+Default candidate status is not "funding is positive" or "spread is positive"
+by itself. The active paper strategy is:
 
 ```text
-total expected net =
-  funding component
-  + executable spread/basis component
-  - fees
-  - slippage
-  - basis reserve
-  - operations buffer
+synchronized_funding_capture_v2
 ```
 
-Funding and spread can offset each other. A route may be funding-led with spread
-drag, spread-led with funding drag, or mixed. A route should be blocked only when
-the total opportunity fails the economic/operational gates, not because one
-component is individually negative.
+This is cross-venue delta-neutral funding capture:
 
-Current strategy labels are edge classifications, not separate independent bots.
-The live paperbot default is intentionally funding-led: `funding_only,combined`.
-`spread_only` remains available for research, but should not be enabled for the
-main funding paperbot unless the user explicitly asks for spread-led entries.
+- long perpetual on one venue;
+- short perpetual on another venue;
+- same canonical base quantity;
+- entry reason is the nearest synchronized funding settlement;
+- spread convergence is not expected profit;
+- executable spread, book walking, fees, basis deterioration, stale data,
+  liquidation/margin risk, and venue capability are costs/gates.
 
-- `funding_only`: funding-led route, spread may still affect PnL.
-- `spread_only`: spread-led route, funding may still affect PnL.
-- `combined`: both funding and spread are material positive edges.
-- `opportunistic_any`: fallback/umbrella label and should not be preferred over a
-  stricter eligible label.
+The initial economic model is:
 
-The strategy engine selects the eligible route with the highest expected net PnL,
-then uses strategy priority as a tie-breaker.
+```text
+initial_expected_net_pnl =
+  conservative_funding_gross
+  - baseline_round_trip_book_cost
+  - total_round_trip_fee_estimate
+  - entry_basis_reserve_usd
+  - entry_legging_reserve_usd
+```
+
+Entry requires:
+
+```text
+conservative_funding_gross >= max(2.50, reference_notional * 0.005)
+initial_expected_net_pnl >= max(1.00, reference_notional * 0.002)
+initial_cost_coverage_ratio >= 1.50
+```
+
+Legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any`
+remain available for experimental/research profiles, but they are not the
+default paper strategy and must not be shown as production-ready by default.
 
 ## 6. Paper Bot Runtime Modes
 
@@ -147,17 +155,17 @@ The Paper Bot loop lives mostly in `smart_money_radar/funding/trader.py` and
 
 Risk exits:
 
-- `price_stop_loss_fraction` is an absolute price-move guard from entry VWAP.
-  Default: 10%.
-- When it triggers, the paperbot must close both long and short legs as one
-  logical close event using the same fresh route snapshot. Never leave one leg
-  open after a price stop-loss.
-- Basis/spread stop-loss is secondary and protects against adverse hedge
-  divergence; it does not replace the hard price-move guard.
+- A common 10% move in both legs is telemetry, not an automatic close. It should
+  create a warning/critical event and force fresh risk recalculation.
+- Basis/spread deterioration, stale data, quantity mismatch, margin/liquidation
+  risk, mark/index divergence, venue failure, and schedule mismatch can close or
+  emergency-unwind the position.
+- Basis/spread stop-loss protects against adverse hedge divergence.
 
 The intended runtime cadence is:
 
-- no hot routes: full market scan every `scan_interval_seconds`;
+- no hot routes: full market scan every `scan_interval_seconds` after the
+  previous scan completes;
 - hot/watch route exists: focused recheck every `monitor_interval_seconds`;
 - urgent route, pending settlement, or open position: focused recheck every
   `hot_interval_seconds`;
@@ -171,9 +179,8 @@ When auditing live behavior, check the active command or launchd script, not onl
 The current launch defaults are approximately:
 
 - full scan: 300 seconds;
-- watch recheck: 120 seconds;
-- urgent/open recheck: 10 seconds from launch scripts, while direct
-  `PaperBotConfig()` defaults to 6 seconds;
+- watch/open normal recheck: 2 seconds;
+- urgent/open recheck: 1 second;
 - status report: 900 seconds from `.env.example`/launch scripts, while direct
   `PaperBotConfig()` defaults to 3600 seconds;
 - target notional: $500 per leg;
@@ -195,22 +202,23 @@ A route can enter only if all conditions are true:
    `config.strategy_set`.
 3. Both long and short legs exist.
 4. Both legs have parseable `next_funding_at`.
-5. Both legs are inside the final entry window:
+5. The two `next_funding_at` timestamps are synchronized:
+   `abs(long_next_funding_at - short_next_funding_at) <= 1.0 second`.
+6. Both legs are inside the entry window:
    `entry_min_lead_seconds <= lead <= entry_max_lead_seconds`.
-   With the current launch defaults this means 0-15 seconds before each leg's
-   next settlement.
-6. Neither settlement has already passed.
-7. If both legs are in the entry window, the route snapshot must be fresh:
-   `route_data_age_seconds <= max_entry_snapshot_age_seconds`; current launch
-   default is 30 seconds.
-8. Each venue has enough paper balance for that leg:
+   With the current defaults this means T-35 to T-25 seconds, target T-30.
+7. Both legs must be simulated-filled no later than T-20.
+8. Neither settlement has already passed.
+9. If both legs are in the entry window, the route snapshot must be fresh:
+   `route_data_age_seconds <= max_entry_snapshot_age_seconds`; current default
+   is 2 seconds.
+10. Each venue has enough paper balance for that leg:
    `notional * (1 + collateral_reserve_fraction)`.
-9. Selected strategy expected net PnL is positive and at least
+11. Selected strategy expected net PnL is positive and at least
    `required_live_net_profit`.
-10. There is no already-open position for the same `route_key`.
-11. There is no existing position with the same `entry_key`.
-12. If focused recheck is enabled, the route is rechecked before opening unless
-    the final freeze-window fallback is valid.
+12. There is no already-open position for the same `route_key`.
+13. There is no existing position with the same `entry_key`.
+14. If focused recheck is enabled, the route is rechecked before opening.
 
 `required_live_net_profit` is:
 
@@ -224,12 +232,9 @@ size.
 
 Important final-window behavior:
 
-- `final_recheck_freeze_seconds` currently defaults to 15 seconds.
-- Inside that final freeze window, the bot should not start a new slow API
-  request.
-- It may use the last successful focused snapshot only if it is not older than
-  `max_entry_snapshot_age_seconds`, currently 30 seconds.
-- If no fresh snapshot exists, it must skip entry.
+- `final_recheck_freeze_seconds` defaults to 0 in the v2 launch path.
+- Do not use the old 30-second fallback snapshot for entry.
+- If no fresh snapshot exists, skip entry.
 
 Telegram `ARMED` means the route is within the wider arm window and still
 economically valid. It is not the same as `OPEN`. `OPEN` happens only after the
@@ -238,11 +243,10 @@ final entry checks above.
 Objective assessment:
 
 - This matches Daniil's requested paper-test idea: do not enter three minutes
-  early; track candidates in advance, then enter near settlement with a fresh or
-  recently frozen snapshot.
-- The current `entry_min_lead_seconds=0` is acceptable for paper simulation, but
-  too optimistic for future real execution. For live trading, use a non-zero
-  minimum such as 3-5 seconds and model order submission latency.
+  early; track candidates in advance, then enter around T-30 with a fresh
+  snapshot.
+- The current entry window is intentionally non-zero because future real
+  execution needs submission/fill time.
 - Requiring both legs to be inside the same final window is conservative. It
   avoids many one-sided funding captures. That matches the safer logic discussed,
   but it also means the bot may miss opportunities where one leg settles now and
@@ -267,16 +271,19 @@ hold:
    remains missing after `max_settlement_publication_lag_seconds`, close with
    `settlement_publication_timeout`.
 2. If current time is before
-   `max_settlement_at + settlement_grace_seconds`, wait.
-3. After grace time, pull realized funding rates from local funding history near
+   `max_settlement_at + no_normal_exit_before_settlement_plus_seconds`, normal
+   close is disallowed unless there is a hard-risk event.
+3. Around T+5, probe the next funding schedule for both venues.
+4. Around T+30, run hold underwriting for the next synchronized cycle.
+5. Pull realized funding rates from local funding history near
    the settlement time.
-4. If history is missing, use entry estimate fallback for paper accounting and
+6. If history is missing, use entry estimate fallback for paper accounting and
    mark the settlement as preliminary.
-5. Fetch the latest route by `route_key`.
-6. Run `position_hold_decision`.
-7. If hold is true, accrue the funding settlement, update the position to the
+7. Fetch the latest route by `route_key`.
+8. Run `position_hold_decision`.
+9. If hold is true, accrue the funding settlement, update the position to the
    next route's future settlement times, and keep the position open.
-8. If hold is false, close and record funding PnL, basis PnL, execution cost, and
+10. If hold is false, close and record funding PnL, basis PnL, execution cost, and
    reason.
 
 The position continues holding only if all conditions are true:
@@ -287,6 +294,11 @@ The position continues holding only if all conditions are true:
 - route does not contain hard data-quality flags such as `unit_identity_mismatch`
   or `basis_divergence`;
 - both next settlements are parseable and future;
+- next settlements are synchronized within 1 second;
+- next synchronized settlement is at least 300 seconds and at most 14,400 seconds
+  away;
+- the position has captured fewer than 4 settlements;
+- projected position age stays within 14,700 seconds;
 - selected strategy is still allowed and eligible;
 - selected strategy expected net PnL is still positive;
 - for funding-sensitive strategies, funding direction has not inverted
@@ -297,12 +309,9 @@ Objective assessment:
 - This matches the agreed correction that the bot should not close merely because
   one funding settlement happened. It accrues funding and keeps the position open
   while the arbitrage window remains valid.
-- The hold gate is intentionally softer than the entry gate: it currently
-  requires positive live net, not necessarily the full $1 actionable threshold.
-  That matches "keep while the window is still positive", but it may keep tiny
-  near-zero paper positions longer than desired. For real trading, consider
-  closing when live net falls below a configurable hold threshold after exit
-  costs and latency.
+- The hold gate is incremental: opening fees are sunk costs and must not be
+  subtracted again. It compares closing now against waiting for the next
+  synchronized settlement.
 - The hold decision uses the latest route snapshot. If focused recheck fails and
   no fresh route is available, the bot should close or skip holding rather than
   assume the old opportunity survived.
@@ -321,20 +330,36 @@ Therefore:
 - positive funding: longs pay, shorts receive;
 - negative funding: longs receive, shorts pay.
 
-Closed trade PnL:
+Current executable PnL for an open position must exclude pending future funding:
 
 ```text
-actual_net_pnl =
-  accrued funding PnL
-  + current settlement funding PnL
-  + basis/spread PnL
-  - expected execution cost
+paper_net_if_exit_now =
+  current_long_price_pnl
+  + current_short_price_pnl
+  + confirmed_funding_pnl
+  - paper_open_fees
+  - current_close_fees
+  - emergency_unwind_costs_already_incurred
 ```
 
-The current paper model uses expected execution cost from the entry route.
-Because it is still paper-only, it does not prove real fill, queue position,
-partial execution, borrow constraints, transfer latency, liquidation risk, or
-account-specific fee tier.
+Do not include expected future funding, provisional settlement estimates, or
+spread convergence in `paper_net_if_exit_now`.
+
+Closed/reconciled result:
+
+```text
+paper_net_pnl_reconciled =
+  paper_long_price_pnl
+  + paper_short_price_pnl
+  + sum(reconciled_cycle_funding_pnl)
+  - paper_open_fees
+  - paper_close_fees
+  - paper_emergency_unwind_cost
+```
+
+The older dashboard/storage layer still contains compatibility fields such as
+`actual_net_pnl`. New accounting code should prefer the `paper_*` names and
+should not treat pending funding as confirmed PnL.
 
 ## 10. Venue Rules
 
@@ -348,6 +373,16 @@ resurrect a disabled venue by only changing the UI. A venue is active only when:
 - depth units are tested;
 - failure mode is fail-closed;
 - it has regression tests.
+
+Default profile uses `venue_set=None`, meaning all active registered adapters are
+scanned automatically. Do not replace this with a hardcoded production list.
+
+For `synchronized_funding_capture_v2`, active is still not enough. A venue is
+paper-eligible only if it supports perpetuals, linear contracts, USDT/USDC/USD
+collateral, discrete next-settlement funding, next funding timestamp, mark/index
+prices, executable orderbook depth, 24h quote volume, open interest, taker fee,
+quantity step, and min notional. Otherwise it remains diagnostics/research-only
+with an explicit reason.
 
 For CLOB venues, depth must be modeled by walking all returned levels needed for
 the target base quantity. Do not use only top-of-book size. Do not use a fixed
@@ -409,7 +444,7 @@ Run focused tests for the area changed. For funding arithmetic, adapter units,
 entry/hold/close behavior, or route filtering, run at least:
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_funding_radar.py tests/test_funding_paper_trader.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_funding_radar.py tests/test_funding_paper_trader.py tests/test_synchronized_funding_v2.py -q
 ```
 
 For retention or storage changes, also run:
@@ -438,7 +473,8 @@ Be especially suspicious of:
 - old history acting as a hard veto for a strong next-settlement live
   opportunity;
 - full market scans blocking urgent focused checks;
-- stale snapshots being used outside the final freeze-window rule;
+- stale snapshots being used as fresh entry data;
+- common 10% price moves being treated as automatic close instead of telemetry;
 - spread-only routes ignoring funding drag;
 - funding-only routes ignoring spread/basis drag;
 - disabled venues appearing in candidates, paper accounts, or Telegram;

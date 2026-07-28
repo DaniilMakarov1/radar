@@ -693,20 +693,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=1_000.0,
     )
     funding_paper_trader.add_argument("--target-notional", type=float, default=500.0)
-    funding_paper_trader.add_argument("--entry-min-lead-seconds", type=int, default=0)
-    funding_paper_trader.add_argument("--entry-max-lead-seconds", type=int, default=15)
-    funding_paper_trader.add_argument("--arm-window-seconds", type=int, default=900)
+    funding_paper_trader.add_argument("--entry-min-lead-seconds", type=float, default=25.0)
+    funding_paper_trader.add_argument("--entry-max-lead-seconds", type=float, default=35.0)
+    funding_paper_trader.add_argument("--arm-window-seconds", type=int, default=120)
     funding_paper_trader.add_argument(
         "--final-recheck-freeze-seconds",
         type=int,
-        default=15,
-        help="Skip fresh API rechecks inside this final pre-settlement window.",
+        default=0,
+        help="Legacy freeze window. Default v2 behavior requires fresh entry snapshots.",
     )
     funding_paper_trader.add_argument(
         "--max-entry-snapshot-age-seconds",
-        type=int,
-        default=30,
-        help="Maximum age of the last successful focused snapshot usable for paper entry.",
+        type=float,
+        default=2.0,
+        help="Maximum fresh route snapshot age usable for paper entry.",
+    )
+    funding_paper_trader.add_argument(
+        "--settlement-alignment-tolerance-seconds",
+        type=float,
+        default=1.0,
+        help="Maximum allowed skew between the two next funding settlement timestamps.",
     )
     funding_paper_trader.add_argument(
         "--settlement-grace-seconds",
@@ -726,10 +732,10 @@ def build_parser() -> argparse.ArgumentParser:
     funding_paper_trader.add_argument("--scan-interval-seconds", type=int, default=300)
     funding_paper_trader.add_argument(
         "--monitor-interval-seconds",
-        type=int,
-        default=120,
+        type=float,
+        default=2.0,
     )
-    funding_paper_trader.add_argument("--hot-interval-seconds", type=int, default=10)
+    funding_paper_trader.add_argument("--hot-interval-seconds", type=float, default=1.0)
     funding_paper_trader.add_argument(
         "--hot-route-recheck-workers",
         type=int,
@@ -769,8 +775,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Comma-separated strategy list: "
-            "funding_only,combined by default. "
-            "Research-only strategy names spread_only/opportunistic_any are accepted."
+            "synchronized_funding_capture by default. "
+            "Legacy spread/funding strategy names are research-only."
         ),
     )
     funding_paper_trader.add_argument(
@@ -780,13 +786,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Close position when unrealized basis loss exceeds this many bps.",
     )
     funding_paper_trader.add_argument(
-        "--price-stop-loss-pct",
+        "--common-price-move-alert-pct",
+        type=float,
+        default=5.0,
+        help="Warn when both legs share at least this common absolute price move.",
+    )
+    funding_paper_trader.add_argument(
+        "--common-price-move-critical-pct",
         type=float,
         default=10.0,
-        help=(
-            "Close both legs when either leg price moves this many percent from entry; "
-            "use 0 to disable."
-        ),
+        help="Critical telemetry threshold for common price move; not an automatic close.",
     )
     funding_paper_trader.add_argument("--no-spread-monitoring", action="store_true")
 
@@ -987,6 +996,9 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         target_notional_per_leg=args.target_notional,
         entry_min_lead_seconds=args.entry_min_lead_seconds,
         entry_max_lead_seconds=args.entry_max_lead_seconds,
+        settlement_alignment_tolerance_seconds=(
+            args.settlement_alignment_tolerance_seconds
+        ),
         arm_window_seconds=args.arm_window_seconds,
         final_recheck_freeze_seconds=args.final_recheck_freeze_seconds,
         max_entry_snapshot_age_seconds=args.max_entry_snapshot_age_seconds,
@@ -1008,8 +1020,11 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         venue_set=venue_set,
         spread_arb_enabled=getattr(args, "spread_arb", False),
         basis_stop_loss_bps=getattr(args, "basis_stop_loss_bps", 200.0),
-        price_stop_loss_fraction=(
-            float(getattr(args, "price_stop_loss_pct", 10.0) or 0.0) / 100.0
+        common_price_move_alert_fraction=(
+            float(getattr(args, "common_price_move_alert_pct", 5.0) or 0.0) / 100.0
+        ),
+        common_price_move_critical_fraction=(
+            float(getattr(args, "common_price_move_critical_pct", 10.0) or 0.0) / 100.0
         ),
         spread_monitoring_enabled=not getattr(args, "no_spread_monitoring", False),
     ).validated()

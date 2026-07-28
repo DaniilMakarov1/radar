@@ -11,8 +11,7 @@ class FundingBotProfile:
     venue_set: tuple[str, ...] | None = None
     required_venues: tuple[str, ...] = ()
     strategy_set: tuple[str, ...] = (
-        "funding_only",
-        "combined",
+        "synchronized_funding_capture",
     )
     metadata: dict[str, Any] | None = None
 
@@ -24,7 +23,7 @@ BUILTIN_FUNDING_BOT_PROFILES: dict[str, FundingBotProfile] = {
     ),
     "core_cex": FundingBotProfile(
         name="core_cex",
-        description="Major CEX-only research profile for cleaner venue risk.",
+        description="Major CEX-only synchronized funding profile for cleaner venue risk.",
         venue_set=(
             "binance",
             "bybit",
@@ -40,15 +39,28 @@ BUILTIN_FUNDING_BOT_PROFILES: dict[str, FundingBotProfile] = {
     "risex_points": FundingBotProfile(
         name="risex_points",
         description=(
-            "Points-farming profile shell. It keeps the shared funding/spread "
+            "Points-farming profile shell. It keeps the shared funding "
             "logic while whitelisting RiseX plus core hedging venues."
         ),
         venue_set=("risex", "binance", "bybit", "okx"),
         strategy_set=(
-            "funding_only",
-            "combined",
+            "synchronized_funding_capture",
         ),
         metadata={"purpose": "risex_points_farming_research"},
+    ),
+    "experimental_spread": FundingBotProfile(
+        name="experimental_spread",
+        description=(
+            "Research-only legacy spread/funding opportunity profile. Not the "
+            "default production paper strategy."
+        ),
+        strategy_set=(
+            "funding_only",
+            "spread_only",
+            "combined",
+            "opportunistic_any",
+        ),
+        metadata={"mode": "experimental_research_only"},
     ),
 }
 

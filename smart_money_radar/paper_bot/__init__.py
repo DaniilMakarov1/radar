@@ -48,7 +48,6 @@ from smart_money_radar.paper_bot.position import (  # noqa: F401
     settlement_rate_or_entry,
     settlement_rates_for_position,
     settlement_payload,
-    price_stop_loss_triggered,
     spread_stop_loss_triggered,
 )
 from smart_money_radar.paper_bot.telegram import (  # noqa: F401

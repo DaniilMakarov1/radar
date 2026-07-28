@@ -21,6 +21,8 @@ warehouse/*.sqlite-*
 warehouse/*.db
 warehouse/*.db-*
 logs/
+.agent_runs/
+.agent_tasks/runtime/
 
 # Generated artifacts
 exports/

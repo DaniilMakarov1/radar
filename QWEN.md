@@ -2,7 +2,7 @@
 
 ## Role
 
-Codex is the orchestrator, architect, and final reviewer for this repository. Qwen/QN is the full-access implementation worker: Codex decides what should be changed, Qwen/QN can edit code and run commands directly, then Codex reviews the result before anything is accepted.
+Codex is the orchestrator, architect, and final reviewer for this repository. Qwen/QN is the scoped write-capable implementation worker: Codex decides what should be changed, Qwen/QN can edit code and run commands inside the assigned task, then Codex reviews the result before anything is accepted.
 
 When Qwen is used from Codex, follow the task exactly and avoid broad redesign unless the prompt explicitly asks for it. Qwen should not change product direction, risk gates, venue eligibility, trading assumptions, or architecture boundaries on its own.
 
@@ -33,7 +33,7 @@ Before changing repository logic, read:
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q
 
 # Focused funding tests
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_funding_radar.py tests/test_funding_paper_trader.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_funding_radar.py tests/test_funding_paper_trader.py tests/test_synchronized_funding_v2.py -q
 
 # Dashboard
 python3 -m smart_money_radar.cli dashboard
@@ -71,14 +71,30 @@ Every market row must obey this contract:
 
 If a venue only publishes an hourly equivalent, set `funding_interval_hours` to the actual cashflow interval if known and keep both published fields for audit. If the source units are uncertain or implausible, fail closed with a risk flag rather than creating a candidate.
 
+## Default Strategy
+
+The production paper strategy is `synchronized_funding_capture_v2`:
+
+- long one perpetual venue and short another with the same canonical base quantity;
+- enter for the nearest synchronized funding settlement;
+- both next settlements must align within 1 second;
+- spread convergence is never expected profit in the default strategy;
+- executable spread, basis deterioration, liquidity, fees, stale data, and margin risk are costs/gates;
+- legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any` are research/experimental labels only unless Codex explicitly enables an experimental profile.
+
 ## Paper Bot Timing
 
 - No routes: full scan after the previous scan completes, normally every 5 minutes.
-- Watch route exists: focused recheck every 120 seconds.
-- <= 3 minutes to settlement: focused recheck every 10 seconds.
-- Pending/open position: focused recheck every 10 seconds.
-- Final fresh API request should be sent no later than 15 seconds before settlement.
-- If the final request fails, entry may use the latest successful focused snapshot only if it is <= 30 seconds old.
+- Watch route exists: focused recheck every 2 seconds by default.
+- Urgent route or open/pending position: focused recheck every 1 second by default.
+- Initial entry target: T-30 seconds.
+- Entry is allowed only in the T-35 to T-25 second window.
+- Both legs must be simulated-filled no later than T-20.
+- Entry snapshot age must be <= 2 seconds.
+- Cross-venue snapshot skew should be <= 1 second when adapter timestamps are available.
+- The old 15-second freeze-window fallback is disabled by default.
+- After settlement, probe next schedules around T+5 and decide hold/close around T+30.
+- Normal close before T+20 is disallowed except for hard-risk events.
 
 ## Project Layout
 
@@ -90,6 +106,7 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 - Storage: `smart_money_radar/storage.py`
 - Runtime scripts: `scripts/`
 - Tests: `tests/test_funding_radar.py`, `tests/test_funding_paper_trader.py`, `tests/test_funding_retention.py`
+  and `tests/test_synchronized_funding_v2.py`
 
 ## Current Venue Notes
 
@@ -108,7 +125,7 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 
 ## Coordination With Codex
 
-Qwen/QN has full local write/edit/bash access for implementation tasks. When acting as Codex's worker, it may edit files, create tests, run formatters, run the app, and inspect local data without separate approval. Return concise summaries with file paths, risks, and tests. Codex owns final architecture, risk acceptance, and commit boundaries.
+Qwen/QN has local write/edit/bash access for scoped implementation tasks. When acting as Codex's worker, it may edit files, create tests, run formatters, run the app, and inspect local data within the task boundaries. Return concise summaries with file paths, risks, and tests. Codex owns final architecture, risk acceptance, and commit boundaries.
 
 Default workflow until Daniil says otherwise:
 

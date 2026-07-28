@@ -1411,6 +1411,160 @@ CREATE TABLE IF NOT EXISTS funding_paper_equity_snapshots (
 CREATE INDEX IF NOT EXISTS idx_funding_paper_equity_snapshots_time
     ON funding_paper_equity_snapshots (observed_at DESC);
 
+CREATE TABLE IF NOT EXISTS funding_capture_positions (
+    position_id TEXT PRIMARY KEY,
+    funding_paper_position_id INTEGER,
+    strategy_name TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    canonical_asset TEXT NOT NULL,
+    long_venue TEXT NOT NULL,
+    long_symbol TEXT NOT NULL,
+    short_venue TEXT NOT NULL,
+    short_symbol TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    target_notional REAL NOT NULL,
+    state TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    closed_at TEXT,
+    settlements_captured_count INTEGER NOT NULL DEFAULT 0,
+    max_settlements INTEGER NOT NULL DEFAULT 4,
+    original_entry_spread REAL,
+    paper_open_fees REAL NOT NULL DEFAULT 0,
+    paper_close_fees REAL NOT NULL DEFAULT 0,
+    paper_emergency_unwind_cost REAL NOT NULL DEFAULT 0,
+    paper_net_pnl_estimated REAL,
+    paper_net_pnl_reconciled REAL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    config_hash TEXT,
+    code_commit TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (funding_paper_position_id)
+        REFERENCES funding_paper_positions(funding_paper_position_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_capture_positions_state
+    ON funding_capture_positions (state, opened_at DESC);
+
+CREATE TABLE IF NOT EXISTS funding_capture_cycles (
+    cycle_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    cycle_number INTEGER NOT NULL,
+    scheduled_funding_at TEXT NOT NULL,
+    long_next_funding_rate_at_decision REAL,
+    short_next_funding_rate_at_decision REAL,
+    conservative_funding_gross REAL,
+    conservative_funding_edge_bps REAL,
+    hold_basis_reserve_bps REAL,
+    hold_legging_reserve_bps REAL,
+    hold_time_reserve_bps REAL,
+    hold_liquidity_reserve_bps REAL,
+    incremental_hold_cost REAL,
+    incremental_hold_net_pnl REAL,
+    hold_cost_coverage_ratio REAL,
+    paper_net_if_exit_at_decision REAL,
+    decision TEXT,
+    decision_reason TEXT,
+    state TEXT NOT NULL,
+    settlement_crossed_at TEXT,
+    reconciliation_status TEXT NOT NULL DEFAULT 'PENDING',
+    reconciled_funding_pnl REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (position_id) REFERENCES funding_capture_positions(position_id),
+    UNIQUE (position_id, cycle_number),
+    UNIQUE (position_id, scheduled_funding_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_capture_cycles_position
+    ON funding_capture_cycles (position_id, cycle_number);
+
+CREATE TABLE IF NOT EXISTS funding_capture_observations (
+    observation_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    cycle_id TEXT,
+    phase TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    long_response_received_at TEXT,
+    short_response_received_at TEXT,
+    cross_venue_skew_ms REAL,
+    long_mark REAL,
+    short_mark REAL,
+    long_index REAL,
+    short_index REAL,
+    long_next_funding_at TEXT,
+    short_next_funding_at TEXT,
+    long_next_funding_rate REAL,
+    short_next_funding_rate REAL,
+    gross_funding_pnl REAL,
+    long_open_vwap REAL,
+    short_open_vwap REAL,
+    long_close_vwap REAL,
+    short_close_vwap REAL,
+    current_exit_spread REAL,
+    total_basis_deterioration_bps REAL,
+    cycle_basis_deterioration_bps REAL,
+    paper_net_if_exit_now REAL,
+    snapshot_valid INTEGER NOT NULL DEFAULT 0,
+    invalid_reason TEXT,
+    FOREIGN KEY (position_id) REFERENCES funding_capture_positions(position_id),
+    FOREIGN KEY (cycle_id) REFERENCES funding_capture_cycles(cycle_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_capture_observations_time
+    ON funding_capture_observations (position_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS funding_paper_orders (
+    paper_order_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    cycle_id TEXT,
+    leg_side TEXT NOT NULL,
+    order_intent TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    decision_at TEXT NOT NULL,
+    submitted_at TEXT,
+    acknowledged_at TEXT,
+    filled_at TEXT,
+    filled_quantity REAL NOT NULL DEFAULT 0,
+    average_fill_price REAL,
+    fee REAL NOT NULL DEFAULT 0,
+    state TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (position_id) REFERENCES funding_capture_positions(position_id),
+    FOREIGN KEY (cycle_id) REFERENCES funding_capture_cycles(cycle_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_paper_orders_position
+    ON funding_paper_orders (position_id, created_at);
+
+CREATE TABLE IF NOT EXISTS funding_settlement_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    cycle_id TEXT,
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    scheduled_funding_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confirmed_funding_rate REAL,
+    settlement_mark_price REAL,
+    funding_pnl REAL,
+    rate_status TEXT,
+    mark_status TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (position_id) REFERENCES funding_capture_positions(position_id),
+    FOREIGN KEY (cycle_id) REFERENCES funding_capture_cycles(cycle_id),
+    UNIQUE (position_id, venue, scheduled_funding_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_settlement_reconciliations_position
+    ON funding_settlement_reconciliations (position_id, scheduled_funding_at);
+
 CREATE TABLE IF NOT EXISTS signal_shadow_marks (
     signal_shadow_mark_id INTEGER PRIMARY KEY AUTOINCREMENT,
     signal_id INTEGER NOT NULL,

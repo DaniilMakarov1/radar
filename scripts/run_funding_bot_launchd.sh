@@ -32,19 +32,20 @@ cd "$ROOT_DIR"
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting funding paper trader"
 exec "$PYTHON_BIN" -u -m smart_money_radar.cli funding-paper-trader \
   --target-notional "${FUNDING_PAPER_TARGET_NOTIONAL:-500}" \
-  --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-0}" \
-  --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-15}" \
-  --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-900}" \
-  --final-recheck-freeze-seconds "${FUNDING_PAPER_FINAL_RECHECK_FREEZE_SECONDS:-15}" \
-  --max-entry-snapshot-age-seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-30}" \
+  --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-25}" \
+  --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-35}" \
+  --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-120}" \
+  --final-recheck-freeze-seconds "${FUNDING_PAPER_FINAL_RECHECK_FREEZE_SECONDS:-0}" \
+  --max-entry-snapshot-age-seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-2}" \
   --max-settlement-publication-lag-seconds "${FUNDING_PAPER_MAX_SETTLEMENT_PUBLICATION_LAG_SECONDS:-300}" \
   --min-live-net-profit "${FUNDING_PAPER_MIN_LIVE_NET_PROFIT:-0}" \
   --scan-interval-seconds "${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-300}" \
-  --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-120}" \
-  --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-10}" \
+  --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-2}" \
+  --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-1}" \
   --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
   --status-report-interval-seconds "${FUNDING_PAPER_STATUS_REPORT_INTERVAL_SECONDS:-900}" \
   --status-report-max-routes "${FUNDING_PAPER_STATUS_REPORT_MAX_ROUTES:-5}" \
-  --strategy-set "${FUNDING_PAPER_STRATEGY_SET:-funding_only,combined}" \
-  --price-stop-loss-pct "${FUNDING_PAPER_PRICE_STOP_LOSS_PCT:-10}" \
+  --strategy-set "${FUNDING_PAPER_STRATEGY_SET:-synchronized_funding_capture}" \
+  --common-price-move-alert-pct "${FUNDING_PAPER_COMMON_PRICE_MOVE_ALERT_PCT:-5}" \
+  --common-price-move-critical-pct "${FUNDING_PAPER_COMMON_PRICE_MOVE_CRITICAL_PCT:-10}" \
   "${funding_telegram_arg[@]}"

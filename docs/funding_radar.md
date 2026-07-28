@@ -389,17 +389,18 @@ cannot silently overwrite the active size or horizon.
 
 The paper trader uses three polling speeds. `--scan-interval-seconds` is the base
 full-market scan interval used when no actionable route is being monitored. It is
-300 seconds in the local screen runner. `--monitor-interval-seconds` is the focused
-route recheck interval for a found candidate/watch route before the final entry
-window; it is 120 seconds. `--hot-interval-seconds` is the urgent focused recheck
-interval, currently 10 seconds, used when both legs are inside the 180-second
-entry window or when a paper position is waiting for settlement publication.
-Paper entries are authorized in the last 0-15 seconds before the shared
-settlement, but the last fresh venue API recheck must start before that final
-freeze window. Inside `--final-recheck-freeze-seconds` the bot does not start a
-new request; it can use the last successful focused snapshot only if it is no
-older than `--max-entry-snapshot-age-seconds` (30 seconds by default). If no fresh
-snapshot exists, the paper entry is skipped.
+300 seconds in the local runner. `--monitor-interval-seconds` is the focused route
+recheck interval for a found candidate/watch route; it defaults to 2 seconds.
+`--hot-interval-seconds` is the urgent focused recheck interval, currently 1
+second, used when both legs are near the synchronized entry window or when a paper
+position is pending/open.
+
+Paper entries use `synchronized_funding_capture_v2`: both legs must have the same
+next settlement within 1 second, and entry is authorized only from T-35 to T-25
+seconds before that settlement. The target is T-30, both simulated fills must be
+done by T-20, and the route snapshot must be no older than
+`--max-entry-snapshot-age-seconds` (2 seconds by default). The old 0-15 second
+entry window and 30-second freeze-window fallback are disabled by default.
 
 Funding scan snapshots are operational diagnostics, not the training ledger. The
 system keeps only the latest scan snapshot plus any scans/routes linked to paper

@@ -75,11 +75,21 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 ## Runtime Rules
 
 - Paper-only. No live execution.
-- Funding candidates are based on next settlement economics.
+- Default paper strategy: `synchronized_funding_capture_v2`.
+- The default profile scans all active registered venues automatically; venues in `DEACTIVATED_FUNDING_VENUES` stay excluded.
+- Strategy-incompatible active venues remain diagnostics/research-only until they pass the capability contract.
+- Funding candidates are based on the next synchronized settlement economics.
+- Spread convergence is not counted as expected profit for the default strategy; executable spread/basis is treated as cost and risk.
 - 4h/8h projections are informational, not the entry decision gate.
 - Focused route checks run in parallel for hot routes.
-- Final fresh recheck should happen no later than 15 seconds before settlement.
-- If the final recheck fails, the bot may use the latest successful focused snapshot only if it is no older than 30 seconds.
+- Initial entry targets T-30 seconds and is allowed only when both legs are 25-35 seconds from the same settlement.
+- Both next settlements must align within 1 second.
+- Entry snapshots must be fresh: each route snapshot may be at most 2 seconds old.
+- The launch defaults do not use the old 15-second final freeze/fallback entry window.
+- After settlement, the bot probes the next schedule around T+5 and evaluates hold/close around T+30.
+- Aligned next settlements can be held if the next cycle passes underwriting; mismatched schedules close.
+- A position can capture at most 4 settlements and live about 4 hours 5 minutes.
+- A common 10% price move is telemetry and a fresh-risk warning, not an automatic stop-loss.
 - Negative-PnL routes are not shown as candidates.
 - Risky venues disabled by user live in `smart_money_radar/funding/venues.py`.
 - Variational is quarantined because its public funding units produced implausible PnL; it must be rebuilt and re-tested before reactivation.

@@ -12,9 +12,18 @@ from smart_money_radar.paper_bot.helpers import (
     route_entry_key,
     route_settlement_leads,
 )
+from smart_money_radar.funding.strategy_synchronized_funding import (
+    STRATEGY_NAME as SYNCHRONIZED_STRATEGY_NAME,
+    STRATEGY_VERSION as SYNCHRONIZED_STRATEGY_VERSION,
+    settlement_skew_seconds,
+    synchronized_strategy_candidate,
+)
 from smart_money_radar.storage import SQLiteStore
 
 STRATEGY_ALIASES = {
+    "synchronized": SYNCHRONIZED_STRATEGY_NAME,
+    "synchronized_funding": SYNCHRONIZED_STRATEGY_NAME,
+    "synchronized_funding_capture": SYNCHRONIZED_STRATEGY_NAME,
     "funding": "funding_only",
     "funding_carry": "funding_only",
     "funnel_only": "funding_only",
@@ -33,7 +42,13 @@ STRATEGY_ALIASES = {
     "opportunistic": "opportunistic_any",
     "opportunistic_total_edge": "opportunistic_any",
 }
-ALLOWED_STRATEGIES = ("funding_only", "spread_only", "combined", "opportunistic_any")
+ALLOWED_STRATEGIES = (
+    SYNCHRONIZED_STRATEGY_NAME,
+    "funding_only",
+    "spread_only",
+    "combined",
+    "opportunistic_any",
+)
 
 
 def normalize_strategy_name(raw: Any) -> str:
@@ -62,11 +77,13 @@ def route_entry_decision(
     if not long_leg or not short_leg:
         reasons.append("missing_route_legs")
     else:
+        settlements: dict[str, datetime] = {}
         for side, leg in (("long", long_leg), ("short", short_leg)):
             settlement_at = parse_iso(leg.get("next_funding_at"))
             if settlement_at is None:
                 reasons.append(f"{side}_settlement_missing")
                 continue
+            settlements[side] = settlement_at
             lead = (settlement_at - now).total_seconds()
             leads[side] = lead
             if lead < 0:
@@ -75,6 +92,13 @@ def route_entry_decision(
                 reasons.append(f"{side}_settlement_inside_final_deadline")
             elif lead > config.entry_max_lead_seconds:
                 reasons.append(f"{side}_settlement_outside_final_entry_window")
+        if "long" in settlements and "short" in settlements:
+            skew = settlement_skew_seconds(settlements["long"], settlements["short"])
+            if (
+                skew is None
+                or skew > float(config.settlement_alignment_tolerance_seconds)
+            ):
+                reasons.append("settlement_alignment_mismatch")
         if long_leg and short_leg:
             for leg in (long_leg, short_leg):
                 venue = str(leg.get("venue") or "")
@@ -124,6 +148,9 @@ def route_entry_decision(
         "strategy_name": (selected_strategy or {}).get("strategy_name"),
         "snapshot_age_seconds": snapshot_age,
         "max_entry_snapshot_age_seconds": config.max_entry_snapshot_age_seconds,
+        "settlement_alignment_tolerance_seconds": (
+            config.settlement_alignment_tolerance_seconds
+        ),
     }
 
 
@@ -159,6 +186,18 @@ def route_monitor_decision(
             reasons.append(f"{side}_settlement_already_passed")
         elif lead > config.arm_window_seconds:
             reasons.append(f"{side}_settlement_outside_arm_window")
+    long_leg = leg_by_side(legs, "long")
+    short_leg = leg_by_side(legs, "short")
+    if long_leg and short_leg:
+        skew = settlement_skew_seconds(
+            long_leg.get("next_funding_at"),
+            short_leg.get("next_funding_at"),
+        )
+        if (
+            skew is None
+            or skew > float(config.settlement_alignment_tolerance_seconds)
+        ):
+            reasons.append("settlement_alignment_mismatch")
     selected_strategy = selected_route_strategy(route, config.strategy_set)
     if selected_strategy is None:
         reasons.append("no_allowed_strategy_candidate")
@@ -205,9 +244,12 @@ def build_position_from_route(
     short_leg = leg_by_side(legs, "short") or {}
     evidence = route.get("evidence") or {}
     selected_strategy = selected_route_strategy(route, config.strategy_set) or {}
-    strategy_name = str(selected_strategy.get("strategy_name") or "funding_only")
+    strategy_name = str(
+        selected_strategy.get("strategy_name") or SYNCHRONIZED_STRATEGY_NAME
+    )
     strategy_components = {
         "strategy_name": strategy_name,
+        "strategy_version": selected_strategy.get("strategy_version"),
         "primary_edge": selected_strategy.get("primary_edge"),
         "selection_model": selected_strategy.get("selection_model"),
         "edge_type": selected_strategy.get("edge_type"),
@@ -218,6 +260,9 @@ def build_position_from_route(
         "spread_pnl_component": selected_strategy.get("spread_pnl_component"),
         "signed_spread_pnl_component": selected_strategy.get(
             "signed_spread_pnl_component"
+        ),
+        "expected_spread_convergence_pnl": selected_strategy.get(
+            "expected_spread_convergence_pnl"
         ),
         "expected_net_pnl": selected_strategy.get("expected_net_pnl"),
         "basis_stress_net_pnl": selected_strategy.get("basis_stress_net_pnl"),
@@ -266,7 +311,7 @@ def build_position_from_route(
         "entry_basis_bps": float(evidence.get("signed_entry_basis") or 0.0) * 10_000.0,
         "notes": {
             "decision": decision,
-            "paper_model": "funding_paper_trader_v2",
+            "paper_model": SYNCHRONIZED_STRATEGY_VERSION,
             "strategy": strategy_components,
             "strategy_name": strategy_name,
         },
@@ -276,7 +321,7 @@ def build_position_from_route(
 def normalize_strategy_set(strategies: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
     raw_values = tuple(strategies or ())
     if not raw_values:
-        raw_values = ("funding_only",)
+        raw_values = (SYNCHRONIZED_STRATEGY_NAME,)
     normalized: list[str] = []
     for raw in raw_values:
         key = normalize_strategy_name(raw)
@@ -355,6 +400,11 @@ def selected_route_strategy(
                 candidate["eligible"] = True
                 candidates.append(candidate)
     if not candidates:
+        if SYNCHRONIZED_STRATEGY_NAME in allowed:
+            synchronized = synchronized_strategy_from_route(route)
+            if synchronized is not None:
+                candidates.append(synchronized)
+    if not candidates:
         legacy_net = optional_float(evidence.get("current_nowcast_net"))
         if (
             legacy_net is not None
@@ -384,6 +434,7 @@ def selected_route_strategy(
     if strict_candidates:
         candidates = strict_candidates
     priority = {
+        SYNCHRONIZED_STRATEGY_NAME: 5,
         "combined": 4,
         "spread_only": 3,
         "funding_only": 2,
@@ -399,6 +450,49 @@ def selected_route_strategy(
     selected.setdefault("strategy_name", selected.get("strategy_class") or "funding_only")
     selected.setdefault("strategy_class", selected.get("strategy_name"))
     return selected
+
+
+def synchronized_strategy_from_route(route: dict[str, Any]) -> dict[str, Any] | None:
+    evidence = route.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
+    ) or {}
+    funding_component = optional_float(selected.get("funding_pnl_component"))
+    if funding_component is None:
+        funding_component = optional_float(evidence.get("current_nowcast_gross"))
+    if funding_component is None:
+        return None
+    row = {
+        "funding_notional": evidence.get("funding_notional")
+        or route.get("target_notional")
+        or route.get("long_notional")
+        or 0.0,
+        "execution_cost": evidence.get("execution_cost")
+        or selected.get("execution_cost")
+        or route.get("total_fees")
+        or 0.0,
+        "basis_stress_loss": evidence.get("basis_stress_loss")
+        or selected.get("basis_stress_loss")
+        or 0.0,
+    }
+    threshold = (
+        optional_float(selected.get("actionable_profit_threshold"))
+        or optional_float(evidence.get("actionable_profit_threshold"))
+        or 0.0
+    )
+    candidate = synchronized_strategy_candidate(
+        row,
+        current_funding_gross=funding_component,
+        actionable_profit_threshold=threshold,
+        blocking_risk_flags=list(evidence.get("blocking_risk_flags") or []),
+        decision_mode=str(evidence.get("decision_mode") or "settlement_capture"),
+    )
+    if route.get("status") != "paper_candidate":
+        candidate["eligible"] = False
+        candidate["reasons"] = list(candidate.get("reasons") or []) + [
+            "route_not_paper_candidate",
+        ]
+    return candidate if candidate.get("eligible") else None
 
 
 def strategy_expected_net(
@@ -584,8 +678,6 @@ def position_hold_decision(
 def close_reason_from_hold_reasons(reasons: list[str]) -> str:
     if "live_net_not_positive" in reasons:
         return "arbitrage_window_closed_live_net_non_positive"
-    if "no_allowed_strategy_candidate" in reasons:
-        return "arbitrage_window_closed_no_allowed_strategy"
     if "data_quality_issue" in reasons:
         return "arbitrage_window_data_quality_issue"
     if (
@@ -595,6 +687,8 @@ def close_reason_from_hold_reasons(reasons: list[str]) -> str:
         return "arbitrage_window_unverifiable_route_stale"
     if "latest_route_missing" in reasons:
         return "arbitrage_window_unverifiable_route_missing"
+    if "no_allowed_strategy_candidate" in reasons:
+        return "arbitrage_window_closed_no_allowed_strategy"
     if any("settlement" in reason for reason in reasons):
         return "arbitrage_window_unverifiable_next_settlement_missing"
     if "live_net_missing" in reasons:
@@ -984,20 +1078,7 @@ def price_stop_loss_triggered(
     snapshot: dict[str, Any],
     config: PaperBotConfig,
 ) -> tuple[bool, str]:
-    if not snapshot.get("price_move_tracking"):
-        return False, ""
-    threshold = float(getattr(config, "price_stop_loss_fraction", 0.0) or 0.0)
-    if threshold <= 0:
-        return False, ""
-    max_abs_move = abs(float(snapshot.get("max_abs_move_fraction") or 0.0))
-    if max_abs_move + 1e-12 < threshold:
-        return False, ""
-    side = str(snapshot.get("max_move_side") or "")
-    signed_move = float(snapshot.get(f"{side}_move_fraction") or 0.0) if side else 0.0
-    return True, (
-        f"price_stop_loss: {side or 'leg'}_move={signed_move * 100:.2f}% "
-        f"abs={max_abs_move * 100:.2f}% >= {threshold * 100:.2f}%"
-    )
+    return False, "common_price_move_is_telemetry_not_stop"
 
 
 def spread_stop_loss_triggered(

@@ -35,6 +35,7 @@ from smart_money_radar.paper_bot.telegram import (
     funding_rate_lines,
     status_report_message,
 )
+from smart_money_radar.paper_bot.risk import common_price_move_telemetry
 from smart_money_radar.storage import SQLiteStore
 
 
@@ -52,11 +53,13 @@ def paper_route(
     long_lead: int,
     short_lead: int,
     *,
-    live_net: float = 0.5,
+    live_net: float = 2.0,
     actionable_threshold: float | None = None,
 ) -> dict:
     long_settlement = (now + timedelta(seconds=long_lead)).isoformat()
     short_settlement = (now + timedelta(seconds=short_lead)).isoformat()
+    execution_cost = 0.5
+    current_gross = live_net + execution_cost
     route = {
         "funding_scan_id": 1,
         "funding_route_id": 2,
@@ -82,10 +85,10 @@ def paper_route(
         "positive_spread_fraction": 1.0,
         "persistence_score": 50.0,
         "history_point_count": 0,
-        "expected_gross_funding": 1.0,
+        "expected_gross_funding": current_gross,
         "expected_net_profit": live_net,
         "net_roc_annualized": 1.0,
-        "total_fees": 0.5,
+        "total_fees": execution_cost,
         "slippage_cost": 0.0,
         "basis_gap": 0.0,
         "basis_reserve": 0.0,
@@ -117,9 +120,9 @@ def paper_route(
         ],
         "evidence": {
             "decision_mode": "settlement_capture",
-            "current_nowcast_gross": 1.0,
+            "current_nowcast_gross": current_gross,
             "current_nowcast_net": live_net,
-            "execution_cost": 0.5,
+            "execution_cost": execution_cost,
         },
     }
     if actionable_threshold is not None:
@@ -210,7 +213,7 @@ def test_entry_requires_both_legs_inside_final_entry_window() -> None:
     ).validated()
 
     too_early = route_entry_decision(
-        paper_route(now, long_lead=60, short_lead=90),
+        paper_route(now, long_lead=90, short_lead=90),
         accounts(),
         now,
         config,
@@ -219,7 +222,7 @@ def test_entry_requires_both_legs_inside_final_entry_window() -> None:
     assert "short_settlement_outside_final_entry_window" in too_early["reasons"]
 
     too_late = route_entry_decision(
-        paper_route(now, long_lead=60, short_lead=20),
+        paper_route(now, long_lead=20, short_lead=20),
         accounts(),
         now,
         config,
@@ -228,7 +231,7 @@ def test_entry_requires_both_legs_inside_final_entry_window() -> None:
     assert "short_settlement_inside_final_deadline" in too_late["reasons"]
 
     eligible = route_entry_decision(
-        paper_route(now, long_lead=60, short_lead=45),
+        paper_route(now, long_lead=45, short_lead=45),
         accounts(),
         now,
         config,
@@ -236,12 +239,12 @@ def test_entry_requires_both_legs_inside_final_entry_window() -> None:
     assert eligible["eligible"]
 
 
-def test_default_entry_window_targets_final_fifteen_seconds() -> None:
+def test_default_entry_window_targets_t_minus_thirty_seconds() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig().validated()
 
     too_early = route_entry_decision(
-        paper_route(now, long_lead=17, short_lead=12),
+        paper_route(now, long_lead=36, short_lead=36),
         accounts(),
         now,
         config,
@@ -249,13 +252,30 @@ def test_default_entry_window_targets_final_fifteen_seconds() -> None:
     assert not too_early["eligible"]
     assert "long_settlement_outside_final_entry_window" in too_early["reasons"]
 
-    eligible = route_entry_decision(
-        paper_route(now, long_lead=14, short_lead=6),
+    allowed_upper = route_entry_decision(
+        paper_route(now, long_lead=35, short_lead=35),
         accounts(),
         now,
         config,
     )
-    assert eligible["eligible"]
+    assert allowed_upper["eligible"]
+
+    allowed_lower = route_entry_decision(
+        paper_route(now, long_lead=25, short_lead=25),
+        accounts(),
+        now,
+        config,
+    )
+    assert allowed_lower["eligible"]
+
+    too_late = route_entry_decision(
+        paper_route(now, long_lead=24, short_lead=24),
+        accounts(),
+        now,
+        config,
+    )
+    assert not too_late["eligible"]
+    assert "long_settlement_inside_final_deadline" in too_late["reasons"]
 
 
 def test_selected_route_strategy_supports_all_strategy_classes() -> None:
@@ -455,7 +475,7 @@ def test_invalid_strategy_config_fails_closed() -> None:
 
 def test_default_paper_bot_strategy_set_is_funding_led() -> None:
     config = PaperBotConfig().validated()
-    assert config.strategy_set == ("funding_only", "combined")
+    assert config.strategy_set == ("synchronized_funding_capture",)
     assert "spread_only" not in config.strategy_set
     assert "opportunistic_any" not in config.strategy_set
 
@@ -557,7 +577,7 @@ def test_entry_requires_route_actionable_profit_threshold() -> None:
     too_small = route_entry_decision(
             paper_route(
                 now,
-                long_lead=60,
+                long_lead=45,
                 short_lead=45,
                 live_net=0.32,
                 actionable_threshold=5.0,
@@ -573,7 +593,7 @@ def test_entry_requires_route_actionable_profit_threshold() -> None:
     enough = route_entry_decision(
             paper_route(
                 now,
-                long_lead=60,
+                long_lead=45,
                 short_lead=45,
                 live_net=5.25,
                 actionable_threshold=5.0,
@@ -907,7 +927,7 @@ def test_settlement_hold_accrues_funding_and_rolls_position(tmp_path) -> None:
         ]
     )
     scan_id = store.start_funding_scan({"scan_mode": "watch"})
-    continuation = paper_route(now, 3_480, 3_480, live_net=0.75)
+    continuation = paper_route(now, 3_480, 3_480, live_net=2.5)
     continuation["legs"][0]["next_funding_at"] = next_long
     continuation["legs"][1]["next_funding_at"] = next_short
     continuation["long_next_funding_at"] = next_long
@@ -1423,8 +1443,8 @@ def test_status_report_sends_once_per_interval(tmp_path) -> None:
         "urgent_route_count": 1,
     }
 
-    trader.maybe_record_status_report(result, [paper_route(now, 60, 45)], [])
-    trader.maybe_record_status_report(result, [paper_route(now, 60, 45)], [])
+    trader.maybe_record_status_report(result, [paper_route(now, 45, 45)], [])
+    trader.maybe_record_status_report(result, [paper_route(now, 45, 45)], [])
 
     assert len(notifier.messages) == 1
     assert "Paper Bot STATUS" in notifier.messages[0]
@@ -1516,7 +1536,7 @@ def test_status_report_does_not_publish_watch_routes(tmp_path) -> None:
         notifier=notifier,
     )
     now = datetime.now(UTC)
-    watch = paper_route(now, 60, 45, live_net=3.0)
+    watch = paper_route(now, 45, 45, live_net=3.0)
     watch["status"] = "watch"
 
     trader.maybe_record_status_report(
@@ -1564,7 +1584,7 @@ def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) ->
             "hot_route_count": 1,
             "urgent_route_count": 1,
         },
-        [paper_route(now, 60, 45, live_net=-0.25)],
+        [paper_route(now, 45, 45, live_net=-0.25)],
         [],
     )
 
@@ -1580,6 +1600,7 @@ def test_next_sleep_uses_three_speed_monitoring(tmp_path) -> None:
         config=PaperBotConfig(
             scan_interval_seconds=300,
             monitor_interval_seconds=120,
+            hot_interval_seconds=6,
         ),
     )
 
@@ -1597,11 +1618,10 @@ def test_monitor_route_is_urgent_only_inside_entry_window() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
         arm_window_seconds=900,
-        entry_max_lead_seconds=15,
     ).validated()
 
-    monitored = route_monitor_decision(paper_route(now, 600, 540), now, config)
-    urgent = route_monitor_decision(paper_route(now, 12, 10), now, config)
+    monitored = route_monitor_decision(paper_route(now, 600, 600), now, config)
+    urgent = route_monitor_decision(paper_route(now, 30, 30), now, config)
 
     assert monitored["hot"]
     assert not monitored["urgent"]
@@ -1619,7 +1639,7 @@ def test_urgent_route_keeps_focused_loop_after_base_interval(tmp_path) -> None:
             scan_interval_seconds=300,
         ),
     )
-    trader.hot_routes["route-1"] = paper_route(now, 12, 10)
+    trader.hot_routes["route-1"] = paper_route(now, 30, 30)
     trader.last_full_scan_monotonic = time.monotonic() - 300
 
     assert trader.should_run_hot_iteration()
@@ -1633,7 +1653,7 @@ def test_non_urgent_hot_route_keeps_focused_loop_when_full_scan_due(tmp_path) ->
         store,
         config=PaperBotConfig(scan_interval_seconds=300),
     )
-    trader.hot_routes["route-1"] = paper_route(now, 600, 540)
+    trader.hot_routes["route-1"] = paper_route(now, 600, 600)
     trader.last_full_scan_monotonic = time.monotonic() - 301
 
     assert trader.full_scan_due()
@@ -1645,13 +1665,13 @@ def test_background_scan_does_not_overwrite_newer_hot_route(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     trader = PaperBot(store, config=PaperBotConfig())
-    older = paper_route(now - timedelta(seconds=20), 600, 540, live_net=0.5)
-    newer = paper_route(now, 600, 540, live_net=1.25)
+    older = paper_route(now - timedelta(seconds=20), 90, 90, live_net=2.0)
+    newer = paper_route(now, 90, 90, live_net=2.25)
     trader.hot_routes["route-1"] = newer
 
     trader.update_hot_routes([older])
 
-    assert trader.hot_routes["route-1"]["evidence"]["current_nowcast_net"] == 1.25
+    assert trader.hot_routes["route-1"]["evidence"]["current_nowcast_net"] == 2.25
 
 
 def test_background_full_scan_does_not_block_hot_iterations(tmp_path) -> None:
@@ -1663,7 +1683,7 @@ def test_background_full_scan_does_not_block_hot_iterations(tmp_path) -> None:
         config=PaperBotConfig(scan_interval_seconds=300),
         background_delay=0.35,
     )
-    trader.hot_routes["route-1"] = paper_route(now, 600, 540)
+    trader.hot_routes["route-1"] = paper_route(now, 90, 90)
     trader.last_full_scan_monotonic = time.monotonic() - 301
 
     first_started = time.perf_counter()
@@ -1698,10 +1718,10 @@ def test_urgent_hot_route_does_not_start_background_full_scan(tmp_path) -> None:
     store.init_db()
     trader = SlowBackgroundScanTrader(
         store,
-        config=PaperBotConfig(scan_interval_seconds=300, entry_max_lead_seconds=15),
+        config=PaperBotConfig(scan_interval_seconds=300),
         background_delay=0.1,
     )
-    trader.hot_routes["route-1"] = paper_route(now, 12, 10)
+    trader.hot_routes["route-1"] = paper_route(now, 30, 30)
     trader.last_full_scan_monotonic = time.monotonic() - 301
 
     result = trader.run_iteration()
@@ -1752,7 +1772,7 @@ def test_hot_route_rechecks_are_parallelized(tmp_path) -> None:
         config=PaperBotConfig(hot_route_recheck_workers=2),
     )
     for index in range(4):
-        route = paper_route(now, 600, 540)
+        route = paper_route(now, 90, 90)
         route["route_key"] = f"route-{index}"
         route["canonical_asset"] = f"ASSET{index}"
         trader.hot_routes[route["route_key"]] = route
@@ -2088,41 +2108,61 @@ def test_price_move_snapshot_tracks_both_legs_from_entry() -> None:
     assert snapshot["max_move_side"] == "long"
 
 
-def test_price_stop_loss_triggers_at_configured_threshold() -> None:
-    config = PaperBotConfig(price_stop_loss_fraction=0.10).validated()
+def test_common_price_move_critical_is_telemetry_not_stop() -> None:
+    config = PaperBotConfig(
+        common_price_move_alert_fraction=0.05,
+        common_price_move_critical_fraction=0.10,
+    ).validated()
     snapshot = {
         "price_move_tracking": True,
         "long_move_fraction": 0.10,
-        "short_move_fraction": 0.02,
+        "short_move_fraction": 0.095,
         "max_abs_move_fraction": 0.10,
         "max_move_side": "long",
     }
 
+    telemetry = common_price_move_telemetry(
+        snapshot,
+        alert_fraction=config.common_price_move_alert_fraction,
+        critical_fraction=config.common_price_move_critical_fraction,
+    )
     triggered, reason = price_stop_loss_triggered(snapshot, config)
 
-    assert triggered
-    assert "price_stop_loss" in reason
-    assert "10.00%" in reason
+    assert telemetry["level"] == "critical"
+    assert telemetry["requires_fresh_risk_recalculation"]
+    assert not triggered
+    assert reason == "common_price_move_is_telemetry_not_stop"
 
 
-def test_price_stop_loss_does_not_trigger_below_threshold() -> None:
-    config = PaperBotConfig(price_stop_loss_fraction=0.10).validated()
+def test_common_price_move_below_alert_threshold_is_quiet() -> None:
+    config = PaperBotConfig(
+        common_price_move_alert_fraction=0.05,
+        common_price_move_critical_fraction=0.10,
+    ).validated()
     snapshot = {
         "price_move_tracking": True,
-        "long_move_fraction": 0.099,
-        "short_move_fraction": -0.04,
-        "max_abs_move_fraction": 0.099,
+        "long_move_fraction": 0.049,
+        "short_move_fraction": 0.045,
+        "max_abs_move_fraction": 0.049,
         "max_move_side": "long",
     }
 
+    telemetry = common_price_move_telemetry(
+        snapshot,
+        alert_fraction=config.common_price_move_alert_fraction,
+        critical_fraction=config.common_price_move_critical_fraction,
+    )
     triggered, _ = price_stop_loss_triggered(snapshot, config)
 
+    assert telemetry["level"] == "none"
     assert not triggered
 
 
-def test_price_stop_loss_ignores_untracked_snapshot() -> None:
-    config = PaperBotConfig(price_stop_loss_fraction=0.10).validated()
+def test_common_price_move_ignores_untracked_snapshot() -> None:
+    config = PaperBotConfig().validated()
+    telemetry = common_price_move_telemetry({"price_move_tracking": False})
     triggered, _ = price_stop_loss_triggered({"price_move_tracking": False}, config)
+    assert telemetry["level"] == "none"
     assert not triggered
 
 
@@ -2187,7 +2227,7 @@ def test_price_stop_loss_close_payload_has_both_legs_in_one_close() -> None:
     assert payload["notes"]["basis_pnl_included"] is True
 
 
-def test_process_open_positions_price_stop_loss_closes_whole_position(tmp_path) -> None:
+def test_process_open_positions_common_price_move_alert_does_not_close(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     store.ensure_funding_paper_accounts(["aster", "binance"], 1_000.0)
@@ -2233,7 +2273,7 @@ def test_process_open_positions_price_stop_loss_closes_whole_position(tmp_path) 
             "entry_evidence": {},
         }
     )
-    live_route = paper_route(now, 3_600, 3_600, live_net=1.25)
+    live_route = paper_route(now, 3_600, 3_600, live_net=2.5)
     live_route["funding_scan_id"] = None
     live_route["funding_route_id"] = None
     live_route["route_key"] = "route-1"
@@ -2248,7 +2288,6 @@ def test_process_open_positions_price_stop_loss_closes_whole_position(tmp_path) 
         store,
         config=PaperBotConfig(
             focused_recheck_enabled=False,
-            price_stop_loss_fraction=0.10,
             telegram_enabled=False,
         ),
         notifier=FakeNotifier(),
@@ -2257,11 +2296,10 @@ def test_process_open_positions_price_stop_loss_closes_whole_position(tmp_path) 
 
     outcomes = trader.process_open_positions()
 
-    assert outcomes == ["closed"]
-    assert store.funding_paper_open_positions() == []
-    closed = store.funding_paper_dashboard()["closed_positions"][0]
-    assert closed["close_reason"].startswith("price_stop_loss")
-    assert "обе ноги закрыты одновременно" in closed["close_reason_label"]
+    assert outcomes == []
+    assert len(store.funding_paper_open_positions()) == 1
+    events = store.funding_paper_dashboard()["events"]
+    assert any(row["event_type"] == "price_move_alert" for row in events)
 
 
 def test_hold_decision_detects_funding_rate_inversion() -> None:
@@ -2275,7 +2313,7 @@ def test_hold_decision_detects_funding_rate_inversion() -> None:
         "expected_execution_cost": 0.5,
         "notes": {},
     }
-    route = paper_route(now, 3_600, 3_600, live_net=1.0)
+    route = paper_route(now, 3_600, 3_600, live_net=2.5)
     route["legs"][0]["hourly_funding_rate"] = 0.001
     route["legs"][1]["hourly_funding_rate"] = 0.0005
 
@@ -2296,7 +2334,7 @@ def test_hold_decision_allows_normal_rate_order() -> None:
         "expected_execution_cost": 0.5,
         "notes": {},
     }
-    route = paper_route(now, 3_600, 3_600, live_net=1.0)
+    route = paper_route(now, 3_600, 3_600, live_net=2.5)
     route["legs"][0]["hourly_funding_rate"] = -0.001
     route["legs"][1]["hourly_funding_rate"] = 0.001
 
@@ -2317,7 +2355,7 @@ def test_build_position_includes_spread_fields() -> None:
     position = build_position_from_route(route, decision, config)
     assert abs(position["entry_cross_spread"] - 0.3) < 1e-9
     assert abs(position["entry_basis_bps"] - (-30.0)) < 1e-9
-    assert position["notes"]["paper_model"] == "funding_paper_trader_v2"
+    assert position["notes"]["paper_model"] == "synchronized_funding_capture_v2"
 
 
 def test_build_close_payload_includes_basis_pnl() -> None:

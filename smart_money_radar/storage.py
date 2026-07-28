@@ -114,6 +114,267 @@ class SQLiteStore:
             "saved_bytes": max(0, before_bytes - after_bytes),
         }
 
+    def upsert_funding_capture_position(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        position_id = str(row["position_id"])
+        config_json = json.dumps(row.get("config", row.get("config_json", {})), sort_keys=True)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_capture_positions (
+                    position_id,
+                    funding_paper_position_id,
+                    strategy_name,
+                    strategy_version,
+                    canonical_asset,
+                    long_venue,
+                    long_symbol,
+                    short_venue,
+                    short_symbol,
+                    quantity,
+                    target_notional,
+                    state,
+                    opened_at,
+                    closed_at,
+                    settlements_captured_count,
+                    max_settlements,
+                    original_entry_spread,
+                    paper_open_fees,
+                    paper_close_fees,
+                    paper_emergency_unwind_cost,
+                    paper_net_pnl_estimated,
+                    paper_net_pnl_reconciled,
+                    config_json,
+                    config_hash,
+                    code_commit,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(position_id) DO UPDATE SET
+                    funding_paper_position_id = excluded.funding_paper_position_id,
+                    state = excluded.state,
+                    closed_at = excluded.closed_at,
+                    settlements_captured_count = excluded.settlements_captured_count,
+                    paper_close_fees = excluded.paper_close_fees,
+                    paper_emergency_unwind_cost = excluded.paper_emergency_unwind_cost,
+                    paper_net_pnl_estimated = excluded.paper_net_pnl_estimated,
+                    paper_net_pnl_reconciled = excluded.paper_net_pnl_reconciled,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    position_id,
+                    row.get("funding_paper_position_id"),
+                    row.get("strategy_name", "synchronized_funding_capture"),
+                    row.get("strategy_version", "synchronized_funding_capture_v2"),
+                    row["canonical_asset"],
+                    row["long_venue"],
+                    row["long_symbol"],
+                    row["short_venue"],
+                    row["short_symbol"],
+                    float(row["quantity"]),
+                    float(row["target_notional"]),
+                    row.get("state", "OPEN"),
+                    row.get("opened_at", now),
+                    row.get("closed_at"),
+                    int(row.get("settlements_captured_count", 0)),
+                    int(row.get("max_settlements", 4)),
+                    row.get("original_entry_spread"),
+                    float(row.get("paper_open_fees", 0.0)),
+                    float(row.get("paper_close_fees", 0.0)),
+                    float(row.get("paper_emergency_unwind_cost", 0.0)),
+                    row.get("paper_net_pnl_estimated"),
+                    row.get("paper_net_pnl_reconciled"),
+                    config_json,
+                    row.get("config_hash"),
+                    row.get("code_commit"),
+                    row.get("created_at", now),
+                    now,
+                ),
+            )
+        return position_id
+
+    def upsert_funding_capture_cycle(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        cycle_id = str(
+            row.get("cycle_id")
+            or f"{row['position_id']}:{row['cycle_number']}"
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_capture_cycles (
+                    cycle_id,
+                    position_id,
+                    cycle_number,
+                    scheduled_funding_at,
+                    long_next_funding_rate_at_decision,
+                    short_next_funding_rate_at_decision,
+                    conservative_funding_gross,
+                    conservative_funding_edge_bps,
+                    hold_basis_reserve_bps,
+                    hold_legging_reserve_bps,
+                    hold_time_reserve_bps,
+                    hold_liquidity_reserve_bps,
+                    incremental_hold_cost,
+                    incremental_hold_net_pnl,
+                    hold_cost_coverage_ratio,
+                    paper_net_if_exit_at_decision,
+                    decision,
+                    decision_reason,
+                    state,
+                    settlement_crossed_at,
+                    reconciliation_status,
+                    reconciled_funding_pnl,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(position_id, cycle_number) DO UPDATE SET
+                    scheduled_funding_at = excluded.scheduled_funding_at,
+                    long_next_funding_rate_at_decision = excluded.long_next_funding_rate_at_decision,
+                    short_next_funding_rate_at_decision = excluded.short_next_funding_rate_at_decision,
+                    conservative_funding_gross = excluded.conservative_funding_gross,
+                    conservative_funding_edge_bps = excluded.conservative_funding_edge_bps,
+                    incremental_hold_cost = excluded.incremental_hold_cost,
+                    incremental_hold_net_pnl = excluded.incremental_hold_net_pnl,
+                    hold_cost_coverage_ratio = excluded.hold_cost_coverage_ratio,
+                    paper_net_if_exit_at_decision = excluded.paper_net_if_exit_at_decision,
+                    decision = excluded.decision,
+                    decision_reason = excluded.decision_reason,
+                    state = excluded.state,
+                    settlement_crossed_at = excluded.settlement_crossed_at,
+                    reconciliation_status = excluded.reconciliation_status,
+                    reconciled_funding_pnl = excluded.reconciled_funding_pnl,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cycle_id,
+                    row["position_id"],
+                    int(row["cycle_number"]),
+                    row["scheduled_funding_at"],
+                    row.get("long_next_funding_rate_at_decision"),
+                    row.get("short_next_funding_rate_at_decision"),
+                    row.get("conservative_funding_gross"),
+                    row.get("conservative_funding_edge_bps"),
+                    row.get("hold_basis_reserve_bps"),
+                    row.get("hold_legging_reserve_bps"),
+                    row.get("hold_time_reserve_bps"),
+                    row.get("hold_liquidity_reserve_bps"),
+                    row.get("incremental_hold_cost"),
+                    row.get("incremental_hold_net_pnl"),
+                    row.get("hold_cost_coverage_ratio"),
+                    row.get("paper_net_if_exit_at_decision"),
+                    row.get("decision"),
+                    row.get("decision_reason"),
+                    row.get("state", "PENDING"),
+                    row.get("settlement_crossed_at"),
+                    row.get("reconciliation_status", "PENDING"),
+                    row.get("reconciled_funding_pnl"),
+                    row.get("created_at", now),
+                    now,
+                ),
+            )
+        return cycle_id
+
+    def upsert_funding_settlement_reconciliation(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        reconciliation_id = str(
+            row.get("reconciliation_id")
+            or ":".join(
+                [
+                    str(row["position_id"]),
+                    str(row["venue"]),
+                    str(row["scheduled_funding_at"]),
+                ]
+            )
+        )
+        evidence_json = json.dumps(row.get("evidence", row.get("evidence_json", {})), sort_keys=True)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_settlement_reconciliations (
+                    reconciliation_id,
+                    position_id,
+                    cycle_id,
+                    venue,
+                    symbol,
+                    side,
+                    scheduled_funding_at,
+                    status,
+                    confirmed_funding_rate,
+                    settlement_mark_price,
+                    funding_pnl,
+                    rate_status,
+                    mark_status,
+                    evidence_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(position_id, venue, scheduled_funding_at) DO UPDATE SET
+                    cycle_id = excluded.cycle_id,
+                    symbol = excluded.symbol,
+                    side = excluded.side,
+                    status = excluded.status,
+                    confirmed_funding_rate = excluded.confirmed_funding_rate,
+                    settlement_mark_price = excluded.settlement_mark_price,
+                    funding_pnl = excluded.funding_pnl,
+                    rate_status = excluded.rate_status,
+                    mark_status = excluded.mark_status,
+                    evidence_json = excluded.evidence_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    reconciliation_id,
+                    row["position_id"],
+                    row.get("cycle_id"),
+                    row["venue"],
+                    row["symbol"],
+                    row["side"],
+                    row["scheduled_funding_at"],
+                    row.get("status", "PENDING"),
+                    row.get("confirmed_funding_rate"),
+                    row.get("settlement_mark_price"),
+                    row.get("funding_pnl"),
+                    row.get("rate_status"),
+                    row.get("mark_status"),
+                    evidence_json,
+                    row.get("created_at", now),
+                    now,
+                ),
+            )
+        return reconciliation_id
+
+    def funding_settlement_reconciliation_rows(
+        self,
+        position_id: str,
+        *,
+        cycle_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        parameters: list[Any] = [position_id]
+        cycle_filter = ""
+        if cycle_id is not None:
+            cycle_filter = "AND cycle_id = ?"
+            parameters.append(cycle_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM funding_settlement_reconciliations
+                WHERE position_id = ?
+                {cycle_filter}
+                ORDER BY scheduled_funding_at, venue
+                """,
+                parameters,
+            ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            output.append(item)
+        return output
+
     def upsert_chains(
         self,
         connection: sqlite3.Connection,

@@ -19,12 +19,12 @@
 
 > Сырые `.jsonl` большие. Для анализа использовать `grep` по ключевым словам + точечное чтение фрагментов, не читать целиком.
 
-## Конфигурация автономии (по состоянию на 2026-07-23)
+## Конфигурация автономии (обновлено 2026-07-27)
 
-- **Qwen:** проект в `approvalMode: "yolo"` (`radar/.qwen/settings.json`); глобально сняты лимиты — `model.maxToolCallsPerTurn: 0`, `maxToolCalls: -1`, `sessionTokenLimit: -1`, `general.preventSystemSleep: true`, `chatRecording: true` (`~/.qwen/settings.json`).
+- **Qwen:** project-level `.qwen/settings.json` использует `model.name = "qwen3.8-max-preview"` и `approvalMode = "auto-edit"`. Qwen — исполнитель для scoped-задач, не владелец формул, risk gates, venue eligibility или live trading.
 - **Codex:** `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, `model_reasoning_effort = "xhigh"` (`~/.codex/config.toml`).
 
-Оба агента работают в режиме полной автономии: не останавливаться на минорных блокерах, тестировать, не спрашивать по рутинным решениям.
+Codex остается архитектором и финальным reviewer. Qwen может выполнять механическую реализацию и тесты внутри заданного scope, но не должен самостоятельно менять торговую логику или коммитить/пушить.
 
 ## Критические уроки из истории сборки (извлечены из сессий Codex)
 
@@ -41,7 +41,7 @@
 
 > Секция обновляется агентами на значимых вехах (не каждый ход). Кратко: что решили, что в работе, что дальше.
 
-- **2026-07-23:** Настроен cross-model handoff. Qwen доведён до паритета с Codex по автономии (yolo + сняты лимиты tool-calls). Проанализирована история сборки Codex (248 директив, ~1766 сообщений) — уроки зафиксированы выше и в памяти агентов.
+- **2026-07-23:** Настроен cross-model handoff. Исторически Qwen доводился до очень широкой автономии, но текущий рабочий контракт 2026-07-27 сужает его роль до scoped implementation worker. Проанализирована история сборки Codex (248 директив, ~1766 сообщений) — уроки зафиксированы выше и в памяти агентов.
 - **2026-07-23 (аудит Qwen):** Полный аудит закрыт. Тесты: 293/293 OK. Funding работает (5132+ сканов, 13 paper-позиций закрыты с плюсом), но 2 бага в retention.py (FK constraint + database locked) и 4 запрещённые биржи (Phemex, Bitunix, BloFin, BingX) всё ещё активны в адаптерах. Prediction сканирует (694 скана, 2704 маршрута), но 0 исполняемых — все `not_profitable`; бот крашится на API-ошибке. Analytics: 5 запросов, 34 Dune-выполнений, данные в exports/. Research Validity и Identity Graph: 0 строк — полностью data-empty. Launchd: только dashboard plist (exit 78), funding/prediction боты не установлены, ни один процесс не запущен. Следующие шаги: (1) исправить retention.py FK + lock баги, (2) удалить Phemex/Bitunix/BloFin/BingX из адаптеров и route universe, (3) переустановить launchd-боты, (4) диагностировать prediction API failure.
 
 ## Конвенция для агентов

@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "blocked", "failed"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "tests_run": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "test_results": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "blockers": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "changed_files",
+    "tests_run",
+    "test_results",
+    "blockers"
+  ],
+  "additionalProperties": false
+}
