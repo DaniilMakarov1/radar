@@ -659,7 +659,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertIn("spread_pnl_component", evidence["pnl_components"])
         self.assertIn("opportunity_expected_net_pnl", evidence["pnl_components"])
 
-    def test_strategy_spread_stress_includes_spread_edge(self) -> None:
+    def test_settlement_capture_strategy_zeros_spread_edge(self) -> None:
         result = build_strategy_evaluation(
             {
                 "funding_notional": 500.0,
@@ -675,15 +675,14 @@ class FundingRadarTest(unittest.TestCase):
             decision_mode="settlement_capture",
         )
 
-        spread = next(
-            row
-            for row in result["strategy_candidates"]
-            if row["strategy_name"] == "spread_only"
-        )
+        candidate = result["strategy_candidates"][0]
 
-        self.assertTrue(spread["eligible"])
-        self.assertAlmostEqual(spread["expected_net_pnl"], 4.25)
-        self.assertAlmostEqual(spread["basis_stress_net_pnl"], 3.50)
+        self.assertIsNone(result["selected_strategy"])
+        self.assertFalse(candidate["eligible"])
+        self.assertEqual(candidate["edge_type"], "no_positive_edge")
+        self.assertAlmostEqual(candidate["spread_pnl_component"], 0.0)
+        self.assertAlmostEqual(candidate["expected_net_pnl"], -0.75)
+        self.assertAlmostEqual(candidate["basis_stress_net_pnl"], -1.50)
 
     def test_funding_led_can_be_fragile_when_basis_stress_not_covered(self) -> None:
         result = build_strategy_evaluation(
@@ -774,12 +773,11 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(selected["strategy_name"], "funding_only")
         self.assertEqual(selected["edge_type"], "funding_led")
         self.assertAlmostEqual(selected["funding_pnl_component"], 6.0)
-        self.assertAlmostEqual(selected["spread_pnl_component"], -2.0)
-        self.assertAlmostEqual(selected["expected_net_pnl"], 3.0)
+        self.assertAlmostEqual(selected["spread_pnl_component"], 0.0)
+        self.assertAlmostEqual(selected["expected_net_pnl"], 5.0)
         self.assertAlmostEqual(selected["risk_adjusted_net_pnl"], 3.0)
-        self.assertIn("spread_drag", selected["warnings"])
 
-    def test_spread_led_subtracts_negative_funding_but_can_cover_it(self) -> None:
+    def test_spread_led_cannot_make_settlement_capture_eligible(self) -> None:
         result = build_strategy_evaluation(
             {
                 "funding_notional": 500.0,
@@ -795,18 +793,17 @@ class FundingRadarTest(unittest.TestCase):
             decision_mode="settlement_capture",
         )
 
-        selected = result["selected_strategy"]
+        candidate = result["strategy_candidates"][0]
 
-        self.assertTrue(selected["eligible"])
-        self.assertEqual(selected["strategy_name"], "spread_only")
-        self.assertEqual(selected["edge_type"], "spread_led")
-        self.assertAlmostEqual(selected["funding_pnl_component"], -1.0)
-        self.assertAlmostEqual(selected["spread_pnl_component"], 6.0)
-        self.assertAlmostEqual(selected["expected_net_pnl"], 4.0)
-        self.assertAlmostEqual(selected["risk_adjusted_net_pnl"], 3.5)
-        self.assertIn("funding_drag", selected["warnings"])
+        self.assertIsNone(result["selected_strategy"])
+        self.assertFalse(candidate["eligible"])
+        self.assertEqual(candidate["edge_type"], "no_positive_edge")
+        self.assertAlmostEqual(candidate["funding_pnl_component"], -1.0)
+        self.assertAlmostEqual(candidate["spread_pnl_component"], 0.0)
+        self.assertAlmostEqual(candidate["expected_net_pnl"], -2.0)
+        self.assertIn("opportunity_net_below_required_profit", candidate["reasons"])
 
-    def test_low_coverage_positive_opportunity_is_fragile_not_blocked(self) -> None:
+    def test_positive_spread_opportunity_below_funding_cost_is_blocked(self) -> None:
         result = build_strategy_evaluation(
             {
                 "funding_notional": 500.0,
@@ -822,15 +819,16 @@ class FundingRadarTest(unittest.TestCase):
             decision_mode="settlement_capture",
         )
 
-        selected = result["selected_strategy"]
+        candidate = result["strategy_candidates"][0]
 
-        self.assertTrue(selected["eligible"])
-        self.assertEqual(selected["edge_type"], "mixed_edge")
-        self.assertEqual(selected["edge_quality"], "fragile")
-        self.assertAlmostEqual(selected["expected_net_pnl"], 1.0)
-        self.assertIn("thin_total_edge_coverage", selected["warnings"])
+        self.assertIsNone(result["selected_strategy"])
+        self.assertFalse(candidate["eligible"])
+        self.assertAlmostEqual(candidate["funding_pnl_component"], 3.0)
+        self.assertAlmostEqual(candidate["spread_pnl_component"], 0.0)
+        self.assertAlmostEqual(candidate["expected_net_pnl"], -2.0)
+        self.assertIn("opportunity_net_below_required_profit", candidate["reasons"])
 
-    def test_live_sizing_uses_full_opportunity_net_not_funding_only_net(self) -> None:
+    def test_live_sizing_uses_funding_only_net_not_full_opportunity_net(self) -> None:
         small = add_live_settlement_economics(
             {
                 "notional": 500.0,
@@ -858,14 +856,14 @@ class FundingRadarTest(unittest.TestCase):
 
         selected = select_live_sizing_row([small, spread_led], [small, spread_led])
 
-        self.assertEqual(selected["notional"], 1_000.0)
-        self.assertLess(
-            selected["current_nowcast_net"],
-            small["current_nowcast_net"],
-        )
+        self.assertEqual(selected["notional"], 500.0)
         self.assertGreater(
+            selected["current_nowcast_net"],
+            spread_led["current_nowcast_net"],
+        )
+        self.assertLess(
             selected["current_opportunity_net"],
-            small["current_opportunity_net"],
+            spread_led["current_opportunity_net"],
         )
 
     def test_dashboard_candidate_filter_uses_selected_strategy_net(self) -> None:
@@ -7002,6 +7000,7 @@ def market(
         "raw_funding_rate": funding_rate,
         "normalized_next_funding_rate": funding_rate,
         "raw_funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_rate_semantics": "next_settlement",
         "funding_rate_unit": "fraction_of_notional_per_settlement",
         "funding_sign_convention": "positive_long_pays",
         "funding_interval_hours": interval_hours,
@@ -7017,6 +7016,7 @@ def market(
         "min_notional_usd": 5.0,
         "contract_type": "linear_perpetual",
         "contract_kind": "linear_perpetual",
+        "supports_discrete_funding": True,
         "collateral_asset": "USDT",
         "quote_asset": "USDT",
         "is_linear_contract": True,
