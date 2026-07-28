@@ -86,6 +86,9 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 - Strategy-incompatible active venues remain diagnostics/research-only until they pass the capability contract.
 - Funding candidates are based on the next synchronized settlement economics.
 - Spread convergence is not counted as expected profit for the default strategy; executable spread/basis is treated as cost and risk.
+- Initial entry never requires 7/30/90-day raw funding history. Long-term history,
+  historical persistence, old median PnL, and historical win rate cannot block the
+  first synchronized entry.
 - Funding estimates are never cashflow. Paper PnL includes funding only after
   public rate plus settlement mark reconciliation.
 - 4h/8h projections are informational, not the entry decision gate.
@@ -100,6 +103,12 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 - Aligned next settlements can be held if the next cycle passes underwriting; mismatched schedules close.
 - Hold decisions use exact next timestamps and incremental economics; they do
   not wait for funding reconciliation and do not charge opening fees again.
+- Hold history is a secondary haircut only. It uses local fully reconciled prior
+  hold cycles for the same directed route, collateral, asset, and wait bucket; it
+  never uses raw long-term exchange funding history for entry.
+- Open v2 positions and critical hot routes have priority over discovery. A
+  background full scan must not delay open-position polling, entry rechecks,
+  emergency close, or reconciliation.
 - A position can capture at most 4 settlements and live about 4 hours 5 minutes.
 - A common 10% price move is telemetry and a fresh-risk warning, not an automatic stop-loss.
 - Negative-PnL routes are not shown as candidates.

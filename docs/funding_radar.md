@@ -309,11 +309,22 @@ creates a `watch` route, not a final candidate and not a fill. The focused engin
 must collect paired fresh observations before entry. A paper position opens only
 after two simulated marketable IOC fills complete before T-20.
 
+Initial entry is deliberately independent from 7/30/90-day raw funding history.
+Historical persistence, old medians, old win rate, or forecast windows can inform
+research views, but they cannot block the first synchronized funding entry. The
+entry gate uses only current next-settlement funding, executable book costs,
+fresh paired observations, fees, reserves, capability, and exact timestamps.
+
 Every captured funding timestamp creates pending reconciliation rows for both
 legs. Missing public funding history never falls back to the entry estimate as a
 cashflow. Reconciled PnL requires both the public funding rate and a nearby
 settlement mark; until then, funding remains pending and excluded from realized
 profitability.
+
+For a hold after settlement, history is allowed only as a compact reliability
+haircut from local fully reconciled prior hold cycles of the same directed route,
+collateral, asset, and wait bucket. Insufficient history applies a 0.75 multiplier
+and allows at most one extra settlement; bad realized history closes the position.
 
 ## Commands
 
@@ -346,6 +357,11 @@ After settlement, normal close is blocked until T+20. Around T+30 the bot either
 holds the next aligned cycle after incremental underwriting or closes through two
 simulated reduce-only exit orders. Hold decisions do not wait for the previous
 cycle's funding reconciliation.
+
+Open positions and critical hot routes have scheduler priority over discovery.
+Full-market scans run as cancellable background work and cannot block
+open-position polling, emergency close, T-35..T-25 entry rechecks, T-20 fill
+deadlines, T+5..T+30 hold observations, or due reconciliation.
 
 Telegram setup uses `FUNDING_TELEGRAM_BOT_TOKEN` and `FUNDING_TELEGRAM_CHAT_ID`
 in `.env`. After
@@ -405,6 +421,10 @@ seconds before that settlement. The target is T-30, both simulated fills must be
 done by T-20, and the route snapshot must be no older than
 `--max-entry-snapshot-age-seconds` (2 seconds by default). The old 0-15 second
 entry window and 30-second freeze-window fallback are disabled by default.
+
+For the default synchronized strategy, spread convergence is always zero expected
+profit. Settlement-capture sizing and blockers use funding-only net economics;
+spread and basis only affect executable cost, price PnL, reserves, and risk.
 
 Funding scan snapshots are operational diagnostics, not the training ledger. The
 system keeps only the latest scan snapshot plus any scans/routes linked to paper

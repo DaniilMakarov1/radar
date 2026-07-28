@@ -144,6 +144,17 @@ initial_expected_net_pnl >= max(1.00, reference_notional * 0.002)
 initial_cost_coverage_ratio >= 1.50
 ```
 
+Entry history policy:
+
+- `entry_history_required = False`.
+- `entry_history_mode = "disabled"`.
+- Long-term raw funding history, historical persistence, historical medians,
+  historical win rate, and old forecast windows are not entry blockers.
+- Focused pre-entry observations are mandatory, but they are current paired
+  snapshots, not long-term history.
+- Settlement reconciliation data is post-trade evidence and cannot create
+  pre-entry funding cashflow.
+
 Legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any`
 remain available for experimental/research profiles, but they are not the
 default paper strategy and must not be shown as production-ready by default.
@@ -184,7 +195,19 @@ profiles and old reports. They are not the source of truth for
 
 The intended runtime cadence is unchanged:
 
-- no hot routes: full market scan every `scan_interval_seconds` after completion;
+- P0 open v2/legacy positions: cancel background full scan, refresh involved
+  venues, run risk/hold/close, reconciliation, and equity snapshot, then return;
+- P1 critical hot routes at <=120 seconds to settlement: cancel background scan
+  and run due hot rechecks before discovery;
+- P2 due reconciliation;
+- P3 normal focused watch-route rechecks;
+- P4 lightweight discovery;
+- P5 background full scan only when no open position and no hot route exists.
+
+Cadence:
+
+- no hot routes: background full market scan every `scan_interval_seconds` after
+  completion;
 - hot/watch route exists: focused recheck every `monitor_interval_seconds`;
 - urgent route, pending settlement, or open position: focused recheck every
   `hot_interval_seconds`;
@@ -192,7 +215,9 @@ The intended runtime cadence is unchanged:
   the value is `0`.
 
 Full market scan can run in the background while hot rechecks continue. It must
-not block urgent entry checks.
+not call blocking `run_full_iteration()` from the scheduler, must not wait on an
+unfinished future, must not clear hot routes, and must not overwrite a newer
+focused snapshot.
 
 ## 7. Scanner, Watch, and Entry Lifecycle
 
@@ -260,6 +285,27 @@ Hold is allowed only if:
 - captured settlements remain below 4 and projected age remains at most 14,700
   seconds;
 - hard risk gates pass.
+
+Before those economics are accepted, apply hold history reliability:
+
+```text
+history_adjusted_next_funding =
+  next_conservative_funding_gross * history_multiplier
+```
+
+The history sample is local-only and scoped to the same canonical asset,
+directed long venue, directed short venue, collateral asset, and next-settlement
+wait bucket (`<=1h`, `>1h..<=2h`, `>2h..<=4h`). It uses only fully reconciled
+prior hold cycles, never raw exchange funding history.
+
+If valid cycles `< 8`, history is insufficient: multiplier `0.75`, no automatic
+veto, and at most one additional settlement may be held. If valid cycles `>= 8`,
+hold fails when positive realization rate `< 0.70` or p25 realization ratio
+`< 0.50`; otherwise the multiplier is `clamp(0.50, 1.00, p25 ratio)`.
+
+Good history cannot override negative current funding, negative current
+executable PnL, stale data, liquidity failure, basis risk, schedule mismatch, or
+hard risk.
 
 Hold does not wait for the prior cycle's reconciliation. The position can be
 `HOLDING_NEXT_CYCLE` while previous public funding rows are still pending.
@@ -353,6 +399,13 @@ collateral, discrete next-settlement funding, next funding timestamp, mark/index
 prices, executable orderbook depth, 24h quote volume, open interest, taker fee,
 quantity step, and min notional. Otherwise it remains diagnostics/research-only
 with an explicit reason.
+
+Do not infer critical capability fields from indirect clues. `contract_type`,
+matching collateral/quote assets, `funding_rate_kind`, or a present
+`normalized_next_funding_rate` are not enough. Paper eligibility requires explicit
+`contract_kind`, `funding_rate_semantics`, `funding_rate_unit`,
+`funding_sign_convention`, and `supports_discrete_funding`. Unknown means
+research-only until an adapter-level contract is declared and tested.
 
 For CLOB venues, depth must be modeled by walking all returned levels needed for
 the target base quantity. Do not use only top-of-book size. Do not use a fixed
