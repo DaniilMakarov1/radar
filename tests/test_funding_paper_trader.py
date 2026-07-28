@@ -1683,32 +1683,35 @@ def test_background_full_scan_does_not_block_hot_iterations(tmp_path) -> None:
         config=PaperBotConfig(scan_interval_seconds=300),
         background_delay=0.35,
     )
-    trader.hot_routes["route-1"] = paper_route(now, 90, 90)
     trader.last_full_scan_monotonic = time.monotonic() - 301
 
     first_started = time.perf_counter()
     first = trader.run_iteration()
     first_elapsed = time.perf_counter() - first_started
 
-    assert first["mode"] == "hot_routes"
+    assert first["mode"] == "background_full_scan_wait"
     assert first["background_full_scan_status"] == "started"
     assert trader.background_started.wait(0.2)
     assert first_elapsed < 0.15
-    assert trader.hot_iterations == 1
+    assert trader.hot_iterations == 0
+
+    trader.hot_routes["route-1"] = paper_route(now, 90, 90)
 
     second_started = time.perf_counter()
     second = trader.run_iteration()
     second_elapsed = time.perf_counter() - second_started
 
-    assert second["mode"] == "hot_routes"
+    assert second["mode"] == "critical_hot_routes"
     assert second.get("background_full_scan_running") is True
     assert second_elapsed < 0.15
-    assert trader.hot_iterations == 2
+    assert trader.hot_iterations == 1
+    assert trader.last_cancel_event is not None
+    assert trader.last_cancel_event.is_set()
 
     assert trader.background_finished.wait(1.0)
     third = trader.run_iteration()
-    assert third["mode"] == "hot_routes"
-    assert third["background_full_scan_results"][0]["mode"] == "background_full_market"
+    assert third["mode"] == "critical_hot_routes"
+    assert third["background_full_scan_results"][0]["status"] == "deferred"
     trader.shutdown_background_full_scan()
 
 
@@ -1726,41 +1729,38 @@ def test_urgent_hot_route_does_not_start_background_full_scan(tmp_path) -> None:
 
     result = trader.run_iteration()
 
-    assert result["mode"] == "hot_routes"
+    assert result["mode"] == "critical_hot_routes"
     assert "background_full_scan_status" not in result
     assert not trader.background_started.is_set()
 
 
-def test_background_discovery_scan_uses_isolated_database(tmp_path, monkeypatch) -> None:
+def test_background_discovery_scan_uses_lightweight_clients_only(tmp_path, monkeypatch) -> None:
     store = SQLiteStore(tmp_path / "main.sqlite")
     store.init_db()
     trader = PaperBot(store, config=PaperBotConfig())
-    seen_db_paths: list[str] = []
+    now = datetime.now(UTC)
+    settlement = now + timedelta(seconds=90)
+    clients = [
+        LightweightFundingClient("venue_a", -0.004, settlement),
+        LightweightFundingClient("venue_b", 0.004, settlement),
+    ]
 
     def fake_run_funding_scan(scan_store, **kwargs):
-        seen_db_paths.append(str(scan_store.db_path))
-        return {
-            "funding_scan_id": 123,
-            "universe_route_count": 0,
-            "execution_shortlist_count": 0,
-            "route_count": 0,
-        }
-
-    def fake_funding_dashboard(self, **kwargs):
-        return {"routes": [], "watch_routes": [], "venues": []}
+        raise AssertionError("paper bot background scan must not call run_funding_scan")
 
     monkeypatch.setattr(
         "smart_money_radar.funding.trader.run_funding_scan",
         fake_run_funding_scan,
     )
-    monkeypatch.setattr(SQLiteStore, "funding_dashboard", fake_funding_dashboard)
+    trader.build_venue_clients = lambda: clients  # type: ignore[method-assign]
 
     result = trader.run_discovery_full_scan()
 
     assert result["mode"] == "background_full_market"
-    assert seen_db_paths
-    assert seen_db_paths[0] != str(store.db_path)
-    assert "funding-background-scan-" in seen_db_paths[0]
+    assert result["watch_count"] == 1
+    assert result["funding_scan_id"] is None
+    assert all(client.orderbook_calls == 0 for client in clients)
+    assert all(client.history_calls == 0 for client in clients)
 
 
 def test_hot_route_rechecks_are_parallelized(tmp_path) -> None:
@@ -1818,6 +1818,53 @@ def test_open_position_keeps_focused_loop_without_hot_route(tmp_path) -> None:
     )
 
     assert trader.should_run_hot_iteration()
+
+
+def test_v2_open_position_forces_scheduler_priority(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    now = datetime.now(UTC)
+    store.upsert_funding_capture_position(
+        {
+            "position_id": "v2-open-1",
+            "strategy_name": "synchronized_funding_capture",
+            "strategy_version": "synchronized_funding_capture_v2",
+            "canonical_asset": "BTC",
+            "long_venue": "venue_a",
+            "long_symbol": "BTCUSDT",
+            "short_venue": "venue_b",
+            "short_symbol": "BTCUSDT",
+            "quantity": 1.0,
+            "target_notional": 500.0,
+            "state": "OPEN",
+            "opened_at": now.isoformat(),
+            "config": {"route_key": "v2-route-1", "entry_legs": []},
+        }
+    )
+    trader = OpenPriorityTrader(store, config=PaperBotConfig(scan_interval_seconds=300))
+    trader.background_full_scan_cancel_event = threading.Event()
+
+    result = trader.run_iteration()
+
+    assert result["mode"] == "open_positions"
+    assert trader.open_position_calls == 1
+    assert trader.background_full_scan_cancel_event.is_set()
+    assert not trader.lightweight_called
+    assert not trader.hot_iteration_called
+
+
+def test_background_future_result_not_called_until_done(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = IdleSchedulerTrader(store, config=PaperBotConfig(scan_interval_seconds=300))
+    trader.last_full_scan_monotonic = trader.clock.monotonic()
+    trader.background_full_scan_future = NotDoneFuture()
+
+    result = trader.run_iteration()
+
+    assert result["mode"] == "background_full_scan_wait"
+    assert result["background_full_scan_running"] is True
+    assert trader.background_full_scan_future.result_called is False
 
 
 def test_status_report_can_be_disabled(tmp_path) -> None:
@@ -1884,6 +1931,7 @@ class SlowBackgroundScanTrader(PaperBot):
         self.background_started = threading.Event()
         self.background_finished = threading.Event()
         self.hot_iterations = 0
+        self.last_cancel_event = None
 
     def run_hot_iteration(self) -> dict:
         self.hot_iterations += 1
@@ -1902,7 +1950,11 @@ class SlowBackgroundScanTrader(PaperBot):
             "urgent_route_count": 0,
         }
 
-    def run_discovery_full_scan(self) -> dict:
+    def _run_lightweight_discovery(self) -> dict | None:
+        return None
+
+    def run_discovery_full_scan(self, cancel_event=None) -> dict:
+        self.last_cancel_event = cancel_event
         self.background_started.set()
         try:
             time.sleep(self.background_delay)
@@ -1925,6 +1977,106 @@ class SlowBackgroundScanTrader(PaperBot):
             }
         finally:
             self.background_finished.set()
+
+
+class OpenPriorityTrader(PaperBot):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.open_position_calls = 0
+        self.lightweight_called = False
+        self.hot_iteration_called = False
+
+    def process_open_positions(self) -> list[str]:
+        self.open_position_calls += 1
+        return []
+
+    def _run_lightweight_discovery(self) -> dict | None:
+        self.lightweight_called = True
+        raise AssertionError("lightweight discovery must not run with open exposure")
+
+    def run_hot_iteration(self) -> dict:
+        self.hot_iteration_called = True
+        raise AssertionError("hot iteration must not run before open exposure")
+
+
+class IdleSchedulerTrader(PaperBot):
+    def _run_lightweight_discovery(self) -> dict | None:
+        return None
+
+
+class NotDoneFuture:
+    result_called = False
+
+    def done(self) -> bool:
+        return False
+
+    def result(self):
+        self.result_called = True
+        raise AssertionError("future.result() must not be called until done()")
+
+
+class LightweightFundingClient:
+    def __init__(
+        self,
+        venue: str,
+        funding_rate: float,
+        next_funding_at: datetime,
+    ) -> None:
+        self.venue = venue
+        self.funding_rate = funding_rate
+        self.next_funding_at = next_funding_at
+        self.orderbook_calls = 0
+        self.history_calls = 0
+
+    def catalog_and_markets(self, observed_at: str):
+        instrument = {
+            "venue": self.venue,
+            "symbol": "ABCUSDT",
+            "canonical_asset": "ABC",
+            "base_asset": "ABC",
+            "quote_asset": "USDT",
+            "collateral_asset": "USDT",
+            "contract_type": "linear_perpetual",
+            "contract_multiplier": 0.01,
+            "status": "active",
+            "observed_at": observed_at,
+        }
+        market = {
+            "venue": self.venue,
+            "symbol": "ABCUSDT",
+            "canonical_asset": "ABC",
+            "funding_rate": self.funding_rate,
+            "normalized_next_funding_rate": self.funding_rate,
+            "funding_rate_unit": "fraction_of_notional_per_settlement",
+            "funding_sign_convention": "positive_long_pays",
+            "funding_interval_hours": 1.0,
+            "hourly_funding_rate": self.funding_rate,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": self.next_funding_at.isoformat(),
+            "mark_price": 100.0,
+            "index_price": 100.0,
+            "open_interest_usd": 10_000_000.0,
+            "volume_24h_usd": 30_000_000.0,
+            "quantity_step": 0.01,
+            "min_notional_usd": 5.0,
+            "taker_fee_rate": 0.0005,
+            "observed_at": observed_at,
+        }
+        return [instrument], [market], []
+
+    def orderbook(self, symbol: str, observed_at: str, limit: int = 100):
+        self.orderbook_calls += 1
+        raise AssertionError("background discovery must not fetch orderbooks")
+
+    def funding_history(
+        self,
+        symbol: str,
+        start_time_ms: int,
+        interval_hours: float,
+        observed_at: str,
+    ):
+        self.history_calls += 1
+        raise AssertionError("background discovery must not fetch history")
 
 
 def test_filtered_summary_preserves_original_pnl() -> None:

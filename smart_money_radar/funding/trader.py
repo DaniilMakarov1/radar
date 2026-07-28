@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
+from threading import Event
 from types import FrameType
 from typing import Any
 
@@ -427,6 +428,8 @@ class PaperBot:
         self.background_full_scan_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_future: Future[dict[str, Any]] | None = None
         self.background_full_scan_started_monotonic = 0.0
+        self.background_full_scan_cancel_event: Event | None = None
+        self.pending_completed_background_full_scan: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle: signal handling, sleep, notifications (folded from BaseBot)
@@ -579,44 +582,78 @@ class PaperBot:
         if completed is not None:
             background_results.append(completed)
 
-        if self.should_run_hot_iteration():
+        if self.has_open_exposure():
+            self.request_background_full_scan_cancel("open_exposure_priority")
+            result = self.run_open_position_iteration()
+            reconciliation = self._maybe_run_reconciliation()
+            if reconciliation is not None:
+                result["reconciliation"] = reconciliation
+            if background_results:
+                result["background_full_scan_results"] = background_results
+            if self.background_full_scan_running():
+                result["background_full_scan_running"] = True
+            return result
+
+        if self.critical_entry_recheck_active():
+            self.request_background_full_scan_cancel("critical_hot_route_priority")
             result = self.run_hot_iteration()
-            background_started = self.maybe_start_background_full_scan()
-            if background_started:
-                result["background_full_scan_status"] = "started"
-        elif self.background_full_scan_running():
-            result = self.run_background_wait_iteration(background_running=True)
-        elif background_results:
-            result = self.run_background_wait_iteration(background_running=False)
+            result["mode"] = "critical_hot_routes"
+            reconciliation = self._maybe_run_reconciliation()
+            if reconciliation is not None:
+                result["reconciliation"] = reconciliation
+            if background_results:
+                result["background_full_scan_results"] = background_results
+            if self.background_full_scan_running():
+                result["background_full_scan_running"] = True
+            return result
+
+        reconciliation = self._maybe_run_reconciliation()
+
+        if self.hot_routes:
+            result = self.run_hot_iteration()
         else:
-            result = self.run_full_iteration()
+            result = self.run_background_wait_iteration(
+                background_running=self.background_full_scan_running()
+            )
+            discovery = self._run_lightweight_discovery()
+            if discovery is not None:
+                result["lightweight_discovery"] = discovery
+
+        if reconciliation is not None:
+            result["reconciliation"] = reconciliation
 
         completed = self.collect_background_full_scan_result()
         if completed is not None:
             background_results.append(completed)
         if background_results:
             result["background_full_scan_results"] = background_results
+
+        if not self.has_open_exposure() and not self.hot_routes:
+            background_started = self.maybe_start_background_full_scan()
+            if background_started:
+                result["background_full_scan_status"] = "started"
+
         if self.background_full_scan_running():
             result["background_full_scan_running"] = True
-        # --- Lightweight discovery between full scans ---
-        discovery = self._run_lightweight_discovery()
-        if discovery is not None:
-            result["lightweight_discovery"] = discovery
-        # --- Reconciliation worker on 10-second cadence ---
-        reconciliation = self._maybe_run_reconciliation()
-        if reconciliation is not None:
-            result["reconciliation"] = reconciliation
         return result
 
     def should_run_hot_iteration(self) -> bool:
+        if self.store.funding_capture_open_positions():
+            return True
         if self.store.funding_paper_open_positions():
             return True
         return bool(self.hot_routes)
 
+    def has_open_exposure(self) -> bool:
+        return bool(
+            self.store.funding_capture_open_positions()
+            or self.store.funding_paper_open_positions()
+        )
+
     def full_scan_due(self) -> bool:
         if self.last_full_scan_monotonic <= 0:
             return True
-        elapsed = time.monotonic() - self.last_full_scan_monotonic
+        elapsed = self.clock.monotonic() - self.last_full_scan_monotonic
         return elapsed >= self.config.scan_interval_seconds
 
     def background_full_scan_running(self) -> bool:
@@ -626,37 +663,62 @@ class PaperBot:
     def critical_entry_recheck_active(self) -> bool:
         if not self.hot_routes:
             return False
-        now = datetime.now(UTC)
+        now = self.clock.now()
         return any(
-            route_monitor_decision(route, now, self.config)["urgent"]
+            any(
+                lead is not None and 0 <= lead <= 120.0
+                for lead in route_monitor_decision(route, now, self.config)[
+                    "lead_seconds"
+                ].values()
+            )
             for route in self.hot_routes.values()
         )
 
     def maybe_start_background_full_scan(self) -> bool:
         if not self.full_scan_due() or self.background_full_scan_running():
             return False
-        if self.critical_entry_recheck_active():
+        if self.has_open_exposure() or self.hot_routes:
             return False
         if self.background_full_scan_executor is None:
             self.background_full_scan_executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="funding-full-scan",
             )
-        self.background_full_scan_started_monotonic = time.monotonic()
+        cancel_event = Event()
+        self.background_full_scan_cancel_event = cancel_event
+        self.background_full_scan_started_monotonic = self.clock.monotonic()
         self.background_full_scan_future = self.background_full_scan_executor.submit(
-            self.run_discovery_full_scan
+            self.run_discovery_full_scan,
+            cancel_event,
         )
         return True
 
+    def request_background_full_scan_cancel(self, reason: str) -> None:
+        event = self.background_full_scan_cancel_event
+        if event is not None:
+            event.set()
+
     def collect_background_full_scan_result(self) -> dict[str, Any] | None:
+        if self.pending_completed_background_full_scan is not None:
+            if self.has_open_exposure() or self.critical_entry_recheck_active():
+                return {
+                    "status": "deferred",
+                    "reason": "protected_hot_or_open_path",
+                    "mode": "background_full_market",
+                }
+            result = self.pending_completed_background_full_scan
+            self.pending_completed_background_full_scan = None
+            return self.merge_background_full_scan_result(result)
+
         future = self.background_full_scan_future
         if future is None or not future.done():
             return None
         self.background_full_scan_future = None
+        self.background_full_scan_cancel_event = None
         try:
             result = future.result()
         except Exception as exc:
-            self.last_full_scan_monotonic = time.monotonic()
+            self.last_full_scan_monotonic = self.clock.monotonic()
             payload = {
                 "status": "failed",
                 "error_type": type(exc).__name__,
@@ -674,8 +736,18 @@ class PaperBot:
             )
             return payload
 
+        if self.has_open_exposure() or self.critical_entry_recheck_active():
+            self.pending_completed_background_full_scan = result
+            return {
+                "status": "deferred",
+                "reason": "protected_hot_or_open_path",
+                "mode": "background_full_market",
+            }
+        return self.merge_background_full_scan_result(result)
+
+    def merge_background_full_scan_result(self, result: dict[str, Any]) -> dict[str, Any]:
         self.last_full_scan_monotonic = float(
-            result.get("completed_monotonic") or time.monotonic()
+            result.get("completed_monotonic") or self.clock.monotonic()
         )
         routes = list(result.pop("_routes", []) or [])
         watch_routes = list(result.pop("_watch_routes", []) or [])
@@ -711,54 +783,67 @@ class PaperBot:
         )
         self.background_full_scan_executor = None
         self.background_full_scan_future = None
+        self.background_full_scan_cancel_event = None
 
-    def run_discovery_full_scan(self) -> dict[str, Any]:
-        started = time.monotonic()
-        # The market-wide scan can be slow and write-heavy. Keep it isolated
-        # from the live paper DB so urgent focused rechecks do not wait on a
-        # long SQLite writer. Once complete, only the route payload is merged
-        # back into the in-memory watch list.
-        with tempfile.TemporaryDirectory(prefix="funding-background-scan-") as tmpdir:
-            discovery_store = SQLiteStore(Path(tmpdir) / "radar.sqlite")
-            discovery_store.init_db()
-            scan_result = run_funding_scan(
-                discovery_store,
-                config=self.scan_config(),
-                venue_clients=self.build_venue_clients(),
-                scan_mode="watch",
+    def run_discovery_full_scan(
+        self,
+        cancel_event: Event | None = None,
+    ) -> dict[str, Any]:
+        started = self.clock.monotonic()
+        clients = self.build_venue_clients() or active_default_funding_clients()
+        clients = [
+            funding_client_for_venue(str(getattr(client, "venue", "")).lower()) or client
+            for client in clients
+            if str(getattr(client, "venue", "")).lower() not in DEACTIVATED_FUNDING_VENUES
+        ]
+        clients = [client for client in clients if client is not None]
+        now = self.clock.now().astimezone(UTC)
+        observed_at = now.isoformat()
+        if cancel_event is not None and cancel_event.is_set():
+            markets: list[dict[str, Any]] = []
+            warnings = ["background scan cancelled before catalog fetch"]
+        else:
+            markets, warnings = self._fetch_lightweight_market_snapshots(
+                clients,
+                observed_at,
+                max_workers=2,
+                cancel_event=cancel_event,
             )
-            funding = discovery_store.funding_dashboard(
-                horizon_mode="next_settlement",
-                include_watch_scans=True,
-            )
-            funding = filter_deactivated_funding_dashboard_payload(funding)
-            routes = list(funding.get("routes") or [])
-            watch_routes = list(funding.get("watch_routes") or [])
+        clients_by_venue = {
+            str(getattr(client, "venue", "")).lower(): client
+            for client in clients
+        }
+        watch_routes, summary = self._build_lightweight_watch_routes(
+            markets,
+            clients_by_venue,
+            now,
+        )
+        routes: list[dict[str, Any]] = []
+        cancelled = bool(cancel_event is not None and cancel_event.is_set())
         return {
             "mode": "background_full_market",
-            "funding_scan_id": scan_result["funding_scan_id"],
+            "funding_scan_id": None,
             "candidate_count": len(routes),
-            "watch_count": len(watch_routes),
+            "watch_count": 0 if cancelled else len(watch_routes),
             "opened_count": 0,
             "closed_count": 0,
             "repriced_count": 0,
             "pending_count": 0,
             "held_count": 0,
-            "open_position_count": len(self.store.funding_paper_open_positions()),
-            "hot_route_count": count_hot_routes([*routes, *watch_routes], self.config),
-            "urgent_route_count": count_urgent_routes([*routes, *watch_routes], self.config),
-            "universe_route_count": scan_result.get("universe_route_count"),
-            "execution_shortlist_count": scan_result.get("execution_shortlist_count"),
-            "route_count": scan_result.get("route_count"),
-            "screen_reasons": (
-                (funding.get("universe_summary") or {}).get("screen_reasons")
-                or []
-            ),
-            "blocker_summary": funding.get("blocker_summary") or [],
+            "open_position_count": 0,
+            "hot_route_count": 0 if cancelled else count_hot_routes(watch_routes, self.config),
+            "urgent_route_count": 0 if cancelled else count_urgent_routes(watch_routes, self.config),
+            "universe_route_count": summary["routes_structurally_matched"],
+            "execution_shortlist_count": 0,
+            "route_count": len(watch_routes),
+            "screen_reasons": summary.get("rejection_reasons") or {},
+            "blocker_summary": [],
+            "warnings": warnings,
+            "cancelled": cancelled,
             "started_monotonic": started,
-            "completed_monotonic": time.monotonic(),
+            "completed_monotonic": self.clock.monotonic(),
             "_routes": routes,
-            "_watch_routes": watch_routes,
+            "_watch_routes": [] if cancelled else watch_routes,
         }
 
     def run_background_wait_iteration(
@@ -767,6 +852,8 @@ class PaperBot:
         background_running: bool,
     ) -> dict[str, Any]:
         self.store.init_db()
+        if self.has_open_exposure():
+            return self.run_open_position_iteration()
         repriced_count = self.refresh_and_publish_repriced_pnl()
         snapshot = self.store.record_funding_paper_equity_snapshot()
         return {
@@ -786,6 +873,34 @@ class PaperBot:
                 self.config,
             ),
             "background_full_scan_running": background_running,
+            "equity": snapshot,
+        }
+
+    def run_open_position_iteration(self) -> dict[str, Any]:
+        self.store.init_db()
+        close_events = self.process_open_positions()
+        repriced_count = self.refresh_and_publish_repriced_pnl()
+        snapshot = self.store.record_funding_paper_equity_snapshot()
+        export_funding_paper_csv(self.store, self.config.export_dir)
+        return {
+            "mode": "open_positions",
+            "funding_scan_id": None,
+            "candidate_count": 0,
+            "watch_count": 0,
+            "opened_count": 0,
+            "closed_count": sum(1 for event in close_events if event == "closed"),
+            "repriced_count": repriced_count,
+            "pending_count": sum(
+                1 for event in close_events if event == "settlement_pending"
+            ),
+            "held_count": sum(1 for event in close_events if event == "held"),
+            "open_position_count": len(self.store.funding_capture_open_positions())
+            + snapshot["open_position_count"],
+            "hot_route_count": len(self.hot_routes),
+            "urgent_route_count": count_urgent_routes(
+                list(self.hot_routes.values()),
+                self.config,
+            ),
             "equity": snapshot,
         }
 
@@ -1967,23 +2082,39 @@ class PaperBot:
         self,
         clients: list[FundingVenueClient],
         observed_at: str,
+        *,
+        max_workers: int | None = None,
+        cancel_event: Event | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         catalog_results: dict[
             str,
             tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], str, str],
         ] = {}
         warnings: list[str] = []
-        with ThreadPoolExecutor(max_workers=max(1, len(clients))) as executor:
+        worker_count = max(1, min(int(max_workers or len(clients) or 1), len(clients) or 1))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {}
             for client in clients:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 venue = str(getattr(client, "venue", "")).lower()
                 request_started_at = self.clock.now().isoformat()
-                futures[executor.submit(client.catalog_and_markets, observed_at)] = (
+                futures[
+                    executor.submit(
+                        self._cancelable_catalog_and_markets,
+                        client,
+                        observed_at,
+                        cancel_event,
+                    )
+                ] = (
                     venue,
                     request_started_at,
                 )
             for future in as_completed(futures):
                 venue, request_started_at = futures[future]
+                if cancel_event is not None and cancel_event.is_set():
+                    future.cancel()
+                    continue
                 try:
                     instruments, markets, venue_warnings = future.result()
                 except FundingDataError as exc:
@@ -2042,6 +2173,16 @@ class PaperBot:
             )
             enriched_markets.append(row)
         return enriched_markets, warnings
+
+    def _cancelable_catalog_and_markets(
+        self,
+        client: FundingVenueClient,
+        observed_at: str,
+        cancel_event: Event | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        if cancel_event is not None and cancel_event.is_set():
+            return [], [], ["background scan cancelled before venue fetch"]
+        return client.catalog_and_markets(observed_at)
 
     def _build_lightweight_watch_routes(
         self,
