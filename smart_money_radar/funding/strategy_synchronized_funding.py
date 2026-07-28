@@ -300,3 +300,122 @@ def synchronized_strategy_candidate(
             "convergence is zero; executable spread and basis are modeled as cost/risk."
         ),
     }
+
+
+def validate_focused_observation(
+    observation: dict[str, Any],
+    *,
+    now: datetime,
+    max_age_seconds: float = 2.0,
+    max_response_skew_seconds: float = 1.0,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    long_age = float(observation.get("long_age_seconds") or 0.0)
+    short_age = float(observation.get("short_age_seconds") or 0.0)
+    long_response_at = parse_time(observation.get("long_response_received_at"))
+    short_response_at = parse_time(observation.get("short_response_received_at"))
+    long_next_funding = parse_time(observation.get("long_next_funding_at"))
+    short_next_funding = parse_time(observation.get("short_next_funding_at"))
+    long_book_executable = bool(observation.get("long_book_executable"))
+    short_book_executable = bool(observation.get("short_book_executable"))
+    capabilities_passed = bool(observation.get("capabilities_passed"))
+    if long_age > max_age_seconds:
+        reasons.append(f"long_age_exceeds_{max_age_seconds}s")
+    if short_age > max_age_seconds:
+        reasons.append(f"short_age_exceeds_{max_age_seconds}s")
+    if long_response_at is not None and short_response_at is not None:
+        response_skew = abs(
+            (long_response_at.astimezone(UTC) - short_response_at.astimezone(UTC)).total_seconds()
+        )
+        if response_skew > max_response_skew_seconds:
+            reasons.append(
+                f"response_skew_{response_skew:.3f}s_exceeds_{max_response_skew_seconds}s"
+            )
+    elif long_response_at is None or short_response_at is None:
+        reasons.append("response_timestamp_missing")
+    if long_next_funding is not None and short_next_funding is not None:
+        funding_skew = abs(
+            (long_next_funding.astimezone(UTC) - short_next_funding.astimezone(UTC)).total_seconds()
+        )
+        if funding_skew > 1.0:
+            reasons.append("funding_timestamps_not_same_cycle")
+    elif long_next_funding is None or short_next_funding is None:
+        reasons.append("funding_timestamp_missing")
+    if not long_book_executable:
+        reasons.append("long_book_not_executable")
+    if not short_book_executable:
+        reasons.append("short_book_not_executable")
+    if not capabilities_passed:
+        reasons.append("capabilities_not_passed")
+    return {
+        "valid": not reasons,
+        "reasons": reasons,
+        "long_age_seconds": long_age,
+        "short_age_seconds": short_age,
+        "gross_funding_pnl": float(observation.get("gross_funding_pnl") or 0.0),
+        "observed_at": observation.get("observed_at"),
+    }
+
+
+def entry_underwriting(
+    observations: list[dict[str, Any]],
+    *,
+    now: datetime,
+    minimum_observations: int = 10,
+    minimum_span_seconds: float = 20.0,
+    max_latest_age_seconds: float = 2.0,
+    conservative_fraction: float = 0.9,
+    latest_vs_median_fraction: float = 0.8,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if len(observations) < minimum_observations:
+        reasons.append(
+            f"insufficient_observations_{len(observations)}<{minimum_observations}"
+        )
+    gross_values = [float(row.get("gross_funding_pnl") or 0.0) for row in observations]
+    observed_times = [
+        parse_time(row.get("observed_at"))
+        for row in observations
+        if parse_time(row.get("observed_at")) is not None
+    ]
+    latest = max(observed_times) if observed_times else None
+    earliest = min(observed_times) if observed_times else None
+    span = (
+        (latest - earliest).total_seconds()
+        if latest is not None and earliest is not None
+        else 0.0
+    )
+    latest_age = (
+        (now.astimezone(UTC) - latest.astimezone(UTC)).total_seconds()
+        if latest is not None
+        else None
+    )
+    if span < minimum_span_seconds:
+        reasons.append(f"observation_span_{span:.1f}s_below_{minimum_span_seconds}s")
+    if latest_age is None or latest_age > max_latest_age_seconds:
+        reasons.append(
+            f"latest_observation_age_{latest_age}s_exceeds_{max_latest_age_seconds}s"
+            if latest_age is not None
+            else "latest_observation_age_missing"
+        )
+    if gross_values and not all(value > 0 for value in gross_values):
+        reasons.append("not_all_gross_funding_positive")
+    median_gross = median(gross_values) if gross_values else 0.0
+    latest_gross = gross_values[-1] if gross_values else 0.0
+    if gross_values and latest_gross < latest_vs_median_fraction * median_gross:
+        reasons.append(
+            f"latest_gross_{latest_gross:.4f}_below_{latest_vs_median_fraction}*median_{median_gross:.4f}"
+        )
+    conservative_funding = conservative_fraction * min(gross_values) if gross_values else 0.0
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "observation_count": len(observations),
+        "observation_span_seconds": span,
+        "latest_observation_age_seconds": latest_age,
+        "median_gross_funding": median_gross,
+        "latest_gross_funding": latest_gross,
+        "minimum_gross_funding": min(gross_values) if gross_values else 0.0,
+        "all_positive": all(value > 0 for value in gross_values),
+        "conservative_funding_gross": conservative_funding,
+    }

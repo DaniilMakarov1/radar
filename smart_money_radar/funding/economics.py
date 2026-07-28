@@ -25,6 +25,13 @@ from smart_money_radar.funding.normalization import (
     funding_persistence,
     parse_timestamp,
 )
+from smart_money_radar.funding.strategy_synchronized_funding import (
+    synchronized_strategy_candidate,
+)
+from smart_money_radar.funding.venue_capabilities import (
+    capability_from_market,
+    synchronized_route_capability_check,
+)
 
 
 MAX_ABSOLUTE_HOURLY_FUNDING_RATE = 0.02
@@ -539,28 +546,84 @@ def evaluate_perp_route(
     if int(forecast["duration_sample_count"]) < 5:
         risk_flags.append("limited_regime_duration_history")
     risk_flags.append("account_margin_unverified")
+    long_capability_market = {
+        **long_market,
+        "orderbook_response_received_at": long_book.get("response_received_at")
+        or long_book.get("observed_at"),
+        "orderbook_event_time": long_book.get("orderbook_event_time")
+        or long_book.get("observed_at"),
+        "orderbook_depth_available": valid_orderbook(long_book),
+    }
+    short_capability_market = {
+        **short_market,
+        "orderbook_response_received_at": short_book.get("response_received_at")
+        or short_book.get("observed_at"),
+        "orderbook_event_time": short_book.get("orderbook_event_time")
+        or short_book.get("observed_at"),
+        "orderbook_depth_available": valid_orderbook(short_book),
+    }
+    capability_check = synchronized_route_capability_check(
+        capability_from_market(long_capability_market),
+        capability_from_market(short_capability_market),
+    )
+    if decision_mode == "settlement_capture" and not capability_check["paper_eligible"]:
+        blocking_risk_flags.extend(capability_check["all_reasons"])
 
-    strategy_evaluation = build_strategy_evaluation(
-        selected_size,
-        current_nowcast_gross,
-        current_nowcast_net,
-        current_basis_stress_net_profit,
-        actionable_profit_threshold,
-        blocking_risk_flags,
-        decision_mode,
-    )
-    selected_strategy = strategy_evaluation["selected_strategy"]
-
-    legacy_paper_candidate = not blocking_reasons
-    strategy_paper_candidate = bool(
-        selected_strategy and selected_strategy.get("eligible")
-    )
-    paper_candidate = (
-        strategy_paper_candidate
-        if decision_mode == "settlement_capture"
-        else legacy_paper_candidate
-    )
-    status = "paper_candidate" if paper_candidate else "watch"
+    if decision_mode == "settlement_capture":
+        synchronized_candidate = synchronized_strategy_candidate(
+            {
+                "funding_notional": selected_size.get("funding_notional", notional),
+                "execution_cost": selected_size.get("execution_cost", total_fees + slippage_cost),
+                "basis_stress_loss": basis_stress_loss,
+            },
+            current_funding_gross=current_nowcast_gross,
+            actionable_profit_threshold=actionable_profit_threshold,
+            blocking_risk_flags=blocking_risk_flags,
+            decision_mode=decision_mode,
+        )
+        strategy_evaluation = {
+            "strategy_candidates": [synchronized_candidate],
+            "selected_strategy": synchronized_candidate if synchronized_candidate.get("eligible") else None,
+            "pnl_components": {
+                "funding_pnl_component": synchronized_candidate.get("funding_pnl_component", 0.0),
+                "spread_pnl_component": 0.0,
+                "signed_spread_pnl_component": 0.0,
+                "spread_convergence_component": 0.0,
+                "execution_cost": synchronized_candidate.get("execution_cost", 0.0),
+                "funding_only_net_pnl": current_nowcast_net,
+                "spread_total_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "combined_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "opportunistic_any_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "opportunity_expected_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "opportunity_risk_adjusted_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "opportunistic_risk_adjusted_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "basis_stress_loss": basis_stress_loss,
+                "incremental_basis_stress_loss": basis_stress_loss,
+                "funding_basis_stress_net_pnl": current_basis_stress_net_profit,
+                "spread_basis_stress_net_pnl": synchronized_candidate.get("expected_net_pnl", 0.0),
+                "positive_edge_pnl": synchronized_candidate.get("funding_pnl_component", 0.0),
+                "drag_pnl": synchronized_candidate.get("execution_cost", 0.0) + basis_stress_loss,
+                "coverage_ratio": synchronized_candidate.get("coverage_ratio", 0.0),
+            },
+        }
+        selected_strategy = synchronized_candidate
+        status = "watch" if capability_check["paper_eligible"] else "research_only"
+    else:
+        strategy_evaluation = build_strategy_evaluation(
+            selected_size,
+            current_nowcast_gross,
+            current_nowcast_net,
+            current_basis_stress_net_profit,
+            actionable_profit_threshold,
+            blocking_risk_flags,
+            decision_mode,
+        )
+        selected_strategy = strategy_evaluation["selected_strategy"]
+        legacy_paper_candidate = not blocking_reasons
+        strategy_paper_candidate = bool(
+            selected_strategy and selected_strategy.get("eligible")
+        )
+        status = "paper_candidate" if legacy_paper_candidate else "watch"
     current_depth_score = min(1.0, capacity / max(config.target_notional, 1.0))
     sequence_depth_score = (
         float(liquidity_profile["route_persistence_score"]) / 100.0
@@ -727,6 +790,9 @@ def evaluate_perp_route(
             "selected_strategy": selected_strategy,
             "strategy_classification": selected_strategy,
             "pnl_components": strategy_evaluation["pnl_components"],
+            "synchronized_capability_passed": capability_check["paper_eligible"],
+            "capability_rejections": capability_check["all_reasons"],
+            "capability_check": capability_check,
             "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
             "blocking_risk_flags": list(dict.fromkeys(blocking_risk_flags)),
             "advisory_reasons": list(dict.fromkeys(advisory_reasons)),
@@ -2022,10 +2088,20 @@ def displayed_side_quantity(levels: list[list[float]]) -> float:
 
 def valid_orderbook(book: dict[str, Any]) -> bool:
     try:
-        best_bid = float(book.get("best_bid"))
-        best_ask = float(book.get("best_ask"))
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        best_bid = float(
+            book.get("best_bid")
+            if book.get("best_bid") is not None
+            else bids[0][0]
+        )
+        best_ask = float(
+            book.get("best_ask")
+            if book.get("best_ask") is not None
+            else asks[0][0]
+        )
         mid = float(book.get("mid_price"))
-    except (TypeError, ValueError):
+    except (IndexError, TypeError, ValueError):
         return False
     return best_bid > 0 and best_ask > best_bid and best_bid < mid < best_ask
 
@@ -2404,6 +2480,15 @@ def route_leg(
         "notional": notional,
         "base_quantity": open_fill.get("filled_size", 0.0),
         "funding_rate": market["funding_rate"],
+        "raw_funding_rate": market.get("raw_funding_rate", market.get("published_funding_rate", market["funding_rate"])),
+        "raw_funding_rate_unit": market.get("raw_funding_rate_unit"),
+        "normalized_next_funding_rate": market.get(
+            "normalized_next_funding_rate",
+            market["funding_rate"],
+        ),
+        "funding_rate_unit": market.get("funding_rate_unit"),
+        "funding_sign_convention": market.get("funding_sign_convention"),
+        "normalization_evidence": market.get("normalization_evidence"),
         "funding_interval_hours": market["funding_interval_hours"],
         "hourly_funding_rate": market["hourly_funding_rate"],
         "funding_rate_kind": market.get("funding_rate_kind"),
@@ -2420,6 +2505,16 @@ def route_leg(
         ),
         "funding_display_note": market.get("funding_display_note"),
         "next_funding_at": next_settlement_at or market.get("next_funding_at"),
+        "market_request_started_at": market.get("request_started_at"),
+        "market_response_received_at": market.get("response_received_at"),
+        "response_received_at": book.get("response_received_at")
+        or market.get("response_received_at"),
+        "normalized_at": market.get("normalized_at"),
+        "venue_server_time": market.get("venue_server_time"),
+        "source_event_at": market.get("source_event_at"),
+        "orderbook_request_started_at": book.get("request_started_at"),
+        "orderbook_response_received_at": book.get("response_received_at"),
+        "orderbook_event_time": book.get("orderbook_event_time"),
         "mark_price": market.get("mark_price"),
         "index_price": market.get("index_price"),
         "best_bid": book.get("best_bid"),

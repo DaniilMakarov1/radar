@@ -52,3 +52,44 @@ def executable_paper_pnl(
         "paper_emergency_unwind_cost": float(emergency_unwind_costs_already_incurred),
         "paper_net_if_exit_now": net_if_exit,
     }
+
+
+# ---------------------------------------------------------------------------
+# Idempotent paper event ledger
+# ---------------------------------------------------------------------------
+
+def order_fee_event_key(order_id: str) -> str:
+    return f"order_fee:{order_id}"
+
+
+def price_pnl_event_key(position_id: str) -> str:
+    return f"price_pnl:{position_id}:close"
+
+
+def funding_event_key(
+    position_id: str,
+    venue: str,
+    scheduled_funding_at: str,
+) -> str:
+    return f"funding:{position_id}:{venue}:{scheduled_funding_at}"
+
+
+def make_ledger_entry(
+    event_key: str,
+    *,
+    position_id: str | None = None,
+    cycle_id: str | None = None,
+    venue: str | None = None,
+    event_type: str,
+    cash_delta: float = 0.0,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "event_key": event_key,
+        "position_id": position_id,
+        "cycle_id": cycle_id,
+        "venue": venue,
+        "event_type": event_type,
+        "cash_delta": float(cash_delta),
+        "payload": payload or {},
+    }

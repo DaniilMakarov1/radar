@@ -86,6 +86,7 @@ from smart_money_radar.paper_bot.helpers import (
     status_route_sort_key,
     tg,
 )
+from smart_money_radar.paper_bot.clock import SystemClock
 from smart_money_radar.paper_bot.position import (
     build_close_payload,
     build_position_from_route,
@@ -113,7 +114,27 @@ from smart_money_radar.paper_bot.position import (
     spread_stop_loss_triggered,
     status_publishable_candidate,
 )
-from smart_money_radar.paper_bot.risk import common_price_move_telemetry
+from smart_money_radar.paper_bot.runtime_v2 import (
+    SynchronizedFundingRuntimeV2,
+    synchronized_runtime_enabled,
+)
+from smart_money_radar.paper_bot.risk import (
+    common_price_move_telemetry,
+    dynamic_basis_risk_budget_bps,
+    dynamic_basis_stop_decision,
+    entry_risk_gates,
+    focused_recheck_capacity_check,
+    hard_risk_triggered,
+    lightweight_discovery_due,
+    risk_poll_interval_seconds,
+    risk_warnings,
+    stale_data_decision,
+)
+from smart_money_radar.paper_bot.cycle_manager import (
+    next_cycle_observation_decision,
+    post_settlement_probe_decision,
+    settlement_crossing_decision,
+)
 from smart_money_radar.paper_bot.telegram import (
     armed_message,
     close_decision_details_message,
@@ -353,6 +374,7 @@ class PaperBot:
         store: SQLiteStore,
         config: PaperBotConfig | None = None,
         notifier: TelegramNotifier | None = None,
+        clock: Any | None = None,
     ) -> None:
         cfg = (config or PaperBotConfig()).validated()
         self.iterations = cfg.iterations
@@ -361,6 +383,7 @@ class PaperBot:
             token_env_var="FUNDING_TELEGRAM_BOT_TOKEN",
             chat_id_env_var="FUNDING_TELEGRAM_CHAT_ID",
         )
+        self.clock = clock or SystemClock()
         self.stop_requested = False
         self.stop_reason: str | None = None
         self.shutdown_notified = False
@@ -375,6 +398,13 @@ class PaperBot:
         self.last_retention_monotonic = 0.0
         self.pending_notified_positions: set[int] = set()
         self.price_move_alerted_positions: set[tuple[int, str]] = set()
+        self.v2_observations_by_route: dict[str, list[dict[str, Any]]] = {}
+        self.synchronized_runtime = SynchronizedFundingRuntimeV2(
+            store=self.store,
+            config=self.config,
+            clock=self.clock,
+            observations_by_route=self.v2_observations_by_route,
+        )
         self.background_full_scan_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_future: Future[dict[str, Any]] | None = None
         self.background_full_scan_started_monotonic = 0.0
@@ -434,6 +464,8 @@ class PaperBot:
         completed = 0
         previous_signal_handlers = self.install_signal_handlers()
         try:
+            if synchronized_runtime_enabled(self.config) and self.store.funding_paper_open_positions():
+                raise RuntimeError("legacy open positions require manual resolution")
             self.record_event(
                 "trader_started",
                 "Paper Bot started",
@@ -547,6 +579,10 @@ class PaperBot:
             result["background_full_scan_results"] = background_results
         if self.background_full_scan_running():
             result["background_full_scan_running"] = True
+        # --- Lightweight discovery between full scans ---
+        discovery = self._run_lightweight_discovery()
+        if discovery is not None:
+            result["lightweight_discovery"] = discovery
         return result
 
     def should_run_hot_iteration(self) -> bool:
@@ -756,7 +792,7 @@ class PaperBot:
         )
         self.update_hot_routes([*routes, *watch_routes])
         close_events = self.process_open_positions()
-        entry_events = self.process_entry_candidates(routes)
+        entry_events = self.process_entry_candidates([*routes, *watch_routes])
         repriced_count = self.refresh_and_publish_repriced_pnl()
         snapshot = self.store.record_funding_paper_equity_snapshot()
         export_funding_paper_csv(self.store, self.config.export_dir)
@@ -816,7 +852,7 @@ class PaperBot:
         )
         close_events = self.process_open_positions()
         entry_events = self.process_entry_candidates(
-            routes,
+            rechecked_routes,
             recheck_before_open=False,
         )
         repriced_count = self.refresh_and_publish_repriced_pnl()
@@ -1340,6 +1376,7 @@ class PaperBot:
             raise FundingDataError(f"No funding client for {venue}")
         previous = self.store.latest_funding_market_with_instrument(venue, symbol) or {}
         snapshot_method = getattr(client, "market_snapshot", None)
+        request_started_at = self.clock.now().isoformat()
         if callable(snapshot_method):
             market = snapshot_method(symbol, asset, observed_at, previous)
         else:
@@ -1355,6 +1392,7 @@ class PaperBot:
             )
             if market is None:
                 raise FundingDataError(f"{venue} {symbol} market unavailable")
+        response_received_at = self.clock.now().isoformat()
         market["canonical_unit_multiplier"] = previous.get(
             "canonical_unit_multiplier",
             market.get("canonical_unit_multiplier", 1.0),
@@ -1363,6 +1401,13 @@ class PaperBot:
             "contract_multiplier",
             market.get("contract_multiplier", 1.0),
         )
+        market.setdefault("request_started_at", request_started_at)
+        market.setdefault("response_received_at", response_received_at)
+        market.setdefault("normalized_at", response_received_at)
+        market.setdefault("normalized_next_funding_rate", market.get("funding_rate"))
+        market.setdefault("funding_rate_unit", "fraction_of_notional_per_settlement")
+        market.setdefault("funding_sign_convention", "positive_long_pays")
+        market.setdefault("normalization_evidence", {"source": "adapter_market_snapshot"})
         return market, client
 
     def fetch_direct_orderbooks(
@@ -1378,16 +1423,21 @@ class PaperBot:
                     str(market["symbol"]),
                     observed_at,
                     100,
-                ): (market, client)
+                ): (market, client, self.clock.now().isoformat())
                 for market, client in markets_and_clients
             }
             for future in as_completed(futures):
-                market, _client = futures[future]
+                market, _client, request_started_at = futures[future]
                 key = (str(market["venue"]), str(market["symbol"]))
-                books[key] = normalize_orderbook_canonical_units(
+                book = normalize_orderbook_canonical_units(
                     future.result(),
                     float(market.get("canonical_unit_multiplier") or 1.0),
                 )
+                response_received_at = self.clock.now().isoformat()
+                book.setdefault("request_started_at", request_started_at)
+                book.setdefault("response_received_at", response_received_at)
+                book.setdefault("orderbook_event_time", response_received_at)
+                books[key] = book
         return books
 
     def next_sleep_seconds(self, result: dict[str, Any]) -> float:
@@ -1408,9 +1458,86 @@ class PaperBot:
         routes: list[dict[str, Any]],
         *,
         recheck_before_open: bool = True,
+    ) -> list[str]:
+        if synchronized_runtime_enabled(self.config):
+            return self.process_synchronized_entry_candidates(
+                routes,
+                recheck_before_open=recheck_before_open,
+            )
+        return [str(row) for row in self.process_legacy_entry_candidates(
+            routes,
+            recheck_before_open=recheck_before_open,
+        )]
+
+    def process_synchronized_entry_candidates(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        recheck_before_open: bool = True,
+    ) -> list[str]:
+        opened: list[str] = []
+        accounts = {
+            row["venue"]: row for row in self.store.funding_paper_account_rows()
+        }
+        for route in routes:
+            route_key = str(route.get("route_key") or "")
+            active_route = route
+            monitor = route_monitor_decision(route, self.clock.now(), self.config)
+            if monitor["hot"] and route_key and route_key not in self.armed_routes:
+                self.armed_routes.add(route_key)
+                self.record_event(
+                    "armed",
+                    armed_message(route, {**monitor, "armed": True}),
+                    {"route": route_summary(route), "decision": monitor},
+                    funding_scan_id=route.get("funding_scan_id"),
+                    funding_route_id=route.get("funding_route_id"),
+                    route_key=route.get("route_key"),
+                    notify=True,
+                )
+            if not monitor["hot"]:
+                continue
+            if recheck_before_open and self.config.focused_recheck_enabled:
+                rechecked = self.focused_recheck_route(route)
+                if not rechecked:
+                    continue
+                active_route = rechecked
+            result = self.synchronized_runtime.consider_route(active_route, accounts)
+            if not result.get("opened"):
+                continue
+            position_id = str(result["position_id"])
+            opened.append(position_id)
+            self.record_event(
+                "open",
+                (
+                    "<b>Paper Bot V2 OPEN</b>\n\n"
+                    f"<b>{tg(active_route.get('canonical_asset'))}</b>\n"
+                    f"LONG {tg(active_route.get('long_venue'))} / "
+                    f"SHORT {tg(active_route.get('short_venue'))}\n"
+                    f"Expected net: <b>{format_signed_money((result.get('economics') or {}).get('initial_expected_net_pnl'))}</b>\n"
+                    "Source: synchronized_funding_capture_v2, two simulated fills."
+                ),
+                {
+                    "route": route_summary(active_route),
+                    "v2_result": result,
+                },
+                funding_scan_id=active_route.get("funding_scan_id"),
+                funding_route_id=active_route.get("funding_route_id"),
+                route_key=active_route.get("route_key"),
+                notify=True,
+            )
+            accounts = {
+                row["venue"]: row for row in self.store.funding_paper_account_rows()
+            }
+        return opened
+
+    def process_legacy_entry_candidates(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        recheck_before_open: bool = True,
     ) -> list[int]:
         opened: list[int] = []
-        now = datetime.now(UTC)
+        now = self.clock.now()
         accounts = {
             row["venue"]: row for row in self.store.funding_paper_account_rows()
         }
@@ -1481,6 +1608,7 @@ class PaperBot:
                 continue
             position = build_position_from_route(active_route, decision, self.config)
             position_id = self.store.open_funding_paper_position(position)
+            self._create_v2_capture_position(position, position_id, now)
             opened.append(position_id)
             if route_key:
                 open_route_keys.add(route_key)
@@ -1503,9 +1631,383 @@ class PaperBot:
             }
         return opened
 
+    def _create_v2_capture_position(
+        self,
+        position: dict[str, Any],
+        funding_paper_position_id: int,
+        now: datetime,
+    ) -> str:
+        """Create a v2 funding_capture_position alongside the legacy position."""
+        from smart_money_radar.funding.strategy_synchronized_funding import (
+            STRATEGY_NAME,
+            STRATEGY_VERSION,
+        )
+        capture_position_id = f"fc-{position.get('route_key', '')}-{int(now.timestamp())}"
+        self.store.upsert_funding_capture_position({
+            "position_id": capture_position_id,
+            "funding_paper_position_id": funding_paper_position_id,
+            "strategy_name": STRATEGY_NAME,
+            "strategy_version": STRATEGY_VERSION,
+            "canonical_asset": position.get("canonical_asset", ""),
+            "long_venue": position.get("long_venue", ""),
+            "long_symbol": position.get("long_symbol", ""),
+            "short_venue": position.get("short_venue", ""),
+            "short_symbol": position.get("short_symbol", ""),
+            "quantity": float(position.get("base_quantity") or 0.0),
+            "target_notional": float(position.get("target_notional") or 0.0),
+            "state": "OPEN",
+            "opened_at": now.isoformat(),
+            "paper_open_fees": float(position.get("expected_execution_cost") or 0.0),
+        })
+        return capture_position_id
+
+    def _detect_settlement_crossing(
+        self,
+        position: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        """Detect settlement crossing and create reconciliation rows."""
+        from smart_money_radar.paper_bot.settlement import build_settlement_crossing_rows
+        max_settlement = parse_iso(position.get("max_settlement_at"))
+        if max_settlement is None or now <= max_settlement:
+            return
+        position_id = int(position["funding_paper_position_id"])
+        route_key = str(position.get("route_key") or "")
+        capture_id = f"fc-{route_key}-{int(max_settlement.timestamp())}"
+        cycle_id = f"{capture_id}:1"
+        quantity = float(position.get("base_quantity") or 0.0)
+        scheduled_at = max_settlement.isoformat()
+        rows = build_settlement_crossing_rows(
+            position_id=capture_id,
+            cycle_id=cycle_id,
+            long_venue=str(position.get("long_venue") or ""),
+            long_symbol=str(position.get("long_symbol") or ""),
+            short_venue=str(position.get("short_venue") or ""),
+            short_symbol=str(position.get("short_symbol") or ""),
+            scheduled_funding_at=scheduled_at,
+            quantity=quantity,
+        )
+        for row in rows:
+            self.store.upsert_funding_settlement_reconciliation(row)
+
+    def _poll_position_risk(
+        self,
+        position: dict[str, Any],
+        route: dict[str, Any] | None,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Poll risk engine for an open position. Returns close payload or None.
+
+        Integrates: stale data, dynamic basis, hard risk (liquidation/margin/mark-index).
+        Called by process_open_positions on every iteration for every open position.
+        """
+        close_reason: str | None = None
+        reasons: list[str] = []
+        risk_details: dict[str, Any] = {}
+
+        # --- Stale data check ---
+        route_age = route_data_age_seconds(route, now) if route else None
+        if route_age is not None:
+            stale = stale_data_decision(snapshot_age_seconds=route_age)
+            if stale["emergency_unwind"]:
+                return {
+                    "close_reason": "risk_data_hard_stale",
+                    "reasons": [f"snapshot_age_{route_age:.1f}s>5s_after_retries"],
+                    "stale_data": stale,
+                }
+
+        # --- Dynamic basis risk ---
+        if route is not None:
+            spread_snap = compute_spread_snapshot(position, route)
+            if spread_snap.get("spread_tracking"):
+                entry_spread = float(spread_snap.get("entry_cross_spread") or 0.0)
+                current_spread = float(spread_snap.get("current_cross_spread") or 0.0)
+                reference = float(spread_snap.get("notional") or 0.0)
+                legs = route.get("legs") or []
+                long_leg = leg_by_side(legs, "long") or {}
+                short_leg = leg_by_side(legs, "short") or {}
+                long_exit_buy = float(long_leg.get("best_ask") or long_leg.get("mark_price") or 0.0)
+                short_exit_buy = float(short_leg.get("best_ask") or short_leg.get("mark_price") or 0.0)
+                long_exit_sell = float(long_leg.get("best_bid") or long_leg.get("mark_price") or 0.0)
+                short_exit_sell = float(short_leg.get("best_bid") or short_leg.get("mark_price") or 0.0)
+                current_exit_spread = short_exit_buy - long_exit_sell if (short_exit_buy > 0 and long_exit_sell > 0) else current_spread
+                notes = position.get("notes") or {}
+                accrued_funding = float(notes.get("accrued_funding_pnl") or 0.0)
+                conservative_edge = accrued_funding + float(spread_snap.get("unrealized_basis_pnl") or 0.0)
+                ref_for_bps = reference if reference > 0 else 500.0
+                conservative_edge_bps = conservative_edge / ref_for_bps * 10_000.0
+                basis_decision = dynamic_basis_stop_decision(
+                    entry_spread=entry_spread,
+                    current_exit_spread=current_exit_spread,
+                    reference_price=ref_for_bps,
+                    active_cycle_conservative_funding_edge_bps=max(0.0, conservative_edge_bps),
+                )
+                risk_details["dynamic_basis"] = basis_decision
+                if basis_decision["immediate_hard_exit"]:
+                    return {
+                        "close_reason": "basis_deterioration",
+                        "reasons": [
+                            f"deterioration_{basis_decision['basis_deterioration_bps']:.1f}bps>=budget_{basis_decision['active_risk_budget_bps']:.1f}bps"
+                        ],
+                        "dynamic_basis": basis_decision,
+                    }
+
+        # --- Hard risk: liquidation, margin, mark/index ---
+        quantity = float(position.get("base_quantity") or 0.0)
+        entry_legs = position.get("entry_legs") or []
+        long_entry = leg_by_side(entry_legs, "long") or {}
+        short_entry = leg_by_side(entry_legs, "short") or {}
+        long_entry_price = float(
+            long_entry.get("entry_fill_price")
+            or long_entry.get("vwap")
+            or long_entry.get("mark_price")
+            or 0.0
+        )
+        short_entry_price = float(
+            short_entry.get("entry_fill_price")
+            or short_entry.get("vwap")
+            or short_entry.get("mark_price")
+            or 0.0
+        )
+        long_notional = float(position.get("long_notional") or 0.0)
+        short_notional = float(position.get("short_notional") or 0.0)
+        if quantity > 0 and long_entry_price > 0 and short_entry_price > 0:
+            from smart_money_radar.paper_bot.risk import (
+                liquidation_distance,
+                synthetic_liquidation_prices,
+            )
+            liq_prices = synthetic_liquidation_prices(
+                quantity=quantity,
+                long_entry_price=long_entry_price,
+                short_entry_price=short_entry_price,
+                long_isolated_collateral=long_notional,
+                short_isolated_collateral=short_notional,
+                long_mmr=0.02,
+                short_mmr=0.02,
+            )
+            current_long = float(
+                (route.get("legs") or [{}])[0].get("mark_price")
+                or long_entry_price
+            ) if route else long_entry_price
+            current_short = float(
+                (route.get("legs") or [{}, {}])[1].get("mark_price")
+                or short_entry_price
+            ) if route else short_entry_price
+            long_liq_dist = liquidation_distance(
+                current_long, liq_prices["long_liquidation_price"], "long"
+            )
+            short_liq_dist = liquidation_distance(
+                current_short, liq_prices["short_liquidation_price"], "short"
+            )
+            min_liq_dist = min(long_liq_dist, short_liq_dist)
+            total_collateral = long_notional + short_notional
+            margin_safety = total_collateral / max(1.0, long_notional + short_notional) * 100.0
+            mark_index_bps = 0.0
+            if route:
+                for leg in route.get("legs") or []:
+                    mark = float(leg.get("mark_price") or 0.0)
+                    index_p = float(leg.get("index_price") or 0.0)
+                    if mark > 0 and index_p > 0:
+                        leg_bps = abs(mark - index_p) / index_p * 10_000.0
+                        mark_index_bps = max(mark_index_bps, leg_bps)
+            triggered, trigger_reason = hard_risk_triggered(
+                liquidation_distance_fraction=min_liq_dist,
+                margin_safety_ratio=margin_safety,
+                mark_index_divergence_bps=mark_index_bps,
+                snapshot_age_seconds=route_age or 0.0,
+            )
+            risk_details["risk_gates"] = {
+                "liquidation_distance": min_liq_dist,
+                "margin_safety_ratio": margin_safety,
+                "mark_index_divergence_bps": mark_index_bps,
+            }
+            if triggered:
+                return {
+                    "close_reason": f"risk_hard_exit:{trigger_reason}",
+                    "reasons": [trigger_reason],
+                    "risk_gates": risk_details["risk_gates"],
+                }
+            warnings_list = risk_warnings(
+                liquidation_distance_fraction=min_liq_dist,
+                margin_safety_ratio=margin_safety,
+            )
+            if warnings_list:
+                risk_details["warnings"] = warnings_list
+
+        return None
+
+    def _run_lightweight_discovery(self) -> dict[str, Any] | None:
+        """Lightweight discovery: market snapshots + next funding only, no full orderbooks."""
+        now_monotonic = time.monotonic()
+        if not lightweight_discovery_due(
+            last_discovery_monotonic=getattr(self, "_last_lightweight_discovery_monotonic", 0.0),
+            now_monotonic=now_monotonic,
+            interval_seconds=30.0,
+        ):
+            return None
+        self._last_lightweight_discovery_monotonic = now_monotonic
+        capacity = focused_recheck_capacity_check(
+            watch_route_count=len(self.hot_routes),
+        )
+        if not capacity["sufficient"]:
+            return {
+                "status": "skipped",
+                "reason": capacity["reason"],
+            }
+        return {
+            "status": "scheduled",
+            "watch_route_count": len(self.hot_routes),
+        }
+
     def process_open_positions(self) -> list[str]:
+        if synchronized_runtime_enabled(self.config):
+            return self.process_synchronized_open_positions()
+        return self.process_legacy_open_positions()
+
+    def process_synchronized_open_positions(self) -> list[str]:
         outcomes: list[str] = []
-        now = datetime.now(UTC)
+        now = self.clock.now()
+        for position in self.store.funding_capture_open_positions():
+            position_id = str(position["position_id"])
+            state = str(position.get("state") or "")
+            if state in {
+                "CLOSED_PENDING_RECONCILIATION",
+                "RECONCILED",
+                "UNRECONCILED",
+                "FAILED",
+            }:
+                continue
+            config_json = position.get("config") or {}
+            route_key = str(config_json.get("route_key") or "")
+            live_route = self.hot_routes.get(route_key) or (
+                self.store.latest_funding_route_by_key(route_key)
+                if route_key
+                else None
+            )
+            legacy_like = self._legacy_like_position_from_capture(position)
+            risk_exit = self._poll_position_risk(legacy_like, live_route, now)
+            if risk_exit is not None:
+                self.store.update_funding_capture_position_state(
+                    position_id,
+                    "EMERGENCY_UNWIND",
+                    now,
+                    paper_net_pnl_estimated=None,
+                )
+                self.record_event(
+                    "close",
+                    (
+                        f"V2 RISK EXIT {position.get('canonical_asset')} "
+                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                        f"Reason: {risk_exit['close_reason']}"
+                    ),
+                    {
+                        "position": position,
+                        "risk_engine": risk_exit,
+                    },
+                    route_key=route_key,
+                    notify=True,
+                    severity="error",
+                )
+                outcomes.append("emergency_unwind")
+                continue
+            if state in {"OPEN", "HOLDING_NEXT_CYCLE"}:
+                crossed = self.synchronized_runtime.mark_settlement_crossed(position, now)
+            else:
+                crossed = None
+            if crossed is not None:
+                self.record_event(
+                    "settlement_crossed",
+                    (
+                        f"V2 SETTLEMENT CROSSED {position.get('canonical_asset')} "
+                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                        "Funding reconciliation is pending public rate + mark."
+                    ),
+                    {"position": position, "cycle": crossed},
+                    route_key=route_key,
+                    notify=True,
+                )
+                outcomes.append("settlement_crossed")
+                continue
+            if state in {"SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION"}:
+                decision = self.synchronized_runtime.next_cycle_hold_or_close_decision(
+                    position,
+                    live_route,
+                    now,
+                )
+                if decision["decision"] == "wait":
+                    continue
+                if decision["decision"] == "hold":
+                    self.record_event(
+                        "hold",
+                        (
+                            f"V2 HOLD NEXT CYCLE {position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            f"Reason: {decision['reason']}\n"
+                            f"Incremental net: "
+                            f"{format_signed_money((decision.get('hold_economics') or {}).get('incremental_hold_net_pnl'))}"
+                        ),
+                        {"position": position, "decision": decision},
+                        route_key=route_key,
+                        notify=True,
+                    )
+                    outcomes.append("hold")
+                    continue
+                close_payload = self.synchronized_runtime.close_position(
+                    position,
+                    live_route,
+                    now,
+                    reason=str(decision.get("reason") or "post_settlement_close"),
+                )
+                self.record_event(
+                    "close",
+                    (
+                        f"V2 CLOSE {position.get('canonical_asset')} "
+                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                        f"Reason: {close_payload['reason']}\n"
+                        f"Price PnL: {format_signed_money(close_payload.get('paper_price_pnl'))}\n"
+                        f"Estimated net without unreconciled funding: "
+                        f"{format_signed_money(close_payload.get('paper_net_if_exit_now'))}"
+                    ),
+                    {"position": position, "decision": decision, "close": close_payload},
+                    route_key=route_key,
+                    notify=True,
+                    severity="warning",
+                )
+                outcomes.append("closed")
+        return outcomes
+
+    def _legacy_like_position_from_capture(self, position: dict[str, Any]) -> dict[str, Any]:
+        config_json = position.get("config") or {}
+        entry_legs = list(config_json.get("entry_legs") or [])
+        return {
+            "funding_paper_position_id": 0,
+            "route_key": config_json.get("route_key"),
+            "canonical_asset": position.get("canonical_asset"),
+            "long_venue": position.get("long_venue"),
+            "long_symbol": position.get("long_symbol"),
+            "short_venue": position.get("short_venue"),
+            "short_symbol": position.get("short_symbol"),
+            "base_quantity": position.get("quantity"),
+            "target_notional": position.get("target_notional"),
+            "long_notional": position.get("target_notional"),
+            "short_notional": position.get("target_notional"),
+            "long_settlement_at": position.get("current_cycle_scheduled_funding_at"),
+            "short_settlement_at": position.get("current_cycle_scheduled_funding_at"),
+            "max_settlement_at": position.get("current_cycle_scheduled_funding_at"),
+            "opened_at": position.get("opened_at"),
+            "expected_execution_cost": position.get("paper_open_fees"),
+            "entry_cross_spread": position.get("original_entry_spread"),
+            "entry_legs": entry_legs,
+            "notes": {
+                "paper_model": "synchronized_funding_capture_v2",
+                "accrued_funding_pnl": 0.0,
+                "strategy": {"strategy_name": "synchronized_funding_capture"},
+            },
+        }
+
+    def process_legacy_open_positions(self) -> list[str]:
+        outcomes: list[str] = []
+        now = self.clock.now()
         for position in self.store.funding_paper_open_positions():
             self.refresh_open_position_route(position)
             now = datetime.now(UTC)
@@ -1593,6 +2095,44 @@ class PaperBot:
                     )
                     outcomes.append("closed")
                     continue
+            self._detect_settlement_crossing(position, now)
+            # --- Risk engine integration ---
+            risk_exit = self._poll_position_risk(position, live_route, now)
+            if risk_exit is not None:
+                close_payload = build_close_payload(
+                    position,
+                    settlement_rates_for_position(position, self.store),
+                    live_route,
+                    use_entry_estimate_for_missing=True,
+                    close_reason=risk_exit["close_reason"],
+                    hold_decision={
+                        "hold": False,
+                        "close_reason": risk_exit["close_reason"],
+                        "reasons": risk_exit.get("reasons", []),
+                        "risk_engine": True,
+                    },
+                )
+                close_payload["risk_engine"] = risk_exit
+                self.store.close_funding_paper_position(position_id, close_payload)
+                self.record_event(
+                    "close",
+                    (
+                        f"RISK EXIT {position.get('canonical_asset')} "
+                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                        f"Reason: {risk_exit['close_reason']}"
+                    ),
+                    {
+                        "position": position_summary(position),
+                        "close": close_payload,
+                        "risk_engine": risk_exit,
+                    },
+                    funding_paper_position_id=position_id,
+                    route_key=position.get("route_key"),
+                    notify=True,
+                    severity="error",
+                )
+                outcomes.append("closed")
+                continue
             result = close_decision(position, now, self.store, self.config)
             if result["status"] == "wait":
                 continue

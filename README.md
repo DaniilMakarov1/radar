@@ -76,18 +76,30 @@ python3 -m smart_money_radar.cli funding-paper-trader --profile core_cex
 
 - Paper-only. No live execution.
 - Default paper strategy: `synchronized_funding_capture_v2`.
+- Scanner output is not final entry authorization: synchronized routes are
+  `watch` until focused observations pass underwriting.
+- New synchronized paper state is stored in `funding_capture_positions`,
+  `funding_capture_cycles`, `funding_capture_observations`,
+  `funding_paper_orders`, `funding_settlement_reconciliations`, and the paper
+  event ledger.
 - The default profile scans all active registered venues automatically; venues in `DEACTIVATED_FUNDING_VENUES` stay excluded.
 - Strategy-incompatible active venues remain diagnostics/research-only until they pass the capability contract.
 - Funding candidates are based on the next synchronized settlement economics.
 - Spread convergence is not counted as expected profit for the default strategy; executable spread/basis is treated as cost and risk.
+- Funding estimates are never cashflow. Paper PnL includes funding only after
+  public rate plus settlement mark reconciliation.
 - 4h/8h projections are informational, not the entry decision gate.
 - Focused route checks run in parallel for hot routes.
 - Initial entry targets T-30 seconds and is allowed only when both legs are 25-35 seconds from the same settlement.
 - Both next settlements must align within 1 second.
 - Entry snapshots must be fresh: each route snapshot may be at most 2 seconds old.
+- Entry requires two simulated fills before T-20; one filled leg can never become
+  an `OPEN` synchronized position.
 - The launch defaults do not use the old 15-second final freeze/fallback entry window.
 - After settlement, the bot probes the next schedule around T+5 and evaluates hold/close around T+30.
 - Aligned next settlements can be held if the next cycle passes underwriting; mismatched schedules close.
+- Hold decisions use exact next timestamps and incremental economics; they do
+  not wait for funding reconciliation and do not charge opening fees again.
 - A position can capture at most 4 settlements and live about 4 hours 5 minutes.
 - A common 10% price move is telemetry and a fresh-risk warning, not an automatic stop-loss.
 - Negative-PnL routes are not shown as candidates.

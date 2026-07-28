@@ -649,7 +649,7 @@ class FundingRadarTest(unittest.TestCase):
         )
         self.assertEqual(
             evidence["selected_strategy"]["selection_model"],
-            "opportunity_engine_v1",
+            "synchronized_funding_capture_v2",
         )
         self.assertIn(
             evidence["selected_strategy"]["edge_type"],
@@ -1400,7 +1400,7 @@ class FundingRadarTest(unittest.TestCase):
             store.finish_funding_scan(scan_id, "success", route_count=1)
             dashboard = store.funding_dashboard()
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertGreaterEqual(route["evidence"]["current_nowcast_net"], 1.0)
         self.assertEqual(len(dashboard["routes"]), 1)
         self.assertEqual(dashboard["watch_routes"], [])
@@ -1810,7 +1810,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         evidence = route["evidence"]
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertEqual(evidence["decision_mode"], "settlement_capture")
         self.assertTrue(evidence["history_is_advisory"])
         self.assertGreaterEqual(
@@ -1873,7 +1873,7 @@ class FundingRadarTest(unittest.TestCase):
 
         evidence = route["evidence"]
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertIn("insufficient_basis_history", evidence["advisory_risk_flags"])
         self.assertNotIn(
             "insufficient_basis_history",
@@ -1919,7 +1919,7 @@ class FundingRadarTest(unittest.TestCase):
         )
         evidence = route["evidence"]
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertGreater(
             evidence["current_opportunity_net"],
             evidence["actionable_profit_threshold"],
@@ -1933,10 +1933,8 @@ class FundingRadarTest(unittest.TestCase):
             "basis_not_covered_by_live_funding",
             evidence["advisory_risk_flags"],
         )
-        self.assertEqual(
-            evidence["selected_strategy"]["warnings"],
-            ["basis_stress_not_covered", "fragile_positive_total_edge"],
-        )
+        self.assertEqual(evidence["selected_strategy"]["warnings"], [])
+        self.assertEqual(evidence["selected_strategy"]["expected_spread_convergence_pnl"], 0.0)
         with TemporaryDirectory() as directory:
             store = SQLiteStore(Path(directory) / "radar.sqlite")
             store.init_db()
@@ -1957,7 +1955,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(funnel["current_raw_actionable"], 1)
         self.assertEqual(
             dashboard["constraint_diagnostics"]["exclusive_stages"],
-            [{"stage": "paper_candidate", "route_count": 1}],
+            [{"stage": "unclassified_gate", "route_count": 1}],
         )
 
     def test_route_legs_use_normalized_future_settlement_times(self) -> None:
@@ -7001,14 +6999,30 @@ def market(
         "symbol": symbol,
         "canonical_asset": asset,
         "funding_rate": funding_rate,
+        "raw_funding_rate": funding_rate,
+        "normalized_next_funding_rate": funding_rate,
+        "raw_funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
         "funding_interval_hours": interval_hours,
         "hourly_funding_rate": funding_rate / interval_hours,
-        "funding_rate_kind": "test",
+        "funding_rate_kind": "published_next_estimate",
         "next_funding_at": observed_at,
         "mark_price": 100.0,
         "index_price": 100.0,
-        "open_interest_usd": 1_000_000,
-        "volume_24h_usd": 10_000_000,
+        "open_interest_usd": 10_000_000,
+        "volume_24h_usd": 30_000_000,
+        "taker_fee_rate": 0.0005,
+        "quantity_step": 0.001,
+        "min_notional_usd": 5.0,
+        "contract_type": "linear_perpetual",
+        "contract_kind": "linear_perpetual",
+        "collateral_asset": "USDT",
+        "quote_asset": "USDT",
+        "is_linear_contract": True,
+        "request_started_at": observed_at,
+        "response_received_at": observed_at,
+        "normalized_at": observed_at,
         "observed_at": observed_at,
         "raw": {},
     }
@@ -7025,6 +7039,9 @@ def book(venue: str, symbol: str, observed_at: str) -> dict[str, Any]:
         "mid_price": 100.0,
         "bid_depth_usd": 199_980,
         "ask_depth_usd": 200_020,
+        "request_started_at": observed_at,
+        "response_received_at": observed_at,
+        "orderbook_event_time": observed_at,
         "raw": {},
     }
 
@@ -7046,6 +7063,9 @@ def shifted_book(
         "mid_price": mid_price,
         "bid_depth_usd": (mid_price - spread) * 2_000,
         "ask_depth_usd": (mid_price + spread) * 2_000,
+        "request_started_at": observed_at,
+        "response_received_at": observed_at,
+        "orderbook_event_time": observed_at,
         "raw": {},
     }
     result["_history"] = [

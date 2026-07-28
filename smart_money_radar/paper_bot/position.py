@@ -622,6 +622,44 @@ def close_decision(
     settlement = settlement_rates_for_position(position, store)
     missing = [side for side, row in settlement.items() if row is None]
 
+    # --- T+20 normal exit gate ---
+    # Normal close forbidden until T+20 seconds after settlement.
+    # Hard-risk exits are always allowed.
+    hard_risk_close_reasons = {
+        "risk_hard_exit",
+        "risk_data_hard_stale",
+        "basis_deterioration",
+        "liquidation_distance",
+        "margin_safety",
+        "mark_index_divergence",
+        "quantity_mismatch",
+        "emergency_unwind",
+    }
+    t20_deadline = max_settlement + timedelta(
+        seconds=config.no_normal_exit_before_settlement_plus_seconds
+    )
+    is_hard_risk = (
+        not hold["hold"]
+        and str(hold.get("close_reason") or "") in hard_risk_close_reasons
+    )
+    if now < t20_deadline and not hold["hold"] and not is_hard_risk:
+        # Normal close before T+20: suppress, force hold
+        accrual = build_settlement_accrual_payload(
+            position,
+            settlement,
+            close_route or {},
+            use_entry_estimate_for_missing=bool(missing),
+            hold_decision={
+                **hold,
+                "hold": True,
+                "close_reason": "",
+                "t20_suppressed": True,
+                "reasons": list(hold.get("reasons") or [])
+                + ["normal_exit_before_t20_suppressed"],
+            },
+        )
+        return {"status": "hold", "accrual": accrual}
+
     if hold["hold"]:
         accrual = build_settlement_accrual_payload(
             position,
@@ -717,14 +755,8 @@ def position_hold_decision(
             and funding_sensitive
         ):
             reasons.append("funding_rate_inverted")
-        long_interval = optional_float(long_leg.get("funding_interval_hours"))
-        short_interval = optional_float(short_leg.get("funding_interval_hours"))
-        if (
-            long_interval is not None
-            and short_interval is not None
-            and abs(float(long_interval) - float(short_interval)) > 0.01
-        ):
-            reasons.append("funding_interval_mismatch")
+        # funding_interval_hours equality is NOT a schedule gate.
+        # Only exact next-settlement timestamp alignment (<=1s) matters.
     close_reason = close_reason_from_hold_reasons(reasons)
     return {
         "hold": not reasons,
@@ -863,12 +895,25 @@ def build_close_payload(
     close_reason: str,
     hold_decision: dict[str, Any] | None = None,
     include_current_settlement_funding: bool = True,
+    v2_no_phantom_funding: bool = False,
 ) -> dict[str, Any]:
     entry_long = current_position_leg(position, "long")
     entry_short = current_position_leg(position, "short")
     if include_current_settlement_funding:
-        long_rate = settlement_rate_or_entry(settlement.get("long"), entry_long)
-        short_rate = settlement_rate_or_entry(settlement.get("short"), entry_short)
+        if v2_no_phantom_funding:
+            long_rate = (
+                float(settlement.get("long", {}).get("funding_rate") or 0.0)
+                if settlement.get("long") is not None
+                else None
+            )
+            short_rate = (
+                float(settlement.get("short", {}).get("funding_rate") or 0.0)
+                if settlement.get("short") is not None
+                else None
+            )
+        else:
+            long_rate = settlement_rate_or_entry(settlement.get("long"), entry_long)
+            short_rate = settlement_rate_or_entry(settlement.get("short"), entry_short)
         settlement_source = None
     else:
         long_rate = 0.0
@@ -876,21 +921,44 @@ def build_close_payload(
         settlement_source = "pre_settlement_no_funding"
     long_notional = float(position.get("long_notional") or 0.0)
     short_notional = float(position.get("short_notional") or 0.0)
-    long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
-    short_funding_pnl = funding_leg_pnl("short", short_notional, short_rate)
+    v2_missing_long = long_rate is None
+    v2_missing_short = short_rate is None
+    long_funding_pnl = (
+        funding_leg_pnl("long", long_notional, long_rate)
+        if long_rate is not None
+        else None
+    )
+    short_funding_pnl = (
+        funding_leg_pnl("short", short_notional, short_rate)
+        if short_rate is not None
+        else None
+    )
     accrued_funding_pnl = float(
         (position.get("notes") or {}).get("accrued_funding_pnl") or 0.0
     )
-    current_funding_pnl = long_funding_pnl + short_funding_pnl
-    actual_funding_pnl = accrued_funding_pnl + current_funding_pnl
+    if long_funding_pnl is not None and short_funding_pnl is not None:
+        current_funding_pnl = long_funding_pnl + short_funding_pnl
+    else:
+        current_funding_pnl = None
+    if current_funding_pnl is not None:
+        actual_funding_pnl = accrued_funding_pnl + current_funding_pnl
+    else:
+        actual_funding_pnl = accrued_funding_pnl if accrued_funding_pnl else None
     actual_execution_cost = float(position.get("expected_execution_cost") or 0.0)
     spread_snap = compute_spread_snapshot(position, close_route)
     basis_pnl = float(spread_snap.get("unrealized_basis_pnl") or 0.0)
-    actual_net_pnl = actual_funding_pnl + basis_pnl - actual_execution_cost
+    if actual_funding_pnl is not None:
+        actual_net_pnl = actual_funding_pnl + basis_pnl - actual_execution_cost
+    else:
+        actual_net_pnl = None
     long_basis_pnl = float(spread_snap.get("long_basis_pnl") or 0.0)
     short_basis_pnl = float(spread_snap.get("short_basis_pnl") or 0.0)
-    long_cash_delta = long_funding_pnl + long_basis_pnl - actual_execution_cost / 2.0
-    short_cash_delta = short_funding_pnl + short_basis_pnl - actual_execution_cost / 2.0
+    long_cash_delta = (
+        (long_funding_pnl or 0.0) + long_basis_pnl - actual_execution_cost / 2.0
+    )
+    short_cash_delta = (
+        (short_funding_pnl or 0.0) + short_basis_pnl - actual_execution_cost / 2.0
+    )
     close_evidence = (close_route or {}).get("evidence") or {}
     strategy = dict((position.get("notes") or {}).get("strategy") or {})
     strategy_name = str(strategy.get("strategy_name") or position.get("strategy_name") or "funding_only")
@@ -919,20 +987,30 @@ def build_close_payload(
             "long": settlement_payload(
                 settlement.get("long"),
                 entry_long,
-                long_rate,
-                source=settlement_source,
+                long_rate if long_rate is not None else 0.0,
+                source=(
+                    settlement_source
+                    or ("v2_missing_public_history" if v2_missing_long else None)
+                ),
             ),
             "short": settlement_payload(
                 settlement.get("short"),
                 entry_short,
-                short_rate,
-                source=settlement_source,
+                short_rate if short_rate is not None else 0.0,
+                source=(
+                    settlement_source
+                    or ("v2_missing_public_history" if v2_missing_short else None)
+                ),
             ),
             "current_funding_pnl": current_funding_pnl,
             "accrued_funding_pnl": accrued_funding_pnl,
             "entry_expected_live_net": position.get("expected_live_net"),
             "entry_expected_live_gross": position.get("expected_live_gross"),
-            "history_missing_fallback": use_entry_estimate_for_missing,
+            "history_missing_fallback": (
+                False if v2_no_phantom_funding else use_entry_estimate_for_missing
+            ),
+            "v2_no_phantom_funding": v2_no_phantom_funding,
+            "funding_pnl_null": current_funding_pnl is None,
             "current_settlement_funding_included": include_current_settlement_funding,
         },
         "notes": {

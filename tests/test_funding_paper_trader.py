@@ -2289,6 +2289,7 @@ def test_process_open_positions_common_price_move_alert_does_not_close(tmp_path)
         config=PaperBotConfig(
             focused_recheck_enabled=False,
             telegram_enabled=False,
+            strategy_set=("funding_only",),
         ),
         notifier=FakeNotifier(),
     )

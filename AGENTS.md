@@ -13,10 +13,15 @@ Default paper trading uses `synchronized_funding_capture_v2` only.
 
 - Entry reason: nearest synchronized funding settlement.
 - Position shape: long one venue, short another venue, same canonical base quantity.
+- Scanner status before focused observations is `watch`, not `paper_candidate`.
 - Entry window: both legs 25-35 seconds before settlement, target T-30.
 - Fill deadline: both legs filled by T-20.
 - Settlement alignment: long and short next funding timestamps must differ by at most 1 second.
 - Spread convergence is not expected profit for the default strategy; spread/basis is modeled as cost and risk.
+- Funding estimates are not cashflow; confirmed funding enters paper PnL only
+  after public rate plus settlement mark reconciliation.
+- Hold uses exact next timestamps and incremental economics. Pending
+  reconciliation from the previous cycle does not block hold.
 - Legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any` belong to experimental/research profiles unless Codex explicitly says otherwise.
 
 ## Runtime Safety
@@ -36,8 +41,12 @@ Read the relevant source and tests first. For funding lifecycle work, start with
 - `docs/MODEL_INSTRUCTIONS.md`
 - `QWEN.md`
 - `smart_money_radar/funding/trader.py`
-- `smart_money_radar/paper_bot/position.py`
+- `smart_money_radar/paper_bot/runtime_v2.py`
 - `smart_money_radar/funding/strategy_synchronized_funding.py`
+- `smart_money_radar/paper_bot/execution.py`
+- `smart_money_radar/paper_bot/accounting.py`
+- `smart_money_radar/paper_bot/settlement.py`
+- `smart_money_radar/paper_bot/risk.py`
 - matching tests under `tests/`
 
 Run focused tests for your area, then run:

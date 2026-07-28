@@ -153,13 +153,29 @@ class SQLiteStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_id) DO UPDATE SET
                     funding_paper_position_id = excluded.funding_paper_position_id,
+                    strategy_name = excluded.strategy_name,
+                    strategy_version = excluded.strategy_version,
+                    canonical_asset = excluded.canonical_asset,
+                    long_venue = excluded.long_venue,
+                    long_symbol = excluded.long_symbol,
+                    short_venue = excluded.short_venue,
+                    short_symbol = excluded.short_symbol,
+                    quantity = excluded.quantity,
+                    target_notional = excluded.target_notional,
                     state = excluded.state,
+                    opened_at = excluded.opened_at,
                     closed_at = excluded.closed_at,
                     settlements_captured_count = excluded.settlements_captured_count,
+                    max_settlements = excluded.max_settlements,
+                    original_entry_spread = excluded.original_entry_spread,
+                    paper_open_fees = excluded.paper_open_fees,
                     paper_close_fees = excluded.paper_close_fees,
                     paper_emergency_unwind_cost = excluded.paper_emergency_unwind_cost,
                     paper_net_pnl_estimated = excluded.paper_net_pnl_estimated,
                     paper_net_pnl_reconciled = excluded.paper_net_pnl_reconciled,
+                    config_json = excluded.config_json,
+                    config_hash = excluded.config_hash,
+                    code_commit = excluded.code_commit,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -236,6 +252,10 @@ class SQLiteStore:
                     short_next_funding_rate_at_decision = excluded.short_next_funding_rate_at_decision,
                     conservative_funding_gross = excluded.conservative_funding_gross,
                     conservative_funding_edge_bps = excluded.conservative_funding_edge_bps,
+                    hold_basis_reserve_bps = excluded.hold_basis_reserve_bps,
+                    hold_legging_reserve_bps = excluded.hold_legging_reserve_bps,
+                    hold_time_reserve_bps = excluded.hold_time_reserve_bps,
+                    hold_liquidity_reserve_bps = excluded.hold_liquidity_reserve_bps,
                     incremental_hold_cost = excluded.incremental_hold_cost,
                     incremental_hold_net_pnl = excluded.incremental_hold_net_pnl,
                     hold_cost_coverage_ratio = excluded.hold_cost_coverage_ratio,
@@ -372,6 +392,342 @@ class SQLiteStore:
         for row in rows:
             item = dict(row)
             item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            output.append(item)
+        return output
+
+    def funding_capture_position_rows(
+        self,
+        *,
+        states: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        parameters: list[Any] = []
+        state_filter = ""
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            state_filter = f"WHERE p.state IN ({placeholders})"
+            parameters.extend(sorted(states))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.*, c.cycle_id AS current_cycle_id,
+                       c.cycle_number AS current_cycle_number,
+                       c.scheduled_funding_at AS current_cycle_scheduled_funding_at,
+                       c.state AS current_cycle_state,
+                       c.conservative_funding_gross AS current_cycle_conservative_funding_gross,
+                       c.conservative_funding_edge_bps AS current_cycle_conservative_funding_edge_bps
+                FROM funding_capture_positions p
+                LEFT JOIN funding_capture_cycles c
+                  ON c.position_id = p.position_id
+                 AND c.cycle_number = (
+                    SELECT MAX(c2.cycle_number)
+                    FROM funding_capture_cycles c2
+                    WHERE c2.position_id = p.position_id
+                 )
+                {state_filter}
+                ORDER BY p.opened_at DESC
+                """,
+                parameters,
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["config"] = json.loads(item.pop("config_json") or "{}")
+            output.append(item)
+        return output
+
+    def funding_capture_open_positions(self) -> list[dict[str, Any]]:
+        return self.funding_capture_position_rows(
+            states={
+                "OPEN",
+                "SETTLEMENT_CROSSED",
+                "POST_SETTLEMENT_EVALUATION",
+                "HOLDING_NEXT_CYCLE",
+                "EXIT_SCHEDULED",
+                "EXIT_SUBMITTED",
+                "PARTIALLY_CLOSED",
+                "EMERGENCY_UNWIND",
+                "CLOSED_PENDING_RECONCILIATION",
+            }
+        )
+
+    def funding_capture_open_position_by_route_key(
+        self,
+        route_key: str,
+    ) -> dict[str, Any] | None:
+        for row in self.funding_capture_open_positions():
+            if str((row.get("config") or {}).get("route_key") or "") == str(route_key):
+                return row
+        return None
+
+    def update_funding_capture_position_state(
+        self,
+        position_id: str,
+        state: str,
+        now: datetime | None = None,
+        *,
+        settlements_captured_count: int | None = None,
+        closed_at: str | None = None,
+        paper_close_fees: float | None = None,
+        paper_emergency_unwind_cost: float | None = None,
+        paper_net_pnl_estimated: float | None = None,
+        paper_net_pnl_reconciled: float | None = None,
+    ) -> None:
+        updated_at = (now or datetime.now(UTC)).replace(microsecond=0).isoformat()
+        assignments = ["state = ?", "updated_at = ?"]
+        parameters: list[Any] = [state, updated_at]
+        optional_fields = {
+            "settlements_captured_count": settlements_captured_count,
+            "closed_at": closed_at,
+            "paper_close_fees": paper_close_fees,
+            "paper_emergency_unwind_cost": paper_emergency_unwind_cost,
+            "paper_net_pnl_estimated": paper_net_pnl_estimated,
+            "paper_net_pnl_reconciled": paper_net_pnl_reconciled,
+        }
+        for column, value in optional_fields.items():
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                parameters.append(value)
+        parameters.append(position_id)
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE funding_capture_positions
+                SET {", ".join(assignments)}
+                WHERE position_id = ?
+                """,
+                parameters,
+            )
+
+    def update_funding_capture_cycle_state(
+        self,
+        cycle_id: str,
+        state: str,
+        now: datetime | None = None,
+        *,
+        settlement_crossed_at: str | None = None,
+        reconciliation_status: str | None = None,
+        reconciled_funding_pnl: float | None = None,
+    ) -> None:
+        updated_at = (now or datetime.now(UTC)).replace(microsecond=0).isoformat()
+        assignments = ["state = ?", "updated_at = ?"]
+        parameters: list[Any] = [state, updated_at]
+        optional_fields = {
+            "settlement_crossed_at": settlement_crossed_at or (updated_at if state == "SETTLEMENT_CROSSED" else None),
+            "reconciliation_status": reconciliation_status,
+            "reconciled_funding_pnl": reconciled_funding_pnl,
+        }
+        for column, value in optional_fields.items():
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                parameters.append(value)
+        parameters.append(cycle_id)
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE funding_capture_cycles
+                SET {", ".join(assignments)}
+                WHERE cycle_id = ?
+                """,
+                parameters,
+            )
+
+    def upsert_funding_paper_order(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        order_id = str(
+            row.get("paper_order_id")
+            or f"{row['position_id']}:{row.get('cycle_id', '')}:{row['leg_side']}:{row['order_intent']}"
+        )
+        payload_json = json.dumps(row.get("payload", row.get("payload_json", {})), sort_keys=True)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_paper_orders (
+                    paper_order_id, position_id, cycle_id, leg_side,
+                    order_intent, venue, symbol, decision_at,
+                    submitted_at, acknowledged_at, filled_at,
+                    filled_quantity, average_fill_price, fee, state,
+                    payload_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(paper_order_id) DO UPDATE SET
+                    submitted_at = excluded.submitted_at,
+                    acknowledged_at = excluded.acknowledged_at,
+                    filled_at = excluded.filled_at,
+                    filled_quantity = excluded.filled_quantity,
+                    average_fill_price = excluded.average_fill_price,
+                    fee = excluded.fee,
+                    state = excluded.state,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    order_id,
+                    row["position_id"],
+                    row.get("cycle_id"),
+                    row["leg_side"],
+                    row["order_intent"],
+                    row["venue"],
+                    row["symbol"],
+                    row["decision_at"],
+                    row.get("submitted_at"),
+                    row.get("acknowledged_at"),
+                    row.get("filled_at"),
+                    float(row.get("filled_quantity", 0.0)),
+                    row.get("average_fill_price"),
+                    float(row.get("fee", 0.0)),
+                    row.get("state", "SUBMITTED"),
+                    payload_json,
+                    row.get("created_at", now),
+                    now,
+                ),
+            )
+        return order_id
+
+    def funding_paper_order_rows(
+        self,
+        position_id: str,
+        *,
+        cycle_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        parameters: list[Any] = [position_id]
+        cycle_filter = ""
+        if cycle_id is not None:
+            cycle_filter = "AND cycle_id = ?"
+            parameters.append(cycle_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM funding_paper_orders
+                WHERE position_id = ?
+                {cycle_filter}
+                ORDER BY created_at
+                """,
+                parameters,
+            ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            output.append(item)
+        return output
+
+    def upsert_funding_capture_observation(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        observation_id = str(
+            row.get("observation_id")
+            or f"{row['position_id']}:{row.get('cycle_id', '')}:{row['observed_at']}"
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_capture_observations (
+                    observation_id, position_id, cycle_id, phase,
+                    observed_at, long_response_received_at,
+                    short_response_received_at, cross_venue_skew_ms,
+                    long_mark, short_mark, long_index, short_index,
+                    long_next_funding_at, short_next_funding_at,
+                    long_next_funding_rate, short_next_funding_rate,
+                    gross_funding_pnl,
+                    long_open_vwap, short_open_vwap,
+                    long_close_vwap, short_close_vwap,
+                    current_exit_spread, total_basis_deterioration_bps,
+                    cycle_basis_deterioration_bps, paper_net_if_exit_now,
+                    snapshot_valid, invalid_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observation_id) DO UPDATE SET
+                    phase = excluded.phase,
+                    long_mark = excluded.long_mark,
+                    short_mark = excluded.short_mark,
+                    gross_funding_pnl = excluded.gross_funding_pnl,
+                    paper_net_if_exit_now = excluded.paper_net_if_exit_now,
+                    snapshot_valid = excluded.snapshot_valid,
+                    invalid_reason = excluded.invalid_reason
+                """,
+                (
+                    observation_id,
+                    row["position_id"],
+                    row.get("cycle_id"),
+                    row.get("phase", "entry"),
+                    row["observed_at"],
+                    row.get("long_response_received_at"),
+                    row.get("short_response_received_at"),
+                    row.get("cross_venue_skew_ms"),
+                    row.get("long_mark"),
+                    row.get("short_mark"),
+                    row.get("long_index"),
+                    row.get("short_index"),
+                    row.get("long_next_funding_at"),
+                    row.get("short_next_funding_at"),
+                    row.get("long_next_funding_rate"),
+                    row.get("short_next_funding_rate"),
+                    row.get("gross_funding_pnl"),
+                    row.get("long_open_vwap"),
+                    row.get("short_open_vwap"),
+                    row.get("long_close_vwap"),
+                    row.get("short_close_vwap"),
+                    row.get("current_exit_spread"),
+                    row.get("total_basis_deterioration_bps"),
+                    row.get("cycle_basis_deterioration_bps"),
+                    row.get("paper_net_if_exit_now"),
+                    int(bool(row.get("snapshot_valid", False))),
+                    row.get("invalid_reason"),
+                ),
+            )
+        return observation_id
+
+    def upsert_paper_event_ledger(self, row: dict[str, Any]) -> str | None:
+        """Idempotent insert. Returns event_key on first insert, None on duplicate."""
+        now = utc_now_iso()
+        event_key = str(row["event_key"])
+        payload_json = json.dumps(row.get("payload", row.get("payload_json", {})), sort_keys=True)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO paper_event_ledger (
+                    event_key, position_id, cycle_id, venue,
+                    event_type, cash_delta, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    row.get("position_id"),
+                    row.get("cycle_id"),
+                    row.get("venue"),
+                    row["event_type"],
+                    float(row.get("cash_delta", 0.0)),
+                    payload_json,
+                    row.get("created_at", now),
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return event_key
+
+    def paper_event_ledger_rows(
+        self,
+        position_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            if position_id is not None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM paper_event_ledger
+                    WHERE position_id = ?
+                    ORDER BY created_at
+                    """,
+                    (position_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM paper_event_ledger ORDER BY created_at"
+                ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
             output.append(item)
         return output
 
@@ -6328,7 +6684,7 @@ class SQLiteStore:
                 candidate_rows = connection.execute(
                     """
                     SELECT * FROM funding_routes
-                    WHERE funding_scan_id = ? AND status = 'paper_candidate'
+                    WHERE funding_scan_id = ? AND status IN ('paper_candidate', 'watch')
                       AND market_capacity >= ?
                       AND (
                           (
@@ -6414,6 +6770,31 @@ class SQLiteStore:
                               '$.strategy_classification.expected_net_pnl'
                           ) AS REAL) > 0
                       )
+                      AND NOT (
+                          COALESCE(json_extract(
+                              evidence_json,
+                              '$.decision_mode'
+                          ), '') = 'settlement_capture'
+                          AND COALESCE(
+                              CAST(json_extract(
+                                  evidence_json,
+                                  '$.selected_strategy.expected_net_pnl'
+                              ) AS REAL),
+                              CAST(json_extract(
+                                  evidence_json,
+                                  '$.strategy_classification.expected_net_pnl'
+                              ) AS REAL),
+                              CAST(json_extract(
+                                  evidence_json,
+                                  '$.current_nowcast_net'
+                              ) AS REAL),
+                              0
+                          ) >= ?
+                          AND json_extract(
+                              evidence_json,
+                              '$.synchronized_capability_passed'
+                          )
+                      )
                     ORDER BY COALESCE(
                                  CAST(json_extract(
                                      evidence_json,
@@ -6435,7 +6816,7 @@ class SQLiteStore:
                              expected_net_profit DESC,
                              market_capacity DESC
                     """,
-                    (scan_id, FUNDING_MINIMUM_ACTIONABLE_NOTIONAL),
+                    (scan_id, FUNDING_MINIMUM_ACTIONABLE_NOTIONAL, minimum_visible_profit),
                 ).fetchall()
                 maker_rows = connection.execute(
                     """
@@ -6813,13 +7194,26 @@ class SQLiteStore:
             if q25_net >= actionable_threshold:
                 economics_funnel["q25_actionable"] += 1
             probability = float(evidence.get("net_profit_probability") or 0)
-            if row.get("status") == "paper_candidate":
-                constraint_counts["paper_candidate"] += 1
-                continue
-            blocker_counts.update(str(flag) for flag in flags)
             settlement_capture = (
                 evidence.get("decision_mode") == "settlement_capture"
             )
+            selected_expected_net = float(
+                (evidence.get("selected_strategy") or {}).get("expected_net_pnl")
+                or (evidence.get("strategy_classification") or {}).get("expected_net_pnl")
+                or evidence.get("current_nowcast_net")
+                or 0
+            )
+            actionable_synchronized_watch = (
+                row.get("status") == "watch"
+                and settlement_capture
+                and bool(evidence.get("synchronized_capability_passed"))
+                and selected_expected_net >= minimum_visible_profit
+                and "live_net_pnl_not_positive" not in flags
+            )
+            if row.get("status") == "paper_candidate" or actionable_synchronized_watch:
+                constraint_counts["paper_candidate"] += 1
+                continue
+            blocker_counts.update(str(flag) for flag in flags)
             economic_flags = {
                 "conservative_net_after_costs_too_low",
                 "actionable_profit_too_low",

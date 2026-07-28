@@ -304,12 +304,16 @@ identity graph. These are explicit risk flags rather than hidden assumptions.
 
 ## Paper Validation
 
-The first qualifying snapshot creates a `paper_candidate`, not a fill. Its
-authorization expires at the earliest upcoming settlement on either leg. A later
-scan rebuilds the same orientation with fresh books and records either
-`settlement_reauthorized` or `settlement_exit_required` after a crossed settlement.
-It never scales PnL beyond the notional actually repriced through that later book.
-The module never labels projected PnL as realized PnL.
+For `synchronized_funding_capture_v2`, the first qualifying scanner snapshot
+creates a `watch` route, not a final candidate and not a fill. The focused engine
+must collect paired fresh observations before entry. A paper position opens only
+after two simulated marketable IOC fills complete before T-20.
+
+Every captured funding timestamp creates pending reconciliation rows for both
+legs. Missing public funding history never falls back to the entry estimate as a
+cashflow. Reconciled PnL requires both the public funding rate and a nearby
+settlement mark; until then, funding remains pending and excluded from realized
+profitability.
 
 ## Commands
 
@@ -332,19 +336,19 @@ python3 -m smart_money_radar.cli dashboard
 
 `funding-paper-trader` is a deterministic local paper-trading loop. It does not
 use an LLM or live capital. The trader initializes $1,000 virtual cash per live
-venue, runs `next_settlement` Funding Radar scans, and opens a paper position
-only when both legs have funding settlement inside the configured entry window
-of 180 seconds. It reserves margin on both venues, records every action in
-SQLite, exports CSV files under `exports/funding_paper/`, and optionally sends
-Telegram notifications.
+venue, runs `next_settlement` Funding Radar scans, and opens a paper position only
+through the synchronized v2 runtime when both legs are 25-35 seconds from the
+same exact settlement timestamp. It records every action in SQLite, exports CSV
+files under `exports/funding_paper/`, and optionally sends Telegram
+notifications.
 
-The first model is a strict settlement-capture test. It closes after the paired
-settlement window once funding history is published. If final funding history is
-not yet available, the position stays in `settlement_pending` rather than
-inventing immediate PnL. After a configurable publication deadline, it can close
-with an explicit entry-estimate fallback flag.
+After settlement, normal close is blocked until T+20. Around T+30 the bot either
+holds the next aligned cycle after incremental underwriting or closes through two
+simulated reduce-only exit orders. Hold decisions do not wait for the previous
+cycle's funding reconciliation.
 
-Telegram setup uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`. After
+Telegram setup uses `FUNDING_TELEGRAM_BOT_TOKEN` and `FUNDING_TELEGRAM_CHAT_ID`
+in `.env`. After
 sending any message to the bot, run:
 
 ```bash

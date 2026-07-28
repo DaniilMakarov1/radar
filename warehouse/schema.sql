@@ -1565,6 +1565,21 @@ CREATE TABLE IF NOT EXISTS funding_settlement_reconciliations (
 CREATE INDEX IF NOT EXISTS idx_funding_settlement_reconciliations_position
     ON funding_settlement_reconciliations (position_id, scheduled_funding_at);
 
+CREATE TABLE IF NOT EXISTS paper_event_ledger (
+    ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    position_id TEXT,
+    cycle_id TEXT,
+    venue TEXT,
+    event_type TEXT NOT NULL,
+    cash_delta REAL NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_event_ledger_position
+    ON paper_event_ledger (position_id, event_type);
+
 CREATE TABLE IF NOT EXISTS signal_shadow_marks (
     signal_shadow_mark_id INTEGER PRIMARY KEY AUTOINCREMENT,
     signal_id INTEGER NOT NULL,
