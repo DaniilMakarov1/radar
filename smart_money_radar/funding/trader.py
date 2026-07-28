@@ -121,7 +121,6 @@ from smart_money_radar.paper_bot.position import (
     route_entry_decision,
     route_monitor_decision,
     selected_route_strategy,
-    settlement_rate_or_entry,
     settlement_rates_for_position,
     settlement_payload,
     price_stop_loss_triggered,

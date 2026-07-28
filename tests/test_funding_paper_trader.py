@@ -25,12 +25,12 @@ from smart_money_radar.funding.trader import (
     route_entry_decision,
     route_monitor_decision,
     selected_route_strategy,
-    settlement_rate_or_entry,
     price_stop_loss_triggered,
     spread_stop_loss_triggered,
 )
 from smart_money_radar.notifications import NotificationResult
 from smart_money_radar.paper_bot.helpers import format_seconds
+from smart_money_radar.paper_bot.position import settlement_rate_or_entry
 from smart_money_radar.paper_bot.telegram import (
     funding_rate_lines,
     status_report_message,
