@@ -19,6 +19,8 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
 )
 from smart_money_radar.paper_bot.accounting import executable_paper_pnl
 from smart_money_radar.paper_bot.accounting import (
+    collateral_reserve_event_key,
+    collateral_release_event_key,
     make_ledger_entry,
     order_fee_event_key,
     price_pnl_event_key,
@@ -215,6 +217,15 @@ class SynchronizedFundingRuntimeV2:
         self.clock = clock
         self.observations_by_route = observations_by_route
 
+    def _record_ledger_entry(self, row: dict[str, Any]) -> str | None:
+        event_key = self.store.upsert_paper_event_ledger(row)
+        if event_key is not None and row.get("venue") and float(row.get("cash_delta") or 0.0) != 0.0:
+            self.store.update_funding_paper_account_cash(
+                str(row["venue"]),
+                float(row.get("cash_delta") or 0.0),
+            )
+        return event_key
+
     def consider_route(
         self,
         route: dict[str, Any],
@@ -251,6 +262,9 @@ class SynchronizedFundingRuntimeV2:
         risk_gate = self._entry_risk_gate(route)
         if not risk_gate["passed"]:
             return {"opened": False, "reason": "entry_risk_gate_failed", "risk_gate": risk_gate}
+        account_check = self._enforce_account_limits(route, accounts)
+        if not account_check["passed"]:
+            return {"opened": False, "reason": account_check["reason"], "account_check": account_check}
         execution = self._execute_entry(route, capture_id, settlement_at, now)
         if execution["state"] != "OPEN":
             return {"opened": False, "reason": "entry_execution_failed", "execution": execution}
@@ -391,31 +405,269 @@ class SynchronizedFundingRuntimeV2:
             reference_notional=reference,
         )
 
+    def _compute_common_quantity(
+        self,
+        long_price: float,
+        short_price: float,
+        long_step: float,
+        short_step: float,
+        long_min_qty: float,
+        short_min_qty: float,
+        long_min_notional: float,
+        short_min_notional: float,
+    ) -> dict[str, Any]:
+        if long_price <= 0 or short_price <= 0:
+            return {"quantity": 0.0, "reason": "zero_price"}
+        target = float(self.config.target_notional_per_leg)
+        q_raw = min(target / long_price, target / short_price)
+        if long_step > 0 and short_step > 0:
+            scale = 10**8
+            long_units = max(1, round(long_step * scale))
+            short_units = max(1, round(short_step * scale))
+            common_units = (long_units * short_units) // math.gcd(long_units, short_units)
+            common_step = common_units / scale
+        else:
+            return {"quantity": 0.0, "reason": "missing_quantity_step"}
+        if common_step <= 0:
+            return {"quantity": 0.0, "reason": "invalid_common_step"}
+        q = math.floor(q_raw / common_step) * common_step
+        long_notional = q * long_price
+        short_notional = q * short_price
+        if q < max(long_min_qty, short_min_qty):
+            return {"quantity": 0.0, "reason": "below_min_quantity"}
+        if long_notional < long_min_notional:
+            return {"quantity": 0.0, "reason": "below_long_min_notional"}
+        if short_notional < short_min_notional:
+            return {"quantity": 0.0, "reason": "below_short_min_notional"}
+        if long_notional < 450 or short_notional < 450:
+            return {"quantity": 0.0, "reason": "below_notional_floor_450"}
+        if long_notional > 500 or short_notional > 500:
+            return {"quantity": 0.0, "reason": "above_notional_cap_500"}
+        return {"quantity": q, "reason": None}
+
     def _target_quantity(self, route: dict[str, Any]) -> float:
+        result = self._compute_target_quantity(route)
+        return result["quantity"]
+
+    def _compute_target_quantity(self, route: dict[str, Any]) -> dict[str, Any]:
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
         long_price = float(long_leg.get("open_vwap") or long_leg.get("vwap") or long_leg.get("mark_price") or 0.0)
         short_price = float(short_leg.get("open_vwap") or short_leg.get("vwap") or short_leg.get("mark_price") or 0.0)
-        if long_price <= 0 or short_price <= 0:
-            return 0.0
-        raw = min(
-            float(self.config.target_notional_per_leg) / long_price,
-            float(self.config.target_notional_per_leg) / short_price,
+        for side, leg in (("long", long_leg), ("short", short_leg)):
+            if optional_float(leg.get("quantity_step")) is None:
+                return {"quantity": 0.0, "reason": f"{side}_quantity_step_missing"}
+            if optional_float(leg.get("min_quantity")) is None:
+                return {"quantity": 0.0, "reason": f"{side}_min_quantity_missing"}
+            if optional_float(leg.get("min_notional")) is None:
+                return {"quantity": 0.0, "reason": f"{side}_min_notional_missing"}
+        long_step = float(long_leg.get("quantity_step") or 0.0)
+        short_step = float(short_leg.get("quantity_step") or 0.0)
+        long_min_qty = float(long_leg.get("min_quantity") or 0.0)
+        short_min_qty = float(short_leg.get("min_quantity") or 0.0)
+        long_min_notional = float(long_leg.get("min_notional") or 0.0)
+        short_min_notional = float(short_leg.get("min_notional") or 0.0)
+        return self._compute_common_quantity(
+            long_price=long_price,
+            short_price=short_price,
+            long_step=long_step,
+            short_step=short_step,
+            long_min_qty=long_min_qty,
+            short_min_qty=short_min_qty,
+            long_min_notional=long_min_notional,
+            short_min_notional=short_min_notional,
         )
-        return max(0.0, raw)
+
+    def _enforce_account_limits(
+        self,
+        route: dict[str, Any],
+        accounts: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        long_venue = str(long_leg.get("venue") or "")
+        short_venue = str(short_leg.get("venue") or "")
+        quantity_result = self._compute_target_quantity(route)
+        quantity = float(quantity_result.get("quantity") or 0.0)
+        if quantity <= 0:
+            return {
+                "passed": False,
+                "reason": str(quantity_result.get("reason") or "quantity_invalid"),
+            }
+        max_total = int(getattr(self.config, "max_open_positions_total", 1))
+        max_per_venue = int(getattr(self.config, "max_open_positions_per_venue", 1))
+        max_exposure = float(getattr(self.config, "max_gross_exposure_usd", 1_000.0))
+        open_positions = self.store.funding_capture_open_positions()
+        active = [
+            p for p in open_positions
+            if str(p.get("state") or "") not in {
+                "CLOSED_PENDING_RECONCILIATION", "RECONCILED",
+                "UNRECONCILED", "FAILED",
+            }
+        ]
+        if len(active) >= max_total:
+            return {"passed": False, "reason": "max_open_positions_total"}
+        venue_counts: dict[str, int] = {}
+        current_exposure = 0.0
+        for p in active:
+            for v in (str(p.get("long_venue") or ""), str(p.get("short_venue") or "")):
+                if v:
+                    venue_counts[v] = venue_counts.get(v, 0) + 1
+            current_exposure += float(p.get("target_notional") or 0.0) * 2.0
+        for v in (long_venue, short_venue):
+            if v and venue_counts.get(v, 0) >= max_per_venue:
+                return {"passed": False, "reason": "max_open_positions_per_venue"}
+        long_price = float(long_leg.get("open_vwap") or long_leg.get("vwap") or long_leg.get("mark_price") or 0.0)
+        short_price = float(short_leg.get("open_vwap") or short_leg.get("vwap") or short_leg.get("mark_price") or 0.0)
+        long_notional = quantity * long_price
+        short_notional = quantity * short_price
+        if current_exposure + long_notional + short_notional > max_exposure:
+            return {"passed": False, "reason": "max_gross_exposure_usd"}
+        leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
+        reserve_fraction = float(getattr(self.config, "collateral_reserve_fraction", 0.25))
+        for side, leg, leg_notional in (
+            ("long", long_leg, long_notional),
+            ("short", short_leg, short_notional),
+        ):
+            venue = str(leg.get("venue") or "")
+            if leg_notional <= 0:
+                return {"passed": False, "reason": f"{side}_price_missing"}
+            isolated_collateral = leg_notional / leverage
+            collateral_reserve = leg_notional * reserve_fraction
+            fee_rate = float(leg.get("fee_rate") or 0.0)
+            estimated_open_fee = leg_notional * fee_rate
+            required_cash = isolated_collateral + collateral_reserve + estimated_open_fee
+            account = accounts.get(venue) or {}
+            available = float(account.get("available_balance") or 0.0)
+            if available < required_cash:
+                return {
+                    "passed": False,
+                    "reason": "insufficient_paper_balance",
+                    "venue": venue,
+                    "required": required_cash,
+                    "available": available,
+                }
+        return {"passed": True, "reason": None}
+
+    def _reserve_collateral(self, capture_id: str, route: dict[str, Any]) -> None:
+        legs = route.get("legs") or []
+        leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
+        reserve_fraction = float(getattr(self.config, "collateral_reserve_fraction", 0.25))
+        quantity = float(self._target_quantity(route) or 0.0)
+        for leg in legs:
+            venue = str(leg.get("venue") or "")
+            if not venue:
+                continue
+            price = float(leg.get("open_vwap") or leg.get("vwap") or leg.get("mark_price") or 0.0)
+            leg_notional = quantity * price
+            if leg_notional <= 0:
+                continue
+            amount = leg_notional / leverage + leg_notional * reserve_fraction
+            event_key = collateral_reserve_event_key(capture_id, venue)
+            reserved = self._record_ledger_entry(
+                make_ledger_entry(
+                    event_key,
+                    position_id=capture_id,
+                    venue=venue,
+                    event_type="collateral_reserve",
+                    cash_delta=0.0,
+                    payload={"amount": amount},
+                )
+            )
+            if reserved is not None:
+                self.store.update_funding_paper_account_reserved(venue, amount)
+
+    def _release_collateral(self, capture_id: str, route: dict[str, Any]) -> None:
+        legs = route.get("legs") or []
+        leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
+        reserve_fraction = float(getattr(self.config, "collateral_reserve_fraction", 0.25))
+        quantity = float(self._target_quantity(route) or 0.0)
+        for leg in legs:
+            venue = str(leg.get("venue") or "")
+            if not venue:
+                continue
+            reserve_key = collateral_reserve_event_key(capture_id, venue)
+            release_key = collateral_release_event_key(capture_id, venue)
+            existing_reserve = self.store.paper_event_ledger_rows(capture_id)
+            if not any(r["event_key"] == reserve_key for r in existing_reserve):
+                continue
+            already_released = any(r["event_key"] == release_key for r in existing_reserve)
+            if already_released:
+                continue
+            price = float(leg.get("open_vwap") or leg.get("vwap") or leg.get("mark_price") or 0.0)
+            leg_notional = quantity * price
+            if leg_notional <= 0:
+                payload_amount = optional_float(
+                    next(
+                        (
+                            row.get("payload", {}).get("amount")
+                            for row in existing_reserve
+                            if row["event_key"] == reserve_key
+                        ),
+                        None,
+                    )
+                )
+                leg_notional = float(payload_amount or 0.0) / (1.0 / leverage + reserve_fraction)
+            amount = leg_notional / leverage + leg_notional * reserve_fraction
+            released = self._record_ledger_entry(
+                make_ledger_entry(
+                    release_key,
+                    position_id=capture_id,
+                    venue=venue,
+                    event_type="collateral_release",
+                    cash_delta=0.0,
+                    payload={"amount": amount},
+                )
+            )
+            if released is not None:
+                self.store.update_funding_paper_account_reserved(venue, -amount)
 
     def _entry_risk_gate(self, route: dict[str, Any]) -> dict[str, Any]:
         legs = route.get("legs") or []
         max_divergence = 0.0
+        q = self._target_quantity(route)
+        if q <= 0:
+            return entry_risk_gates(
+                liquidation_distance_fraction=0.0,
+                margin_safety_ratio=0.0,
+                mark_index_divergence_bps=math.inf,
+            )
+        leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
+        min_liquidation_distance = math.inf
+        min_margin_safety = math.inf
         for leg in legs:
             mark = float(leg.get("mark_price") or 0.0)
             index = float(leg.get("index_price") or 0.0)
-            if mark > 0 and index > 0:
-                max_divergence = max(max_divergence, abs(mark - index) / index * 10_000.0)
+            entry_price = float(leg.get("open_vwap") or leg.get("vwap") or mark or 0.0)
+            if mark <= 0 or index <= 0 or entry_price <= 0:
+                return entry_risk_gates(
+                    liquidation_distance_fraction=0.0,
+                    margin_safety_ratio=0.0,
+                    mark_index_divergence_bps=math.inf,
+                )
+            max_divergence = max(max_divergence, abs(mark - index) / index * 10_000.0)
+            notional = q * entry_price
+            isolated_collateral = notional / leverage
+            mmr = float(leg.get("maintenance_margin_rate") or getattr(self.config, "paper_mmr", 0.02) or 0.02)
+            maintenance_margin = notional * mmr
+            margin_safety = isolated_collateral / maintenance_margin if maintenance_margin > 0 else 0.0
+            min_margin_safety = min(min_margin_safety, margin_safety)
+            liquidation_buffer_usd = max(0.0, isolated_collateral - maintenance_margin)
+            liquidation_move = liquidation_buffer_usd / max(q, 1e-12)
+            if str(leg.get("side") or "").lower() == "long":
+                liquidation_price = max(0.0, entry_price - liquidation_move)
+                liquidation_distance = max(0.0, (mark - liquidation_price) / mark)
+            else:
+                liquidation_price = entry_price + liquidation_move
+                liquidation_distance = max(0.0, (liquidation_price - mark) / mark)
+            min_liquidation_distance = min(min_liquidation_distance, liquidation_distance)
         return entry_risk_gates(
-            liquidation_distance_fraction=1.0,
-            margin_safety_ratio=99.0,
+            liquidation_distance_fraction=(
+                min_liquidation_distance if math.isfinite(min_liquidation_distance) else 0.0
+            ),
+            margin_safety_ratio=(min_margin_safety if math.isfinite(min_margin_safety) else 0.0),
             mark_index_divergence_bps=max_divergence,
         )
 
@@ -427,13 +679,32 @@ class SynchronizedFundingRuntimeV2:
         decision_at: datetime,
     ) -> dict[str, Any]:
         q = self._target_quantity(route)
+        if q <= 0:
+            return {"state": "FAILED", "reason": "zero_quantity", "quantity": 0.0, "target_quantity": 0.0,
+                    "long_entry_price": 0.0, "short_entry_price": 0.0, "paper_open_fees": 0.0,
+                    "filled_at": decision_at.isoformat(), "deadline_ok": False,
+                    "long_fill_ratio": 0.0, "short_fill_ratio": 0.0, "quantity_mismatch_fraction": 0.0}
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
         long_open = float(long_leg.get("open_vwap") or long_leg.get("vwap") or 0.0)
         short_open = float(short_leg.get("open_vwap") or short_leg.get("vwap") or 0.0)
-        long_levels = long_leg.get("asks") or _synthetic_levels(long_open, q)
-        short_levels = short_leg.get("bids") or _synthetic_levels(short_open, q)
+        long_levels = long_leg.get("asks")
+        short_levels = short_leg.get("bids")
+        if not long_levels:
+            return {"state": "FAILED", "reason": "executable_orderbook_missing",
+                    "missing_side": "long_asks", "quantity": 0.0, "target_quantity": q,
+                    "long_entry_price": 0.0, "short_entry_price": 0.0, "paper_open_fees": 0.0,
+                    "filled_at": decision_at.isoformat(), "deadline_ok": False,
+                    "long_fill_ratio": 0.0, "short_fill_ratio": 0.0, "quantity_mismatch_fraction": 0.0}
+        if not short_levels:
+            return {"state": "FAILED", "reason": "executable_orderbook_missing",
+                    "missing_side": "short_bids", "quantity": 0.0, "target_quantity": q,
+                    "long_entry_price": 0.0, "short_entry_price": 0.0, "paper_open_fees": 0.0,
+                    "filled_at": decision_at.isoformat(), "deadline_ok": False,
+                    "long_fill_ratio": 0.0, "short_fill_ratio": 0.0, "quantity_mismatch_fraction": 0.0}
+        self.store.update_funding_capture_position_state(capture_id, "ENTRY_SUBMITTED", decision_at)
+        self._reserve_collateral(capture_id, route)
         submitted_at = decision_at + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
         deadline_ok = t20_deadline_passed(filled_at, settlement_at, self.config.entry_fill_deadline_lead_seconds)
@@ -447,7 +718,7 @@ class SynchronizedFundingRuntimeV2:
             target_quantity=q,
         )
         state = fill_state["state"] if deadline_ok else "FAILED"
-        if state != "OPEN" and (long_fill["filled_quantity"] > 0 or short_fill["filled_quantity"] > 0):
+        if not deadline_ok and (long_fill["filled_quantity"] > 0 or short_fill["filled_quantity"] > 0):
             state = "PARTIALLY_HEDGED"
         cycle_id = f"{capture_id}:1"
         for side, leg, fill, fee in (
@@ -475,7 +746,7 @@ class SynchronizedFundingRuntimeV2:
                     "payload": fill,
                 }
             )
-            self.store.upsert_paper_event_ledger(
+            self._record_ledger_entry(
                 make_ledger_entry(
                     order_fee_event_key(order_id),
                     position_id=capture_id,
@@ -485,6 +756,42 @@ class SynchronizedFundingRuntimeV2:
                     cash_delta=-fee,
                     payload={"order_id": order_id},
                 )
+            )
+        if state in ("PARTIALLY_HEDGED", "FAILED") and (long_fill["filled_quantity"] > 0 or short_fill["filled_quantity"] > 0):
+            self.store.update_funding_capture_position_state(capture_id, "PARTIALLY_HEDGED", filled_at)
+            unwind = self._unwind_partial_entry(
+                route=route,
+                capture_id=capture_id,
+                cycle_id=cycle_id,
+                long_fill=long_fill,
+                short_fill=short_fill,
+                long_fee=long_fee,
+                short_fee=short_fee,
+                decision_at=decision_at,
+                now=filled_at,
+            )
+            return {
+                "state": "FAILED",
+                "quantity": 0.0,
+                "target_quantity": q,
+                "long_entry_price": long_fill["average_fill_price"],
+                "short_entry_price": short_fill["average_fill_price"],
+                "paper_open_fees": long_fee + short_fee,
+                "filled_at": filled_at.isoformat(),
+                "deadline_ok": deadline_ok,
+                "unwind": unwind,
+                **fill_state,
+            }
+        if state == "FAILED":
+            self._release_collateral(capture_id, route)
+            self.store.update_funding_capture_position_state(
+                capture_id,
+                "FAILED",
+                filled_at,
+                closed_at=filled_at.isoformat(),
+                paper_close_fees=0.0,
+                paper_emergency_unwind_cost=0.0,
+                paper_net_pnl_estimated=-(long_fee + short_fee),
             )
         return {
             "state": state,
@@ -496,6 +803,122 @@ class SynchronizedFundingRuntimeV2:
             "filled_at": filled_at.isoformat(),
             "deadline_ok": deadline_ok,
             **fill_state,
+        }
+
+    def _unwind_partial_entry(
+        self,
+        *,
+        route: dict[str, Any],
+        capture_id: str,
+        cycle_id: str,
+        long_fill: dict[str, Any],
+        short_fill: dict[str, Any],
+        long_fee: float,
+        short_fee: float,
+        decision_at: datetime,
+        now: datetime,
+    ) -> dict[str, Any]:
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        long_unwind_qty = float(long_fill["filled_quantity"])
+        short_unwind_qty = float(short_fill["filled_quantity"])
+        long_entry_price = float(long_fill["average_fill_price"] or 0.0)
+        short_entry_price = float(short_fill["average_fill_price"] or 0.0)
+        long_exit_price = long_entry_price * (1.0 - 100.0 / 10_000.0) if long_entry_price > 0 else 0.0
+        short_exit_price = short_entry_price * (1.0 + 100.0 / 10_000.0) if short_entry_price > 0 else 0.0
+        long_price_pnl = long_unwind_qty * (long_exit_price - long_entry_price) if long_entry_price > 0 else 0.0
+        short_price_pnl = short_unwind_qty * (short_entry_price - short_exit_price) if short_entry_price > 0 else 0.0
+        total_price_pnl = long_price_pnl + short_price_pnl
+        long_unwind_fee = long_unwind_qty * long_exit_price * float(long_leg.get("fee_rate") or 0.0)
+        short_unwind_fee = short_unwind_qty * short_exit_price * float(short_leg.get("fee_rate") or 0.0)
+        emergency_cost = (
+            long_unwind_qty * long_entry_price * 100.0 / 10_000.0
+            + short_unwind_qty * short_entry_price * 100.0 / 10_000.0
+        )
+        self.store.update_funding_capture_position_state(capture_id, "EMERGENCY_UNWIND", now)
+        submitted_at = now + timedelta(milliseconds=750)
+        filled_at = submitted_at + timedelta(milliseconds=750)
+        for side, leg, qty, price, fee in (
+            ("long", long_leg, long_unwind_qty, long_exit_price, long_unwind_fee),
+            ("short", short_leg, short_unwind_qty, short_exit_price, short_unwind_fee),
+        ):
+            if qty <= 0:
+                continue
+            order_id = f"{capture_id}:unwind:{side}"
+            self.store.upsert_funding_paper_order(
+                {
+                    "paper_order_id": order_id,
+                    "position_id": capture_id,
+                    "cycle_id": cycle_id,
+                    "leg_side": side,
+                    "order_intent": "UNWIND",
+                    "venue": leg.get("venue") or "",
+                    "symbol": leg.get("symbol") or "",
+                    "decision_at": now.isoformat(),
+                    "submitted_at": submitted_at.isoformat(),
+                    "acknowledged_at": submitted_at.isoformat(),
+                    "filled_at": filled_at.isoformat(),
+                    "filled_quantity": qty,
+                    "average_fill_price": price,
+                    "fee": fee,
+                    "state": "FILLED",
+                    "payload": {"adverse_penalty_bps": 100.0},
+                }
+            )
+            self._record_ledger_entry(
+                make_ledger_entry(
+                    order_fee_event_key(order_id),
+                    position_id=capture_id,
+                    cycle_id=cycle_id,
+                    venue=leg.get("venue"),
+                    event_type="order_fee",
+                    cash_delta=-fee,
+                    payload={"order_id": order_id, "intent": "unwind"},
+                )
+            )
+        if total_price_pnl != 0.0:
+            self._record_ledger_entry(
+                make_ledger_entry(
+                    price_pnl_event_key(capture_id),
+                    position_id=capture_id,
+                    cycle_id=cycle_id,
+                    venue=None,
+                    event_type="price_pnl",
+                    cash_delta=total_price_pnl,
+                    payload={"reason": "partial_entry_unwind", "price_pnl": total_price_pnl},
+                )
+            )
+        if emergency_cost > 0:
+            self._record_ledger_entry(
+                make_ledger_entry(
+                    f"emergency_unwind:{capture_id}:partial_entry",
+                    position_id=capture_id,
+                    cycle_id=cycle_id,
+                    venue=None,
+                    event_type="emergency_unwind_cost",
+                    cash_delta=-emergency_cost,
+                    payload={"reason": "partial_entry_unwind"},
+                )
+            )
+        self._release_collateral(capture_id, route)
+        self.store.update_funding_capture_position_state(
+            capture_id,
+            "FAILED",
+            now,
+            closed_at=now.isoformat(),
+            paper_close_fees=long_unwind_fee + short_unwind_fee,
+            paper_emergency_unwind_cost=emergency_cost,
+            paper_net_pnl_estimated=total_price_pnl - long_fee - short_fee - long_unwind_fee - short_unwind_fee - emergency_cost,
+        )
+        return {
+            "long_unwind_quantity": long_unwind_qty,
+            "short_unwind_quantity": short_unwind_qty,
+            "long_exit_price": long_exit_price,
+            "short_exit_price": short_exit_price,
+            "price_pnl": total_price_pnl,
+            "unwind_fees": long_unwind_fee + short_unwind_fee,
+            "emergency_cost": emergency_cost,
         }
 
     def _mark_open(
@@ -733,6 +1156,7 @@ class SynchronizedFundingRuntimeV2:
         now: datetime,
         *,
         reason: str,
+        emergency: bool = False,
     ) -> dict[str, Any]:
         position_id = str(position["position_id"])
         cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
@@ -743,28 +1167,68 @@ class SynchronizedFundingRuntimeV2:
         entry_legs = (position.get("config") or {}).get("entry_legs") or []
         long_entry_leg = leg_by_side(entry_legs, "long") or {}
         short_entry_leg = leg_by_side(entry_legs, "short") or {}
+        long_entry_price = float(
+            long_entry_leg.get("entry_fill_price") or long_entry_leg.get("vwap") or 0.0
+        )
+        short_entry_price = float(
+            short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0
+        )
+        pricing_quality = "executable_book"
+        penalty_bps = 0.0
+        long_has_book = bool(long_route_leg.get("bids"))
+        short_has_book = bool(short_route_leg.get("asks"))
+        if emergency:
+            self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+        if not emergency:
+            if not long_has_book or not short_has_book:
+                return {
+                    "decision": "rejected",
+                    "reason": "executable_orderbook_missing",
+                    "state": str(position.get("state") or ""),
+                    "missing_long_bids": not long_has_book,
+                    "missing_short_asks": not short_has_book,
+                }
+        else:
+            if not long_has_book or not short_has_book:
+                long_mark = float(long_route_leg.get("mark_price") or long_entry_leg.get("entry_fill_price") or long_entry_leg.get("vwap") or 0.0)
+                short_mark = float(short_route_leg.get("mark_price") or short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0)
+                if long_mark > 0 and short_mark > 0:
+                    pricing_quality = "fallback_mark_300bps"
+                    penalty_bps = 300.0
+                else:
+                    return {
+                        "decision": "rejected",
+                        "reason": "emergency_pricing_unavailable",
+                        "state": "EMERGENCY_UNWIND",
+                    }
         long_exit_price = float(
             optional_float(long_route_leg.get("close_vwap"))
             or optional_float(long_route_leg.get("best_bid"))
             or optional_float(long_route_leg.get("mark_price"))
-            or optional_float(long_entry_leg.get("entry_fill_price"))
-            or optional_float(long_entry_leg.get("vwap"))
             or 0.0
         )
         short_exit_price = float(
             optional_float(short_route_leg.get("close_vwap"))
             or optional_float(short_route_leg.get("best_ask"))
             or optional_float(short_route_leg.get("mark_price"))
-            or optional_float(short_entry_leg.get("entry_fill_price"))
-            or optional_float(short_entry_leg.get("vwap"))
             or 0.0
         )
-        long_levels = long_route_leg.get("bids") or _synthetic_levels(long_exit_price, quantity)
-        short_levels = short_route_leg.get("asks") or _synthetic_levels(short_exit_price, quantity)
+        if emergency and penalty_bps > 0:
+            long_exit_price = float(long_route_leg.get("mark_price") or long_entry_leg.get("entry_fill_price") or long_entry_leg.get("vwap") or 0.0)
+            short_exit_price = float(short_route_leg.get("mark_price") or short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0)
+            long_exit_price = long_exit_price * (1.0 - penalty_bps / 10_000.0) if long_exit_price > 0 else 0.0
+            short_exit_price = short_exit_price * (1.0 + penalty_bps / 10_000.0) if short_exit_price > 0 else 0.0
+            long_levels = _synthetic_levels(long_exit_price, quantity) if long_exit_price > 0 else []
+            short_levels = _synthetic_levels(short_exit_price, quantity) if short_exit_price > 0 else []
+        else:
+            long_levels = long_route_leg.get("bids") or []
+            short_levels = short_route_leg.get("asks") or []
         long_exit = simulate_marketable_ioc(long_levels, "sell", quantity, EXECUTION_HAIRCUT_FRACTION)
         short_exit = simulate_marketable_ioc(short_levels, "buy", quantity, EXECUTION_HAIRCUT_FRACTION)
-        long_fee = long_exit["notional"] * float(long_route_leg.get("fee_rate") or long_entry_leg.get("fee_rate") or 0.0)
-        short_fee = short_exit["notional"] * float(short_route_leg.get("fee_rate") or short_entry_leg.get("fee_rate") or 0.0)
+        long_fee_rate = float(long_route_leg.get("fee_rate") or long_entry_leg.get("fee_rate") or 0.0)
+        short_fee_rate = float(short_route_leg.get("fee_rate") or short_entry_leg.get("fee_rate") or 0.0)
+        long_fee = long_exit["notional"] * long_fee_rate
+        short_fee = short_exit["notional"] * short_fee_rate
         residual_quantity = float(long_exit["unfilled_quantity"]) + float(short_exit["unfilled_quantity"])
         reference_price = (
             float(long_exit["average_fill_price"] or 0.0)
@@ -777,6 +1241,11 @@ class SynchronizedFundingRuntimeV2:
             if residual_quantity > 0
             else 0.0
         )
+        if emergency and penalty_bps > 0:
+            emergency_cost += (
+                quantity * max(long_exit_price, 0.0) * penalty_bps / 10_000.0
+                + quantity * max(short_exit_price, 0.0) * penalty_bps / 10_000.0
+            )
         submitted_at = now + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
         for side, leg, fill, fee in (
@@ -804,7 +1273,7 @@ class SynchronizedFundingRuntimeV2:
                     "payload": fill,
                 }
             )
-            self.store.upsert_paper_event_ledger(
+            self._record_ledger_entry(
                 make_ledger_entry(
                     order_fee_event_key(order_id),
                     position_id=position_id,
@@ -817,17 +1286,17 @@ class SynchronizedFundingRuntimeV2:
             )
         pnl = executable_paper_pnl(
             quantity=quantity,
-            long_entry_price=float(long_entry_leg.get("entry_fill_price") or long_entry_leg.get("vwap") or 0.0),
+            long_entry_price=long_entry_price,
             long_exit_price=float(long_exit["average_fill_price"] or long_exit_price or 0.0),
-            short_entry_price=float(short_entry_leg.get("entry_fill_price") or short_entry_leg.get("vwap") or 0.0),
+            short_entry_price=short_entry_price,
             short_exit_price=float(short_exit["average_fill_price"] or short_exit_price or 0.0),
-            long_taker_fee=float(long_route_leg.get("fee_rate") or long_entry_leg.get("fee_rate") or 0.0),
-            short_taker_fee=float(short_route_leg.get("fee_rate") or short_entry_leg.get("fee_rate") or 0.0),
+            long_taker_fee=long_fee_rate,
+            short_taker_fee=short_fee_rate,
             confirmed_funding_pnl=0.0,
             paper_open_fees=float(position.get("paper_open_fees") or 0.0),
             emergency_unwind_costs_already_incurred=emergency_cost,
         )
-        self.store.upsert_paper_event_ledger(
+        self._record_ledger_entry(
             make_ledger_entry(
                 price_pnl_event_key(position_id),
                 position_id=position_id,
@@ -839,7 +1308,7 @@ class SynchronizedFundingRuntimeV2:
             )
         )
         if emergency_cost > 0:
-            self.store.upsert_paper_event_ledger(
+            self._record_ledger_entry(
                 make_ledger_entry(
                     f"emergency_unwind:{position_id}:close",
                     position_id=position_id,
@@ -847,9 +1316,10 @@ class SynchronizedFundingRuntimeV2:
                     venue=None,
                     event_type="emergency_unwind_cost",
                     cash_delta=-emergency_cost,
-                    payload={"reason": reason, "residual_quantity": residual_quantity},
+                    payload={"reason": reason, "residual_quantity": residual_quantity, "pricing_quality": pricing_quality},
                 )
             )
+        self._release_collateral(position_id, route or {"legs": entry_legs})
         final_state = "CLOSED_PENDING_RECONCILIATION"
         self.store.update_funding_capture_position_state(
             position_id,
@@ -864,6 +1334,7 @@ class SynchronizedFundingRuntimeV2:
             "decision": "closed",
             "reason": reason,
             "state": final_state,
+            "pricing_quality": pricing_quality,
             "long_exit": long_exit,
             "short_exit": short_exit,
             "paper_close_fees": long_fee + short_fee,

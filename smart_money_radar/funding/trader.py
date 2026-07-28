@@ -1889,20 +1889,30 @@ class PaperBot:
             if risk_exit is not None:
                 self.store.update_funding_capture_position_state(
                     position_id,
-                    "EMERGENCY_UNWIND",
+                    "EXIT_SUBMITTED",
                     now,
-                    paper_net_pnl_estimated=None,
+                )
+                close_payload = self.synchronized_runtime.close_position(
+                    position,
+                    live_route,
+                    now,
+                    reason=str(risk_exit.get("close_reason") or "hard_risk"),
+                    emergency=True,
                 )
                 self.record_event(
                     "close",
                     (
                         f"V2 RISK EXIT {position.get('canonical_asset')} "
                         f"{position.get('long_venue')}/{position.get('short_venue')}\n"
-                        f"Reason: {risk_exit['close_reason']}"
+                        f"Reason: {risk_exit['close_reason']}\n"
+                        f"Price PnL: {format_signed_money(close_payload.get('paper_price_pnl'))}\n"
+                        f"Emergency cost: {format_signed_money(close_payload.get('paper_emergency_unwind_cost'))}\n"
+                        f"State: {close_payload.get('state')}"
                     ),
                     {
                         "position": position,
                         "risk_engine": risk_exit,
+                        "close": close_payload,
                     },
                     route_key=route_key,
                     notify=True,
@@ -1958,6 +1968,21 @@ class PaperBot:
                     now,
                     reason=str(decision.get("reason") or "post_settlement_close"),
                 )
+                if close_payload.get("decision") != "closed":
+                    self.record_event(
+                        "close_skipped",
+                        (
+                            f"V2 CLOSE SKIPPED {position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            f"Reason: {close_payload.get('reason')}"
+                        ),
+                        {"position": position, "decision": decision, "close": close_payload},
+                        route_key=route_key,
+                        notify=True,
+                        severity="warning",
+                    )
+                    outcomes.append("close_rejected")
+                    continue
                 self.record_event(
                     "close",
                     (

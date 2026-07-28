@@ -1469,6 +1469,9 @@ def _v2_runtime_route(
                 "best_ask": 100.02,
                 "fee_rate": 0.0005,
                 "base_quantity": 5.0,
+                "quantity_step": 0.01,
+                "min_quantity": 0.01,
+                "min_notional": 10.0,
                 "response_received_at": response_at.isoformat(),
                 "orderbook_response_received_at": response_at.isoformat(),
                 "asks": [[100.02, 20.0]],
@@ -1491,6 +1494,9 @@ def _v2_runtime_route(
                 "best_ask": 100.02,
                 "fee_rate": 0.0005,
                 "base_quantity": 5.0,
+                "quantity_step": 0.01,
+                "min_quantity": 0.01,
+                "min_notional": 10.0,
                 "response_received_at": (response_at + timedelta(milliseconds=500)).isoformat(),
                 "orderbook_response_received_at": (response_at + timedelta(milliseconds=500)).isoformat(),
                 "asks": [[100.02, 20.0]],
@@ -1591,12 +1597,14 @@ def test_paperbot_v2_entry_uses_new_runtime_not_legacy_open(tmp_path, monkeypatc
     capture_rows = store.funding_capture_position_rows(states={"OPEN"})
     assert len(capture_rows) == 1
     assert capture_rows[0]["position_id"] == capture_id
-    assert capture_rows[0]["quantity"] == pytest.approx(4.999000199960008)
+    assert capture_rows[0]["quantity"] == pytest.approx(4.99)
     orders = store.funding_paper_order_rows(capture_id)
     assert [row["order_intent"] for row in orders] == ["ENTRY", "ENTRY"]
     assert {row["state"] for row in orders} == {"FILLED"}
     ledger = store.paper_event_ledger_rows(capture_id)
-    assert [row["event_type"] for row in ledger] == ["order_fee", "order_fee"]
+    event_types = [row["event_type"] for row in ledger]
+    assert event_types.count("order_fee") == 2
+    assert event_types.count("collateral_reserve") == 2
 
 
 def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp_path, monkeypatch) -> None:
@@ -2196,3 +2204,406 @@ def test_next_cycle_observation_eligibility() -> None:
     assert result["observation_count"] == 15
     assert result["observation_span_seconds"] >= 20.0
     assert result["conservative_funding_gross"] == pytest.approx(0.9 * 5.0)
+
+
+# ---------------------------------------------------------------------------
+# PASS 1: end-to-end runtime defect-fix tests
+# ---------------------------------------------------------------------------
+
+
+def _open_position_for_close_tests(tmp_path, now: datetime):
+    """Create an OPEN position directly in storage for close-path tests."""
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    position_id = "fc-close-test"
+    store.upsert_funding_capture_position({
+        "position_id": position_id,
+        "canonical_asset": "BTC",
+        "long_venue": "binance",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "bybit",
+        "short_symbol": "BTCUSDT",
+        "quantity": 5.0,
+        "target_notional": 500.0,
+        "state": "OPEN",
+        "opened_at": now.isoformat(),
+        "paper_open_fees": 0.50,
+        "config": {
+            "route_key": "BTC:binance:bybit",
+            "entry_legs": [
+                {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+                 "entry_fill_price": 100.02, "vwap": 100.02, "fee_rate": 0.0005},
+                {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+                 "entry_fill_price": 99.98, "vwap": 99.98, "fee_rate": 0.0005},
+            ],
+        },
+    })
+    store.upsert_funding_capture_cycle({
+        "position_id": position_id,
+        "cycle_number": 1,
+        "scheduled_funding_at": (now + timedelta(seconds=30)).isoformat(),
+        "state": "OPEN",
+    })
+    # Manually reserve collateral to simulate a real open
+    from smart_money_radar.paper_bot.accounting import collateral_reserve_event_key, make_ledger_entry
+    for venue in ("binance", "bybit"):
+        amount = 500.0 + 500.0 * 0.25  # isolated + reserve at leverage=1
+        store.upsert_paper_event_ledger(make_ledger_entry(
+            collateral_reserve_event_key(position_id, venue),
+            position_id=position_id, venue=venue,
+            event_type="collateral_reserve", cash_delta=0.0,
+            payload={"amount": amount},
+        ))
+        store.update_funding_paper_account_reserved(venue, amount)
+    return store, position_id
+
+
+def test_hard_risk_executes_exit_orders_and_releases_collateral(tmp_path) -> None:
+    """Hard-risk close: 2 exit orders, collateral release, price PnL, CLOSED_PENDING_RECONCILIATION."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    config = PaperBotConfig(telegram_enabled=False, venue_starting_balance=10_000.0).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    # Route with executable books and a hard-risk trigger (mark/index divergence > 100bps)
+    bot.hot_routes["BTC:binance:bybit"] = {
+        "status": "paper_candidate",
+        "route_key": "BTC:binance:bybit",
+        "observed_at": now.isoformat(),
+        "risk_flags": [],
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "next_funding_at": (now + timedelta(seconds=3600)).isoformat(),
+             "mark_price": 100.0, "index_price": 99.0,
+             "best_bid": 99.5, "best_ask": 100.5,
+             "close_vwap": 99.5, "bids": [[99.5, 20.0]],
+             "fee_rate": 0.0005, "funding_rate": 0.001,
+             "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "next_funding_at": (now + timedelta(seconds=3600)).isoformat(),
+             "mark_price": 100.0, "index_price": 99.0,
+             "best_bid": 99.5, "best_ask": 100.5,
+             "close_vwap": 100.5, "asks": [[100.5, 20.0]],
+             "fee_rate": 0.0005, "funding_rate": 0.001,
+             "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
+        ],
+        "evidence": {"selected_strategy": {
+            "selection_model": "opportunity_engine_v1",
+            "strategy_name": "synchronized_funding_capture",
+            "eligible": True, "expected_net_pnl": 5.0,
+        }},
+    }
+    outcomes = bot.process_open_positions()
+    assert "emergency_unwind" in outcomes
+    # Position must be CLOSED_PENDING_RECONCILIATION, not EMERGENCY_UNWIND
+    positions = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})
+    assert len(positions) == 1
+    assert positions[0]["position_id"] == position_id
+    # Must NOT appear as open
+    assert all(p["position_id"] != position_id for p in store.funding_capture_open_positions())
+    # Exit orders exist
+    orders = store.funding_paper_order_rows(position_id)
+    exit_orders = [o for o in orders if o["order_intent"] == "EXIT"]
+    assert len(exit_orders) == 2
+    assert {o["leg_side"] for o in exit_orders} == {"long", "short"}
+    # Ledger: price_pnl, order_fee x2, collateral_release x2
+    ledger = store.paper_event_ledger_rows(position_id)
+    event_types = [row["event_type"] for row in ledger]
+    assert "price_pnl" in event_types
+    assert event_types.count("order_fee") >= 2
+    assert event_types.count("collateral_release") == 2
+    # Collateral actually released on accounts
+    accounts = {r["venue"]: r for r in store.funding_paper_account_rows()}
+    for venue in ("binance", "bybit"):
+        reserved = accounts[venue]["reserved_margin"]
+        assert reserved == 0.0, f"{venue} reserved_margin should be 0 after release, got {reserved}"
+
+
+def test_hard_stale_no_fresh_book_uses_emergency_fallback(tmp_path) -> None:
+    """Hard stale with no executable book uses fallback_mark_300bps and closes."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    config = PaperBotConfig(telegram_enabled=False, venue_starting_balance=10_000.0).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    # Route with mark_price but NO bids/asks, stale observed_at (>5s old)
+    stale_at = now - timedelta(seconds=10)
+    bot.hot_routes["BTC:binance:bybit"] = {
+        "status": "paper_candidate",
+        "route_key": "BTC:binance:bybit",
+        "observed_at": stale_at.isoformat(),
+        "risk_flags": [],
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "next_funding_at": (now + timedelta(seconds=3600)).isoformat(),
+             "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "funding_rate": 0.001,
+             "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "next_funding_at": (now + timedelta(seconds=3600)).isoformat(),
+             "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "funding_rate": 0.001,
+             "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
+        ],
+        "evidence": {"selected_strategy": {
+            "selection_model": "opportunity_engine_v1",
+            "strategy_name": "synchronized_funding_capture",
+            "eligible": True, "expected_net_pnl": 5.0,
+        }},
+    }
+    outcomes = bot.process_open_positions()
+    assert "emergency_unwind" in outcomes
+    positions = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})
+    assert len(positions) == 1
+    ledger = store.paper_event_ledger_rows(position_id)
+    emergency_events = [r for r in ledger if r["event_type"] == "emergency_unwind_cost"]
+    assert len(emergency_events) >= 1
+    payload = emergency_events[0]["payload"]
+    assert payload.get("pricing_quality") == "fallback_mark_300bps"
+
+
+def test_partial_entry_unwinds_and_releases_collateral(tmp_path, monkeypatch) -> None:
+    """Partial fill (long 100%, short 90%) never opens, creates unwind, final FAILED."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+    import smart_money_radar.funding.trader as trader_module
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    route = _v2_runtime_route(now)
+    capture_id = capture_position_id_for_route(route)
+    settlement_at = now + timedelta(seconds=30)
+    config = PaperBotConfig(
+        telegram_enabled=False, focused_recheck_enabled=False,
+        venue_starting_balance=10_000.0, target_notional_per_leg=500.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    bot.v2_observations_by_route[route["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    # Make short bids thin so short fill is only ~90%
+    for leg in route["legs"]:
+        if leg["side"] == "short":
+            leg["bids"] = [[99.98, 1.1]]  # visible 1.1 * 0.4 haircut = 0.44 fillable
+    monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+    assert opened == []
+    # Position must NOT be OPEN
+    open_positions = store.funding_capture_position_rows(states={"OPEN"})
+    assert len(open_positions) == 0
+    # Position must be FAILED
+    failed = store.funding_capture_position_rows(states={"FAILED"})
+    assert len(failed) == 1
+    assert failed[0]["position_id"] == capture_id
+    # Unwind orders exist
+    orders = store.funding_paper_order_rows(capture_id)
+    unwind_orders = [o for o in orders if o["order_intent"] == "UNWIND"]
+    assert len(unwind_orders) >= 1
+    # Ledger has fees, price_pnl, emergency cost
+    ledger = store.paper_event_ledger_rows(capture_id)
+    event_types = [r["event_type"] for r in ledger]
+    assert "order_fee" in event_types
+    assert "price_pnl" in event_types
+    assert "emergency_unwind_cost" in event_types
+
+
+def test_missing_entry_book_rejects(tmp_path, monkeypatch) -> None:
+    """Missing asks/bids rejects with executable_orderbook_missing."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    import smart_money_radar.funding.trader as trader_module
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    route = _v2_runtime_route(now)
+    # Remove asks from long leg
+    for leg in route["legs"]:
+        if leg["side"] == "long":
+            del leg["asks"]
+    settlement_at = now + timedelta(seconds=30)
+    config = PaperBotConfig(
+        telegram_enabled=False, focused_recheck_enabled=False,
+        venue_starting_balance=10_000.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    bot.v2_observations_by_route[route["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+    assert opened == []
+    open_positions = store.funding_capture_position_rows(states={"OPEN"})
+    assert len(open_positions) == 0
+
+
+def test_quantity_step_lcm_common_quantity() -> None:
+    """LCM example: long step 0.01, short step 0.025, q_raw 4.999 => common_step 0.05, q 4.95."""
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+    from smart_money_radar.funding.trader import PaperBotConfig
+    config = PaperBotConfig(target_notional_per_leg=500.0).validated()
+    runtime = SynchronizedFundingRuntimeV2(
+        store=None, config=config, clock=None, observations_by_route={},
+    )
+    result = runtime._compute_common_quantity(
+        long_price=100.0,
+        short_price=100.02,
+        long_step=0.01,
+        short_step=0.025,
+        long_min_qty=0.01,
+        short_min_qty=0.01,
+        long_min_notional=10.0,
+        short_min_notional=10.0,
+    )
+    # q_raw = min(500/100, 500/100.02) = min(5.0, 4.99900019996) = 4.99900019996
+    # LCM(1000000, 2500000) = 5000000 => common_step = 0.05
+    # q = floor(4.99900019996 / 0.05) * 0.05 = floor(99.98) * 0.05 = 99 * 0.05 = 4.95
+    assert result["quantity"] == pytest.approx(4.95)
+    assert result["reason"] is None
+
+
+def test_insufficient_balance_rejects_entry(tmp_path, monkeypatch) -> None:
+    """Insufficient balance rejects with no entry orders."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+    import smart_money_radar.funding.trader as trader_module
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    # Only 100 USD per venue — not enough for 500 + 125 reserve + fee
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 100.0)
+    route = _v2_runtime_route(now)
+    settlement_at = now + timedelta(seconds=30)
+    config = PaperBotConfig(
+        telegram_enabled=False, focused_recheck_enabled=False,
+        venue_starting_balance=100.0, target_notional_per_leg=500.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    bot.v2_observations_by_route[route["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+    assert opened == []
+    capture_id = capture_position_id_for_route(route)
+    orders = store.funding_paper_order_rows(capture_id)
+    entry_orders = [o for o in orders if o["order_intent"] == "ENTRY"]
+    assert len(entry_orders) == 0
+
+
+def test_max_position_limit_rejects_second_entry(tmp_path, monkeypatch) -> None:
+    """Max position limit (1) rejects second synchronized entry."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+    import smart_money_radar.funding.trader as trader_module
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit", "okx"], 10_000.0)
+    config = PaperBotConfig(
+        telegram_enabled=False, focused_recheck_enabled=False,
+        venue_starting_balance=10_000.0, target_notional_per_leg=500.0,
+        max_open_positions_total=1,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    # Open first position
+    route1 = _v2_runtime_route(now, route_key="BTC:binance:bybit")
+    settlement_at = now + timedelta(seconds=30)
+    bot.v2_observations_by_route[route1["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
+    opened1 = bot.process_entry_candidates([route1], recheck_before_open=False)
+    assert len(opened1) == 1
+    # Second route on different venues
+    route2 = _v2_runtime_route(
+        now, route_key="BTC:binance:okx",
+        next_lead_seconds=30, short_next_lead_seconds=30,
+    )
+    for leg in route2["legs"]:
+        if leg["side"] == "short":
+            leg["venue"] = "okx"
+            leg["symbol"] = "BTCUSDT"
+    route2["short_venue"] = "okx"
+    bot.v2_observations_by_route[route2["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    opened2 = bot.process_entry_candidates([route2], recheck_before_open=False)
+    assert len(opened2) == 0
+
+
+def test_normal_close_rejects_without_orderbook(tmp_path) -> None:
+    """Normal close_position rejects with executable_orderbook_missing when no bids/asks."""
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+    from smart_money_radar.funding.trader import PaperBotConfig
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    config = PaperBotConfig(telegram_enabled=False).validated()
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store, config=config, clock=FakeClock(now), observations_by_route={},
+    )
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    # Route without bids/asks
+    route_no_book = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "mark_price": 100.0, "fee_rate": 0.0005},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "mark_price": 100.0, "fee_rate": 0.0005},
+        ],
+    }
+    result = runtime.close_position(position, route_no_book, now, reason="test_close")
+    assert result["decision"] == "rejected"
+    assert result["reason"] == "executable_orderbook_missing"
+
+
+def test_collateral_reserved_on_entry_and_released_on_close(tmp_path, monkeypatch) -> None:
+    """Collateral is reserved on entry and released on close."""
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+    import smart_money_radar.funding.trader as trader_module
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    route = _v2_runtime_route(now)
+    capture_id = capture_position_id_for_route(route)
+    settlement_at = now + timedelta(seconds=30)
+    config = PaperBotConfig(
+        telegram_enabled=False, focused_recheck_enabled=False,
+        venue_starting_balance=10_000.0, target_notional_per_leg=500.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    bot.v2_observations_by_route[route["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - i * 2), settlement_at)
+        for i in range(9)
+    ]
+    monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
+    # Before entry: reserved = 0
+    accounts_before = {r["venue"]: r for r in store.funding_paper_account_rows()}
+    assert accounts_before["binance"]["reserved_margin"] == 0.0
+    assert accounts_before["bybit"]["reserved_margin"] == 0.0
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+    assert len(opened) == 1
+    # After entry: reserved > 0
+    accounts_after = {r["venue"]: r for r in store.funding_paper_account_rows()}
+    assert accounts_after["binance"]["reserved_margin"] > 0.0
+    assert accounts_after["bybit"]["reserved_margin"] > 0.0
+    # Ledger has collateral_reserve events
+    ledger = store.paper_event_ledger_rows(capture_id)
+    reserve_events = [r for r in ledger if r["event_type"] == "collateral_reserve"]
+    assert len(reserve_events) == 2  # one per venue

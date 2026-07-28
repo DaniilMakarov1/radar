@@ -446,7 +446,6 @@ class SQLiteStore:
                 "EXIT_SUBMITTED",
                 "PARTIALLY_CLOSED",
                 "EMERGENCY_UNWIND",
-                "CLOSED_PENDING_RECONCILIATION",
             }
         )
 
@@ -7500,6 +7499,43 @@ class SQLiteStore:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def update_funding_paper_account_reserved(
+        self,
+        venue: str,
+        delta: float,
+    ) -> None:
+        """Adjust reserved_margin for a venue account. Idempotent via ledger."""
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE funding_paper_accounts
+                SET reserved_margin = MAX(0, reserved_margin + ?),
+                    updated_at = ?
+                WHERE venue = ?
+                """,
+                (float(delta), now, str(venue)),
+            )
+
+    def update_funding_paper_account_cash(
+        self,
+        venue: str,
+        delta: float,
+    ) -> None:
+        """Adjust cash/realized PnL for v2 idempotent paper ledger effects."""
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE funding_paper_accounts
+                SET cash_balance = cash_balance + ?,
+                    realized_pnl = realized_pnl + ?,
+                    updated_at = ?
+                WHERE venue = ?
+                """,
+                (float(delta), float(delta), now, str(venue)),
+            )
 
     def funding_paper_open_positions(self) -> list[dict[str, Any]]:
         with self.connect() as connection:

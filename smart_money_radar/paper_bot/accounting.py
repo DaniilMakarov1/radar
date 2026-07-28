@@ -66,6 +66,14 @@ def price_pnl_event_key(position_id: str) -> str:
     return f"price_pnl:{position_id}:close"
 
 
+def collateral_reserve_event_key(position_id: str, venue: str) -> str:
+    return f"collateral_reserve:{position_id}:{venue}"
+
+
+def collateral_release_event_key(position_id: str, venue: str) -> str:
+    return f"collateral_release:{position_id}:{venue}"
+
+
 def funding_event_key(
     position_id: str,
     venue: str,
