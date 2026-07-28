@@ -1627,26 +1627,24 @@ def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp
 def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
-    decision_at = now + timedelta(seconds=61)
-    bot.clock.advance(30)
-    next_route = _v2_runtime_route(decision_at, lead_seconds=30, next_lead_seconds=3600)
-    next_route["route_key"] = route["route_key"]
-    position = store.funding_capture_position_rows(states={"SETTLEMENT_CROSSED"})[0]
-    cycle_id = position["current_cycle_id"]
-    next_settlement = decision_at + timedelta(seconds=3600)
-    for index in range(14):
-        obs_time = decision_at - timedelta(seconds=20 - index * 1.5)
-        bot.synchronized_runtime.collect_hold_observation(
-            position,
-            _v2_runtime_route(obs_time, lead_seconds=30, next_lead_seconds=(next_settlement - obs_time).total_seconds()),
-            obs_time,
+    next_settlement = settlement_at + timedelta(seconds=3600)
+    outcomes: list[str] = []
+    for offset in range(5, 31):
+        target = settlement_at + timedelta(seconds=offset)
+        bot.clock.advance((target - bot.clock.now()).total_seconds())
+        current = bot.clock.now()
+        next_route = _v2_runtime_route(
+            current,
+            lead_seconds=30,
+            next_lead_seconds=(next_settlement - current).total_seconds(),
         )
-    bot.hot_routes[route["route_key"]] = next_route
-
-    outcomes = bot.process_open_positions()
+        next_route["route_key"] = route["route_key"]
+        bot.hot_routes[route["route_key"]] = next_route
+        outcomes = bot.process_open_positions()
 
     assert outcomes == ["hold"]
     held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
@@ -1656,20 +1654,49 @@ def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp
             "SELECT cycle_number, state FROM funding_capture_cycles WHERE position_id = ? ORDER BY cycle_number",
             (capture_id,),
         ).fetchall()
+        hold_rows = conn.execute(
+            """
+            SELECT observed_at
+            FROM funding_capture_observations
+            WHERE position_id = ? AND phase = 'hold'
+            ORDER BY observed_at
+            """,
+            (capture_id,),
+        ).fetchall()
     assert [(row[0], row[1]) for row in cycles] == [(1, "SETTLEMENT_CROSSED"), (2, "HOLDING_NEXT_CYCLE")]
+    assert len(hold_rows) >= 15
+    hold_start = datetime.fromisoformat(hold_rows[0][0])
+    hold_end = datetime.fromisoformat(hold_rows[-1][0])
+    assert (hold_end - hold_start).total_seconds() >= 20
     assert all(row["status"] == "PENDING" for row in store.funding_settlement_reconciliation_rows(capture_id))
 
 
 def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_funding(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
-    decision_at = now + timedelta(seconds=61)
-    bot.clock.advance(30)
+    for offset in range(5, 20):
+        target = settlement_at + timedelta(seconds=offset)
+        bot.clock.advance((target - bot.clock.now()).total_seconds())
+        current = bot.clock.now()
+        mismatch_route = _v2_runtime_route(
+            current,
+            lead_seconds=30,
+            next_lead_seconds=3600,
+            short_next_lead_seconds=3900,
+        )
+        mismatch_route["route_key"] = route["route_key"]
+        bot.hot_routes[route["route_key"]] = mismatch_route
+        assert bot.process_open_positions() == []
+
+    target = settlement_at + timedelta(seconds=20)
+    bot.clock.advance((target - bot.clock.now()).total_seconds())
+    current = bot.clock.now()
     mismatch_route = _v2_runtime_route(
-        decision_at,
+        current,
         lead_seconds=30,
         next_lead_seconds=3600,
         short_next_lead_seconds=3900,
@@ -1687,6 +1714,95 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     assert ledger_types.count("order_fee") == 4
     assert ledger_types.count("price_pnl") == 1
     assert "funding" not in ledger_types
+
+
+def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tmp_path, monkeypatch) -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    settlement_at = now + timedelta(seconds=30)
+    bot.clock.advance(31)
+    assert bot.process_open_positions() == ["settlement_crossed"]
+
+    next_settlement = settlement_at + timedelta(seconds=3600)
+    outcomes: list[str] = []
+    for offset in range(5, 31):
+        target = settlement_at + timedelta(seconds=offset)
+        bot.clock.advance((target - bot.clock.now()).total_seconds())
+        current = bot.clock.now()
+        next_route = _v2_runtime_route(
+            current,
+            lead_seconds=30,
+            next_lead_seconds=(next_settlement - current).total_seconds(),
+        )
+        next_route["route_key"] = route["route_key"]
+        next_route["legs"][0]["funding_interval_hours"] = 1.0
+        next_route["legs"][1]["funding_interval_hours"] = 4.0
+        bot.hot_routes[route["route_key"]] = next_route
+        outcomes = bot.process_open_positions()
+
+    assert outcomes == ["hold"]
+    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
+    assert held["position_id"] == capture_id
+
+
+def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tmp_path, monkeypatch) -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    settlement_at = now + timedelta(seconds=30)
+    bot.clock.advance(31)
+    assert bot.process_open_positions() == ["settlement_crossed"]
+
+    next_settlement = settlement_at + timedelta(seconds=3600)
+    outcomes: list[str] = []
+    for offset in range(5, 31):
+        target = settlement_at + timedelta(seconds=offset)
+        bot.clock.advance((target - bot.clock.now()).total_seconds())
+        current = bot.clock.now()
+        next_route = _v2_runtime_route(
+            current,
+            lead_seconds=30,
+            next_lead_seconds=(next_settlement - current).total_seconds(),
+        )
+        next_route["route_key"] = route["route_key"]
+        next_route["legs"][0]["close_vwap"] = 80.0
+        next_route["legs"][1]["close_vwap"] = 120.0
+        bot.hot_routes[route["route_key"]] = next_route
+        outcomes = bot.process_open_positions()
+
+    assert outcomes == ["closed"]
+    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
+    assert closed["position_id"] == capture_id
+    assert closed["paper_net_pnl_estimated"] < 0
+
+
+def test_v2_entry_rejects_missing_normalized_next_funding_rate(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now))
+    route = _v2_runtime_route(now)
+    route["legs"][0].pop("normalized_next_funding_rate")
+    capture_id = capture_position_id_for_route(route)
+    settlement_at = now + timedelta(seconds=30)
+    bot.v2_observations_by_route[route["route_key"]] = [
+        _valid_v2_observation(now - timedelta(seconds=20 - index * 2), settlement_at)
+        for index in range(9)
+    ]
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is False
+    assert result["reason"] == "required_route_data_missing"
+    assert "long_normalized_next_funding_rate_missing" in result["missing"]
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "ARMED"
 
 
 def test_hold_proceeds_while_prior_reconciliation_pending(tmp_path) -> None:

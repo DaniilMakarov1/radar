@@ -29,6 +29,7 @@ from smart_money_radar.paper_bot.accounting import (
 from smart_money_radar.paper_bot.cycle_manager import (
     next_cycle_observation_decision,
     next_cycle_schedule_decision,
+    post_settlement_probe_decision,
 )
 from smart_money_radar.paper_bot.execution import (
     EXECUTION_HAIRCUT_FRACTION,
@@ -49,6 +50,17 @@ OBSERVATION_MIN_COUNT = 10
 OBSERVATION_MIN_SPAN_SECONDS = 20.0
 POST_SETTLEMENT_NORMAL_EXIT_DELAY_SECONDS = 20.0
 POST_SETTLEMENT_HOLD_DECISION_SECONDS = 30.0
+POST_SETTLEMENT_PROBE_START_SECONDS = 5.0
+POST_SETTLEMENT_PROBE_END_SECONDS = 15.0
+POST_SETTLEMENT_CLOSE_AT_T20_SECONDS = 20.0
+POST_SETTLEMENT_EVALUATION_START_SECONDS = 5.0
+
+
+def schedule_seconds_to_next(probe_decision: dict[str, Any], now: datetime) -> float | None:
+    next_at = parse_time(probe_decision.get("next_cycle_at"))
+    if next_at is None:
+        return None
+    return max(0.0, (next_at.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
 
 
 def synchronized_runtime_enabled(config: Any) -> bool:
@@ -99,6 +111,14 @@ def _leg_rate(leg: dict[str, Any]) -> float:
         optional_float(leg.get("normalized_next_funding_rate"))
         if optional_float(leg.get("normalized_next_funding_rate")) is not None
         else optional_float(leg.get("funding_rate")) or 0.0
+    )
+
+
+def _leg_fee_rate(leg: dict[str, Any]) -> float:
+    return float(
+        optional_float(leg.get("fee_rate"))
+        if optional_float(leg.get("fee_rate")) is not None
+        else optional_float(leg.get("taker_fee_rate")) or 0.0
     )
 
 
@@ -567,14 +587,10 @@ class SynchronizedFundingRuntimeV2:
                 "short_exit_price": short_exit_price,
             }
         long_fee_rate = float(
-            optional_float(long_route_leg.get("fee_rate"))
-            or optional_float(long_entry_leg.get("fee_rate"))
-            or 0.0
+            _leg_fee_rate(long_route_leg) or _leg_fee_rate(long_entry_leg)
         )
         short_fee_rate = float(
-            optional_float(short_route_leg.get("fee_rate"))
-            or optional_float(short_entry_leg.get("fee_rate"))
-            or 0.0
+            _leg_fee_rate(short_route_leg) or _leg_fee_rate(short_entry_leg)
         )
         pnl = executable_paper_pnl(
             quantity=quantity,
@@ -663,6 +679,9 @@ class SynchronizedFundingRuntimeV2:
         if existing_open is not None:
             return {"opened": False, "reason": "route_already_open", "position_id": existing_open["position_id"]}
         self._ensure_discovered_or_armed(route, capture_id, settlement_at, lead, now)
+        missing_data = self._missing_required_route_data(route)
+        if missing_data:
+            return {"opened": False, "reason": "required_route_data_missing", "missing": missing_data}
         observation = build_focused_observation(route, now=now)
         self._store_observation(route, capture_id, settlement_at, observation, phase="entry")
         observations = self._valid_observations(route_key, now, phase="entry", cycle_id=f"{capture_id}:1")
@@ -807,15 +826,49 @@ class SynchronizedFundingRuntimeV2:
         price_pnl_if_flat_now = q * (long_close - long_open) + q * (short_open - short_close)
         baseline_book_cost = max(0.0, -price_pnl_if_flat_now)
         fees = (
-            q * long_open * float(long_leg.get("fee_rate") or 0.0)
-            + q * long_close * float(long_leg.get("fee_rate") or 0.0)
-            + q * short_open * float(short_leg.get("fee_rate") or 0.0)
-            + q * short_close * float(short_leg.get("fee_rate") or 0.0)
+            q * long_open * _leg_fee_rate(long_leg)
+            + q * long_close * _leg_fee_rate(long_leg)
+            + q * short_open * _leg_fee_rate(short_leg)
+            + q * short_close * _leg_fee_rate(short_leg)
         )
         reference = min(q * long_open, q * short_open)
-        basis_reserve_usd = reference * 30.0 / 10_000.0
-        legging_reserve_usd = reference * 15.0 / 10_000.0
-        return initial_entry_economics(
+        sorted_obs = sorted(observations, key=lambda o: str(o.get("observed_at") or ""))
+        adverse_exit_spread_changes_bps: list[float] = []
+        for previous, current in zip(sorted_obs, sorted_obs[1:]):
+            previous_spread = optional_float(previous.get("current_exit_spread"))
+            current_spread = optional_float(current.get("current_exit_spread"))
+            if previous_spread is None or current_spread is None:
+                continue
+            adverse_change = max(0.0, current_spread - previous_spread)
+            adverse_exit_spread_changes_bps.append(
+                adverse_change / max(long_open, short_open, 1e-12) * 10_000.0
+            )
+        if len(adverse_exit_spread_changes_bps) >= 10:
+            from smart_money_radar.funding.strategy_synchronized_funding import percentile_95
+            basis_reserve_bps = max(
+                15.0,
+                min(50.0, 3.0 * percentile_95(adverse_exit_spread_changes_bps)),
+            )
+        else:
+            basis_reserve_bps = 30.0
+        mark_returns: list[float] = []
+        for previous, current in zip(sorted_obs, sorted_obs[1:]):
+            step_returns: list[float] = []
+            for key in ("long_mark", "short_mark"):
+                previous_mark = optional_float(previous.get(key))
+                current_mark = optional_float(current.get(key))
+                if previous_mark is not None and previous_mark > 0 and current_mark is not None:
+                    step_returns.append(abs(current_mark - previous_mark) / previous_mark * 10_000.0)
+            if step_returns:
+                mark_returns.append(max(step_returns))
+        if len(mark_returns) >= 10:
+            from smart_money_radar.funding.strategy_synchronized_funding import percentile_95
+            legging_reserve_bps = min(30.0, max(10.0, 2.0 * percentile_95(mark_returns)))
+        else:
+            legging_reserve_bps = 15.0
+        basis_reserve_usd = reference * basis_reserve_bps / 10_000.0
+        legging_reserve_usd = reference * legging_reserve_bps / 10_000.0
+        result = initial_entry_economics(
             conservative_funding_gross=float(underwriting["conservative_funding_gross"]),
             baseline_round_trip_book_cost=baseline_book_cost,
             total_round_trip_fee_estimate=fees,
@@ -823,6 +876,9 @@ class SynchronizedFundingRuntimeV2:
             entry_legging_reserve_usd=legging_reserve_usd,
             reference_notional=reference,
         )
+        result["entry_basis_reserve_bps"] = basis_reserve_bps
+        result["entry_legging_reserve_bps"] = legging_reserve_bps
+        return result
 
     def _compute_common_quantity(
         self,
@@ -955,7 +1011,7 @@ class SynchronizedFundingRuntimeV2:
                 return {"passed": False, "reason": f"{side}_price_missing"}
             isolated_collateral = leg_notional / leverage
             collateral_reserve = leg_notional * reserve_fraction
-            fee_rate = float(leg.get("fee_rate") or 0.0)
+            fee_rate = _leg_fee_rate(leg)
             estimated_open_fee = leg_notional * fee_rate
             required_cash = isolated_collateral + collateral_reserve + estimated_open_fee
             account = accounts.get(venue) or {}
@@ -1129,8 +1185,8 @@ class SynchronizedFundingRuntimeV2:
         deadline_ok = t20_deadline_passed(filled_at, settlement_at, self.config.entry_fill_deadline_lead_seconds)
         long_fill = simulate_marketable_ioc(long_levels, "buy", q, EXECUTION_HAIRCUT_FRACTION)
         short_fill = simulate_marketable_ioc(short_levels, "sell", q, EXECUTION_HAIRCUT_FRACTION)
-        long_fee = long_fill["notional"] * float(long_leg.get("fee_rate") or 0.0)
-        short_fee = short_fill["notional"] * float(short_leg.get("fee_rate") or 0.0)
+        long_fee = long_fill["notional"] * _leg_fee_rate(long_leg)
+        short_fee = short_fill["notional"] * _leg_fee_rate(short_leg)
         fill_state = entry_fill_state(
             long_filled_quantity=long_fill["filled_quantity"],
             short_filled_quantity=short_fill["filled_quantity"],
@@ -1249,8 +1305,8 @@ class SynchronizedFundingRuntimeV2:
         long_price_pnl = long_unwind_qty * (long_exit_price - long_entry_price) if long_entry_price > 0 else 0.0
         short_price_pnl = short_unwind_qty * (short_entry_price - short_exit_price) if short_entry_price > 0 else 0.0
         total_price_pnl = long_price_pnl + short_price_pnl
-        long_unwind_fee = long_unwind_qty * long_exit_price * float(long_leg.get("fee_rate") or 0.0)
-        short_unwind_fee = short_unwind_qty * short_exit_price * float(short_leg.get("fee_rate") or 0.0)
+        long_unwind_fee = long_unwind_qty * long_exit_price * _leg_fee_rate(long_leg)
+        short_unwind_fee = short_unwind_qty * short_exit_price * _leg_fee_rate(short_leg)
         emergency_cost = (
             long_unwind_qty * long_entry_price * 100.0 / 10_000.0
             + short_unwind_qty * short_entry_price * 100.0 / 10_000.0
@@ -1416,6 +1472,64 @@ class SynchronizedFundingRuntimeV2:
         )
         return observation
 
+    def _probe_state(self, position: dict[str, Any]) -> dict[str, Any]:
+        config = dict(position.get("config") or {})
+        return dict(config.get("post_settlement_probes") or {})
+
+    def _missing_required_route_data(self, route: dict[str, Any]) -> list[str]:
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        missing: list[str] = []
+        for side, leg in (("long", long_leg), ("short", short_leg)):
+            if optional_float(leg.get("mark_price")) is None:
+                missing.append(f"{side}_mark_price_missing")
+            if optional_float(leg.get("index_price")) is None:
+                missing.append(f"{side}_index_price_missing")
+            if optional_float(leg.get("fee_rate")) is None and optional_float(leg.get("taker_fee_rate")) is None:
+                missing.append(f"{side}_fee_rate_missing")
+            if optional_float(leg.get("normalized_next_funding_rate")) is None:
+                missing.append(f"{side}_normalized_next_funding_rate_missing")
+        return missing
+
+    def _save_probe_state(
+        self,
+        position: dict[str, Any],
+        probe_state: dict[str, Any],
+    ) -> None:
+        position_id = str(position["position_id"])
+        config = dict(position.get("config") or {})
+        config["post_settlement_probes"] = probe_state
+        position["config"] = config
+        self.store.update_funding_capture_position_config(position_id, config)
+
+    def _record_schedule_probe(
+        self,
+        position: dict[str, Any],
+        route: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        probe = {
+            "observed_at": now.astimezone(UTC).isoformat(),
+            "long_next_funding_at": long_leg.get("next_funding_at"),
+            "short_next_funding_at": short_leg.get("next_funding_at"),
+            "fresh": True,
+        }
+        probe_state = self._probe_state(position)
+        probes = list(probe_state.get("probes") or [])
+        probes.append(probe)
+        if len(probes) > 30:
+            probes = probes[-30:]
+        probe_state["probes"] = probes
+        probe_state["latest_probe_at"] = now.astimezone(UTC).isoformat()
+        if not probe_state.get("first_probe_at"):
+            probe_state["first_probe_at"] = now.astimezone(UTC).isoformat()
+        self._save_probe_state(position, probe_state)
+        return probe_state
+
     def next_cycle_hold_or_close_decision(
         self,
         position: dict[str, Any],
@@ -1426,37 +1540,127 @@ class SynchronizedFundingRuntimeV2:
         if scheduled is None:
             return {"decision": "close", "reason": "current_cycle_settlement_missing"}
         seconds_after = (now.astimezone(UTC) - scheduled.astimezone(UTC)).total_seconds()
-        if seconds_after < POST_SETTLEMENT_NORMAL_EXIT_DELAY_SECONDS:
+        position_id = str(position["position_id"])
+        state = str(position.get("state") or "")
+
+        if seconds_after < POST_SETTLEMENT_EVALUATION_START_SECONDS:
             return {
                 "decision": "wait",
-                "reason": "normal_exit_forbidden_before_t_plus_20",
+                "reason": "post_settlement_evaluation_not_started",
                 "seconds_after_settlement": seconds_after,
             }
-        if route is None:
-            return {"decision": "close", "reason": "post_settlement_route_missing"}
 
+        if state == "SETTLEMENT_CROSSED":
+            self.store.update_funding_capture_position_state(
+                position_id, "POST_SETTLEMENT_EVALUATION", now,
+            )
+            position = {**position, "state": "POST_SETTLEMENT_EVALUATION"}
+
+        if route is None:
+            if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
+                return {"decision": "close", "reason": "post_settlement_route_missing"}
+            return {
+                "decision": "wait",
+                "reason": "post_settlement_route_missing_waiting",
+                "seconds_after_settlement": seconds_after,
+            }
+
+        missing_data = self._missing_required_route_data(route)
+        if missing_data:
+            if seconds_after < POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
+                return {
+                    "decision": "wait",
+                    "reason": "required_route_data_missing_waiting_until_t20",
+                    "missing": missing_data,
+                    "seconds_after_settlement": seconds_after,
+                }
+            return {
+                "decision": "close",
+                "reason": "required_route_data_missing",
+                "missing": missing_data,
+            }
+
+        probe_state = self._probe_state(position)
+        if seconds_after <= POST_SETTLEMENT_PROBE_END_SECONDS:
+            probe_state = self._record_schedule_probe(position, route, now)
         self.collect_hold_observation(position, route, now)
-        route_key = str((position.get("config") or {}).get("route_key") or route.get("route_key") or "")
-        position_id = str(position["position_id"])
-        cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
-        long_leg = leg_by_side(route.get("legs") or [], "long") or {}
-        short_leg = leg_by_side(route.get("legs") or [], "short") or {}
-        schedule = next_cycle_schedule_decision(
-            long_next_funding_at=long_leg.get("next_funding_at"),
-            short_next_funding_at=short_leg.get("next_funding_at"),
-            now=now,
-            min_wait_seconds=float(getattr(self.config, "min_next_settlement_wait_seconds", 300)),
-            max_wait_seconds=float(getattr(self.config, "max_next_settlement_wait_seconds", 14_400)),
+
+        probes = list(probe_state.get("probes") or [])
+        probe_decision = post_settlement_probe_decision(
+            probes=probes,
+            now=now.astimezone(UTC),
+            settlement_at=scheduled.astimezone(UTC),
         )
-        if not schedule["hold_schedule"]:
-            return {"decision": "close", "reason": "next_cycle_schedule_failed", "schedule": schedule}
+
+        if probe_decision.get("decision") == "close_at_t20":
+            if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
+                probe_state["mismatch_reason"] = probe_decision.get("reason", "schedule_mismatch")
+                self._save_probe_state(position, probe_state)
+                return {
+                    "decision": "close",
+                    "reason": "next_settlement_schedule_mismatch",
+                    "probe_decision": probe_decision,
+                    "seconds_after_settlement": seconds_after,
+                }
+            return {
+                "decision": "wait",
+                "reason": "awaiting_t20_close_window",
+                "probe_decision": probe_decision,
+                "seconds_after_settlement": seconds_after,
+            }
+
+        schedule: dict[str, Any] | None = None
+        if probe_decision.get("decision") == "hold_next_cycle":
+            schedule = next_cycle_schedule_decision(
+                long_next_funding_at=probe_decision.get("long_next_funding_at"),
+                short_next_funding_at=probe_decision.get("short_next_funding_at"),
+                now=now,
+                min_wait_seconds=float(getattr(self.config, "min_next_settlement_wait_seconds", 300)),
+                max_wait_seconds=float(getattr(self.config, "max_next_settlement_wait_seconds", 14_400)),
+            )
+            if not schedule["hold_schedule"]:
+                if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
+                    return {
+                        "decision": "close",
+                        "reason": "next_cycle_schedule_failed",
+                        "schedule": schedule,
+                        "probe_decision": probe_decision,
+                    }
+                return {
+                    "decision": "wait",
+                    "reason": "next_cycle_schedule_failed_waiting_until_t20",
+                    "schedule": schedule,
+                    "probe_decision": probe_decision,
+                }
+            probe_decision = {
+                **probe_decision,
+                "seconds_to_next_cycle": schedule.get("seconds_to_next_cycle"),
+            }
+            if probe_state.get("aligned_next_settlement_at") != probe_decision.get("next_cycle_at"):
+                probe_state["aligned_next_settlement_at"] = probe_decision.get("next_cycle_at")
+                probe_state["consecutive_agreements"] = probe_decision.get("consecutive_agreements")
+                self._save_probe_state(position, probe_state)
+
         if seconds_after < POST_SETTLEMENT_HOLD_DECISION_SECONDS:
             return {
                 "decision": "wait",
                 "reason": "collecting_next_cycle_observations",
                 "seconds_after_settlement": seconds_after,
-                "schedule": schedule,
+                "probe_decision": probe_decision,
             }
+
+        if probe_decision.get("decision") not in ("hold_next_cycle",):
+            return {
+                "decision": "close",
+                "reason": "next_settlement_schedule_not_confirmed",
+                "probe_decision": probe_decision,
+                "seconds_after_settlement": seconds_after,
+            }
+
+        route_key = str((position.get("config") or {}).get("route_key") or route.get("route_key") or "")
+        cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
+        long_leg = leg_by_side(route.get("legs") or [], "long") or {}
+        short_leg = leg_by_side(route.get("legs") or [], "short") or {}
 
         observations = self._valid_observations(route_key, now, phase="hold", cycle_id=cycle_id)
         observation_decision = next_cycle_observation_decision(observations=observations, now=now)
@@ -1465,7 +1669,6 @@ class SynchronizedFundingRuntimeV2:
                 "decision": "close",
                 "reason": "next_cycle_observations_failed",
                 "observation_decision": observation_decision,
-                "schedule": schedule,
             }
 
         quantity = float(position.get("quantity") or 0.0)
@@ -1476,18 +1679,33 @@ class SynchronizedFundingRuntimeV2:
             quantity * max(0.0, float(close_prices.get("short_exit_price") or 0.0)),
         )
         entry_economics = (position.get("config") or {}).get("entry_economics") or {}
+        entry_basis_reserve_bps = float(entry_economics.get("entry_basis_reserve_bps") or 0.0)
+        if entry_basis_reserve_bps <= 0:
+            entry_basis_reserve_bps = 30.0
+        entry_observations = self._valid_observations(
+            route_key, now, phase="entry", cycle_id=f"{position_id}:1",
+        )
+        adverse_basis_changes = [
+            abs(float(obs.get("current_exit_spread") or 0.0))
+            for obs in entry_observations
+            if obs.get("current_exit_spread") is not None
+        ]
+        p95_mark_return = None
         hold = hold_economics(
             next_conservative_funding_gross=float(observation_decision["conservative_funding_gross"]),
             current_close_fees=current_close_fees,
             reference_notional=reference_notional,
-            wait_seconds=float(schedule.get("seconds_to_next_cycle") or 0.0),
-            entry_basis_reserve_bps=float(entry_economics.get("entry_basis_reserve_bps") or 30.0),
+            wait_seconds=float(probe_decision.get("seconds_to_next_cycle") or schedule_seconds_to_next(probe_decision, now) or 0.0),
+            entry_basis_reserve_bps=entry_basis_reserve_bps,
+            adverse_basis_change_30s_bps=adverse_basis_changes if len(adverse_basis_changes) >= 10 else None,
+            p95_abs_mark_return_1s_bps=p95_mark_return,
         )
-        projected_total = float(position.get("paper_net_pnl_estimated") or 0.0) + float(
+        current_executable_pnl = float(position.get("paper_net_pnl_estimated") or 0.0)
+        projected_total = current_executable_pnl + float(
             hold["incremental_hold_net_pnl"]
         )
         opened_at = parse_time(position.get("opened_at")) or now
-        next_cycle_time = parse_time(schedule.get("next_cycle_settlement_at"))
+        next_cycle_time = parse_time(probe_decision.get("next_cycle_at"))
         projected_age = (
             (next_cycle_time.astimezone(UTC) - opened_at.astimezone(UTC)).total_seconds()
             + POST_SETTLEMENT_NORMAL_EXIT_DELAY_SECONDS
@@ -1516,7 +1734,6 @@ class SynchronizedFundingRuntimeV2:
                 "decision": "close",
                 "reason": "hold_economics_failed",
                 "reasons": reasons,
-                "schedule": schedule,
                 "observation_decision": observation_decision,
                 "hold_economics": hold,
                 "projected_total_after_next_cycle": projected_total,
@@ -1529,7 +1746,7 @@ class SynchronizedFundingRuntimeV2:
                 "cycle_id": f"{position_id}:{next_cycle_number}",
                 "position_id": position_id,
                 "cycle_number": next_cycle_number,
-                "scheduled_funding_at": str(schedule["next_cycle_settlement_at"]),
+                "scheduled_funding_at": str(probe_decision.get("next_cycle_at")),
                 "long_next_funding_rate_at_decision": _leg_rate(long_leg),
                 "short_next_funding_rate_at_decision": _leg_rate(short_leg),
                 "conservative_funding_gross": observation_decision["conservative_funding_gross"],
@@ -1545,7 +1762,7 @@ class SynchronizedFundingRuntimeV2:
                 "incremental_hold_cost": hold["incremental_hold_cost"],
                 "incremental_hold_net_pnl": hold["incremental_hold_net_pnl"],
                 "hold_cost_coverage_ratio": hold["hold_cost_coverage_ratio"],
-                "paper_net_if_exit_at_decision": position.get("paper_net_pnl_estimated"),
+                "paper_net_if_exit_at_decision": current_executable_pnl,
                 "decision": "HOLD",
                 "decision_reason": "next_cycle_underwriting_passed",
                 "state": "HOLDING_NEXT_CYCLE",
@@ -1562,7 +1779,6 @@ class SynchronizedFundingRuntimeV2:
             "reason": "next_cycle_underwriting_passed",
             "cycle_id": next_cycle_id,
             "cycle_number": next_cycle_number,
-            "schedule": schedule,
             "observation_decision": observation_decision,
             "hold_economics": hold,
             "projected_total_after_next_cycle": projected_total,
@@ -1644,8 +1860,8 @@ class SynchronizedFundingRuntimeV2:
             short_levels = short_route_leg.get("asks") or []
         long_exit = simulate_marketable_ioc(long_levels, "sell", quantity, EXECUTION_HAIRCUT_FRACTION)
         short_exit = simulate_marketable_ioc(short_levels, "buy", quantity, EXECUTION_HAIRCUT_FRACTION)
-        long_fee_rate = float(long_route_leg.get("fee_rate") or long_entry_leg.get("fee_rate") or 0.0)
-        short_fee_rate = float(short_route_leg.get("fee_rate") or short_entry_leg.get("fee_rate") or 0.0)
+        long_fee_rate = _leg_fee_rate(long_route_leg) or _leg_fee_rate(long_entry_leg)
+        short_fee_rate = _leg_fee_rate(short_route_leg) or _leg_fee_rate(short_entry_leg)
         long_fee = long_exit["notional"] * long_fee_rate
         short_fee = short_exit["notional"] * short_fee_rate
         residual_quantity = float(long_exit["unfilled_quantity"]) + float(short_exit["unfilled_quantity"])
@@ -1790,8 +2006,8 @@ class SynchronizedFundingRuntimeV2:
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
         return (
-            quantity * float(prices.get("long_exit_price") or 0.0) * float(long_leg.get("fee_rate") or 0.0)
-            + quantity * float(prices.get("short_exit_price") or 0.0) * float(short_leg.get("fee_rate") or 0.0)
+            quantity * float(prices.get("long_exit_price") or 0.0) * _leg_fee_rate(long_leg)
+            + quantity * float(prices.get("short_exit_price") or 0.0) * _leg_fee_rate(short_leg)
         )
 
     def mark_settlement_crossed(self, position: dict[str, Any], now: datetime) -> dict[str, Any] | None:

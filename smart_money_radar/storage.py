@@ -564,6 +564,24 @@ class SQLiteStore:
                 parameters,
             )
 
+    def update_funding_capture_position_config(
+        self,
+        position_id: str,
+        config: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        updated_at = (now or datetime.now(UTC)).replace(microsecond=0).isoformat()
+        config_json = json.dumps(config, sort_keys=True)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE funding_capture_positions
+                SET config_json = ?, updated_at = ?
+                WHERE position_id = ?
+                """,
+                (config_json, updated_at, str(position_id)),
+            )
+
     def update_funding_capture_cycle_state(
         self,
         cycle_id: str,
