@@ -8,6 +8,8 @@ from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Any
 
+from smart_money_radar.funding.adapter_contracts import USD_MAJOR_STABLE, collateral_family
+from smart_money_radar.funding.fees import fee_evidence_status, fee_rate_value
 from smart_money_radar.funding.settlement_contracts import (
     FundingSettlementContract,
     settlement_contract_blockers,
@@ -529,10 +531,81 @@ def classify_event_for_hold_window(
 
 
 def _fee_rate(market: dict[str, Any]) -> Decimal | None:
-    value = _optional_decimal(market.get("taker_fee_rate"))
-    if value is None:
-        value = _optional_decimal(market.get("fee_rate"))
-    return value
+    value = fee_rate_value(market, "taker")
+    return _optional_decimal(value)
+
+
+def _stablecoin_route_snapshot(
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+) -> dict[str, Any]:
+    for source in (
+        long_market.get("stablecoin_route_evaluation"),
+        short_market.get("stablecoin_route_evaluation"),
+        long_market.get("stablecoin_risk"),
+        short_market.get("stablecoin_risk"),
+    ):
+        if isinstance(source, dict):
+            return source
+    return {}
+
+
+def _stablecoin_cost_gate(
+    *,
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+    now: datetime,
+) -> tuple[Decimal, list[str], dict[str, Any]]:
+    long_asset = str(long_market.get("collateral_asset") or long_market.get("quote_asset") or "").upper()
+    short_asset = str(short_market.get("collateral_asset") or short_market.get("quote_asset") or "").upper()
+    if long_asset == short_asset:
+        if collateral_family(long_asset) == USD_MAJOR_STABLE:
+            return Decimal("0"), [], {
+                "status": "PASS",
+                "cross_stable": False,
+                "stablecoin_pair": f"{long_asset}/{short_asset}",
+                "stablecoin_reserve_usd": 0.0,
+            }
+        return Decimal("0"), ["same_asset_collateral_not_trusted"], {
+            "status": "RESEARCH_ONLY",
+            "cross_stable": False,
+            "stablecoin_pair": f"{long_asset}/{short_asset}",
+        }
+    if (
+        collateral_family(long_asset) != USD_MAJOR_STABLE
+        or collateral_family(short_asset) != USD_MAJOR_STABLE
+    ):
+        return Decimal("0"), ["stablecoin_family_not_compatible"], {
+            "status": "RESEARCH_ONLY",
+            "cross_stable": True,
+            "stablecoin_pair": f"{long_asset}/{short_asset}",
+        }
+    snapshot = _stablecoin_route_snapshot(long_market, short_market)
+    if not snapshot:
+        return Decimal("0"), ["stablecoin_snapshot_missing"], {
+            "status": "RESEARCH_ONLY",
+            "cross_stable": True,
+            "stablecoin_pair": f"{long_asset}/{short_asset}",
+        }
+    blockers = [str(reason) for reason in snapshot.get("blockers") or []]
+    observed_at = parse_time(snapshot.get("observed_at") or snapshot.get("priced_at"))
+    expires_at = parse_time(snapshot.get("expires_at"))
+    if observed_at is None:
+        blockers.append("stablecoin_snapshot_observed_at_missing")
+    else:
+        age = (now.astimezone(UTC) - observed_at.astimezone(UTC)).total_seconds()
+        if age < -60.0 or age > 5.0:
+            blockers.append("stablecoin_snapshot_stale")
+    if expires_at is None:
+        blockers.append("stablecoin_snapshot_expires_at_missing")
+    elif now.astimezone(UTC) > expires_at.astimezone(UTC):
+        blockers.append("stablecoin_snapshot_expired")
+    if str(snapshot.get("status") or "").upper() != "PASS":
+        blockers.append("stablecoin_snapshot_not_pass")
+    if not snapshot.get("source") and not snapshot.get("source_identity") and not snapshot.get("prices"):
+        blockers.append("stablecoin_snapshot_source_missing")
+    reserve = _non_negative_decimal(snapshot.get("stablecoin_reserve_usd"))
+    return reserve, list(dict.fromkeys(blockers)), snapshot
 
 
 def _cost_estimate(
@@ -573,23 +646,49 @@ def _planned_costs(
     short_market: dict[str, Any],
     target_notional: float,
     config: EventWindowPlannerConfig,
+    now: datetime,
 ) -> tuple[dict[str, float], list[str], list[CostEstimate], Decimal]:
     reference_decimal = _non_negative_decimal(target_notional)
     blockers: list[str] = []
     long_fee = _fee_rate(long_market)
     short_fee = _fee_rate(short_market)
+    long_fee_status = fee_evidence_status(long_market, "taker", now=now)
+    short_fee_status = fee_evidence_status(short_market, "taker", now=now)
     if long_fee is None:
         blockers.append("long_fee_unknown")
         long_fee = Decimal("0")
     if short_fee is None:
         blockers.append("short_fee_unknown")
         short_fee = Decimal("0")
+    if not bool(long_fee_status.get("verified")):
+        blockers.append(str(long_fee_status.get("blocker") or "long_fee_provenance_unverified").replace("taker_", "long_"))
+    if not bool(short_fee_status.get("verified")):
+        blockers.append(str(short_fee_status.get("blocker") or "short_fee_provenance_unverified").replace("taker_", "short_"))
+    long_fee_blocker = (
+        "long_fee_unknown"
+        if "long_fee_unknown" in blockers
+        else str(long_fee_status.get("blocker") or "long_fee_provenance_unverified")
+    )
+    short_fee_blocker = (
+        "short_fee_unknown"
+        if "short_fee_unknown" in blockers
+        else str(short_fee_status.get("blocker") or "short_fee_provenance_unverified")
+    )
     entry_fees = reference_decimal * (long_fee + short_fee)
     exit_fees = entry_fees
     entry_slippage = reference_decimal * _non_negative_decimal(config.entry_slippage_bps) / Decimal("10000")
     exit_slippage = reference_decimal * _non_negative_decimal(config.exit_slippage_bps) / Decimal("10000")
     basis_reserve = reference_decimal * _non_negative_decimal(config.basis_movement_reserve_bps) / Decimal("10000")
-    stablecoin_reserve = _non_negative_decimal(config.stablecoin_reserve_usd)
+    stablecoin_snapshot_reserve, stablecoin_blockers, stablecoin_snapshot = _stablecoin_cost_gate(
+        long_market=long_market,
+        short_market=short_market,
+        now=now,
+    )
+    blockers.extend(stablecoin_blockers)
+    stablecoin_reserve = max(
+        _non_negative_decimal(config.stablecoin_reserve_usd),
+        stablecoin_snapshot_reserve,
+    )
     execution_failure = reference_decimal * _non_negative_decimal(config.execution_failure_reserve_bps) / Decimal("10000")
     partial_fill = reference_decimal * _non_negative_decimal(config.partial_fill_reserve_bps) / Decimal("10000")
     timing = reference_decimal * _non_negative_decimal(config.timing_uncertainty_reserve_bps) / Decimal("10000")
@@ -598,46 +697,46 @@ def _planned_costs(
         _cost_estimate(
             component="entry_fee_leg_a",
             value=reference_decimal * long_fee,
-            source=long_market.get("fee_source"),
-            source_type="venue_market_fee",
-            observed_at=long_market.get("response_received_at"),
+            source=long_fee_status.get("source_identifier") or long_market.get("fee_source"),
+            source_type=str(long_fee_status.get("source_kind") or "fee_provenance_missing"),
+            observed_at=long_fee_status.get("observed_at"),
             target_notional_usd=reference_decimal,
-            status="UNKNOWN" if "long_fee_unknown" in blockers else "VERIFIED",
-            verified="long_fee_unknown" not in blockers,
-            blocker_if_missing="long_fee_unknown",
+            status=str(long_fee_status.get("trust_status") or "UNKNOWN"),
+            verified=bool(long_fee_status.get("verified")),
+            blocker_if_missing=long_fee_blocker,
         ),
         _cost_estimate(
             component="entry_fee_leg_b",
             value=reference_decimal * short_fee,
-            source=short_market.get("fee_source"),
-            source_type="venue_market_fee",
-            observed_at=short_market.get("response_received_at"),
+            source=short_fee_status.get("source_identifier") or short_market.get("fee_source"),
+            source_type=str(short_fee_status.get("source_kind") or "fee_provenance_missing"),
+            observed_at=short_fee_status.get("observed_at"),
             target_notional_usd=reference_decimal,
-            status="UNKNOWN" if "short_fee_unknown" in blockers else "VERIFIED",
-            verified="short_fee_unknown" not in blockers,
-            blocker_if_missing="short_fee_unknown",
+            status=str(short_fee_status.get("trust_status") or "UNKNOWN"),
+            verified=bool(short_fee_status.get("verified")),
+            blocker_if_missing=short_fee_blocker,
         ),
         _cost_estimate(
             component="exit_fee_leg_a",
             value=reference_decimal * long_fee,
-            source=long_market.get("fee_source"),
-            source_type="venue_market_fee",
-            observed_at=long_market.get("response_received_at"),
+            source=long_fee_status.get("source_identifier") or long_market.get("fee_source"),
+            source_type=str(long_fee_status.get("source_kind") or "fee_provenance_missing"),
+            observed_at=long_fee_status.get("observed_at"),
             target_notional_usd=reference_decimal,
-            status="UNKNOWN" if "long_fee_unknown" in blockers else "VERIFIED",
-            verified="long_fee_unknown" not in blockers,
-            blocker_if_missing="long_fee_unknown",
+            status=str(long_fee_status.get("trust_status") or "UNKNOWN"),
+            verified=bool(long_fee_status.get("verified")),
+            blocker_if_missing=long_fee_blocker,
         ),
         _cost_estimate(
             component="exit_fee_leg_b",
             value=reference_decimal * short_fee,
-            source=short_market.get("fee_source"),
-            source_type="venue_market_fee",
-            observed_at=short_market.get("response_received_at"),
+            source=short_fee_status.get("source_identifier") or short_market.get("fee_source"),
+            source_type=str(short_fee_status.get("source_kind") or "fee_provenance_missing"),
+            observed_at=short_fee_status.get("observed_at"),
             target_notional_usd=reference_decimal,
-            status="UNKNOWN" if "short_fee_unknown" in blockers else "VERIFIED",
-            verified="short_fee_unknown" not in blockers,
-            blocker_if_missing="short_fee_unknown",
+            status=str(short_fee_status.get("trust_status") or "UNKNOWN"),
+            verified=bool(short_fee_status.get("verified")),
+            blocker_if_missing=short_fee_blocker,
         ),
         _cost_estimate(
             component="entry_slippage_leg_a",
@@ -687,9 +786,13 @@ def _planned_costs(
             component="stablecoin_reserve",
             value=stablecoin_reserve,
             source="stablecoin_route_evaluation",
-            source_type="conservative_config",
+            source_type=str(stablecoin_snapshot.get("source") or stablecoin_snapshot.get("source_identity") or "snapshot_or_config"),
+            observed_at=stablecoin_snapshot.get("observed_at") or stablecoin_snapshot.get("priced_at"),
+            expires_at=stablecoin_snapshot.get("expires_at"),
             target_notional_usd=reference_decimal,
-            status="CONSERVATIVE_CONFIGURED",
+            status=str(stablecoin_snapshot.get("status") or "CONSERVATIVE_CONFIGURED"),
+            verified=not stablecoin_blockers,
+            blocker_if_missing=stablecoin_blockers[0] if stablecoin_blockers else None,
         ),
         _cost_estimate(
             component="execution_failure_reserve",
@@ -756,6 +859,7 @@ def _build_hold_plan(
     exit_after_event: FundingSettlementEvent,
     events: list[FundingSettlementEvent],
     planned_entry_at: datetime,
+    now: datetime,
     long_market: dict[str, Any],
     short_market: dict[str, Any],
     target_notional: float,
@@ -789,6 +893,7 @@ def _build_hold_plan(
         short_market=short_market,
         target_notional=target_notional,
         config=config,
+        now=now,
     )
     expected_cashflow = sum(
         (_decimal(event.expected_cashflow_usd) for event in included),
@@ -913,7 +1018,16 @@ def _eligibility_status(blockers: list[str], *, lifecycle_state: str) -> str:
     if any(
         token in reason
         for reason in blockers
-        for token in ("environment", "capability", "contract", "semantics", "continuous")
+        for token in (
+            "environment",
+            "capability",
+            "contract",
+            "semantics",
+            "continuous",
+            "endpoint",
+            "execution_model",
+            "product_type",
+        )
     ):
         return "CAPABILITY_BLOCKED"
     if blockers:
@@ -923,12 +1037,58 @@ def _eligibility_status(blockers: list[str], *, lifecycle_state: str) -> str:
 
 def _venue_capability_blockers(market: dict[str, Any], prefix: str) -> list[str]:
     blockers: list[str] = []
-    if market.get("data_enabled") is False:
+    if market.get("data_enabled") is not True:
         blockers.append(f"{prefix}_data_capability_disabled")
-    if market.get("strategy_observation_enabled") is False:
+    if market.get("strategy_observation_enabled") is not True:
         blockers.append(f"{prefix}_strategy_observation_capability_disabled")
     if market.get("shadow_candidate_enabled") is False:
         blockers.append(f"{prefix}_shadow_candidate_disabled")
+    if market.get("paper_enabled") is not True:
+        blockers.append(f"{prefix}_paper_capability_disabled")
+    if market.get("live_enabled") is True:
+        blockers.append(f"{prefix}_live_capability_enabled_in_paper_plan")
+    execution_model = str(market.get("execution_model") or "").upper()
+    if execution_model != "CLOB":
+        blockers.append(f"{prefix}_execution_model_not_clob")
+    market_type = str(
+        market.get("market_type")
+        or market.get("product_type")
+        or market.get("contract_type")
+        or ""
+    ).lower()
+    if not market_type:
+        blockers.append(f"{prefix}_market_type_missing")
+    return blockers
+
+
+def _endpoint_identity_blockers(market: dict[str, Any], prefix: str) -> list[str]:
+    blockers: list[str] = []
+    venue = str(market.get("venue") or "").strip().lower()
+    if not venue or venue == "unknown":
+        blockers.append(f"{prefix}_venue_identity_missing")
+    environment = str(market.get("environment") or "").strip().lower()
+    if environment not in {"mainnet", "testnet"}:
+        blockers.append(f"{prefix}_environment_unknown")
+    if market.get("environment_verified") is not True:
+        blockers.append(f"{prefix}_environment_unverified")
+    endpoint_base_url = str(market.get("endpoint_base_url") or "").strip()
+    if not endpoint_base_url:
+        blockers.append(f"{prefix}_endpoint_base_url_missing")
+    provenance = str(market.get("endpoint_identity_provenance") or "").strip().lower()
+    if provenance in {"", "unknown", "unverified_client_endpoint", "unverified"}:
+        blockers.append(f"{prefix}_endpoint_identity_unverified")
+    api_product = str(
+        market.get("api_product_type")
+        or market.get("product_type")
+        or market.get("market_type")
+        or market.get("contract_type")
+        or ""
+    ).strip().lower()
+    if api_product in {"", "unknown"}:
+        blockers.append(f"{prefix}_product_type_unverified")
+    semantics = str(market.get("funding_rate_semantics") or "").strip().lower()
+    if semantics in {"", "unknown"}:
+        blockers.append(f"{prefix}_funding_semantics_unverified")
     return blockers
 
 
@@ -964,13 +1124,15 @@ class FundingSettlementPlanner:
             blockers.append("funding_continuous_pro_rata")
         blockers.extend(_venue_capability_blockers(long_market, "long"))
         blockers.extend(_venue_capability_blockers(short_market, "short"))
+        blockers.extend(_endpoint_identity_blockers(long_market, "long"))
+        blockers.extend(_endpoint_identity_blockers(short_market, "short"))
         long_env = str(long_market.get("environment") or "").lower()
         short_env = str(short_market.get("environment") or "").lower()
         if long_env not in {"mainnet", "testnet"} or short_env not in {"mainnet", "testnet"}:
             blockers.append("environment_unverified")
         elif (
-            long_market.get("environment_verified") is False
-            or short_market.get("environment_verified") is False
+            long_market.get("environment_verified") is not True
+            or short_market.get("environment_verified") is not True
         ):
             blockers.append("environment_unverified")
         elif long_env != short_env:
@@ -1097,6 +1259,7 @@ class FundingSettlementPlanner:
                     exit_after_event=event,
                     events=events,
                     planned_entry_at=planned_entry_at,
+                    now=now,
                     long_market=long_market,
                     short_market=short_market,
                     target_notional=target_notional,
@@ -1110,6 +1273,7 @@ class FundingSettlementPlanner:
                     exit_after_event=first_event,
                     events=events,
                     planned_entry_at=planned_entry_at,
+                    now=now,
                     long_market=long_market,
                     short_market=short_market,
                     target_notional=target_notional,

@@ -111,7 +111,7 @@ def evaluate_hold_history_reliability(
     if len(valid) < int(min_cycles_for_gate):
         return HoldHistoryReliability(
             status="INSUFFICIENT",
-            gate_passed=True,
+            gate_passed=False,
             valid_cycle_count=len(valid),
             positive_realization_rate=None,
             p25_realization_ratio=None,

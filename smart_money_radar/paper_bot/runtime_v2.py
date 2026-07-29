@@ -5,6 +5,7 @@ import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from smart_money_radar.funding.fees import fee_evidence_status
 from smart_money_radar.funding.strategy_synchronized_funding import (
     EventWindowPlannerConfig,
     FundingRoutePlan,
@@ -574,6 +575,8 @@ class SynchronizedFundingRuntimeV2:
                     rate_status="CONFIRMED",
                     mark_status="MISSING",
                     evidence_update={
+                        "venue_event_state": "VENUE_EVENT_CONFIRMED",
+                        "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
                         "public_event": {
                             "rate_semantics": public_event.get("rate_semantics")
                             if public_event
@@ -612,6 +615,11 @@ class SynchronizedFundingRuntimeV2:
                 rate_status=leg_result.get("rate_status"),
                 mark_status=leg_result.get("mark_status"),
                 evidence_update={
+                    "venue_event_state": "VENUE_EVENT_CONFIRMED",
+                    "payment_reconciliation_state": "PAYMENT_RECONCILED",
+                    "payment_reconciled_at": now_utc.isoformat(),
+                    "paper_simulated": True,
+                    "not_venue_account_ledger": True,
                     "public_event": {
                         "rate_semantics": public_event.get("rate_semantics")
                         if public_event
@@ -659,6 +667,9 @@ class SynchronizedFundingRuntimeV2:
                             "confirmed_rate": public_rate,
                             "settlement_mark": mark_price,
                             "side": side,
+                            "payment_reconciliation_state": "PAYMENT_RECONCILED",
+                            "paper_simulated": True,
+                            "not_venue_account_ledger": True,
                             "rate_semantics": public_event.get("rate_semantics")
                             if public_event
                             else "stored_confirmed_rate",
@@ -1387,7 +1398,7 @@ class SynchronizedFundingRuntimeV2:
             leg = (plan or {}).get(label)
             if not isinstance(leg, dict):
                 continue
-            if leg.get("paper_enabled") is False:
+            if leg.get("paper_enabled") is not True:
                 venue = str(leg.get("venue") or label)
                 reasons.append(f"{venue}_paper_disabled")
             if leg.get("live_enabled") is True:
@@ -1496,6 +1507,16 @@ class SynchronizedFundingRuntimeV2:
         account_check = self._enforce_account_limits(route, accounts)
         if not account_check["passed"]:
             return {"opened": False, "reason": account_check["reason"], "account_check": account_check}
+        gate_result = self._entry_gate_result(
+            route=route,
+            route_plan=route_plan,
+            underwriting=underwriting,
+            economics=economics,
+            risk_gate=risk_gate,
+            account_check=account_check,
+            now=now,
+        )
+        self._mark_armed(route, capture_id, settlement_at, now, route_plan, gate_result)
         execution = self._execute_entry(route, capture_id, settlement_at, now)
         if execution["state"] != "OPEN":
             if execution.get("attempt_id"):
@@ -1612,7 +1633,6 @@ class SynchronizedFundingRuntimeV2:
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
         route_key = str(route.get("route_key") or "")
-        state = "ARMED" if lead <= float(self.config.arm_window_seconds) else "DISCOVERED"
         self.store.upsert_funding_capture_position(
             {
                 "position_id": capture_id,
@@ -1625,27 +1645,143 @@ class SynchronizedFundingRuntimeV2:
                 "short_symbol": short_leg.get("symbol") or route.get("short_symbol") or "",
                 "quantity": 0.0,
                 "target_notional": float(route.get("target_notional") or self.config.target_notional_per_leg),
-                "state": state,
+                "state": "DISCOVERED",
                 "opened_at": now.isoformat(),
                 "config": {
                     "route_key": route_key,
                     "route_entry_key": route_entry_key(route),
                     "entry_legs": legs,
+                    "candidate_state": "DISCOVERED",
+                    "lead_seconds": lead,
                 },
             }
         )
-        if state == "ARMED":
-            self.store.upsert_funding_capture_cycle(
-                {
-                    "cycle_id": f"{capture_id}:1",
-                    "position_id": capture_id,
-                    "cycle_number": 1,
-                    "scheduled_funding_at": settlement_at.isoformat(),
-                    "state": "ARMED",
-                    "decision": "ARMED",
-                    "decision_reason": "focused_observations_collecting",
-                }
-            )
+        self.store.upsert_funding_capture_cycle(
+            {
+                "cycle_id": f"{capture_id}:1",
+                "position_id": capture_id,
+                "cycle_number": 1,
+                "scheduled_funding_at": settlement_at.isoformat(),
+                "state": "DISCOVERED",
+                "decision": "DISCOVERED",
+                "decision_reason": "entry_gates_collecting",
+            }
+        )
+
+    def _entry_gate_result(
+        self,
+        *,
+        route: dict[str, Any],
+        route_plan: dict[str, Any],
+        underwriting: dict[str, Any],
+        economics: dict[str, Any],
+        risk_gate: dict[str, Any],
+        account_check: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        return {
+            "passed": True,
+            "observed_at": now.astimezone(UTC).isoformat(),
+            "passed_gates": [
+                "normalized_instrument_identity",
+                "endpoint_identity",
+                "environment_identity",
+                "venue_capability",
+                "paper_execution_support",
+                "funding_semantics",
+                "settlement_timing",
+                "funding_freshness",
+                "book_freshness",
+                "executable_depth",
+                "fee_provenance",
+                "stablecoin_conversion",
+                "slippage",
+                "net_edge",
+                "risk_limits",
+                "account_limits",
+                "focused_underwriting",
+            ],
+            "blocked_gates": [],
+            "reason_codes": [],
+            "fee_evidence": {
+                "long": fee_evidence_status(long_leg, "taker", now=now),
+                "short": fee_evidence_status(short_leg, "taker", now=now),
+            },
+            "endpoint_identity": {
+                "long": {
+                    "venue": long_leg.get("venue"),
+                    "environment": long_leg.get("environment"),
+                    "base_url": long_leg.get("endpoint_base_url"),
+                    "provenance": long_leg.get("endpoint_identity_provenance"),
+                },
+                "short": {
+                    "venue": short_leg.get("venue"),
+                    "environment": short_leg.get("environment"),
+                    "base_url": short_leg.get("endpoint_base_url"),
+                    "provenance": short_leg.get("endpoint_identity_provenance"),
+                },
+            },
+            "route_plan": {
+                "eligibility_status": route_plan.get("eligibility_status"),
+                "lifecycle_state": route_plan.get("lifecycle_state"),
+                "conservative_net_usd": route_plan.get("conservative_net_usd"),
+                "cost_estimates": route_plan.get("cost_estimates"),
+            },
+            "underwriting": underwriting,
+            "economics": economics,
+            "risk_gate": risk_gate,
+            "account_check": account_check,
+        }
+
+    def _mark_armed(
+        self,
+        route: dict[str, Any],
+        capture_id: str,
+        settlement_at: datetime,
+        now: datetime,
+        route_plan: dict[str, Any],
+        gate_result: dict[str, Any],
+    ) -> None:
+        cycle_identity = f"{STRATEGY_VERSION}:{capture_id}:1:{settlement_at.astimezone(UTC).isoformat()}"
+        position = self.store.funding_capture_position_by_id(capture_id)
+        config = dict((position or {}).get("config") or {})
+        config.update(
+            {
+                "candidate_state": "ARMED",
+                "armed_at": now.astimezone(UTC).isoformat(),
+                "entry_gate_result": gate_result,
+                "plan_generation": 1,
+                "cycle_identity_key": cycle_identity,
+                "funding_route_plan": route_plan,
+                "included_settlement_events": route_plan.get("included_settlement_events") or [],
+                "planned_exit_at": route_plan.get("planned_exit_at"),
+                "monitor_until": route_plan.get("monitor_until"),
+                "entry_legs": route.get("legs") or config.get("entry_legs") or [],
+            }
+        )
+        self.store.update_funding_capture_position_config(capture_id, config, now)
+        self.store.update_funding_capture_position_state(capture_id, "ARMED", now)
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        self.store.upsert_funding_capture_cycle(
+            {
+                "cycle_id": f"{capture_id}:1",
+                "position_id": capture_id,
+                "cycle_number": 1,
+                "scheduled_funding_at": settlement_at.astimezone(UTC).isoformat(),
+                "long_next_funding_rate_at_decision": _leg_rate(long_leg),
+                "short_next_funding_rate_at_decision": _leg_rate(short_leg),
+                "conservative_funding_gross": route_plan.get("conservative_funding_cashflow_usd"),
+                "conservative_funding_edge_bps": route_plan.get("conservative_net_bps"),
+                "decision": "ARMED",
+                "decision_reason": "all_entry_gates_passed",
+                "state": "ARMED",
+            }
+        )
 
     def _store_observation(
         self,
@@ -2542,6 +2678,11 @@ class SynchronizedFundingRuntimeV2:
                 missing.append(f"{side}_index_price_missing")
             if optional_float(leg.get("fee_rate")) is None and optional_float(leg.get("taker_fee_rate")) is None:
                 missing.append(f"{side}_fee_rate_missing")
+            fee_status = fee_evidence_status(leg, "taker")
+            if not bool(fee_status.get("verified")):
+                missing.append(
+                    f"{side}_{fee_status.get('blocker') or 'fee_provenance_unverified'}"
+                )
             if optional_float(leg.get("normalized_next_funding_rate")) is None:
                 missing.append(f"{side}_normalized_next_funding_rate_missing")
         return missing
@@ -2811,6 +2952,11 @@ class SynchronizedFundingRuntimeV2:
                     "RECONCILED",
                     "UNRECONCILED",
                 }
+                and (
+                    parse_time(cycle.get("scheduled_funding_at")) is None
+                    or parse_time(cycle.get("scheduled_funding_at")).astimezone(UTC)
+                    > scheduled.astimezone(UTC)
+                )
             ]
             if unfinished_cycles:
                 return {
@@ -2818,20 +2964,6 @@ class SynchronizedFundingRuntimeV2:
                     "reason": "included_settlement_events_pending",
                     "unfinished_cycle_count": len(unfinished_cycles),
                 }
-            if now.astimezone(UTC) >= planned_exit.astimezone(UTC):
-                return {
-                    "decision": "close",
-                    "reason": "planned_event_window_complete",
-                    "planned_exit_at": planned_exit.astimezone(UTC).isoformat(),
-                }
-            return {
-                "decision": "wait",
-                "reason": "waiting_for_planned_exit",
-                "planned_exit_at": planned_exit.astimezone(UTC).isoformat(),
-                "seconds_until_planned_exit": (
-                    planned_exit.astimezone(UTC) - now.astimezone(UTC)
-                ).total_seconds(),
-            }
 
         if route is None:
             if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
@@ -2855,6 +2987,77 @@ class SynchronizedFundingRuntimeV2:
                 "decision": "close",
                 "reason": "required_route_data_missing",
                 "missing": missing_data,
+            }
+
+        next_plan = self._plan_dict_for_route(route, now)
+        next_plan_blockers = self._route_plan_blocking_reasons(next_plan)
+        next_plan_blockers.extend(self._paper_capability_blocking_reasons(next_plan))
+        next_plan_blockers = list(dict.fromkeys(next_plan_blockers))
+        next_settlement_at = self._first_included_settlement_at(next_plan) or route_next_settlement(route)
+        next_cycle_number = int(position.get("current_cycle_number") or 1) + 1
+        replan_record = {
+            "plan_generation": next_cycle_number,
+            "previous_cycle_id": str(position.get("current_cycle_id") or f"{position_id}:1"),
+            "observed_at": now.astimezone(UTC).isoformat(),
+            "previous_scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
+            "new_scheduled_funding_at": (
+                next_settlement_at.astimezone(UTC).isoformat()
+                if next_settlement_at is not None
+                else None
+            ),
+            "blockers": next_plan_blockers,
+            "route_plan": next_plan,
+        }
+        replans = list(config.get("post_settlement_replans") or [])
+        replans = [
+            item
+            for item in replans
+            if int(item.get("plan_generation") or 0) != next_cycle_number
+        ]
+        replans.append(replan_record)
+        config["post_settlement_replans"] = replans[-10:]
+        config["plan_generation"] = next_cycle_number
+        config["last_post_settlement_route_plan"] = next_plan
+        position["config"] = config
+        self.store.update_funding_capture_position_config(position_id, config, now)
+        if next_settlement_at is None:
+            if seconds_after < POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
+                return {
+                    "decision": "wait",
+                    "reason": "next_cycle_plan_settlement_missing_waiting_until_t20",
+                    "route_plan": next_plan,
+                    "seconds_after_settlement": seconds_after,
+                }
+            return {
+                "decision": "close",
+                "reason": "next_cycle_plan_settlement_missing",
+                "route_plan": next_plan,
+            }
+        if (
+            next_settlement_at.astimezone(UTC) <= scheduled.astimezone(UTC)
+            or next_settlement_at.astimezone(UTC) <= now.astimezone(UTC)
+        ):
+            return {
+                "decision": "close",
+                "reason": "next_cycle_stale_or_past_settlement",
+                "route_plan": next_plan,
+                "new_scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
+                "previous_scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
+            }
+        if next_plan_blockers:
+            if seconds_after < POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
+                return {
+                    "decision": "wait",
+                    "reason": "next_cycle_plan_blocked_waiting_until_t20",
+                    "blockers": next_plan_blockers,
+                    "route_plan": next_plan,
+                    "seconds_after_settlement": seconds_after,
+                }
+            return {
+                "decision": "close",
+                "reason": "next_cycle_plan_blocked",
+                "blockers": next_plan_blockers,
+                "route_plan": next_plan,
             }
 
         probe_state = self._probe_state(position)
@@ -2940,6 +3143,15 @@ class SynchronizedFundingRuntimeV2:
 
         observations = self._valid_observations(route, now, phase="hold", cycle_id=cycle_id)
         observation_decision = next_cycle_observation_decision(observations=observations, now=now)
+        plan_conservative_gross = optional_float(
+            (next_plan or {}).get("conservative_funding_cashflow_usd")
+        )
+        if plan_conservative_gross is not None:
+            observation_decision = {
+                **observation_decision,
+                "conservative_funding_gross": plan_conservative_gross,
+                "route_plan_conservative_funding_cashflow_usd": plan_conservative_gross,
+            }
         if not observation_decision["eligible"]:
             return {
                 "decision": "close",
@@ -3042,13 +3254,12 @@ class SynchronizedFundingRuntimeV2:
                 "projected_position_age_at_next_exit": projected_age,
             }
 
-        next_cycle_number = int(position.get("current_cycle_number") or 1) + 1
         next_cycle_id = self.store.upsert_funding_capture_cycle(
             {
                 "cycle_id": f"{position_id}:{next_cycle_number}",
                 "position_id": position_id,
                 "cycle_number": next_cycle_number,
-                "scheduled_funding_at": str(probe_decision.get("next_cycle_at")),
+                "scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
                 "long_next_funding_rate_at_decision": _leg_rate(long_leg),
                 "short_next_funding_rate_at_decision": _leg_rate(short_leg),
                 "conservative_funding_gross": observation_decision["conservative_funding_gross"],
@@ -3081,6 +3292,7 @@ class SynchronizedFundingRuntimeV2:
             "reason": "next_cycle_underwriting_passed",
             "cycle_id": next_cycle_id,
             "cycle_number": next_cycle_number,
+            "route_plan": next_plan,
             "observation_decision": observation_decision,
             "hold_economics": hold,
             "current_executable_pnl": current_pnl_snapshot,
@@ -3533,6 +3745,20 @@ class SynchronizedFundingRuntimeV2:
                     scheduled_funding_at=scheduled.isoformat(),
                     quantity=float(position.get("quantity") or 0.0),
                 )
+                for row in rows:
+                    evidence = dict(row.get("evidence") or {})
+                    evidence.update(
+                        {
+                            "lifecycle_state": "BOUNDARY_CROSSED",
+                            "boundary_crossed_at": now.astimezone(UTC).isoformat(),
+                            "venue_event_state": "VENUE_EVENT_PENDING",
+                            "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
+                            "payment_reconciliation_source": "PAPER_RECONCILIATION_WORKER",
+                            "paper_simulated": True,
+                            "not_venue_account_ledger": True,
+                        }
+                    )
+                    row["evidence"] = evidence
             else:
                 rows = []
                 for event in cycle_events:
@@ -3560,8 +3786,13 @@ class SynchronizedFundingRuntimeV2:
                         "rate_status": None,
                         "mark_status": None,
                         "evidence": {
-                            "lifecycle_state": "EVENT_CONFIRMED",
-                            "payment_reconciliation_source": "SIMULATED",
+                            "lifecycle_state": "BOUNDARY_CROSSED",
+                            "boundary_crossed_at": now.astimezone(UTC).isoformat(),
+                            "venue_event_state": "VENUE_EVENT_PENDING",
+                            "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
+                            "payment_reconciliation_source": "PAPER_RECONCILIATION_WORKER",
+                            "paper_simulated": True,
+                            "not_venue_account_ledger": True,
                             "planned_event": event,
                         },
                     })
@@ -3572,8 +3803,10 @@ class SynchronizedFundingRuntimeV2:
 
         if not crossed_cycles:
             return None
-        config["lifecycle_state"] = "EVENT_CONFIRMED"
+        config["lifecycle_state"] = "BOUNDARY_CROSSED"
+        config["venue_event_state"] = "VENUE_EVENT_PENDING"
         config["payment_reconciliation_state"] = "PAYMENT_RECONCILIATION_PENDING"
+        config["boundary_crossed_at"] = now.astimezone(UTC).isoformat()
         self.store.update_funding_capture_position_config(position_id, config, now)
         self.store.update_funding_capture_position_state(
             position_id,
@@ -3585,6 +3818,8 @@ class SynchronizedFundingRuntimeV2:
             "position_id": position_id,
             "cycle_id": str(crossed_cycles[-1].get("cycle_id") or ""),
             "state": "SETTLEMENT_CROSSED",
-            "lifecycle_state": "EVENT_CONFIRMED",
+            "lifecycle_state": "BOUNDARY_CROSSED",
+            "venue_event_state": "VENUE_EVENT_PENDING",
+            "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
             "crossed_cycles": crossed_cycles,
         }

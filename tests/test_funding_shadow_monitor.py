@@ -213,6 +213,21 @@ def complete_market(
         "settlement_collateral": collateral,
         "collateral_family": USD_MAJOR_STABLE,
         "environment": environment,
+        "environment_verified": True,
+        "endpoint_base_url": f"https://api.{venue}.test",
+        "endpoint_identity_provenance": f"test-fixture:{venue}:endpoint:v1",
+        "endpoint_client_version": "test-client-v1",
+        "endpoint_verified_at": observed_at,
+        "api_product_type": "linear_perpetual",
+        "market_type": "linear_perpetual",
+        "product_type": "linear_perpetual",
+        "data_enabled": True,
+        "strategy_observation_enabled": True,
+        "shadow_candidate_enabled": True,
+        "paper_enabled": True,
+        "live_enabled": False,
+        "execution_model": "CLOB",
+        "settlement_verification_level": "test_fixture",
         "funding_rate": funding_rate,
         "normalized_next_funding_rate": funding_rate,
         "funding_interval_hours": funding_interval_hours,
@@ -232,6 +247,20 @@ def complete_market(
         "min_quantity": 0.001,
         "min_notional_usd": 5.0,
         "taker_fee_rate": 0.0005,
+        "fee_source": "configured_trusted_fee",
+        "fee_evidence": {
+            "source_kind": "configured_trusted_fee",
+            "source_identifier": f"test-fixture:{venue}:fees:v1",
+            "trust_status": "CONFIGURED_TRUSTED",
+            "venue": venue,
+            "liquidity_role": "taker",
+            "observed_at": observed_at,
+            "reviewed_at": observed_at,
+            "market_type": "linear_perpetual",
+            "applicability": "taker",
+        },
+        "fee_observed_at": observed_at,
+        "fee_reviewed_at": observed_at,
         "supports_perpetuals": True,
         "is_linear_contract": True,
         "supports_discrete_funding": True,
@@ -825,7 +854,7 @@ def test_explicit_zero_fee_is_allowed_when_payload_provides_it() -> None:
         row["component"]: row
         for row in opportunity["cost_estimates"]
     }
-    assert costs["entry_fee_leg_a"]["status"] == "VERIFIED"
+    assert costs["entry_fee_leg_a"]["status"] == "CONFIGURED_TRUSTED"
     assert float(costs["entry_fee_leg_a"]["value"]) == 0.0
 
 
@@ -1012,7 +1041,7 @@ def test_nado_periodic_unverified_route_is_research_only() -> None:
         target_notional=1_000,
     )
 
-    assert opportunity["eligibility_status"] == "RESEARCH_ONLY"
+    assert opportunity["eligibility_status"] == "CAPABILITY_BLOCKED"
     assert "long_shadow_candidate_disabled" in opportunity["blockers"]
     assert nado["paper_enabled"] is False
     assert nado["live_enabled"] is False

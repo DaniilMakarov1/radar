@@ -1423,37 +1423,7 @@ class PaperBot:
                 notify=False,
                 severity="warning",
             )
-            # Fall through to scan-based fallback instead of returning None.
-        clients = funding_clients_for_route(route, fast=True)
-        if len(clients) < 2:
-            return None
-        try:
-            result = run_funding_scan(
-                self.store,
-                config=self.focused_scan_config(),
-                venue_clients=clients,
-                scan_mode="watch",
-                hydrate_missing_history=False,
-            )
-        except Exception as exc:
-            self.record_event(
-                "focused_recheck_failed",
-                (
-                    "Paper Bot focused recheck failed\n"
-                    f"{route.get('canonical_asset')}: "
-                    f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
-                    f"Error: {type(exc).__name__}: {exc}"
-                ),
-                {"route": route_summary(route), "error": str(exc)},
-                route_key=route.get("route_key"),
-                notify=False,
-                severity="warning",
-            )
-            return None
-        return self.store.funding_route_by_scan_and_key(
-            int(result["funding_scan_id"]),
-            str(route.get("route_key") or ""),
-        )
+        return None
 
     def direct_focused_recheck_route(
         self,
@@ -1588,18 +1558,7 @@ class PaperBot:
         if callable(snapshot_method):
             market = snapshot_method(symbol, asset, observed_at, previous)
         else:
-            _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
-            market = next(
-                (
-                    row
-                    for row in markets
-                    if str(row.get("symbol") or "") == symbol
-                    and str(row.get("venue") or "") == venue
-                ),
-                None,
-            )
-            if market is None:
-                raise FundingDataError(f"{venue} {symbol} market unavailable")
+            raise FundingDataError(f"{venue} focused_symbol_snapshot_not_supported")
         response_received_at = self.clock.now().isoformat()
         for field in (
             "canonical_asset",
@@ -1628,6 +1587,28 @@ class PaperBot:
             "exit_safety_buffer_seconds",
             "timing_policy_source",
             "normalization_evidence",
+            "fee_source",
+            "fee_evidence",
+            "fee_observed_at",
+            "fee_reviewed_at",
+            "environment_verified",
+            "endpoint_base_url",
+            "endpoint_identity_provenance",
+            "endpoint_client_version",
+            "endpoint_verified_at",
+            "api_product_type",
+            "market_type",
+            "product_type",
+            "data_enabled",
+            "strategy_observation_enabled",
+            "shadow_candidate_enabled",
+            "paper_enabled",
+            "live_enabled",
+            "execution_model",
+            "settlement_verification_level",
+            "venue_capability_blockers",
+            "stablecoin_route_evaluation",
+            "stablecoin_risk",
         ):
             if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
                 market[field] = previous[field]
@@ -2920,18 +2901,10 @@ class PaperBot:
         if callable(snapshot_method):
             market = snapshot_method(symbol, canonical_asset, observed_at, previous)
         else:
-            _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
-            market = next(
-                (
-                    row
-                    for row in markets
-                    if str(row.get("venue") or "").lower() == venue
-                    and str(row.get("symbol") or "") == symbol
-                ),
-                None,
-            )
-            if market is None:
-                return {"status": "unavailable", "reason": "market_snapshot_missing"}
+            return {
+                "status": "unavailable",
+                "reason": "focused_symbol_snapshot_not_supported",
+            }
         market = dict(market)
         market.setdefault("venue", venue)
         market.setdefault("symbol", symbol)
@@ -2963,6 +2936,28 @@ class PaperBot:
             "exit_safety_buffer_seconds",
             "timing_policy_source",
             "normalization_evidence",
+            "fee_source",
+            "fee_evidence",
+            "fee_observed_at",
+            "fee_reviewed_at",
+            "environment_verified",
+            "endpoint_base_url",
+            "endpoint_identity_provenance",
+            "endpoint_client_version",
+            "endpoint_verified_at",
+            "api_product_type",
+            "market_type",
+            "product_type",
+            "data_enabled",
+            "strategy_observation_enabled",
+            "shadow_candidate_enabled",
+            "paper_enabled",
+            "live_enabled",
+            "execution_model",
+            "settlement_verification_level",
+            "venue_capability_blockers",
+            "stablecoin_route_evaluation",
+            "stablecoin_risk",
         ):
             if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
                 market[field] = previous[field]
@@ -3014,12 +3009,34 @@ class PaperBot:
             "fee_rate": fee_rate,
             "taker_fee_rate": fee_rate,
             "maker_fee_rate": market.get("maker_fee_rate"),
+            "fee_source": market.get("fee_source"),
+            "fee_evidence": market.get("fee_evidence"),
+            "fee_observed_at": market.get("fee_observed_at"),
+            "fee_reviewed_at": market.get("fee_reviewed_at"),
             "quantity_step": market.get("quantity_step"),
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
             "min_notional_usd": min_notional,
             "quote_asset": market.get("quote_asset"),
             "collateral_asset": market.get("collateral_asset"),
+            "environment_verified": market.get("environment_verified"),
+            "endpoint_base_url": market.get("endpoint_base_url"),
+            "endpoint_identity_provenance": market.get("endpoint_identity_provenance"),
+            "endpoint_client_version": market.get("endpoint_client_version"),
+            "endpoint_verified_at": market.get("endpoint_verified_at"),
+            "api_product_type": market.get("api_product_type"),
+            "market_type": market.get("market_type"),
+            "product_type": market.get("product_type"),
+            "data_enabled": market.get("data_enabled"),
+            "strategy_observation_enabled": market.get("strategy_observation_enabled"),
+            "shadow_candidate_enabled": market.get("shadow_candidate_enabled"),
+            "paper_enabled": market.get("paper_enabled"),
+            "live_enabled": market.get("live_enabled"),
+            "execution_model": market.get("execution_model"),
+            "settlement_verification_level": market.get("settlement_verification_level"),
+            "venue_capability_blockers": market.get("venue_capability_blockers"),
+            "stablecoin_route_evaluation": market.get("stablecoin_route_evaluation"),
+            "stablecoin_risk": market.get("stablecoin_risk"),
             "contract_type": market.get("contract_type"),
             "contract_kind": market.get("contract_kind"),
             "contract_multiplier": market.get("contract_multiplier"),
@@ -3155,6 +3172,24 @@ class PaperBot:
                         "last_valid_executable_route"
                     )
                     if last_valid_route:
+                        crossed = self.synchronized_runtime.mark_settlement_crossed(
+                            position,
+                            self.clock.now(),
+                        )
+                        if crossed is not None:
+                            self.record_event(
+                                "settlement_crossed",
+                                (
+                                    f"V2 SETTLEMENT CROSSED {position.get('canonical_asset')} "
+                                    f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                                    "Funding reconciliation obligation was stored before hard-stale exit."
+                                ),
+                                {"position": position, "cycle": crossed},
+                                route_key=route_key,
+                                notify=True,
+                            )
+                            outcomes.append("settlement_crossed")
+                            position = self.store.funding_capture_position_by_id(position_id) or position
                         close_payload = self.synchronized_runtime.close_position(
                             position,
                             last_valid_route,
@@ -3199,6 +3234,29 @@ class PaperBot:
                     **position,
                     "paper_net_pnl_estimated": current_pnl.get("paper_net_if_exit_now"),
                 }
+            crossed = None
+            if state in {
+                "OPEN",
+                "HOLDING_NEXT_CYCLE",
+                "SETTLEMENT_CROSSED",
+                "POST_SETTLEMENT_EVALUATION",
+            }:
+                crossed = self.synchronized_runtime.mark_settlement_crossed(position, now)
+                if crossed is not None:
+                    self.record_event(
+                        "settlement_crossed",
+                        (
+                            f"V2 SETTLEMENT CROSSED {position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            "Funding reconciliation is pending public rate + mark."
+                        ),
+                        {"position": position, "cycle": crossed},
+                        route_key=route_key,
+                        notify=True,
+                    )
+                    outcomes.append("settlement_crossed")
+                    position = self.store.funding_capture_position_by_id(position_id) or position
+                    state = str(position.get("state") or state)
             risk_exit = self.synchronized_runtime.poll_synchronized_position_risk(
                 position,
                 live_route,
@@ -3266,28 +3324,7 @@ class PaperBot:
                 )
                 outcomes.append("emergency_unwind")
                 continue
-            if state in {
-                "OPEN",
-                "HOLDING_NEXT_CYCLE",
-                "SETTLEMENT_CROSSED",
-                "POST_SETTLEMENT_EVALUATION",
-            }:
-                crossed = self.synchronized_runtime.mark_settlement_crossed(position, now)
-            else:
-                crossed = None
             if crossed is not None:
-                self.record_event(
-                    "settlement_crossed",
-                    (
-                        f"V2 SETTLEMENT CROSSED {position.get('canonical_asset')} "
-                        f"{position.get('long_venue')}/{position.get('short_venue')}\n"
-                        "Funding reconciliation is pending public rate + mark."
-                    ),
-                    {"position": position, "cycle": crossed},
-                    route_key=route_key,
-                    notify=True,
-                )
-                outcomes.append("settlement_crossed")
                 continue
             if state in {"SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION"}:
                 decision = self.synchronized_runtime.next_cycle_hold_or_close_decision(

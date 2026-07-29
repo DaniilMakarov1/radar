@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
+from smart_money_radar.funding.adapter_contracts import USD_MAJOR_STABLE, collateral_family
+from smart_money_radar.funding.fees import fee_evidence_status
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 
 PAPER_COLLATERAL_ASSETS = {"USDT", "USDC", "USD"}
@@ -319,10 +321,7 @@ def capability_from_market(market: dict[str, Any]) -> VenueCapability:
         ),
         supports_24h_quote_volume=positive(market.get("volume_24h_usd")),
         supports_open_interest=positive(market.get("open_interest_usd")),
-        supports_taker_fee=(
-            market.get("taker_fee_rate") is not None
-            or market.get("fee_rate") is not None
-        ),
+        supports_taker_fee=bool(fee_evidence_status(market, "taker").get("verified")),
         supports_quantity_step=positive(market.get("quantity_step")),
         supports_min_notional=positive(market.get("min_notional_usd")) or positive(
             market.get("min_notional")
@@ -425,9 +424,20 @@ def synchronized_route_capability_check(
     long_rejections = synchronized_capability_rejection(long_capability)
     short_rejections = synchronized_capability_rejection(short_capability)
     cross_venue_reasons: list[str] = []
-    if long_capability.collateral_asset != short_capability.collateral_asset:
+    collateral_family_compatible = (
+        collateral_family(long_capability.collateral_asset) == USD_MAJOR_STABLE
+        and collateral_family(short_capability.collateral_asset) == USD_MAJOR_STABLE
+    )
+    quote_family_compatible = (
+        collateral_family(long_capability.quote_asset) == USD_MAJOR_STABLE
+        and collateral_family(short_capability.quote_asset) == USD_MAJOR_STABLE
+    )
+    if (
+        long_capability.collateral_asset != short_capability.collateral_asset
+        and not collateral_family_compatible
+    ):
         cross_venue_reasons.append("collateral_asset_mismatch")
-    if long_capability.quote_asset != short_capability.quote_asset:
+    if long_capability.quote_asset != short_capability.quote_asset and not quote_family_compatible:
         cross_venue_reasons.append("quote_asset_mismatch")
     if long_capability.collateral_asset not in PAPER_COLLATERAL_ASSETS:
         cross_venue_reasons.append("long_collateral_not_paper_eligible")
