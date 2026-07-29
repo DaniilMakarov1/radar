@@ -535,10 +535,11 @@ def _fee_rate(market: dict[str, Any]) -> Decimal | None:
     return _optional_decimal(value)
 
 
-def _stablecoin_route_snapshot(
+def _stablecoin_route_snapshots(
     long_market: dict[str, Any],
     short_market: dict[str, Any],
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
     for source in (
         long_market.get("stablecoin_route_evaluation"),
         short_market.get("stablecoin_route_evaluation"),
@@ -546,8 +547,8 @@ def _stablecoin_route_snapshot(
         short_market.get("stablecoin_risk"),
     ):
         if isinstance(source, dict):
-            return source
-    return {}
+            snapshots.append(source)
+    return snapshots
 
 
 def _stablecoin_cost_gate(
@@ -580,21 +581,47 @@ def _stablecoin_cost_gate(
             "cross_stable": True,
             "stablecoin_pair": f"{long_asset}/{short_asset}",
         }
-    snapshot = _stablecoin_route_snapshot(long_market, short_market)
+    snapshots = _stablecoin_route_snapshots(long_market, short_market)
+    expected_pair = f"{long_asset}/{short_asset}"
+    snapshot = next(
+        (
+            item
+            for item in snapshots
+            if str(item.get("long_asset") or "").upper() == long_asset
+            and str(item.get("short_asset") or "").upper() == short_asset
+            and str(item.get("stablecoin_pair") or item.get("canonical_pair") or "").upper()
+            == expected_pair
+        ),
+        {},
+    )
     if not snapshot:
-        return Decimal("0"), ["stablecoin_snapshot_missing"], {
+        return Decimal("0"), [
+            "stablecoin_snapshot_pair_mismatch" if snapshots else "stablecoin_snapshot_missing"
+        ], {
             "status": "RESEARCH_ONLY",
             "cross_stable": True,
-            "stablecoin_pair": f"{long_asset}/{short_asset}",
+            "stablecoin_pair": expected_pair,
         }
     blockers = [str(reason) for reason in snapshot.get("blockers") or []]
     observed_at = parse_time(snapshot.get("observed_at") or snapshot.get("priced_at"))
     expires_at = parse_time(snapshot.get("expires_at"))
+    if int(snapshot.get("schema_version") or 0) != 1:
+        blockers.append("stablecoin_snapshot_schema_version_missing")
+    if str(snapshot.get("long_asset") or "").upper() != long_asset:
+        blockers.append("stablecoin_snapshot_long_asset_mismatch")
+    if str(snapshot.get("short_asset") or "").upper() != short_asset:
+        blockers.append("stablecoin_snapshot_short_asset_mismatch")
+    if str(snapshot.get("stablecoin_pair") or snapshot.get("canonical_pair") or "").upper() != expected_pair:
+        blockers.append("stablecoin_snapshot_pair_mismatch")
+    if bool(snapshot.get("cross_stable")) is not True:
+        blockers.append("stablecoin_snapshot_cross_stable_mismatch")
     if observed_at is None:
         blockers.append("stablecoin_snapshot_observed_at_missing")
     else:
         age = (now.astimezone(UTC) - observed_at.astimezone(UTC)).total_seconds()
-        if age < -60.0 or age > 5.0:
+        if age < -1.0:
+            blockers.append("stablecoin_snapshot_future_dated")
+        elif age > 5.0:
             blockers.append("stablecoin_snapshot_stale")
     if expires_at is None:
         blockers.append("stablecoin_snapshot_expires_at_missing")
@@ -602,8 +629,18 @@ def _stablecoin_cost_gate(
         blockers.append("stablecoin_snapshot_expired")
     if str(snapshot.get("status") or "").upper() != "PASS":
         blockers.append("stablecoin_snapshot_not_pass")
-    if not snapshot.get("source") and not snapshot.get("source_identity") and not snapshot.get("prices"):
+    source_identity = snapshot.get("source_identity") if isinstance(snapshot.get("source_identity"), dict) else {}
+    if not source_identity.get("provider") or not source_identity.get("sources"):
         blockers.append("stablecoin_snapshot_source_missing")
+    prices = snapshot.get("prices") if isinstance(snapshot.get("prices"), dict) else {}
+    if not prices or (
+        not prices.get("long")
+        and not prices.get(long_asset)
+    ) or (
+        not prices.get("short")
+        and not prices.get(short_asset)
+    ):
+        blockers.append("stablecoin_snapshot_prices_incomplete")
     reserve = _non_negative_decimal(snapshot.get("stablecoin_reserve_usd"))
     return reserve, list(dict.fromkeys(blockers)), snapshot
 

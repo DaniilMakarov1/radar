@@ -50,7 +50,6 @@ from smart_money_radar.paper_bot.risk import (
 )
 from smart_money_radar.paper_bot.settlement import (
     REALIZED_FUNDING_RATE_SOURCES,
-    build_settlement_crossing_rows,
     funding_rate_semantics,
     funding_rate_semantics_source,
     reconcile_leg,
@@ -334,18 +333,169 @@ class SynchronizedFundingRuntimeV2:
             )
         )
 
+    def _cycle_events_for_scheduled_at(
+        self,
+        route_plan: dict[str, Any] | None,
+        scheduled_at: datetime,
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        scheduled_utc = scheduled_at.astimezone(UTC)
+        for event in list((route_plan or {}).get("included_settlement_events") or []):
+            if not isinstance(event, dict):
+                continue
+            event_time = parse_time(event.get("scheduled_at"))
+            if event_time is None:
+                continue
+            if abs((event_time.astimezone(UTC) - scheduled_utc).total_seconds()) <= 1.0:
+                events.append(dict(event))
+        return events
+
+    def _event_side(self, event: dict[str, Any], position_or_route: dict[str, Any]) -> str | None:
+        leg_id = str(event.get("leg_id") or "").lower()
+        if leg_id.endswith(":long") or ":long:" in leg_id:
+            return "long"
+        if leg_id.endswith(":short") or ":short:" in leg_id:
+            return "short"
+        venue = str(event.get("venue") or "").lower()
+        if venue and venue == str(position_or_route.get("long_venue") or "").lower():
+            return "long"
+        if venue and venue == str(position_or_route.get("short_venue") or "").lower():
+            return "short"
+        return None
+
+    def _cycle_plan_snapshot(
+        self,
+        *,
+        position_id: str,
+        cycle_id: str,
+        cycle_number: int,
+        plan_generation: int,
+        scheduled_at: datetime,
+        route: dict[str, Any],
+        route_plan: dict[str, Any] | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        events = self._cycle_events_for_scheduled_at(route_plan, scheduled_at)
+        legs = route.get("legs") or []
+        long_leg = leg_by_side(legs, "long") or {}
+        short_leg = leg_by_side(legs, "short") or {}
+        expected_leg_identities: list[dict[str, Any]] = []
+        for event in events:
+            side = self._event_side(event, route)
+            fallback_leg = long_leg if side == "long" else short_leg if side == "short" else {}
+            expected_leg_identities.append(
+                {
+                    "event_id": event.get("event_id"),
+                    "leg_id": event.get("leg_id"),
+                    "side": side,
+                    "venue": event.get("venue") or fallback_leg.get("venue"),
+                    "symbol": event.get("symbol") or fallback_leg.get("symbol"),
+                    "scheduled_at": event.get("scheduled_at") or scheduled_at.isoformat(),
+                    "rate_per_next_settlement": event.get("rate_per_next_settlement"),
+                }
+            )
+        scheduled_timestamps = sorted(
+            {
+                str(item.get("scheduled_at") or scheduled_at.astimezone(UTC).isoformat())
+                for item in expected_leg_identities
+            }
+        )
+        evidence_versions = [
+            str(event.get("evidence_version"))
+            for event in events
+            if event.get("evidence_version")
+        ]
+        return {
+            "schema_version": 1,
+            "cycle_id": cycle_id,
+            "position_id": position_id,
+            "plan_generation": int(plan_generation),
+            "cycle_number": int(cycle_number),
+            "route_plan": route_plan or {},
+            "included_settlement_events": events,
+            "expected_event_count": len(events),
+            "expected_venues": sorted(
+                {
+                    str(item.get("venue") or "")
+                    for item in expected_leg_identities
+                    if item.get("venue")
+                }
+            ),
+            "expected_symbols": sorted(
+                {
+                    str(item.get("symbol") or "")
+                    for item in expected_leg_identities
+                    if item.get("symbol")
+                }
+            ),
+            "expected_sides": sorted(
+                {
+                    str(item.get("side") or "")
+                    for item in expected_leg_identities
+                    if item.get("side")
+                }
+            ),
+            "scheduled_funding_timestamps": scheduled_timestamps,
+            "scheduled_funding_at": scheduled_at.astimezone(UTC).isoformat(),
+            "expected_leg_identities": expected_leg_identities,
+            "planned_exit_at": (route_plan or {}).get("planned_exit_at"),
+            "monitor_until": (route_plan or {}).get("monitor_until"),
+            "captured_at_plan_built_at": now.astimezone(UTC).isoformat(),
+            "evidence_version": max(evidence_versions) if evidence_versions else "unknown",
+        }
+
+    def _active_cycle_plan_for_cycle(
+        self,
+        position: dict[str, Any],
+        cycle: dict[str, Any],
+    ) -> dict[str, Any]:
+        plan = cycle.get("active_plan") if isinstance(cycle.get("active_plan"), dict) else {}
+        if plan:
+            return dict(plan)
+        config = dict(position.get("config") or {})
+        scheduled = parse_time(cycle.get("scheduled_funding_at"))
+        if scheduled is None:
+            return {}
+        route_plan = dict(config.get("funding_route_plan") or {})
+        events = self._cycle_events_for_scheduled_at(route_plan, scheduled)
+        if not events:
+            return {}
+        return {
+            "schema_version": 0,
+            "cycle_id": cycle.get("cycle_id"),
+            "position_id": position.get("position_id"),
+            "plan_generation": int(config.get("active_plan_generation") or config.get("plan_generation") or cycle.get("cycle_number") or 0),
+            "route_plan": route_plan,
+            "included_settlement_events": events,
+            "expected_event_count": len(events),
+            "scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
+            "scheduled_funding_timestamps": [scheduled.astimezone(UTC).isoformat()],
+            "expected_leg_identities": [
+                {
+                    "event_id": event.get("event_id"),
+                    "leg_id": event.get("leg_id"),
+                    "side": self._event_side(event, position),
+                    "venue": event.get("venue"),
+                    "symbol": event.get("symbol"),
+                    "scheduled_at": event.get("scheduled_at"),
+                    "rate_per_next_settlement": event.get("rate_per_next_settlement"),
+                }
+                for event in events
+            ],
+            "planned_exit_at": config.get("planned_exit_at"),
+            "monitor_until": config.get("monitor_until"),
+            "evidence_version": "legacy_config_snapshot",
+        }
+
     def _record_ledger_entry(self, row: dict[str, Any]) -> str | None:
         if float(row.get("cash_delta") or 0.0) != 0.0 and not row.get("venue"):
             raise ValueError(
                 f"cash-affecting paper ledger entry requires venue: {row.get('event_key')}"
             )
-        event_key = self.store.upsert_paper_event_ledger(row)
-        if event_key is not None and row.get("venue") and float(row.get("cash_delta") or 0.0) != 0.0:
-            self.store.update_funding_paper_account_cash(
-                str(row["venue"]),
-                float(row.get("cash_delta") or 0.0),
-            )
-        return event_key
+        if float(row.get("cash_delta") or 0.0) != 0.0:
+            result = self.store.apply_paper_cash_event(row)
+            return str(row["event_key"]) if result.get("applied") else None
+        return self.store.upsert_paper_event_ledger(row)
 
     def _record_price_pnl_entries(
         self,
@@ -441,6 +591,116 @@ class SynchronizedFundingRuntimeV2:
             total += float(row.get("cash_delta") or 0.0)
         return total
 
+    def recover_reconciled_funding_effects(self, now: datetime) -> dict[str, Any]:
+        repaired = 0
+        touched: set[tuple[str, str]] = set()
+        for row in self.store.reconciliation_rows_by_status({"RATE_AND_MARK_RECONCILED"}):
+            position_id = str(row["position_id"])
+            cycle_id = str(row.get("cycle_id") or "")
+            if cycle_id:
+                touched.add((position_id, cycle_id))
+            evidence = dict(row.get("evidence") or {})
+            financial_effect = evidence.get("financial_effect") if isinstance(evidence.get("financial_effect"), dict) else {}
+            event_key = str(financial_effect.get("event_key") or "")
+            position = self.store.funding_capture_position_by_id(position_id) or {}
+            attempt_id = _position_attempt_id(position)
+            if not event_key:
+                event_key = funding_event_key(
+                    position_id,
+                    str(row["venue"]),
+                    str(row["scheduled_funding_at"]),
+                    attempt_id=attempt_id,
+                )
+            ledger_rows = self.store.paper_event_ledger_rows(position_id)
+            exists = any(str(item.get("event_key") or "") == event_key for item in ledger_rows)
+            if not exists:
+                funding_pnl = float(row.get("funding_pnl") or 0.0)
+                self.store.apply_reconciled_funding_effect(
+                    row,
+                    make_ledger_entry(
+                        event_key,
+                        position_id=position_id,
+                        cycle_id=row.get("cycle_id"),
+                        venue=row.get("venue"),
+                        event_type="funding",
+                        cash_delta=funding_pnl,
+                        payload={
+                            "confirmed_rate": row.get("confirmed_funding_rate"),
+                            "settlement_mark": row.get("settlement_mark_price"),
+                            "side": row.get("side"),
+                            "payment_reconciliation_state": "PAYMENT_RECONCILED",
+                            "paper_simulated": True,
+                            "not_venue_account_ledger": True,
+                            "attempt_id": attempt_id,
+                            "recovered_at": now.astimezone(UTC).isoformat(),
+                        },
+                    ),
+                )
+                repaired += 1
+        account_report = self.store.paper_account_consistency_report()
+        account_repaired = False
+        if not account_report.get("ok"):
+            account_report = self.store.repair_paper_account_consistency()
+            account_repaired = True
+        finalized_cycles = 0
+        finalized_positions = 0
+        for position_id, cycle_id in sorted(touched):
+            before_cycle = next(
+                (
+                    item
+                    for item in self.store.funding_capture_cycles_for_position(position_id)
+                    if str(item.get("cycle_id") or "") == cycle_id
+                ),
+                {},
+            )
+            before_position = self.store.funding_capture_position_by_id(position_id) or {}
+            self._maybe_finalize_cycle_after_reconciliation(position_id, cycle_id)
+            self._maybe_finalize_position_after_reconciliation(position_id)
+            after_cycle = next(
+                (
+                    item
+                    for item in self.store.funding_capture_cycles_for_position(position_id)
+                    if str(item.get("cycle_id") or "") == cycle_id
+                ),
+                {},
+            )
+            after_position = self.store.funding_capture_position_by_id(position_id) or {}
+            if before_cycle.get("state") != after_cycle.get("state") and after_cycle.get("state") in {"RECONCILED", "UNRECONCILED"}:
+                finalized_cycles += 1
+            if before_position.get("state") != after_position.get("state") and after_position.get("state") in {"RECONCILED", "UNRECONCILED"}:
+                finalized_positions += 1
+        return {
+            "reconciled_funding_effects_repaired": repaired,
+            "account_repaired": account_repaired,
+            "account_consistency": account_report,
+            "finalized_cycles": finalized_cycles,
+            "finalized_positions": finalized_positions,
+        }
+
+    def _reconciliation_financial_effect_ready(self, row: dict[str, Any]) -> bool:
+        if str(row.get("status") or "") != "RATE_AND_MARK_RECONCILED":
+            return False
+        evidence = dict(row.get("evidence") or {})
+        financial_effect = evidence.get("financial_effect") if isinstance(evidence.get("financial_effect"), dict) else {}
+        event_key = str(financial_effect.get("event_key") or "")
+        position_id = str(row["position_id"])
+        if not event_key:
+            position = self.store.funding_capture_position_by_id(position_id) or {}
+            event_key = funding_event_key(
+                position_id,
+                str(row["venue"]),
+                str(row["scheduled_funding_at"]),
+                attempt_id=_position_attempt_id(position),
+            )
+        ledger_rows = self.store.paper_event_ledger_rows(position_id)
+        return any(
+            str(item.get("event_key") or "") == event_key
+            and str(item.get("event_type") or "") == "funding"
+            and str(item.get("venue") or "") == str(row.get("venue") or "")
+            and str(item.get("cycle_id") or "") == str(row.get("cycle_id") or "")
+            for item in ledger_rows
+        )
+
     def process_pending_reconciliations(self, now: datetime) -> dict[str, Any]:
         """Process all PENDING reconciliation rows.
 
@@ -456,6 +716,7 @@ class SynchronizedFundingRuntimeV2:
         if provider is None:
             return {"processed": 0, "reason": "no_settlement_data_provider"}
 
+        self.recover_reconciled_funding_effects(now)
         pending_rows = self.store.pending_reconciliation_rows()
         if not pending_rows:
             return {"processed": 0}
@@ -606,43 +867,49 @@ class SynchronizedFundingRuntimeV2:
                 quantity=quantity,
             )
 
-            self._update_reconciliation_row(
-                row,
-                status=leg_result["status"],
-                confirmed_funding_rate=leg_result.get("confirmed_funding_rate"),
-                settlement_mark_price=leg_result.get("settlement_mark_price"),
-                funding_pnl=leg_result.get("funding_pnl"),
-                rate_status=leg_result.get("rate_status"),
-                mark_status=leg_result.get("mark_status"),
-                evidence_update={
-                    "venue_event_state": "VENUE_EVENT_CONFIRMED",
-                    "payment_reconciliation_state": "PAYMENT_RECONCILED",
-                    "payment_reconciled_at": now_utc.isoformat(),
-                    "paper_simulated": True,
-                    "not_venue_account_ledger": True,
-                    "public_event": {
-                        "rate_semantics": public_event.get("rate_semantics")
-                        if public_event
-                        else "stored_confirmed_rate",
-                        "rate_semantics_source": public_event.get("rate_semantics_source")
-                        if public_event
-                        else None,
-                        "published_at": public_event.get("published_at")
-                        if public_event
-                        else None,
-                        "skew_seconds": public_event.get("skew_seconds")
-                        if public_event
-                        else None,
-                    },
-                    "mark_snapshot": {
-                        "observed_at": mark_snapshot.get("observed_at"),
-                        "skew_seconds": mark_snapshot.get("skew_seconds"),
-                        "source": mark_snapshot.get("source"),
-                        "timestamp_source": mark_snapshot.get("timestamp_source"),
-                        "reconciliation_quality": mark_snapshot.get("reconciliation_quality")
-                        or "UNKNOWN",
-                    },
+            reconciliation_evidence = {
+                "venue_event_state": "VENUE_EVENT_CONFIRMED",
+                "payment_reconciliation_state": "PAYMENT_RECONCILED",
+                "payment_reconciled_at": now_utc.isoformat(),
+                "paper_simulated": True,
+                "not_venue_account_ledger": True,
+                "public_event": {
+                    "rate_semantics": public_event.get("rate_semantics")
+                    if public_event
+                    else "stored_confirmed_rate",
+                    "rate_semantics_source": public_event.get("rate_semantics_source")
+                    if public_event
+                    else None,
+                    "published_at": public_event.get("published_at")
+                    if public_event
+                    else None,
+                    "skew_seconds": public_event.get("skew_seconds")
+                    if public_event
+                    else None,
                 },
+                "mark_snapshot": {
+                    "observed_at": mark_snapshot.get("observed_at"),
+                    "skew_seconds": mark_snapshot.get("skew_seconds"),
+                    "source": mark_snapshot.get("source"),
+                    "timestamp_source": mark_snapshot.get("timestamp_source"),
+                    "reconciliation_quality": mark_snapshot.get("reconciliation_quality")
+                    or "UNKNOWN",
+                },
+            }
+            updated_row = dict(row)
+            updated_row.update(
+                {
+                    "status": leg_result["status"],
+                    "confirmed_funding_rate": leg_result.get("confirmed_funding_rate"),
+                    "settlement_mark_price": leg_result.get("settlement_mark_price"),
+                    "funding_pnl": leg_result.get("funding_pnl"),
+                    "rate_status": leg_result.get("rate_status"),
+                    "mark_status": leg_result.get("mark_status"),
+                    "evidence": {
+                        **dict(row.get("evidence") or {}),
+                        **reconciliation_evidence,
+                    },
+                }
             )
 
             if leg_result["status"] == "RATE_AND_MARK_RECONCILED":
@@ -655,7 +922,8 @@ class SynchronizedFundingRuntimeV2:
                     scheduled_at_str,
                     attempt_id=attempt_id,
                 )
-                self._record_ledger_entry(
+                self.store.apply_reconciled_funding_effect(
+                    updated_row,
                     make_ledger_entry(
                         event_key,
                         position_id=position_id,
@@ -680,9 +948,20 @@ class SynchronizedFundingRuntimeV2:
                             "reconciliation_quality": mark_snapshot.get("reconciliation_quality")
                             or "UNKNOWN",
                         },
-                    )
+                    ),
                 )
                 reconciled += 1
+            else:
+                self._update_reconciliation_row(
+                    row,
+                    status=leg_result["status"],
+                    confirmed_funding_rate=leg_result.get("confirmed_funding_rate"),
+                    settlement_mark_price=leg_result.get("settlement_mark_price"),
+                    funding_pnl=leg_result.get("funding_pnl"),
+                    rate_status=leg_result.get("rate_status"),
+                    mark_status=leg_result.get("mark_status"),
+                    evidence_update=reconciliation_evidence,
+                )
             processed += 1
             self._maybe_finalize_cycle_after_reconciliation(position_id, cycle_id)
             self._maybe_finalize_position_after_reconciliation(position_id)
@@ -742,9 +1021,22 @@ class SynchronizedFundingRuntimeV2:
         )
         if not leg_rows:
             return
+        position = self.store.funding_capture_position_by_id(position_id) or {}
+        cycle = next(
+            (
+                item
+                for item in self.store.funding_capture_cycles_for_position(position_id)
+                if str(item.get("cycle_id") or "") == str(cycle_id)
+            ),
+            {},
+        )
+        active_plan = self._active_cycle_plan_for_cycle(position, cycle) if cycle else {}
+        expected_count = int(active_plan.get("expected_event_count") or 0)
+        if expected_count > 0 and len(leg_rows) != expected_count:
+            return
         all_resolved = all(
             str(r.get("status") or "") in {
-                "RATE_AND_MARK_RECONCILED", "PUBLIC_RATE_CONFIRMED", "UNRECONCILED",
+                "RATE_AND_MARK_RECONCILED", "UNRECONCILED",
             }
             for r in leg_rows
         )
@@ -763,6 +1055,10 @@ class SynchronizedFundingRuntimeV2:
             for r in leg_rows
         )
         if all_reconciled:
+            if not all(self._reconciliation_financial_effect_ready(r) for r in leg_rows):
+                return
+            if not self.store.paper_account_consistency_report().get("ok"):
+                return
             total_funding = sum(float(r.get("funding_pnl") or 0.0) for r in leg_rows)
             self.store.update_funding_capture_cycle_state(
                 cycle_id,
@@ -1621,6 +1917,223 @@ class SynchronizedFundingRuntimeV2:
         config["entry_attempts"] = attempts
         self.store.update_funding_capture_position_config(capture_id, config, now)
 
+    def recover_runtime_state(self, now: datetime) -> dict[str, Any]:
+        boundary = self.store.repair_funding_capture_boundary_consistency(now=now)
+        entry = self.recover_stale_entry_submissions(now)
+        reconciliation = self.recover_reconciled_funding_effects(now)
+        accounts = self.store.repair_paper_account_consistency()
+        return {
+            "boundary": boundary,
+            "entry_submitted": entry,
+            "reconciliation": reconciliation,
+            "accounts": accounts,
+        }
+
+    def recover_stale_entry_submissions(self, now: datetime) -> dict[str, Any]:
+        recovered = 0
+        completed_open = 0
+        aborted = 0
+        unwound = 0
+        for position in self.store.funding_capture_position_rows(states={"ENTRY_SUBMITTED"}):
+            position_id = str(position["position_id"])
+            config = dict(position.get("config") or {})
+            attempt_id = _position_attempt_id(position)
+            if not attempt_id:
+                attempt_id = str(config.get("entry_attempt_id") or position_id)
+            cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
+            entry_legs = list(config.get("entry_legs") or [])
+            ledger_rows = self.store.paper_event_ledger_rows(position_id)
+            reserve_rows = [
+                row
+                for row in ledger_rows
+                if str(row.get("event_type") or "") == "collateral_reserve"
+                and str(row.get("event_key") or "").startswith(f"collateral_reserve:{attempt_id}:")
+            ]
+            orders = [
+                row
+                for row in self.store.funding_paper_order_rows(position_id)
+                if str(row.get("order_intent") or "") == "ENTRY"
+                and str(row.get("paper_order_id") or "").startswith(f"{attempt_id}:entry:")
+            ]
+            route_legs = [dict(leg) for leg in entry_legs if isinstance(leg, dict)]
+            for reserve in reserve_rows:
+                if any(str(leg.get("venue") or "") == str(reserve.get("venue") or "") for leg in route_legs):
+                    continue
+                side = "long" if str(reserve.get("venue") or "") == str(position.get("long_venue") or "") else "short"
+                route_legs.append(
+                    {
+                        "side": side,
+                        "venue": reserve.get("venue"),
+                        "symbol": position.get(f"{side}_symbol"),
+                        "fee_rate": 0.0,
+                    }
+                )
+            route = {
+                "route_key": config.get("route_key"),
+                "canonical_asset": position.get("canonical_asset"),
+                "long_venue": position.get("long_venue"),
+                "short_venue": position.get("short_venue"),
+                "long_symbol": position.get("long_symbol"),
+                "short_symbol": position.get("short_symbol"),
+                "target_notional": position.get("target_notional"),
+                "legs": route_legs,
+            }
+
+            if not reserve_rows and not orders:
+                self._mark_entry_attempt_terminal(
+                    capture_id=position_id,
+                    attempt_id=attempt_id,
+                    state="RECOVERED_ABORTED",
+                    now=now,
+                    reason="entry_submitted_no_reserve_no_orders",
+                )
+                self.store.update_funding_capture_position_state(
+                    position_id,
+                    "FAILED",
+                    now,
+                    closed_at=now.astimezone(UTC).isoformat(),
+                )
+                aborted += 1
+                recovered += 1
+                continue
+
+            if reserve_rows and not orders:
+                self._release_collateral(position_id, route, attempt_id=attempt_id)
+                self._mark_entry_attempt_terminal(
+                    capture_id=position_id,
+                    attempt_id=attempt_id,
+                    state="RECOVERED_ABORTED",
+                    now=now,
+                    reason="entry_submitted_reserve_without_orders",
+                )
+                self.store.update_funding_capture_position_state(
+                    position_id,
+                    "FAILED",
+                    now,
+                    closed_at=now.astimezone(UTC).isoformat(),
+                )
+                aborted += 1
+                recovered += 1
+                continue
+
+            by_side = {str(order.get("leg_side") or ""): order for order in orders}
+            long_order = by_side.get("long")
+            short_order = by_side.get("short")
+            long_qty = float((long_order or {}).get("filled_quantity") or 0.0)
+            short_qty = float((short_order or {}).get("filled_quantity") or 0.0)
+            both_full = (
+                long_order is not None
+                and short_order is not None
+                and str(long_order.get("state") or "") == "FILLED"
+                and str(short_order.get("state") or "") == "FILLED"
+                and long_qty > 0
+                and short_qty > 0
+                and abs(long_qty - short_qty) <= max(long_qty, short_qty) * 0.001
+            )
+            if not both_full or not reserve_rows:
+                for order in orders:
+                    self._record_ledger_entry(
+                        make_ledger_entry(
+                            order_fee_event_key(str(order["paper_order_id"])),
+                            position_id=position_id,
+                            cycle_id=cycle_id,
+                            venue=order.get("venue"),
+                            event_type="order_fee",
+                            cash_delta=-float(order.get("fee") or 0.0),
+                            payload={"order_id": order["paper_order_id"], "attempt_id": attempt_id},
+                        )
+                    )
+                long_fill = {
+                    "filled_quantity": long_qty,
+                    "average_fill_price": (long_order or {}).get("average_fill_price"),
+                }
+                short_fill = {
+                    "filled_quantity": short_qty,
+                    "average_fill_price": (short_order or {}).get("average_fill_price"),
+                }
+                self._unwind_partial_entry(
+                    route=route,
+                    capture_id=position_id,
+                    cycle_id=cycle_id,
+                    long_fill=long_fill,
+                    short_fill=short_fill,
+                    long_fee=float((long_order or {}).get("fee") or 0.0),
+                    short_fee=float((short_order or {}).get("fee") or 0.0),
+                    decision_at=now,
+                    now=now,
+                    attempt_id=attempt_id,
+                )
+                self._mark_entry_attempt_terminal(
+                    capture_id=position_id,
+                    attempt_id=attempt_id,
+                    state="REJECTED_AFTER_SUBMISSION",
+                    now=now,
+                    reason="entry_submitted_partial_or_unreserved_exposure_unwound",
+                )
+                unwound += 1
+                recovered += 1
+                continue
+
+            for order in (long_order, short_order):
+                self._record_ledger_entry(
+                    make_ledger_entry(
+                        order_fee_event_key(str(order["paper_order_id"])),
+                        position_id=position_id,
+                        cycle_id=cycle_id,
+                        venue=order.get("venue"),
+                        event_type="order_fee",
+                        cash_delta=-float(order.get("fee") or 0.0),
+                        payload={"order_id": order["paper_order_id"], "attempt_id": attempt_id},
+                    )
+                )
+            settlement_at = parse_time(config.get("entry_attempt_submitted_at")) or now
+            attempts = list(config.get("entry_attempts") or [])
+            for attempt in attempts:
+                if attempt.get("attempt_id") == attempt_id:
+                    settlement_at = parse_time(attempt.get("settlement_at")) or settlement_at
+                    break
+            execution = {
+                "state": "FILLED",
+                "attempt_id": attempt_id,
+                "quantity": min(long_qty, short_qty),
+                "target_quantity": min(long_qty, short_qty),
+                "long_entry_price": float(long_order.get("average_fill_price") or 0.0),
+                "short_entry_price": float(short_order.get("average_fill_price") or 0.0),
+                "paper_open_fees": float(long_order.get("fee") or 0.0) + float(short_order.get("fee") or 0.0),
+                "filled_at": (long_order.get("filled_at") or short_order.get("filled_at") or now.isoformat()),
+                "deadline_ok": True,
+                "fill_state": "FILLED",
+                "long_fill_ratio": 1.0,
+                "short_fill_ratio": 1.0,
+                "quantity_mismatch_fraction": 0.0,
+            }
+            self._mark_open(
+                route,
+                position_id,
+                settlement_at,
+                dict(config.get("entry_economics") or {}),
+                execution,
+                now,
+                config.get("funding_route_plan"),
+            )
+            self._mark_entry_attempt_terminal(
+                capture_id=position_id,
+                attempt_id=attempt_id,
+                state="OPEN",
+                now=now,
+                reason="entry_submitted_recovered_open",
+            )
+            completed_open += 1
+            recovered += 1
+        account_report = self.store.repair_paper_account_consistency()
+        return {
+            "processed": recovered,
+            "recovered_aborted": aborted,
+            "recovered_unwound": unwound,
+            "recovered_open": completed_open,
+            "account_consistency": account_report,
+        }
+
     def _ensure_discovered_or_armed(
         self,
         route: dict[str, Any],
@@ -1754,6 +2267,7 @@ class SynchronizedFundingRuntimeV2:
                 "armed_at": now.astimezone(UTC).isoformat(),
                 "entry_gate_result": gate_result,
                 "plan_generation": 1,
+                "active_plan_generation": 1,
                 "cycle_identity_key": cycle_identity,
                 "funding_route_plan": route_plan,
                 "included_settlement_events": route_plan.get("included_settlement_events") or [],
@@ -1767,11 +2281,23 @@ class SynchronizedFundingRuntimeV2:
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
+        cycle_id = f"{capture_id}:1"
+        active_plan = self._cycle_plan_snapshot(
+            position_id=capture_id,
+            cycle_id=cycle_id,
+            cycle_number=1,
+            plan_generation=1,
+            scheduled_at=settlement_at,
+            route=route,
+            route_plan=route_plan,
+            now=now,
+        )
         self.store.upsert_funding_capture_cycle(
             {
-                "cycle_id": f"{capture_id}:1",
+                "cycle_id": cycle_id,
                 "position_id": capture_id,
                 "cycle_number": 1,
+                "plan_generation": 1,
                 "scheduled_funding_at": settlement_at.astimezone(UTC).isoformat(),
                 "long_next_funding_rate_at_decision": _leg_rate(long_leg),
                 "short_next_funding_rate_at_decision": _leg_rate(short_leg),
@@ -1780,6 +2306,7 @@ class SynchronizedFundingRuntimeV2:
                 "decision": "ARMED",
                 "decision_reason": "all_entry_gates_passed",
                 "state": "ARMED",
+                "active_plan": active_plan,
             }
         )
 
@@ -2130,7 +2657,7 @@ class SynchronizedFundingRuntimeV2:
                 continue
             amount = leg_notional / leverage + leg_notional * reserve_fraction
             event_key = collateral_reserve_event_key(capture_id, venue, attempt_id=attempt_id)
-            reserved = self._record_ledger_entry(
+            self.store.apply_paper_reserve_event(
                 make_ledger_entry(
                     event_key,
                     position_id=capture_id,
@@ -2138,10 +2665,9 @@ class SynchronizedFundingRuntimeV2:
                     event_type="collateral_reserve",
                     cash_delta=0.0,
                     payload={"amount": amount, "attempt_id": attempt_id},
-                )
+                ),
+                reserve_delta=amount,
             )
-            if reserved is not None:
-                self.store.update_funding_paper_account_reserved(venue, amount)
 
     def _release_collateral(
         self,
@@ -2176,7 +2702,7 @@ class SynchronizedFundingRuntimeV2:
             amount = float(optional_float((reserve_row.get("payload") or {}).get("amount")) or 0.0)
             if amount <= 0:
                 continue
-            released = self._record_ledger_entry(
+            self.store.apply_paper_reserve_event(
                 make_ledger_entry(
                     release_key,
                     position_id=capture_id,
@@ -2184,10 +2710,9 @@ class SynchronizedFundingRuntimeV2:
                     event_type="collateral_release",
                     cash_delta=0.0,
                     payload={"amount": amount, "attempt_id": attempt_id},
-                )
+                ),
+                reserve_delta=-amount,
             )
-            if released is not None:
-                self.store.update_funding_paper_account_reserved(venue, -amount)
 
     def _entry_risk_gate(self, route: dict[str, Any]) -> dict[str, Any]:
         legs = route.get("legs") or []
@@ -2575,6 +3100,8 @@ class SynchronizedFundingRuntimeV2:
                     "entry_attempt_id": attempt_id,
                     "entry_attempt_submitted": True,
                     "entry_attempt_state": "OPEN",
+                    "plan_generation": 1,
+                    "active_plan_generation": 1,
                     "route_key": route.get("route_key"),
                     "route_entry_key": route_entry_key(route),
                     "entry_legs": [long_leg, short_leg],
@@ -2612,6 +3139,18 @@ class SynchronizedFundingRuntimeV2:
         )
         for cycle_number, scheduled in enumerate(scheduled_keys, start=1):
             cycle_events = cycle_groups[scheduled]
+            scheduled_time = parse_time(scheduled) or settlement_at.astimezone(UTC)
+            cycle_id = f"{capture_id}:{cycle_number}"
+            active_plan = self._cycle_plan_snapshot(
+                position_id=capture_id,
+                cycle_id=cycle_id,
+                cycle_number=cycle_number,
+                plan_generation=cycle_number,
+                scheduled_at=scheduled_time,
+                route=route,
+                route_plan=route_plan,
+                now=now,
+            )
             long_rate = _leg_rate(long_leg)
             short_rate = _leg_rate(short_leg)
             conservative_gross = float(economics.get("conservative_funding_gross") or 0.0)
@@ -2628,9 +3167,10 @@ class SynchronizedFundingRuntimeV2:
                         short_rate = float(event.get("rate_per_next_settlement") or short_rate)
             self.store.upsert_funding_capture_cycle(
                 {
-                    "cycle_id": f"{capture_id}:{cycle_number}",
+                    "cycle_id": cycle_id,
                     "position_id": capture_id,
                     "cycle_number": cycle_number,
+                    "plan_generation": cycle_number,
                     "scheduled_funding_at": scheduled,
                     "long_next_funding_rate_at_decision": long_rate,
                     "short_next_funding_rate_at_decision": short_rate,
@@ -2639,6 +3179,7 @@ class SynchronizedFundingRuntimeV2:
                     "state": "OPEN",
                     "decision": "OPEN",
                     "decision_reason": "event_window_entry_legs_filled_before_t20",
+                    "active_plan": active_plan,
                 }
             )
 
@@ -3016,8 +3557,8 @@ class SynchronizedFundingRuntimeV2:
         ]
         replans.append(replan_record)
         config["post_settlement_replans"] = replans[-10:]
-        config["plan_generation"] = next_cycle_number
-        config["last_post_settlement_route_plan"] = next_plan
+        config["proposed_plan_generation"] = next_cycle_number
+        config["proposed_post_settlement_route_plan"] = next_plan
         position["config"] = config
         self.store.update_funding_capture_position_config(position_id, config, now)
         if next_settlement_at is None:
@@ -3254,11 +3795,40 @@ class SynchronizedFundingRuntimeV2:
                 "projected_position_age_at_next_exit": projected_age,
             }
 
-        next_cycle_id = self.store.upsert_funding_capture_cycle(
+        next_cycle_id = f"{position_id}:{next_cycle_number}"
+        active_config = dict(config)
+        active_config.update(
             {
-                "cycle_id": f"{position_id}:{next_cycle_number}",
+                "plan_generation": next_cycle_number,
+                "active_plan_generation": next_cycle_number,
+                "active_cycle_id": next_cycle_id,
+                "active_cycle_number": next_cycle_number,
+                "active_cycle_scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
+                "funding_route_plan": next_plan,
+                "included_settlement_events": next_plan.get("included_settlement_events") or [],
+                "excluded_settlement_events": next_plan.get("excluded_settlement_events") or [],
+                "ambiguous_settlement_events": next_plan.get("ambiguous_settlement_events") or [],
+                "planned_exit_at": next_plan.get("planned_exit_at"),
+                "monitor_until": next_plan.get("monitor_until"),
+                "last_post_settlement_route_plan": next_plan,
+            }
+        )
+        active_plan = self._cycle_plan_snapshot(
+            position_id=position_id,
+            cycle_id=next_cycle_id,
+            cycle_number=next_cycle_number,
+            plan_generation=next_cycle_number,
+            scheduled_at=next_settlement_at,
+            route=route,
+            route_plan=next_plan,
+            now=now,
+        )
+        next_cycle_id = self.store.activate_funding_capture_hold_cycle(
+            cycle_row={
+                "cycle_id": next_cycle_id,
                 "position_id": position_id,
                 "cycle_number": next_cycle_number,
+                "plan_generation": next_cycle_number,
                 "scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
                 "long_next_funding_rate_at_decision": _leg_rate(long_leg),
                 "short_next_funding_rate_at_decision": _leg_rate(short_leg),
@@ -3279,12 +3849,10 @@ class SynchronizedFundingRuntimeV2:
                 "decision": "HOLD",
                 "decision_reason": "next_cycle_underwriting_passed",
                 "state": "HOLDING_NEXT_CYCLE",
-            }
-        )
-        self.store.update_funding_capture_position_state(
-            position_id,
-            "HOLDING_NEXT_CYCLE",
-            now,
+                "active_plan": active_plan,
+            },
+            active_config=active_config,
+            now=now,
             paper_net_pnl_estimated=projected_total,
         )
         return {
@@ -3698,26 +4266,8 @@ class SynchronizedFundingRuntimeV2:
     def mark_settlement_crossed(self, position: dict[str, Any], now: datetime) -> dict[str, Any] | None:
         position_id = str(position["position_id"])
         config = dict(position.get("config") or {})
-        planned_events = [
-            event
-            for event in list(config.get("included_settlement_events") or [])
-            if isinstance(event, dict)
-        ]
         cycles = self.store.funding_capture_cycles_for_position(position_id)
         crossed_cycles: list[dict[str, Any]] = []
-
-        def events_for_cycle(cycle: dict[str, Any]) -> list[dict[str, Any]]:
-            scheduled = parse_time(cycle.get("scheduled_funding_at"))
-            if scheduled is None:
-                return []
-            matched: list[dict[str, Any]] = []
-            for event in planned_events:
-                event_time = parse_time(event.get("scheduled_at"))
-                if event_time is None:
-                    continue
-                if abs((event_time.astimezone(UTC) - scheduled.astimezone(UTC)).total_seconds()) <= 1e-6:
-                    matched.append(event)
-            return matched
 
         for cycle in cycles:
             cycle_state = str(cycle.get("state") or "")
@@ -3727,93 +4277,151 @@ class SynchronizedFundingRuntimeV2:
                 "RATE_AND_MARK_RECONCILED",
                 "RECONCILED",
                 "UNRECONCILED",
+                "SETTLEMENT_PLAN_MISMATCH",
             }:
                 continue
             scheduled = parse_time(cycle.get("scheduled_funding_at"))
             if scheduled is None or now.astimezone(UTC) < scheduled.astimezone(UTC):
                 continue
             cycle_id = str(cycle.get("cycle_id") or f"{position_id}:{cycle.get('cycle_number')}")
-            cycle_events = events_for_cycle(cycle)
-            if not cycle_events and not planned_events:
-                rows = build_settlement_crossing_rows(
+            active_plan = self._active_cycle_plan_for_cycle(position, cycle)
+            expected_events = [
+                event
+                for event in list(active_plan.get("included_settlement_events") or [])
+                if isinstance(event, dict)
+            ]
+            expected_count = int(active_plan.get("expected_event_count") or len(expected_events))
+            matched_events: list[dict[str, Any]] = []
+            missing_events: list[dict[str, Any]] = []
+            duplicate_events: list[dict[str, Any]] = []
+            seen_keys: set[tuple[str, str, str, str]] = set()
+            for event in expected_events:
+                event_time = parse_time(event.get("scheduled_at"))
+                side = self._event_side(event, position)
+                venue = str(event.get("venue") or "")
+                symbol = str(event.get("symbol") or "")
+                key = (
+                    str(side or ""),
+                    venue,
+                    symbol,
+                    event_time.astimezone(UTC).isoformat() if event_time else "",
+                )
+                invalid = (
+                    event_time is None
+                    or side not in {"long", "short"}
+                    or not venue
+                    or not symbol
+                    or abs((event_time.astimezone(UTC) - scheduled.astimezone(UTC)).total_seconds()) > 1.0
+                )
+                if key in seen_keys:
+                    duplicate_events.append(event)
+                    invalid = True
+                seen_keys.add(key)
+                if invalid:
+                    missing_events.append(event)
+                    continue
+                matched_events.append(event)
+            expected_sides = {self._event_side(event, position) for event in matched_events}
+            standard_two_leg_mismatch = (
+                expected_count == 2
+                and (
+                    len(matched_events) != 2
+                    or expected_sides != {"long", "short"}
+                )
+            )
+            if (
+                expected_count <= 0
+                or len(matched_events) != expected_count
+                or duplicate_events
+                or standard_two_leg_mismatch
+            ):
+                evidence = {
+                    "cycle_id": cycle_id,
+                    "active_plan_generation": active_plan.get("plan_generation"),
+                    "expected_event_count": expected_count,
+                    "expected_events": expected_events,
+                    "matched_events": matched_events,
+                    "missing_events": missing_events,
+                    "duplicate_events": duplicate_events,
+                    "actual_scheduled_timestamp": scheduled.astimezone(UTC).isoformat(),
+                    "blocker": "settlement_plan_event_mismatch",
+                    "state": "SETTLEMENT_PLAN_MISMATCH",
+                }
+                self.store.mark_settlement_plan_mismatch(
                     position_id=position_id,
                     cycle_id=cycle_id,
-                    long_venue=str(position.get("long_venue") or ""),
-                    long_symbol=str(position.get("long_symbol") or ""),
-                    short_venue=str(position.get("short_venue") or ""),
-                    short_symbol=str(position.get("short_symbol") or ""),
-                    scheduled_funding_at=scheduled.isoformat(),
-                    quantity=float(position.get("quantity") or 0.0),
+                    evidence=evidence,
+                    now=now,
                 )
-                for row in rows:
-                    evidence = dict(row.get("evidence") or {})
-                    evidence.update(
-                        {
-                            "lifecycle_state": "BOUNDARY_CROSSED",
-                            "boundary_crossed_at": now.astimezone(UTC).isoformat(),
-                            "venue_event_state": "VENUE_EVENT_PENDING",
-                            "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
-                            "payment_reconciliation_source": "PAPER_RECONCILIATION_WORKER",
-                            "paper_simulated": True,
-                            "not_venue_account_ledger": True,
-                        }
-                    )
-                    row["evidence"] = evidence
-            else:
-                rows = []
-                for event in cycle_events:
-                    leg_id = str(event.get("leg_id") or "")
-                    venue = str(event.get("venue") or "")
-                    if ":long" in leg_id or venue == str(position.get("long_venue") or ""):
-                        side = "long"
-                        symbol = str(event.get("symbol") or position.get("long_symbol") or "")
-                        venue = venue or str(position.get("long_venue") or "")
-                    else:
-                        side = "short"
-                        symbol = str(event.get("symbol") or position.get("short_symbol") or "")
-                        venue = venue or str(position.get("short_venue") or "")
-                    rows.append({
-                        "position_id": position_id,
+                return {
+                    "position_id": position_id,
+                    "cycle_id": cycle_id,
+                    "state": "SETTLEMENT_PLAN_MISMATCH",
+                    "blocker": "settlement_plan_event_mismatch",
+                    "evidence": evidence,
+                }
+            rows = []
+            for event in matched_events:
+                side = self._event_side(event, position) or ""
+                venue = str(event.get("venue") or "")
+                symbol = str(event.get("symbol") or "")
+                rows.append({
+                    "position_id": position_id,
+                    "cycle_id": cycle_id,
+                    "venue": venue,
+                    "symbol": symbol,
+                    "side": side,
+                    "scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
+                    "status": "PENDING",
+                    "confirmed_funding_rate": None,
+                    "settlement_mark_price": None,
+                    "funding_pnl": None,
+                    "rate_status": None,
+                    "mark_status": None,
+                    "evidence": {
+                        "lifecycle_state": "BOUNDARY_CROSSED",
+                        "boundary_crossed_at": now.astimezone(UTC).isoformat(),
+                        "venue_event_state": "VENUE_EVENT_PENDING",
+                        "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
+                        "payment_reconciliation_source": "PAPER_RECONCILIATION_WORKER",
+                        "paper_simulated": True,
+                        "not_venue_account_ledger": True,
+                        "active_plan_generation": active_plan.get("plan_generation"),
                         "cycle_id": cycle_id,
-                        "venue": venue,
-                        "symbol": symbol,
-                        "side": side,
-                        "scheduled_funding_at": scheduled.isoformat(),
-                        "status": "PENDING",
-                        "confirmed_funding_rate": None,
-                        "settlement_mark_price": None,
-                        "funding_pnl": None,
-                        "rate_status": None,
-                        "mark_status": None,
-                        "evidence": {
-                            "lifecycle_state": "BOUNDARY_CROSSED",
-                            "boundary_crossed_at": now.astimezone(UTC).isoformat(),
-                            "venue_event_state": "VENUE_EVENT_PENDING",
-                            "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
-                            "payment_reconciliation_source": "PAPER_RECONCILIATION_WORKER",
-                            "paper_simulated": True,
-                            "not_venue_account_ledger": True,
-                            "planned_event": event,
-                        },
-                    })
-            for row in rows:
-                self.store.upsert_funding_settlement_reconciliation(row)
-            self.store.update_funding_capture_cycle_state(cycle_id, "SETTLEMENT_CROSSED", now)
+                        "planned_event": event,
+                    },
+                })
+            boundary_evidence = {
+                "cycle_id": cycle_id,
+                "active_plan_generation": active_plan.get("plan_generation"),
+                "expected_events": expected_events,
+                "matched_events": matched_events,
+                "actual_scheduled_timestamp": scheduled.astimezone(UTC).isoformat(),
+                "obligation_count": len(rows),
+                "boundary_crossed_at": now.astimezone(UTC).isoformat(),
+            }
+            config_update = {
+                "lifecycle_state": "BOUNDARY_CROSSED",
+                "venue_event_state": "VENUE_EVENT_PENDING",
+                "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
+                "boundary_crossed_at": now.astimezone(UTC).isoformat(),
+                "active_cycle_id": cycle_id,
+                "active_plan_generation": active_plan.get("plan_generation"),
+            }
+            self.store.apply_settlement_boundary(
+                position_id=position_id,
+                cycle_id=cycle_id,
+                expected_obligation_count=len(rows),
+                reconciliation_rows=rows,
+                boundary_evidence=boundary_evidence,
+                position_config_update=config_update,
+                now=now,
+            )
             crossed_cycles.append({**cycle, "cycle_id": cycle_id, "scheduled_funding_at": scheduled.isoformat()})
 
         if not crossed_cycles:
             return None
-        config["lifecycle_state"] = "BOUNDARY_CROSSED"
-        config["venue_event_state"] = "VENUE_EVENT_PENDING"
-        config["payment_reconciliation_state"] = "PAYMENT_RECONCILIATION_PENDING"
-        config["boundary_crossed_at"] = now.astimezone(UTC).isoformat()
-        self.store.update_funding_capture_position_config(position_id, config, now)
-        self.store.update_funding_capture_position_state(
-            position_id,
-            "SETTLEMENT_CROSSED",
-            now,
-            settlements_captured_count=int(position.get("settlements_captured_count") or 0) + len(crossed_cycles),
-        )
+        current_position = self.store.funding_capture_position_by_id(position_id) or {}
         return {
             "position_id": position_id,
             "cycle_id": str(crossed_cycles[-1].get("cycle_id") or ""),
@@ -3822,4 +4430,5 @@ class SynchronizedFundingRuntimeV2:
             "venue_event_state": "VENUE_EVENT_PENDING",
             "payment_reconciliation_state": "PAYMENT_RECONCILIATION_PENDING",
             "crossed_cycles": crossed_cycles,
+            "settlements_captured_count": current_position.get("settlements_captured_count"),
         }

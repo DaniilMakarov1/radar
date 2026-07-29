@@ -497,6 +497,11 @@ class PaperBot:
         self._background_venues: set[str] = set()
         self._last_lightweight_nearest_settlement_seconds: float | None = None
         self._lightweight_pending_futures: dict[Future[Any], str] = {}
+        self.last_runtime_recovery: dict[str, Any] | None = None
+        self.store.init_db()
+        self.last_runtime_recovery = self.synchronized_runtime.recover_runtime_state(
+            self.clock.now()
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle: signal handling, sleep, notifications (folded from BaseBot)
@@ -650,11 +655,17 @@ class PaperBot:
         if completed is not None:
             background_results.append(completed)
 
+        runtime_recovery = self.synchronized_runtime.recover_runtime_state(
+            self.clock.now()
+        )
+        self.last_runtime_recovery = runtime_recovery
+
         reconciliation = self._maybe_run_reconciliation()
 
         if self.has_open_exposure():
             self.request_background_full_scan_cancel("open_exposure_priority")
             result = self.run_open_position_iteration()
+            result["runtime_recovery"] = runtime_recovery
             if reconciliation is not None:
                 result["reconciliation"] = reconciliation
             if background_results:
@@ -667,6 +678,7 @@ class PaperBot:
             self.request_background_full_scan_cancel("critical_hot_route_priority")
             result = self.run_hot_iteration()
             result["mode"] = "critical_hot_routes"
+            result["runtime_recovery"] = runtime_recovery
             if reconciliation is not None:
                 result["reconciliation"] = reconciliation
             if background_results:
@@ -684,6 +696,7 @@ class PaperBot:
             discovery = self._run_lightweight_discovery()
             if discovery is not None:
                 result["lightweight_discovery"] = discovery
+        result["runtime_recovery"] = runtime_recovery
 
         if reconciliation is not None:
             result["reconciliation"] = reconciliation
@@ -2712,6 +2725,7 @@ class PaperBot:
             "normalized_next_funding_rate": market.get(
                 "normalized_next_funding_rate"
             ),
+            "funding_rate_semantics": market.get("funding_rate_semantics"),
             "funding_rate_unit": market.get("funding_rate_unit"),
             "funding_sign_convention": market.get("funding_sign_convention"),
             "normalization_evidence": market.get("normalization_evidence"),
@@ -2984,6 +2998,7 @@ class PaperBot:
             "normalized_next_funding_rate": market.get(
                 "normalized_next_funding_rate"
             ),
+            "funding_rate_semantics": market.get("funding_rate_semantics"),
             "funding_rate_unit": market.get("funding_rate_unit"),
             "funding_sign_convention": market.get("funding_sign_convention"),
             "normalization_evidence": market.get("normalization_evidence"),
@@ -3171,25 +3186,32 @@ class PaperBot:
                     last_valid_route = (position.get("config") or {}).get(
                         "last_valid_executable_route"
                     )
-                    if last_valid_route:
-                        crossed = self.synchronized_runtime.mark_settlement_crossed(
-                            position,
-                            self.clock.now(),
+                    crossed = self.synchronized_runtime.mark_settlement_crossed(
+                        position,
+                        self.clock.now(),
+                    )
+                    if crossed is not None:
+                        self.record_event(
+                            "settlement_crossed"
+                            if crossed.get("state") == "SETTLEMENT_CROSSED"
+                            else "settlement_plan_mismatch",
+                            (
+                                f"V2 SETTLEMENT BOUNDARY {position.get('canonical_asset')} "
+                                f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                                "Funding reconciliation obligation persistence was attempted before hard-stale exit."
+                            ),
+                            {"position": position, "cycle": crossed},
+                            route_key=route_key,
+                            notify=True,
+                            severity="error" if crossed.get("state") != "SETTLEMENT_CROSSED" else "warning",
                         )
-                        if crossed is not None:
-                            self.record_event(
-                                "settlement_crossed",
-                                (
-                                    f"V2 SETTLEMENT CROSSED {position.get('canonical_asset')} "
-                                    f"{position.get('long_venue')}/{position.get('short_venue')}\n"
-                                    "Funding reconciliation obligation was stored before hard-stale exit."
-                                ),
-                                {"position": position, "cycle": crossed},
-                                route_key=route_key,
-                                notify=True,
-                            )
-                            outcomes.append("settlement_crossed")
-                            position = self.store.funding_capture_position_by_id(position_id) or position
+                        outcomes.append(
+                            "settlement_crossed"
+                            if crossed.get("state") == "SETTLEMENT_CROSSED"
+                            else "settlement_plan_mismatch"
+                        )
+                        position = self.store.funding_capture_position_by_id(position_id) or position
+                    if last_valid_route:
                         close_payload = self.synchronized_runtime.close_position(
                             position,
                             last_valid_route,
@@ -3224,16 +3246,6 @@ class PaperBot:
                     self.clock.now(),
                 )
                 continue
-            current_pnl = self.synchronized_runtime.record_current_executable_pnl(
-                position,
-                live_route,
-                now,
-            )
-            if current_pnl.get("decision") == "recorded":
-                position = {
-                    **position,
-                    "paper_net_pnl_estimated": current_pnl.get("paper_net_if_exit_now"),
-                }
             crossed = None
             if state in {
                 "OPEN",
@@ -3244,19 +3256,43 @@ class PaperBot:
                 crossed = self.synchronized_runtime.mark_settlement_crossed(position, now)
                 if crossed is not None:
                     self.record_event(
-                        "settlement_crossed",
+                        "settlement_crossed"
+                        if crossed.get("state") == "SETTLEMENT_CROSSED"
+                        else "settlement_plan_mismatch",
                         (
-                            f"V2 SETTLEMENT CROSSED {position.get('canonical_asset')} "
+                            f"V2 SETTLEMENT BOUNDARY {position.get('canonical_asset')} "
                             f"{position.get('long_venue')}/{position.get('short_venue')}\n"
                             "Funding reconciliation is pending public rate + mark."
                         ),
                         {"position": position, "cycle": crossed},
                         route_key=route_key,
                         notify=True,
+                        severity="error" if crossed.get("state") != "SETTLEMENT_CROSSED" else "info",
                     )
-                    outcomes.append("settlement_crossed")
+                    outcomes.append(
+                        "settlement_crossed"
+                        if crossed.get("state") == "SETTLEMENT_CROSSED"
+                        else "settlement_plan_mismatch"
+                    )
                     position = self.store.funding_capture_position_by_id(position_id) or position
                     state = str(position.get("state") or state)
+            try:
+                current_pnl = self.synchronized_runtime.record_current_executable_pnl(
+                    position,
+                    live_route,
+                    now,
+                )
+            except Exception as exc:
+                current_pnl = {
+                    "decision": "skipped",
+                    "quality": "ERROR",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            if current_pnl.get("decision") == "recorded":
+                position = {
+                    **position,
+                    "paper_net_pnl_estimated": current_pnl.get("paper_net_if_exit_now"),
+                }
             risk_exit = self.synchronized_runtime.poll_synchronized_position_risk(
                 position,
                 live_route,
@@ -3323,8 +3359,6 @@ class PaperBot:
                     severity="error",
                 )
                 outcomes.append("emergency_unwind")
-                continue
-            if crossed is not None:
                 continue
             if state in {"SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION"}:
                 decision = self.synchronized_runtime.next_cycle_hold_or_close_decision(

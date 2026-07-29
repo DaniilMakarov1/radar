@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from smart_money_radar.funding.profiles import funding_bot_profile
+from smart_money_radar.funding.fees import fee_evidence_status
 from smart_money_radar.funding.strategy_synchronized_funding import (
     FundingSettlementPlanner,
     STRATEGY_NAME,
@@ -32,6 +37,11 @@ from smart_money_radar.funding.venue_capabilities import (
 )
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.funding.service import active_default_funding_clients
+from smart_money_radar.funding.stablecoins import (
+    StablecoinPrice,
+    StaticStablecoinPriceProvider,
+    evaluate_stablecoin_route,
+)
 from smart_money_radar.paper_bot.accounting import executable_paper_pnl
 from smart_money_radar.paper_bot.cycle_manager import evaluate_hold_history_reliability
 from smart_money_radar.paper_bot.execution import entry_fill_state
@@ -54,8 +64,11 @@ def _trusted_fee_evidence(venue: str, observed_at: str) -> dict:
         "liquidity_role": "taker",
         "observed_at": observed_at,
         "reviewed_at": observed_at,
+        "environment": "mainnet",
         "market_type": "linear_perpetual",
+        "product_type": "linear_perpetual",
         "applicability": "taker",
+        "evidence_version": "test-fee-evidence-v1",
     }
 
 
@@ -3853,6 +3866,47 @@ def test_venue_cash_matches_venue_ledger_delta_after_close(tmp_path) -> None:
     assert sum(float(row["cash_delta"]) for row in price_rows) == pytest.approx(close["paper_price_pnl"])
 
 
+def test_account_consistency_repairs_reserve_ledger_without_margin_delta(tmp_path) -> None:
+    from smart_money_radar.paper_bot.accounting import collateral_reserve_event_key, make_ledger_entry
+
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance"], 10_000.0)
+    store.upsert_paper_event_ledger(
+        make_ledger_entry(
+            collateral_reserve_event_key("pos-reserve", "binance"),
+            position_id="pos-reserve",
+            venue="binance",
+            event_type="collateral_reserve",
+            cash_delta=0.0,
+            payload={"amount": 625.0},
+        )
+    )
+
+    assert not store.paper_account_consistency_report()["ok"]
+    first = store.repair_paper_account_consistency()
+    second = store.repair_paper_account_consistency()
+
+    assert first["repaired"]
+    assert second["ok"]
+    assert store.funding_paper_account_rows()[0]["reserved_margin"] == pytest.approx(625.0)
+
+
+def test_account_consistency_repairs_margin_delta_without_ledger(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance"], 10_000.0)
+    store.update_funding_paper_account_reserved("binance", 625.0)
+
+    assert not store.paper_account_consistency_report()["ok"]
+    first = store.repair_paper_account_consistency()
+    second = store.repair_paper_account_consistency()
+
+    assert first["repaired"]
+    assert second["ok"]
+    assert store.funding_paper_account_rows()[0]["reserved_margin"] == pytest.approx(0.0)
+
+
 def test_current_executable_pnl_requires_full_ioc_depth(tmp_path) -> None:
     from smart_money_radar.funding.trader import PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
@@ -4337,6 +4391,150 @@ def _seed_attempt_observations(bot, route: dict, now: datetime) -> None:
         _valid_v2_observation(now - timedelta(seconds=20 - index * 2), settlement)
         for index in range(9)
     ]
+
+
+def _seed_entry_submitted_attempt(
+    store: SQLiteStore,
+    now: datetime,
+    *,
+    reserve: bool = False,
+    order_sides: tuple[str, ...] = (),
+) -> tuple[str, str, dict]:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2, capture_position_id_for_route
+
+    route = _v2_runtime_route(now)
+    capture_id = capture_position_id_for_route(route)
+    settlement_at = now + timedelta(seconds=30)
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False, target_notional_per_leg=500.0).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route_plan = runtime._plan_dict_for_route(route, now)
+    runtime._ensure_discovered_or_armed(route, capture_id, settlement_at, 30.0, now)
+    runtime._mark_armed(route, capture_id, settlement_at, now, route_plan, {"passed": True})
+    attempt_id = "entry-recovery-attempt"
+    runtime._mark_entry_attempt_submitted(
+        capture_id=capture_id,
+        route=route,
+        attempt_id=attempt_id,
+        settlement_at=settlement_at,
+        decision_at=now,
+    )
+    store.update_funding_capture_position_state(capture_id, "ENTRY_SUBMITTED", now)
+    if reserve:
+        runtime._reserve_collateral(capture_id, route, attempt_id=attempt_id)
+    for side in order_sides:
+        leg = next(leg for leg in route["legs"] if leg["side"] == side)
+        order_id = f"{attempt_id}:entry:{side}"
+        store.upsert_funding_paper_order(
+            {
+                "paper_order_id": order_id,
+                "position_id": capture_id,
+                "cycle_id": f"{capture_id}:1",
+                "leg_side": side,
+                "order_intent": "ENTRY",
+                "venue": leg["venue"],
+                "symbol": leg["symbol"],
+                "decision_at": now.isoformat(),
+                "submitted_at": now.isoformat(),
+                "acknowledged_at": now.isoformat(),
+                "filled_at": (now + timedelta(seconds=1)).isoformat(),
+                "filled_quantity": 4.99,
+                "average_fill_price": 100.0,
+                "fee": 0.25,
+                "state": "FILLED",
+                "payload": {"attempt_id": attempt_id},
+            }
+        )
+    return capture_id, attempt_id, route
+
+
+def test_entry_submitted_recovery_aborts_without_reserve_or_orders(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    capture_id, _attempt_id, _route = _seed_entry_submitted_attempt(store, now)
+
+    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now + timedelta(seconds=5)))
+
+    position = store.funding_capture_position_by_id(capture_id)
+    assert bot.last_runtime_recovery["entry_submitted"]["recovered_aborted"] == 1
+    assert position["state"] == "FAILED"
+    assert position["config"]["entry_attempt_state"] == "RECOVERED_ABORTED"
+    assert store.funding_paper_order_rows(capture_id) == []
+
+
+def test_entry_submitted_recovery_releases_reserve_without_orders(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    capture_id, _attempt_id, _route = _seed_entry_submitted_attempt(store, now, reserve=True)
+
+    PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now + timedelta(seconds=5)))
+
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "FAILED"
+    assert [row for row in store.paper_event_ledger_rows(capture_id) if row["event_type"] == "collateral_release"]
+    assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
+
+
+def test_entry_submitted_recovery_unwinds_one_leg_exposure(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    capture_id, _attempt_id, _route = _seed_entry_submitted_attempt(
+        store,
+        now,
+        reserve=True,
+        order_sides=("long",),
+    )
+
+    PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now + timedelta(seconds=5)))
+
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "FAILED"
+    orders = store.funding_paper_order_rows(capture_id)
+    assert {order["order_intent"] for order in orders} >= {"ENTRY", "UNWIND"}
+    assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
+
+
+def test_entry_submitted_recovery_completes_open_after_both_legs_filled(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    capture_id, _attempt_id, _route = _seed_entry_submitted_attempt(
+        store,
+        now,
+        reserve=True,
+        order_sides=("long", "short"),
+    )
+
+    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now + timedelta(seconds=5)))
+    second = bot.synchronized_runtime.recover_stale_entry_submissions(now + timedelta(seconds=6))
+
+    position = store.funding_capture_position_by_id(capture_id)
+    assert bot.last_runtime_recovery["entry_submitted"]["recovered_open"] == 1
+    assert second["processed"] == 0
+    assert position["state"] == "OPEN"
+    assert [row["event_type"] for row in store.paper_event_ledger_rows(capture_id)].count("order_fee") == 2
 
 
 def test_failed_attempt_cannot_resurrect(tmp_path, monkeypatch) -> None:
@@ -4904,6 +5102,99 @@ def test_numeric_fee_without_provenance_blocks_armed(tmp_path) -> None:
     assert store.funding_capture_position_by_id(capture_id)["state"] == "DISCOVERED"
 
 
+def _fee_status_market(now: datetime, venue: str = "binance") -> dict:
+    return {
+        "venue": venue,
+        "environment": "mainnet",
+        "market_type": "linear_perpetual",
+        "product_type": "linear_perpetual",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "configured_trusted_fee",
+        "fee_evidence": _trusted_fee_evidence(venue, now.isoformat()),
+    }
+
+
+def test_trusted_looking_fee_source_without_evidence_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+    market.pop("fee_evidence")
+    market["fee_source"] = "venue_public_tier"
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert not status["verified"]
+    assert status["blocker"] == "taker_fee_evidence_missing"
+
+
+def test_fee_evidence_venue_mismatch_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+    market["fee_evidence"]["venue"] = "bybit"
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert not status["verified"]
+    assert status["blocker"] == "taker_fee_venue_mismatch"
+
+
+def test_fee_evidence_role_mismatch_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+    market["fee_evidence"]["liquidity_role"] = "maker"
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert not status["verified"]
+    assert status["blocker"] == "taker_fee_role_mismatch"
+
+
+def test_fee_evidence_product_environment_mismatch_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    env_market = _fee_status_market(now)
+    env_market["fee_evidence"]["environment"] = "testnet"
+    product_market = _fee_status_market(now)
+    product_market["fee_evidence"]["product_type"] = "spot"
+
+    env_status = fee_evidence_status(env_market, "taker", now=now)
+    product_status = fee_evidence_status(product_market, "taker", now=now)
+
+    assert env_status["blocker"] == "taker_fee_environment_mismatch"
+    assert product_status["blocker"] == "taker_fee_product_mismatch"
+
+
+def test_fee_evidence_stale_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    stale = now - timedelta(days=31)
+    market = _fee_status_market(now)
+    market["fee_evidence"]["observed_at"] = stale.isoformat()
+    market["fee_evidence"]["reviewed_at"] = stale.isoformat()
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert not status["verified"]
+    assert status["blocker"] == "taker_fee_evidence_stale"
+
+
+def test_out_of_range_fee_blocks_without_clamp() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+    market["taker_fee_rate"] = 0.5
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert not status["verified"]
+    assert status["rate"] == pytest.approx(0.5)
+    assert status["blocker"] == "taker_fee_rate_out_of_range"
+
+
+def test_full_explicit_trusted_fee_fixture_passes() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    status = fee_evidence_status(_fee_status_market(now), "taker", now=now)
+
+    assert status["verified"]
+    assert status["blocker"] is None
+
+
 def test_missing_endpoint_identity_blocks_armed(tmp_path) -> None:
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
@@ -4933,18 +5224,33 @@ def test_missing_endpoint_identity_blocks_armed(tmp_path) -> None:
 
 def test_cross_stable_requires_fresh_snapshot_and_can_open_with_peg_guard(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    provider = StaticStablecoinPriceProvider(
+        {
+            "USDT": [
+                StablecoinPrice("USDT", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDT", 1.0001, "source-b", now.isoformat(), now.isoformat()),
+            ],
+            "USDC": [
+                StablecoinPrice("USDC", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDC", 1.0001, "source-b", now.isoformat(), now.isoformat()),
+            ],
+        }
+    )
     stale_route = _v2_runtime_route(now)
     stale_route["legs"][1]["collateral_asset"] = "USDC"
     stale_route["legs"][1]["quote_asset"] = "USDC"
-    stale_route["legs"][0]["stablecoin_route_evaluation"] = {
-        "status": "PASS",
-        "cross_stable": True,
-        "observed_at": (now - timedelta(seconds=10)).isoformat(),
-        "expires_at": (now + timedelta(seconds=30)).isoformat(),
-        "source": "test-stablecoin-cache",
-        "stablecoin_reserve_usd": 0.05,
-        "prices": {"USDT": 1.0, "USDC": 1.0},
-    }
+    stale_snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    stale_snapshot["observed_at"] = (now - timedelta(seconds=10)).isoformat()
+    stale_snapshot["expires_at"] = (now + timedelta(seconds=30)).isoformat()
+    stale_route["legs"][0]["stablecoin_route_evaluation"] = stale_snapshot
     stale_plan = build_settlement_capture_opportunity(
         long_market=stale_route["legs"][0],
         short_market=stale_route["legs"][1],
@@ -4956,15 +5262,16 @@ def test_cross_stable_requires_fresh_snapshot_and_can_open_with_peg_guard(tmp_pa
     fresh_route = _v2_runtime_route(now)
     fresh_route["legs"][1]["collateral_asset"] = "USDC"
     fresh_route["legs"][1]["quote_asset"] = "USDC"
-    snapshot = {
-        "status": "PASS",
-        "cross_stable": True,
-        "observed_at": now.isoformat(),
-        "expires_at": (now + timedelta(seconds=30)).isoformat(),
-        "source": "test-stablecoin-cache",
-        "stablecoin_reserve_usd": 0.05,
-        "prices": {"USDT": 1.0, "USDC": 1.0},
-    }
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    assert snapshot["status"] == "PASS"
     fresh_route["legs"][0]["stablecoin_route_evaluation"] = snapshot
     fresh_route["legs"][1]["stablecoin_route_evaluation"] = snapshot
     store, bot = _paper_bot_for_route(tmp_path, now)
@@ -4974,6 +5281,109 @@ def test_cross_stable_requires_fresh_snapshot_and_can_open_with_peg_guard(tmp_pa
     monkeypatch.setattr(trader_module, "build_position_from_route", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")))
     opened = bot.process_entry_candidates([fresh_route], recheck_before_open=False)
     assert opened
+
+
+def _stablecoin_provider_for(now: datetime, *, disagreement: bool = False) -> StaticStablecoinPriceProvider:
+    if disagreement:
+        usdt_prices = [
+            StablecoinPrice("USDT", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+            StablecoinPrice("USDT", 1.0100, "source-b", now.isoformat(), now.isoformat()),
+        ]
+    else:
+        usdt_prices = [
+            StablecoinPrice("USDT", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+            StablecoinPrice("USDT", 1.0001, "source-b", now.isoformat(), now.isoformat()),
+        ]
+    return StaticStablecoinPriceProvider(
+        {
+            "USDT": usdt_prices,
+            "USDC": [
+                StablecoinPrice("USDC", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDC", 1.0001, "source-b", now.isoformat(), now.isoformat()),
+            ],
+        }
+    )
+
+
+def _cross_stable_plan_with_snapshot(now: datetime, snapshot: dict) -> dict:
+    route = _v2_runtime_route(now)
+    route["legs"][1]["collateral_asset"] = "USDC"
+    route["legs"][1]["quote_asset"] = "USDC"
+    route["legs"][0]["stablecoin_route_evaluation"] = snapshot
+    route["legs"][1]["stablecoin_route_evaluation"] = snapshot
+    return build_settlement_capture_opportunity(
+        long_market=route["legs"][0],
+        short_market=route["legs"][1],
+        now=now,
+        target_notional=500.0,
+    )
+
+
+def test_stablecoin_wrong_pair_snapshot_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDC",
+        short_collateral="USDT",
+        provider=_stablecoin_provider_for(now),
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    plan = _cross_stable_plan_with_snapshot(now, snapshot)
+
+    assert "stablecoin_snapshot_pair_mismatch" in plan["blockers"]
+
+
+def test_stablecoin_expired_snapshot_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=_stablecoin_provider_for(now),
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    snapshot["expires_at"] = (now - timedelta(seconds=1)).isoformat()
+    plan = _cross_stable_plan_with_snapshot(now, snapshot)
+
+    assert "stablecoin_snapshot_expired" in plan["blockers"]
+
+
+def test_stablecoin_missing_identity_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=_stablecoin_provider_for(now),
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    snapshot.pop("source_identity", None)
+    plan = _cross_stable_plan_with_snapshot(now, snapshot)
+
+    assert "stablecoin_snapshot_source_missing" in plan["blockers"]
+
+
+def test_stablecoin_source_disagreement_blocks() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=_stablecoin_provider_for(now, disagreement=True),
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    plan = _cross_stable_plan_with_snapshot(now, snapshot)
+
+    assert "stablecoin_cross_source_disagreement" in snapshot["blockers"]
+    assert "stablecoin_snapshot_not_pass" in plan["blockers"]
 
 
 def test_focused_recheck_does_not_run_venue_wide_hot_path(tmp_path, monkeypatch) -> None:
@@ -5067,6 +5477,169 @@ def test_boundary_is_recorded_before_hard_stale_exit_and_reconciles_after_close(
     assert store.funding_capture_position_by_id(capture_id)["state"] == "RECONCILED"
 
 
+def _boundary_rows_from_cycle_plan(position: dict, cycle: dict, crossed_at: datetime) -> list[dict]:
+    rows: list[dict] = []
+    scheduled = cycle["scheduled_funding_at"]
+    for event in (cycle.get("active_plan") or {}).get("included_settlement_events") or []:
+        leg_id = str(event.get("leg_id") or "")
+        side = "long" if ":long" in leg_id else "short"
+        rows.append(
+            {
+                "position_id": position["position_id"],
+                "cycle_id": cycle["cycle_id"],
+                "venue": event["venue"],
+                "symbol": event["symbol"],
+                "side": side,
+                "scheduled_funding_at": scheduled,
+                "status": "PENDING",
+                "confirmed_funding_rate": None,
+                "settlement_mark_price": None,
+                "funding_pnl": None,
+                "rate_status": None,
+                "mark_status": None,
+                "evidence": {
+                    "lifecycle_state": "BOUNDARY_CROSSED",
+                    "boundary_crossed_at": crossed_at.isoformat(),
+                    "planned_event": event,
+                },
+            }
+        )
+    return rows
+
+
+@pytest.mark.parametrize(
+    "fault_after",
+    [
+        "first_obligation",
+        "all_obligations",
+        "cycle_state",
+        "before_position_counter",
+        "position_counter",
+    ],
+)
+def test_boundary_atomic_fault_retries_to_single_capture(tmp_path, monkeypatch, fault_after) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    position = store.funding_capture_position_by_id(capture_id)
+    cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    crossed_at = now + timedelta(seconds=31)
+    rows = _boundary_rows_from_cycle_plan(position, cycle, crossed_at)
+
+    with pytest.raises(RuntimeError):
+        store.apply_settlement_boundary(
+            position_id=capture_id,
+            cycle_id=cycle["cycle_id"],
+            expected_obligation_count=2,
+            reconciliation_rows=rows,
+            boundary_evidence={"fault_after": fault_after},
+            position_config_update={"boundary_crossed_at": crossed_at.isoformat()},
+            now=crossed_at,
+            fault_after=fault_after,
+        )
+
+    assert store.funding_settlement_reconciliation_rows(capture_id) == []
+    assert store.funding_capture_cycles_for_position(capture_id)[0]["state"] == "OPEN"
+    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
+
+    restarted = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(crossed_at),
+    )
+    _install_targeted_refresh_clients(restarted, route["route_key"], route)
+    restarted.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, crossed_at)
+    assert restarted.process_open_positions() == ["settlement_crossed"]
+    assert len(store.funding_settlement_reconciliation_rows(capture_id)) == 2
+    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 1
+    assert restarted.process_open_positions() == []
+    assert len(store.funding_settlement_reconciliation_rows(capture_id)) == 2
+    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 1
+
+
+def test_boundary_recovery_repairs_legacy_obligations_plus_uncrossed_cycle(tmp_path, monkeypatch) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, _bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    position = store.funding_capture_position_by_id(capture_id)
+    cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    crossed_at = now + timedelta(seconds=31)
+    for row in _boundary_rows_from_cycle_plan(position, cycle, crossed_at):
+        store.upsert_funding_settlement_reconciliation(row)
+
+    restarted = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(crossed_at),
+    )
+
+    assert restarted.last_runtime_recovery["boundary"]["cycles_completed_from_obligations"] == 1
+    assert store.funding_capture_cycles_for_position(capture_id)[0]["state"] == "SETTLEMENT_CROSSED"
+    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 1
+
+
+def test_zero_obligation_crossed_legacy_cycle_fails_closed(tmp_path, monkeypatch) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, _bot, _route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    store.update_funding_capture_cycle_state(
+        f"{capture_id}:1",
+        "SETTLEMENT_CROSSED",
+        now + timedelta(seconds=31),
+    )
+
+    restarted = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now + timedelta(seconds=31)),
+    )
+
+    assert restarted.last_runtime_recovery["boundary"]["zero_obligation_mismatches"] == 1
+    assert store.funding_capture_cycles_for_position(capture_id)[0]["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
+
+
+def test_active_cycle_event_mismatch_does_not_cross_or_create_obligations(tmp_path, monkeypatch) -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    plan = dict(cycle["active_plan"])
+    events = [dict(event) for event in plan["included_settlement_events"]]
+    events[0]["scheduled_at"] = (now + timedelta(seconds=33)).isoformat()
+    plan["included_settlement_events"] = events
+    plan["expected_event_count"] = 2
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE funding_capture_cycles
+            SET active_plan_json = ?
+            WHERE cycle_id = ?
+            """,
+            (json.dumps(plan, sort_keys=True), cycle["cycle_id"]),
+        )
+    bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
+
+    outcomes = bot.process_open_positions()
+
+    assert outcomes == ["settlement_plan_mismatch"]
+    assert store.funding_settlement_reconciliation_rows(capture_id) == []
+    updated_cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    assert updated_cycle["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert updated_cycle["boundary_evidence"]["blocker"] == "settlement_plan_event_mismatch"
+    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
+
+
 def test_restart_between_boundary_and_reconciliation_preserves_obligation(tmp_path, monkeypatch) -> None:
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
@@ -5103,6 +5676,36 @@ def test_restart_between_boundary_and_reconciliation_preserves_obligation(tmp_pa
     rows = store.funding_settlement_reconciliation_rows(capture_id)
     assert result["reconciled"] == 2
     assert {row["status"] for row in rows} == {"RATE_AND_MARK_RECONCILED"}
+
+
+def test_two_cycle_paper_mvp_script_reaches_reconciled_state() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(repo_root)}
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_synchronized_funding_two_cycle_paper_mvp.py"),
+        ],
+        cwd=repo_root,
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    events = {line["event"]: line for line in lines}
+
+    assert events["hold"]["active_plan_generation"] == 2
+    assert events["cycle_1_boundary"]["obligation_count"] == 2
+    assert events["cycle_2_boundary"]["obligation_count"] == 2
+    final = events["reconcile"]
+    assert final["final_state"] == "RECONCILED"
+    assert final["settlements_captured_count"] == 2
+    assert final["cycle_1_obligation_count"] == 2
+    assert final["cycle_2_obligation_count"] == 2
+    assert final["total_funding_ledger_count"] == 4
+    assert final["ledger_account_consistency"]["ok"] is True
+    assert final["repeat_reconciliation"]["processed"] == 0
 
 
 def test_risk_close_before_boundary_creates_no_settlement_accrual(tmp_path, monkeypatch) -> None:

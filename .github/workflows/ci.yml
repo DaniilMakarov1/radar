@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - review/synchronized-funding-v2-qwen-20260728-075432
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+      - name: Compile check
+        run: |
+          python -m py_compile \
+            smart_money_radar/paper_bot/runtime_v2.py \
+            smart_money_radar/funding/trader.py \
+            smart_money_radar/funding/strategy_synchronized_funding.py \
+            smart_money_radar/funding/stablecoins.py \
+            smart_money_radar/funding/fees.py \
+            smart_money_radar/storage.py
+      - name: Targeted synchronized funding tests
+        run: python -m pytest tests/test_synchronized_funding_v2.py -q
+      - name: Reconciliation tests
+        run: python -m pytest tests/test_reconciliation_worker.py -q
+      - name: Full pytest suite
+        run: python -m pytest -q
+      - name: Single-cycle paper MVP scenario
+        run: python scripts/run_synchronized_funding_paper_mvp.py
+      - name: Two-cycle paper MVP scenario
+        run: python scripts/run_synchronized_funding_two_cycle_paper_mvp.py
+      - name: Diff check
+        run: git diff --check

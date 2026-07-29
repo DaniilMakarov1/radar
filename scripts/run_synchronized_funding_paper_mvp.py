@@ -23,8 +23,11 @@ def trusted_fee_evidence(venue: str, observed_at: str) -> dict[str, Any]:
         "liquidity_role": "taker",
         "observed_at": observed_at,
         "reviewed_at": observed_at,
+        "environment": "mainnet",
         "market_type": "linear_perpetual",
+        "product_type": "linear_perpetual",
         "applicability": "taker",
+        "evidence_version": "fixture-fee-evidence-v1",
     }
 
 

@@ -126,6 +126,7 @@ class SQLiteStore:
             connection.execute("PRAGMA synchronous = NORMAL")
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             self._ensure_funding_paper_position_columns(connection)
+            self._ensure_funding_capture_cycle_columns(connection)
             self._ensure_funding_shadow_columns(connection)
             self.upsert_chains(connection, CHAINS)
 
@@ -142,6 +143,24 @@ class SQLiteStore:
             if name not in columns:
                 connection.execute(
                     f"ALTER TABLE funding_paper_positions ADD COLUMN {name} REAL"
+                )
+
+    def _ensure_funding_capture_cycle_columns(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(funding_capture_cycles)")
+        }
+        specs = {
+            "plan_generation": "INTEGER NOT NULL DEFAULT 0",
+            "active_plan_json": "TEXT NOT NULL DEFAULT '{}'",
+            "boundary_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, spec in specs.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE funding_capture_cycles ADD COLUMN {name} {spec}"
                 )
 
     def _ensure_funding_shadow_columns(self, connection: sqlite3.Connection) -> None:
@@ -323,6 +342,14 @@ class SQLiteStore:
             row.get("cycle_id")
             or f"{row['position_id']}:{row['cycle_number']}"
         )
+        active_plan_json = json.dumps(
+            row.get("active_plan", row.get("active_plan_json", {})),
+            sort_keys=True,
+        )
+        boundary_evidence_json = json.dumps(
+            row.get("boundary_evidence", row.get("boundary_evidence_json", {})),
+            sort_keys=True,
+        )
         with self.connect() as connection:
             connection.execute(
                 """
@@ -330,6 +357,7 @@ class SQLiteStore:
                     cycle_id,
                     position_id,
                     cycle_number,
+                    plan_generation,
                     scheduled_funding_at,
                     long_next_funding_rate_at_decision,
                     short_next_funding_rate_at_decision,
@@ -349,11 +377,14 @@ class SQLiteStore:
                     settlement_crossed_at,
                     reconciliation_status,
                     reconciled_funding_pnl,
+                    active_plan_json,
+                    boundary_evidence_json,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_id, cycle_number) DO UPDATE SET
+                    plan_generation = excluded.plan_generation,
                     scheduled_funding_at = excluded.scheduled_funding_at,
                     long_next_funding_rate_at_decision = excluded.long_next_funding_rate_at_decision,
                     short_next_funding_rate_at_decision = excluded.short_next_funding_rate_at_decision,
@@ -373,12 +404,21 @@ class SQLiteStore:
                     settlement_crossed_at = excluded.settlement_crossed_at,
                     reconciliation_status = excluded.reconciliation_status,
                     reconciled_funding_pnl = excluded.reconciled_funding_pnl,
+                    active_plan_json = CASE
+                        WHEN excluded.active_plan_json != '{}' THEN excluded.active_plan_json
+                        ELSE funding_capture_cycles.active_plan_json
+                    END,
+                    boundary_evidence_json = CASE
+                        WHEN excluded.boundary_evidence_json != '{}' THEN excluded.boundary_evidence_json
+                        ELSE funding_capture_cycles.boundary_evidence_json
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
                     cycle_id,
                     row["position_id"],
                     int(row["cycle_number"]),
+                    int(row.get("plan_generation") or row.get("cycle_number") or 0),
                     row["scheduled_funding_at"],
                     row.get("long_next_funding_rate_at_decision"),
                     row.get("short_next_funding_rate_at_decision"),
@@ -398,6 +438,8 @@ class SQLiteStore:
                     row.get("settlement_crossed_at"),
                     row.get("reconciliation_status", "PENDING"),
                     row.get("reconciled_funding_pnl"),
+                    active_plan_json,
+                    boundary_evidence_json,
                     row.get("created_at", now),
                     now,
                 ),
@@ -520,6 +562,530 @@ class SQLiteStore:
             output.append(item)
         return output
 
+    def reconciliation_rows_by_status(self, statuses: set[str]) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM funding_settlement_reconciliations
+                WHERE status IN ({placeholders})
+                ORDER BY scheduled_funding_at, venue
+                """,
+                sorted(statuses),
+            ).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            output.append(item)
+        return output
+
+    def apply_settlement_boundary(
+        self,
+        *,
+        position_id: str,
+        cycle_id: str,
+        expected_obligation_count: int,
+        reconciliation_rows: list[dict[str, Any]],
+        boundary_evidence: dict[str, Any],
+        position_config_update: dict[str, Any],
+        now: datetime,
+        position_state: str = "SETTLEMENT_CROSSED",
+        fault_after: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist obligations, cycle boundary state, and position counter atomically."""
+        if expected_obligation_count <= 0 or not reconciliation_rows:
+            raise ValueError("settlement boundary requires non-empty expected obligations")
+        now_iso = now.astimezone(UTC).replace(microsecond=0).isoformat()
+        evidence_json = json.dumps(boundary_evidence, sort_keys=True)
+        with self.connect() as connection:
+            inserted = 0
+            for index, row in enumerate(reconciliation_rows, start=1):
+                reconciliation_id = str(
+                    row.get("reconciliation_id")
+                    or ":".join(
+                        [
+                            str(row["position_id"]),
+                            str(row["venue"]),
+                            str(row["scheduled_funding_at"]),
+                        ]
+                    )
+                )
+                row_evidence_json = json.dumps(
+                    row.get("evidence", row.get("evidence_json", {})),
+                    sort_keys=True,
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO funding_settlement_reconciliations (
+                        reconciliation_id,
+                        position_id,
+                        cycle_id,
+                        venue,
+                        symbol,
+                        side,
+                        scheduled_funding_at,
+                        status,
+                        confirmed_funding_rate,
+                        settlement_mark_price,
+                        funding_pnl,
+                        rate_status,
+                        mark_status,
+                        evidence_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(position_id, venue, scheduled_funding_at) DO UPDATE SET
+                        cycle_id = excluded.cycle_id,
+                        symbol = excluded.symbol,
+                        side = excluded.side,
+                        status = excluded.status,
+                        confirmed_funding_rate = excluded.confirmed_funding_rate,
+                        settlement_mark_price = excluded.settlement_mark_price,
+                        funding_pnl = excluded.funding_pnl,
+                        rate_status = excluded.rate_status,
+                        mark_status = excluded.mark_status,
+                        evidence_json = excluded.evidence_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        reconciliation_id,
+                        row["position_id"],
+                        row.get("cycle_id"),
+                        row["venue"],
+                        row["symbol"],
+                        row["side"],
+                        row["scheduled_funding_at"],
+                        row.get("status", "PENDING"),
+                        row.get("confirmed_funding_rate"),
+                        row.get("settlement_mark_price"),
+                        row.get("funding_pnl"),
+                        row.get("rate_status"),
+                        row.get("mark_status"),
+                        row_evidence_json,
+                        row.get("created_at", now_iso),
+                        now_iso,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    inserted += 1
+                if fault_after == "first_obligation" and index == 1:
+                    raise RuntimeError("fault_after_first_obligation")
+            if fault_after == "all_obligations":
+                raise RuntimeError("fault_after_all_obligations")
+            actual_obligations = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM funding_settlement_reconciliations
+                WHERE position_id = ? AND cycle_id = ?
+                """,
+                (position_id, cycle_id),
+            ).fetchone()[0]
+            if int(actual_obligations) != int(expected_obligation_count):
+                raise ValueError(
+                    f"settlement obligation count mismatch {actual_obligations}!={expected_obligation_count}"
+                )
+            connection.execute(
+                """
+                UPDATE funding_capture_cycles
+                SET state = 'SETTLEMENT_CROSSED',
+                    settlement_crossed_at = COALESCE(settlement_crossed_at, ?),
+                    boundary_evidence_json = ?,
+                    updated_at = ?
+                WHERE cycle_id = ?
+                """,
+                (now_iso, evidence_json, now_iso, cycle_id),
+            )
+            if fault_after == "cycle_state":
+                raise RuntimeError("fault_after_cycle_state")
+            if fault_after == "before_position_counter":
+                raise RuntimeError("fault_after_before_position_counter")
+            row = connection.execute(
+                """
+                SELECT config_json
+                FROM funding_capture_positions
+                WHERE position_id = ?
+                """,
+                (position_id,),
+            ).fetchone()
+            current_config = json.loads(row["config_json"] or "{}") if row else {}
+            current_config.update(position_config_update)
+            captured_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM funding_capture_cycles
+                WHERE position_id = ?
+                  AND (
+                    settlement_crossed_at IS NOT NULL
+                    OR state IN (
+                        'SETTLEMENT_CROSSED',
+                        'PUBLIC_RATE_CONFIRMED',
+                        'RATE_AND_MARK_RECONCILED',
+                        'RECONCILED',
+                        'UNRECONCILED'
+                    )
+                  )
+                """,
+                (position_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                UPDATE funding_capture_positions
+                SET state = ?,
+                    config_json = ?,
+                    settlements_captured_count = MAX(settlements_captured_count, ?),
+                    updated_at = ?
+                WHERE position_id = ?
+                """,
+                (
+                    position_state,
+                    json.dumps(current_config, sort_keys=True),
+                    int(captured_count),
+                    now_iso,
+                    position_id,
+                ),
+            )
+            if fault_after == "position_counter":
+                raise RuntimeError("fault_after_position_counter")
+        return {
+            "position_id": position_id,
+            "cycle_id": cycle_id,
+            "expected_obligation_count": int(expected_obligation_count),
+            "actual_obligation_count": int(expected_obligation_count),
+            "inserted_obligation_count": inserted,
+            "settlements_captured_count": int(captured_count),
+        }
+
+    def activate_funding_capture_hold_cycle(
+        self,
+        *,
+        cycle_row: dict[str, Any],
+        active_config: dict[str, Any],
+        now: datetime,
+        paper_net_pnl_estimated: float | None = None,
+    ) -> str:
+        """Atomically create the next active HOLD cycle and switch position state."""
+        now_iso = now.astimezone(UTC).replace(microsecond=0).isoformat()
+        position_id = str(cycle_row["position_id"])
+        cycle_id = str(
+            cycle_row.get("cycle_id")
+            or f"{position_id}:{int(cycle_row['cycle_number'])}"
+        )
+        active_plan_json = json.dumps(
+            cycle_row.get("active_plan", cycle_row.get("active_plan_json", {})),
+            sort_keys=True,
+        )
+        boundary_evidence_json = json.dumps(
+            cycle_row.get("boundary_evidence", cycle_row.get("boundary_evidence_json", {})),
+            sort_keys=True,
+        )
+        assignments = [
+            "state = 'HOLDING_NEXT_CYCLE'",
+            "config_json = ?",
+            "updated_at = ?",
+        ]
+        parameters: list[Any] = [json.dumps(active_config, sort_keys=True), now_iso]
+        if paper_net_pnl_estimated is not None:
+            assignments.append("paper_net_pnl_estimated = ?")
+            parameters.append(float(paper_net_pnl_estimated))
+        parameters.append(position_id)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_capture_cycles (
+                    cycle_id,
+                    position_id,
+                    cycle_number,
+                    plan_generation,
+                    scheduled_funding_at,
+                    long_next_funding_rate_at_decision,
+                    short_next_funding_rate_at_decision,
+                    conservative_funding_gross,
+                    conservative_funding_edge_bps,
+                    hold_basis_reserve_bps,
+                    hold_legging_reserve_bps,
+                    hold_time_reserve_bps,
+                    hold_liquidity_reserve_bps,
+                    incremental_hold_cost,
+                    incremental_hold_net_pnl,
+                    hold_cost_coverage_ratio,
+                    paper_net_if_exit_at_decision,
+                    decision,
+                    decision_reason,
+                    state,
+                    settlement_crossed_at,
+                    reconciliation_status,
+                    reconciled_funding_pnl,
+                    active_plan_json,
+                    boundary_evidence_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(position_id, cycle_number) DO UPDATE SET
+                    plan_generation = excluded.plan_generation,
+                    scheduled_funding_at = excluded.scheduled_funding_at,
+                    long_next_funding_rate_at_decision = excluded.long_next_funding_rate_at_decision,
+                    short_next_funding_rate_at_decision = excluded.short_next_funding_rate_at_decision,
+                    conservative_funding_gross = excluded.conservative_funding_gross,
+                    conservative_funding_edge_bps = excluded.conservative_funding_edge_bps,
+                    hold_basis_reserve_bps = excluded.hold_basis_reserve_bps,
+                    hold_legging_reserve_bps = excluded.hold_legging_reserve_bps,
+                    hold_time_reserve_bps = excluded.hold_time_reserve_bps,
+                    hold_liquidity_reserve_bps = excluded.hold_liquidity_reserve_bps,
+                    incremental_hold_cost = excluded.incremental_hold_cost,
+                    incremental_hold_net_pnl = excluded.incremental_hold_net_pnl,
+                    hold_cost_coverage_ratio = excluded.hold_cost_coverage_ratio,
+                    paper_net_if_exit_at_decision = excluded.paper_net_if_exit_at_decision,
+                    decision = excluded.decision,
+                    decision_reason = excluded.decision_reason,
+                    state = excluded.state,
+                    settlement_crossed_at = excluded.settlement_crossed_at,
+                    reconciliation_status = excluded.reconciliation_status,
+                    reconciled_funding_pnl = excluded.reconciled_funding_pnl,
+                    active_plan_json = CASE
+                        WHEN excluded.active_plan_json != '{}' THEN excluded.active_plan_json
+                        ELSE funding_capture_cycles.active_plan_json
+                    END,
+                    boundary_evidence_json = CASE
+                        WHEN excluded.boundary_evidence_json != '{}' THEN excluded.boundary_evidence_json
+                        ELSE funding_capture_cycles.boundary_evidence_json
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cycle_id,
+                    position_id,
+                    int(cycle_row["cycle_number"]),
+                    int(cycle_row.get("plan_generation") or cycle_row.get("cycle_number") or 0),
+                    cycle_row["scheduled_funding_at"],
+                    cycle_row.get("long_next_funding_rate_at_decision"),
+                    cycle_row.get("short_next_funding_rate_at_decision"),
+                    cycle_row.get("conservative_funding_gross"),
+                    cycle_row.get("conservative_funding_edge_bps"),
+                    cycle_row.get("hold_basis_reserve_bps"),
+                    cycle_row.get("hold_legging_reserve_bps"),
+                    cycle_row.get("hold_time_reserve_bps"),
+                    cycle_row.get("hold_liquidity_reserve_bps"),
+                    cycle_row.get("incremental_hold_cost"),
+                    cycle_row.get("incremental_hold_net_pnl"),
+                    cycle_row.get("hold_cost_coverage_ratio"),
+                    cycle_row.get("paper_net_if_exit_at_decision"),
+                    cycle_row.get("decision", "HOLD"),
+                    cycle_row.get("decision_reason", "next_cycle_underwriting_passed"),
+                    cycle_row.get("state", "HOLDING_NEXT_CYCLE"),
+                    cycle_row.get("settlement_crossed_at"),
+                    cycle_row.get("reconciliation_status", "PENDING"),
+                    cycle_row.get("reconciled_funding_pnl"),
+                    active_plan_json,
+                    boundary_evidence_json,
+                    cycle_row.get("created_at", now_iso),
+                    now_iso,
+                ),
+            )
+            connection.execute(
+                f"""
+                UPDATE funding_capture_positions
+                SET {", ".join(assignments)}
+                WHERE position_id = ?
+                """,
+                parameters,
+            )
+        return cycle_id
+
+    def mark_settlement_plan_mismatch(
+        self,
+        *,
+        position_id: str,
+        cycle_id: str,
+        evidence: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        now_iso = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).isoformat()
+        evidence_json = json.dumps(evidence, sort_keys=True)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE funding_capture_cycles
+                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                    settlement_crossed_at = NULL,
+                    boundary_evidence_json = ?,
+                    updated_at = ?
+                WHERE cycle_id = ?
+                """,
+                (evidence_json, now_iso, cycle_id),
+            )
+            row = connection.execute(
+                """
+                SELECT config_json
+                FROM funding_capture_positions
+                WHERE position_id = ?
+                """,
+                (position_id,),
+            ).fetchone()
+            config = json.loads(row["config_json"] or "{}") if row else {}
+            diagnostics = list(config.get("settlement_plan_mismatches") or [])
+            diagnostics.append(evidence)
+            config["settlement_plan_mismatches"] = diagnostics[-10:]
+            config["lifecycle_state"] = "SETTLEMENT_PLAN_MISMATCH"
+            config["blocker"] = "settlement_plan_event_mismatch"
+            connection.execute(
+                """
+                UPDATE funding_capture_positions
+                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                    config_json = ?,
+                    updated_at = ?
+                WHERE position_id = ?
+                """,
+                (json.dumps(config, sort_keys=True), now_iso, position_id),
+            )
+
+    def repair_funding_capture_boundary_consistency(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Repair legacy boundary partial writes without creating synthetic funding."""
+        now_iso = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).isoformat()
+        repaired_counts = 0
+        completed_cycles = 0
+        mismatches = 0
+        with self.connect() as connection:
+            positions = connection.execute(
+                "SELECT position_id, config_json FROM funding_capture_positions"
+            ).fetchall()
+            for pos in positions:
+                position_id = str(pos["position_id"])
+                cycles = connection.execute(
+                    """
+                    SELECT *
+                    FROM funding_capture_cycles
+                    WHERE position_id = ?
+                    ORDER BY cycle_number
+                    """,
+                    (position_id,),
+                ).fetchall()
+                for cycle in cycles:
+                    cycle_id = str(cycle["cycle_id"])
+                    state = str(cycle["state"] or "")
+                    obligation_count = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM funding_settlement_reconciliations
+                            WHERE position_id = ? AND cycle_id = ?
+                            """,
+                            (position_id, cycle_id),
+                        ).fetchone()[0]
+                    )
+                    expected = 0
+                    try:
+                        plan = json.loads(cycle["active_plan_json"] or "{}")
+                    except (TypeError, ValueError):
+                        plan = {}
+                    expected = int(plan.get("expected_event_count") or 0)
+                    crossed_like = (
+                        cycle["settlement_crossed_at"] is not None
+                        or state
+                        in {
+                            "SETTLEMENT_CROSSED",
+                            "PUBLIC_RATE_CONFIRMED",
+                            "RATE_AND_MARK_RECONCILED",
+                            "RECONCILED",
+                            "UNRECONCILED",
+                        }
+                    )
+                    if crossed_like and obligation_count == 0:
+                        evidence = {
+                            "repair": "zero_obligation_legacy_inconsistency",
+                            "cycle_id": cycle_id,
+                            "position_id": position_id,
+                            "active_plan_generation": cycle["plan_generation"],
+                            "expected_event_count": expected,
+                            "blocker": "settlement_plan_event_mismatch",
+                            "requires_review": True,
+                        }
+                        connection.execute(
+                            """
+                            UPDATE funding_capture_cycles
+                            SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                                settlement_crossed_at = NULL,
+                                boundary_evidence_json = ?,
+                                updated_at = ?
+                            WHERE cycle_id = ?
+                            """,
+                            (json.dumps(evidence, sort_keys=True), now_iso, cycle_id),
+                        )
+                        mismatches += 1
+                        continue
+                    if (
+                        obligation_count > 0
+                        and not crossed_like
+                        and expected > 0
+                        and obligation_count == expected
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE funding_capture_cycles
+                            SET state = 'SETTLEMENT_CROSSED',
+                                settlement_crossed_at = COALESCE(settlement_crossed_at, ?),
+                                updated_at = ?
+                            WHERE cycle_id = ?
+                            """,
+                            (now_iso, now_iso, cycle_id),
+                        )
+                        completed_cycles += 1
+                captured_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM funding_capture_cycles
+                        WHERE position_id = ?
+                          AND (
+                            settlement_crossed_at IS NOT NULL
+                            OR state IN (
+                                'SETTLEMENT_CROSSED',
+                                'PUBLIC_RATE_CONFIRMED',
+                                'RATE_AND_MARK_RECONCILED',
+                                'RECONCILED',
+                                'UNRECONCILED'
+                            )
+                          )
+                        """,
+                        (position_id,),
+                    ).fetchone()[0]
+                )
+                current_count = int(
+                    connection.execute(
+                        """
+                        SELECT settlements_captured_count
+                        FROM funding_capture_positions
+                        WHERE position_id = ?
+                        """,
+                        (position_id,),
+                    ).fetchone()[0]
+                )
+                if captured_count != current_count:
+                    connection.execute(
+                        """
+                        UPDATE funding_capture_positions
+                        SET settlements_captured_count = ?,
+                            updated_at = ?
+                        WHERE position_id = ?
+                        """,
+                        (captured_count, now_iso, position_id),
+                    )
+                    repaired_counts += 1
+        return {
+            "position_counters_repaired": repaired_counts,
+            "cycles_completed_from_obligations": completed_cycles,
+            "zero_obligation_mismatches": mismatches,
+        }
+
     def funding_capture_cycles_for_position(
         self,
         position_id: str,
@@ -535,7 +1101,13 @@ class SQLiteStore:
                 """,
                 (position_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["active_plan"] = json.loads(item.pop("active_plan_json") or "{}")
+            item["boundary_evidence"] = json.loads(item.pop("boundary_evidence_json") or "{}")
+            output.append(item)
+        return output
 
     def reconciled_funding_capture_hold_cycles(
         self,
@@ -972,6 +1544,260 @@ class SQLiteStore:
             if cursor.rowcount == 0:
                 return None
         return event_key
+
+    def apply_paper_cash_event(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Insert a cash ledger row and apply its account effect atomically."""
+        now = utc_now_iso()
+        event_key = str(row["event_key"])
+        venue = str(row.get("venue") or "")
+        cash_delta = float(row.get("cash_delta", 0.0))
+        if cash_delta != 0.0 and not venue:
+            raise ValueError(f"cash-affecting paper ledger entry requires venue: {event_key}")
+        payload_json = json.dumps(row.get("payload", row.get("payload_json", {})), sort_keys=True)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO paper_event_ledger (
+                    event_key, position_id, cycle_id, venue,
+                    event_type, cash_delta, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    row.get("position_id"),
+                    row.get("cycle_id"),
+                    row.get("venue"),
+                    row["event_type"],
+                    cash_delta,
+                    payload_json,
+                    row.get("created_at", now),
+                ),
+            )
+            applied = cursor.rowcount == 1
+            if venue:
+                connection.execute(
+                    """
+                    INSERT INTO funding_paper_accounts (
+                        venue, starting_balance, cash_balance, reserved_margin,
+                        realized_pnl, updated_at
+                    )
+                    VALUES (?, 0, 0, 0, 0, ?)
+                    ON CONFLICT(venue) DO NOTHING
+                    """,
+                    (venue, now),
+                )
+            if applied and venue and cash_delta != 0.0:
+                connection.execute(
+                    """
+                    UPDATE funding_paper_accounts
+                    SET cash_balance = cash_balance + ?,
+                        realized_pnl = realized_pnl + ?,
+                        updated_at = ?
+                    WHERE venue = ?
+                    """,
+                    (cash_delta, cash_delta, now, venue),
+                )
+        return {"event_key": event_key, "applied": applied}
+
+    def apply_paper_reserve_event(
+        self,
+        row: dict[str, Any],
+        *,
+        reserve_delta: float,
+    ) -> dict[str, Any]:
+        """Insert a collateral ledger row and apply reserved_margin atomically."""
+        now = utc_now_iso()
+        event_key = str(row["event_key"])
+        venue = str(row.get("venue") or "")
+        if not venue:
+            raise ValueError(f"collateral paper ledger entry requires venue: {event_key}")
+        payload_json = json.dumps(row.get("payload", row.get("payload_json", {})), sort_keys=True)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO paper_event_ledger (
+                    event_key, position_id, cycle_id, venue,
+                    event_type, cash_delta, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    row.get("position_id"),
+                    row.get("cycle_id"),
+                    row.get("venue"),
+                    row["event_type"],
+                    float(row.get("cash_delta", 0.0)),
+                    payload_json,
+                    row.get("created_at", now),
+                ),
+            )
+            applied = cursor.rowcount == 1
+            connection.execute(
+                """
+                INSERT INTO funding_paper_accounts (
+                    venue, starting_balance, cash_balance, reserved_margin,
+                    realized_pnl, updated_at
+                )
+                VALUES (?, 0, 0, 0, 0, ?)
+                ON CONFLICT(venue) DO NOTHING
+                """,
+                (venue, now),
+            )
+            if applied and float(reserve_delta) != 0.0:
+                connection.execute(
+                    """
+                    UPDATE funding_paper_accounts
+                    SET reserved_margin = MAX(0, reserved_margin + ?),
+                        updated_at = ?
+                    WHERE venue = ?
+                    """,
+                    (float(reserve_delta), now, venue),
+                )
+        return {"event_key": event_key, "applied": applied}
+
+    def apply_reconciled_funding_effect(
+        self,
+        reconciliation_row: dict[str, Any],
+        ledger_row: dict[str, Any],
+        *,
+        fault_after: str | None = None,
+    ) -> dict[str, Any]:
+        """Store a reconciled funding leg, ledger row, and cash effect together."""
+        now = utc_now_iso()
+        event_key = str(ledger_row["event_key"])
+        venue = str(ledger_row.get("venue") or "")
+        cash_delta = float(ledger_row.get("cash_delta") or 0.0)
+        if not venue:
+            raise ValueError(f"funding reconciliation ledger entry requires venue: {event_key}")
+        evidence = dict(reconciliation_row.get("evidence") or {})
+        evidence["financial_effect"] = {
+            "event_key": event_key,
+            "event_type": ledger_row.get("event_type"),
+            "venue": venue,
+            "cash_delta": cash_delta,
+            "applied": True,
+            "applied_at": now,
+        }
+        reconciliation_id = str(
+            reconciliation_row.get("reconciliation_id")
+            or ":".join(
+                [
+                    str(reconciliation_row["position_id"]),
+                    venue,
+                    str(reconciliation_row["scheduled_funding_at"]),
+                ]
+            )
+        )
+        recon_evidence_json = json.dumps(evidence, sort_keys=True)
+        ledger_payload_json = json.dumps(
+            ledger_row.get("payload", ledger_row.get("payload_json", {})),
+            sort_keys=True,
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_settlement_reconciliations (
+                    reconciliation_id,
+                    position_id,
+                    cycle_id,
+                    venue,
+                    symbol,
+                    side,
+                    scheduled_funding_at,
+                    status,
+                    confirmed_funding_rate,
+                    settlement_mark_price,
+                    funding_pnl,
+                    rate_status,
+                    mark_status,
+                    evidence_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(position_id, venue, scheduled_funding_at) DO UPDATE SET
+                    cycle_id = excluded.cycle_id,
+                    symbol = excluded.symbol,
+                    side = excluded.side,
+                    status = excluded.status,
+                    confirmed_funding_rate = excluded.confirmed_funding_rate,
+                    settlement_mark_price = excluded.settlement_mark_price,
+                    funding_pnl = excluded.funding_pnl,
+                    rate_status = excluded.rate_status,
+                    mark_status = excluded.mark_status,
+                    evidence_json = excluded.evidence_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    reconciliation_id,
+                    reconciliation_row["position_id"],
+                    reconciliation_row.get("cycle_id"),
+                    venue,
+                    reconciliation_row["symbol"],
+                    reconciliation_row["side"],
+                    reconciliation_row["scheduled_funding_at"],
+                    reconciliation_row.get("status", "RATE_AND_MARK_RECONCILED"),
+                    reconciliation_row.get("confirmed_funding_rate"),
+                    reconciliation_row.get("settlement_mark_price"),
+                    reconciliation_row.get("funding_pnl"),
+                    reconciliation_row.get("rate_status"),
+                    reconciliation_row.get("mark_status"),
+                    recon_evidence_json,
+                    reconciliation_row.get("created_at", now),
+                    now,
+                ),
+            )
+            if fault_after == "reconciliation_row":
+                raise RuntimeError("fault_after_reconciliation_row")
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO paper_event_ledger (
+                    event_key, position_id, cycle_id, venue,
+                    event_type, cash_delta, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    ledger_row.get("position_id"),
+                    ledger_row.get("cycle_id"),
+                    venue,
+                    ledger_row["event_type"],
+                    cash_delta,
+                    ledger_payload_json,
+                    ledger_row.get("created_at", now),
+                ),
+            )
+            ledger_inserted = cursor.rowcount == 1
+            if fault_after == "ledger_insert":
+                raise RuntimeError("fault_after_ledger_insert")
+            connection.execute(
+                """
+                INSERT INTO funding_paper_accounts (
+                    venue, starting_balance, cash_balance, reserved_margin,
+                    realized_pnl, updated_at
+                )
+                VALUES (?, 0, 0, 0, 0, ?)
+                ON CONFLICT(venue) DO NOTHING
+                """,
+                (venue, now),
+            )
+            if ledger_inserted and cash_delta != 0.0:
+                connection.execute(
+                    """
+                    UPDATE funding_paper_accounts
+                    SET cash_balance = cash_balance + ?,
+                        realized_pnl = realized_pnl + ?,
+                        updated_at = ?
+                    WHERE venue = ?
+                    """,
+                    (cash_delta, cash_delta, now, venue),
+                )
+            if fault_after == "cash_update":
+                raise RuntimeError("fault_after_cash_update")
+        return {"event_key": event_key, "applied": ledger_inserted}
 
     def paper_event_ledger_rows(
         self,
@@ -7855,6 +8681,134 @@ class SQLiteStore:
                 """,
                 (float(delta), float(delta), now, str(venue)),
             )
+
+    def paper_account_consistency_report(self) -> dict[str, Any]:
+        """Compare venue accounts with idempotent ledger-derived effects."""
+        with self.connect() as connection:
+            accounts = [dict(row) for row in connection.execute(
+                "SELECT * FROM funding_paper_accounts ORDER BY venue"
+            ).fetchall()]
+            ledger_rows = connection.execute(
+                "SELECT * FROM paper_event_ledger ORDER BY created_at"
+            ).fetchall()
+        cash_by_venue: dict[str, float] = {}
+        reserve_by_venue: dict[str, float] = {}
+        for row in ledger_rows:
+            venue = str(row["venue"] or "")
+            if not venue:
+                continue
+            cash_by_venue[venue] = cash_by_venue.get(venue, 0.0) + float(row["cash_delta"] or 0.0)
+            payload: dict[str, Any]
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            event_type = str(row["event_type"] or "")
+            if event_type == "collateral_reserve":
+                reserve_by_venue[venue] = reserve_by_venue.get(venue, 0.0) + float(payload.get("amount") or 0.0)
+            elif event_type == "collateral_release":
+                reserve_by_venue[venue] = reserve_by_venue.get(venue, 0.0) - float(payload.get("amount") or 0.0)
+        mismatches: list[dict[str, Any]] = []
+        venues = {str(row["venue"]) for row in accounts} | set(cash_by_venue) | set(reserve_by_venue)
+        accounts_by_venue = {str(row["venue"]): row for row in accounts}
+        for venue in sorted(venues):
+            account = accounts_by_venue.get(venue)
+            if account is None:
+                mismatches.append({"venue": venue, "kind": "account_missing"})
+                continue
+            expected_cash = float(account["starting_balance"] or 0.0) + float(cash_by_venue.get(venue, 0.0))
+            expected_realized = float(cash_by_venue.get(venue, 0.0))
+            expected_reserved = max(0.0, float(reserve_by_venue.get(venue, 0.0)))
+            actual_cash = float(account["cash_balance"] or 0.0)
+            actual_realized = float(account["realized_pnl"] or 0.0)
+            actual_reserved = float(account["reserved_margin"] or 0.0)
+            if abs(actual_cash - expected_cash) > 1e-8:
+                mismatches.append({
+                    "venue": venue,
+                    "kind": "cash_balance_mismatch",
+                    "expected": expected_cash,
+                    "actual": actual_cash,
+                })
+            if abs(actual_realized - expected_realized) > 1e-8:
+                mismatches.append({
+                    "venue": venue,
+                    "kind": "realized_pnl_mismatch",
+                    "expected": expected_realized,
+                    "actual": actual_realized,
+                })
+            if abs(actual_reserved - expected_reserved) > 1e-8:
+                mismatches.append({
+                    "venue": venue,
+                    "kind": "reserved_margin_mismatch",
+                    "expected": expected_reserved,
+                    "actual": actual_reserved,
+                })
+        return {
+            "ok": not mismatches,
+            "mismatches": mismatches,
+            "ledger_cash_delta_by_venue": cash_by_venue,
+            "ledger_reserved_margin_by_venue": {
+                venue: max(0.0, value) for venue, value in reserve_by_venue.items()
+            },
+        }
+
+    def repair_paper_account_consistency(self) -> dict[str, Any]:
+        """Reset paper account balances to the deterministic ledger-derived state."""
+        report = self.paper_account_consistency_report()
+        now = utc_now_iso()
+        if report["ok"]:
+            return {"repaired": False, **report}
+        with self.connect() as connection:
+            accounts = [dict(row) for row in connection.execute(
+                "SELECT * FROM funding_paper_accounts ORDER BY venue"
+            ).fetchall()]
+            accounts_by_venue = {str(row["venue"]): row for row in accounts}
+            cash_by_venue = {
+                str(key): float(value)
+                for key, value in (report.get("ledger_cash_delta_by_venue") or {}).items()
+            }
+            reserve_by_venue = {
+                str(key): float(value)
+                for key, value in (report.get("ledger_reserved_margin_by_venue") or {}).items()
+            }
+            venues = set(accounts_by_venue) | set(cash_by_venue) | set(reserve_by_venue)
+            for venue in sorted(venues):
+                account = accounts_by_venue.get(venue)
+                if account is None:
+                    connection.execute(
+                        """
+                        INSERT INTO funding_paper_accounts (
+                            venue, starting_balance, cash_balance, reserved_margin,
+                            realized_pnl, updated_at
+                        )
+                        VALUES (?, 0, 0, 0, 0, ?)
+                        ON CONFLICT(venue) DO NOTHING
+                        """,
+                        (venue, now),
+                    )
+                    account = {
+                        "venue": venue,
+                        "starting_balance": 0.0,
+                    }
+                cash_delta = cash_by_venue.get(venue, 0.0)
+                connection.execute(
+                    """
+                    UPDATE funding_paper_accounts
+                    SET cash_balance = ?,
+                        realized_pnl = ?,
+                        reserved_margin = ?,
+                        updated_at = ?
+                    WHERE venue = ?
+                    """,
+                    (
+                        float(account["starting_balance"] or 0.0) + cash_delta,
+                        cash_delta,
+                        max(0.0, reserve_by_venue.get(venue, 0.0)),
+                        now,
+                        venue,
+                    ),
+                )
+        return {"repaired": True, **self.paper_account_consistency_report()}
 
     def funding_paper_open_positions(self) -> list[dict[str, Any]]:
         with self.connect() as connection:

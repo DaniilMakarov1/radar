@@ -5,7 +5,7 @@ import json
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
 
 from smart_money_radar.funding.adapter_contracts import (
@@ -172,8 +172,8 @@ def _fresh_prices(
         )
         if event_at is None:
             continue
-        age = abs((observed.astimezone(UTC) - event_at.astimezone(UTC)).total_seconds())
-        if age > max_age_seconds:
+        age = (observed.astimezone(UTC) - event_at.astimezone(UTC)).total_seconds()
+        if age < -1.0 or age > max_age_seconds:
             continue
         source = str(row.source)
         if source in seen_sources:
@@ -237,30 +237,48 @@ def evaluate_stablecoin_route(
 ) -> dict[str, Any]:
     long_asset = str(long_collateral or "").upper()
     short_asset = str(short_collateral or "").upper()
+    requested_observed = _parse_time(observed_at) or datetime.now(UTC)
+
+    def base_result(status: str, blockers: list[str], *, cross_stable: bool) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "compatible": status != "RESEARCH_ONLY" or not blockers or "stablecoin_family_not_compatible" not in blockers,
+            "numeraire": "USD" if collateral_family(long_asset) == USD_MAJOR_STABLE and collateral_family(short_asset) == USD_MAJOR_STABLE else None,
+            "stablecoin_pair": f"{long_asset}/{short_asset}",
+            "canonical_pair": f"{long_asset}/{short_asset}",
+            "direction": "long_collateral/short_collateral",
+            "cross_stable": cross_stable,
+            "long_asset": long_asset,
+            "short_asset": short_asset,
+            "status": status,
+            "blockers": blockers,
+            "observed_at": requested_observed.astimezone(UTC).isoformat(),
+            "expires_at": requested_observed.astimezone(UTC).isoformat(),
+            "source_identity": {"provider": None, "sources": []},
+            "evidence_version": "stablecoin-route-snapshot-v1",
+        }
+
     if long_asset == short_asset:
         if (
             long_asset not in TRUSTED_SAME_ASSET_COLLATERAL
             or collateral_family(long_asset) != USD_MAJOR_STABLE
         ):
             return {
+                **base_result(
+                    "RESEARCH_ONLY",
+                    ["same_asset_collateral_not_trusted"],
+                    cross_stable=False,
+                ),
                 "compatible": False,
                 "numeraire": None,
-                "stablecoin_pair": f"{long_asset}/{short_asset}",
-                "cross_stable": False,
-                "status": "RESEARCH_ONLY",
-                "blockers": ["same_asset_collateral_not_trusted"],
                 "funding_net_before_stablecoin_reserve": (
                     funding_net_before_stablecoin_reserve
                 ),
                 "funding_net_after_stablecoin_reserve": None,
             }
         return {
+            **base_result("PASS", [], cross_stable=False),
             "compatible": True,
-            "numeraire": "USD",
-            "stablecoin_pair": f"{long_asset}/{short_asset}",
-            "cross_stable": False,
-            "status": "PASS",
-            "blockers": [],
             "current_stablecoin_basis_bps": 0.0,
             "stablecoin_reserve_bps": 0.0,
             "stablecoin_reserve_usd": 0.0,
@@ -273,21 +291,22 @@ def evaluate_stablecoin_route(
         }
     if not stablecoin_pair_compatible(long_asset, short_asset):
         return {
+            **base_result(
+                "RESEARCH_ONLY",
+                ["stablecoin_family_not_compatible"],
+                cross_stable=True,
+            ),
             "compatible": False,
             "numeraire": None,
-            "stablecoin_pair": f"{long_asset}/{short_asset}",
-            "cross_stable": True,
-            "status": "RESEARCH_ONLY",
-            "blockers": ["stablecoin_family_not_compatible"],
         }
     if provider is None:
         return {
+            **base_result(
+                "RESEARCH_ONLY",
+                ["stablecoin_price_provider_unavailable"],
+                cross_stable=True,
+            ),
             "compatible": True,
-            "numeraire": "USD",
-            "stablecoin_pair": f"{long_asset}/{short_asset}",
-            "cross_stable": True,
-            "status": "RESEARCH_ONLY",
-            "blockers": ["stablecoin_price_provider_unavailable"],
         }
     long_prices = _fresh_prices(
         provider.prices(long_asset, observed_at),
@@ -301,12 +320,12 @@ def evaluate_stablecoin_route(
     )
     if len(long_prices) < 2 or len(short_prices) < 2:
         return {
+            **base_result(
+                "RESEARCH_ONLY",
+                ["insufficient_stablecoin_price_sources"],
+                cross_stable=True,
+            ),
             "compatible": True,
-            "numeraire": "USD",
-            "stablecoin_pair": f"{long_asset}/{short_asset}",
-            "cross_stable": True,
-            "status": "RESEARCH_ONLY",
-            "blockers": ["insufficient_stablecoin_price_sources"],
             "long_source_count": len(long_prices),
             "short_source_count": len(short_prices),
         }
@@ -329,13 +348,24 @@ def evaluate_stablecoin_route(
     if reserve > 50.0:
         blockers.append("stablecoin_reserve_above_50bps")
     reserve_usd = max(0.0, float(reference_notional)) * reserve / 10_000.0
+    all_prices = [*long_prices, *short_prices]
+    source_times = [
+        _parse_time(row.source_event_at) or _parse_time(row.response_received_at)
+        for row in all_prices
+    ]
+    source_times = [row.astimezone(UTC) for row in source_times if row is not None]
+    snapshot_observed = min(source_times) if source_times else requested_observed.astimezone(UTC)
+    expires_at = snapshot_observed + timedelta(seconds=5.0)
+    sources = sorted({str(row.source) for row in all_prices if row.source})
     return {
+        **base_result("PASS" if not blockers else "RESEARCH_ONLY", blockers, cross_stable=True),
         "compatible": True,
-        "numeraire": "USD",
-        "stablecoin_pair": f"{long_asset}/{short_asset}",
-        "cross_stable": True,
-        "status": "PASS" if not blockers else "RESEARCH_ONLY",
-        "blockers": blockers,
+        "observed_at": snapshot_observed.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "source_identity": {
+            "provider": type(provider).__name__,
+            "sources": sources,
+        },
         "long_collateral_usd_price": long_price,
         "short_collateral_usd_price": short_price,
         "long_source_count": len(long_prices),
@@ -354,5 +384,7 @@ def evaluate_stablecoin_route(
         "prices": {
             "long": [row.as_dict() for row in long_prices],
             "short": [row.as_dict() for row in short_prices],
+            long_asset: [row.as_dict() for row in long_prices],
+            short_asset: [row.as_dict() for row in short_prices],
         },
     }

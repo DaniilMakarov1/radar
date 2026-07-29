@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import UTC, datetime
 from typing import Any
@@ -117,9 +118,30 @@ def fee_rate_value(
         value = float(raw)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(value):
+        return None
     if role == "maker":
-        return max(-0.001, min(value, 0.02))
-    return max(0.0, min(value, 0.02))
+        if value < -0.001 or value > 0.02:
+            return None
+        return value
+    if value < 0.0 or value > 0.02:
+        return None
+    return value
+
+
+def _raw_fee_rate_value(
+    market: dict[str, Any],
+    liquidity_role: str,
+) -> float | None:
+    role = "maker" if liquidity_role == "maker" else "taker"
+    raw = market.get(f"{role}_fee_rate")
+    if raw is None and role == "taker":
+        raw = market.get("fee_rate")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -160,12 +182,13 @@ def fee_evidence_status(
 ) -> dict[str, Any]:
     """Return trust status for a fee rate without inventing verification."""
     role = "maker" if liquidity_role == "maker" else "taker"
+    raw_rate = _raw_fee_rate_value(market, role)
     rate = fee_rate_value(market, role)
     venue = str(market.get("venue") or "").lower()
     status: dict[str, Any] = {
         "venue": venue,
         "liquidity_role": role,
-        "rate": rate,
+        "rate": raw_rate if raw_rate is not None else rate,
         "verified": False,
         "trust_status": "UNKNOWN",
         "source_kind": None,
@@ -175,7 +198,11 @@ def fee_evidence_status(
         "blocker": None,
     }
     if rate is None:
-        status["blocker"] = f"{role}_fee_rate_missing"
+        status["blocker"] = (
+            f"{role}_fee_rate_out_of_range"
+            if raw_rate is not None
+            else f"{role}_fee_rate_missing"
+        )
         return status
 
     evidence = _select_fee_evidence(market, role)
@@ -196,15 +223,10 @@ def fee_evidence_status(
     reviewed = _parse_timestamp(evidence.get("reviewed_at") or market.get("fee_reviewed_at"))
 
     source = str(market.get("fee_source") or "").strip().lower()
-    if not evidence and source in TRUSTED_FEE_SOURCES:
-        source_kind = "configured_trusted_fee"
-        source_identifier = source
-        trust_status = "CONFIGURED_TRUSTED"
-        observed = observed or _parse_timestamp(market.get("response_received_at"))
-    elif not evidence and source in UNTRUSTED_FEE_SOURCES:
+    if not evidence:
         status["trust_status"] = "UNVERIFIED"
         status["source_identifier"] = source or None
-        status["blocker"] = f"{role}_fee_provenance_unverified"
+        status["blocker"] = f"{role}_fee_evidence_missing"
         return status
 
     status.update(
@@ -228,6 +250,10 @@ def fee_evidence_status(
         status["trust_status"] = trust_status or "UNVERIFIED"
         status["blocker"] = f"{role}_fee_trust_status_unverified"
         return status
+    evidence_version = evidence.get("evidence_version") or evidence.get("schema_version")
+    if not evidence_version:
+        status["blocker"] = f"{role}_fee_evidence_version_missing"
+        return status
     if observed is None and reviewed is None:
         status["blocker"] = f"{role}_fee_timestamp_missing"
         return status
@@ -239,8 +265,32 @@ def fee_evidence_status(
             status["blocker"] = f"{role}_fee_evidence_stale"
             return status
     evidence_venue = str(evidence.get("venue") or "").strip().lower()
-    if evidence_venue and venue and evidence_venue != venue:
+    if not evidence_venue or (venue and evidence_venue != venue):
         status["blocker"] = f"{role}_fee_venue_mismatch"
+        return status
+    evidence_role = str(evidence.get("liquidity_role") or "").strip().lower()
+    if evidence_role != role:
+        status["blocker"] = f"{role}_fee_role_mismatch"
+        return status
+    market_environment = str(market.get("environment") or "mainnet").strip().lower()
+    evidence_environment = str(evidence.get("environment") or "").strip().lower()
+    if not evidence_environment or evidence_environment != market_environment:
+        status["blocker"] = f"{role}_fee_environment_mismatch"
+        return status
+    market_product = str(
+        market.get("product_type")
+        or market.get("market_type")
+        or market.get("api_product_type")
+        or "linear_perpetual"
+    ).strip().lower()
+    evidence_product = str(
+        evidence.get("product_type")
+        or evidence.get("market_type")
+        or evidence.get("product")
+        or ""
+    ).strip().lower()
+    if not evidence_product or evidence_product != market_product:
+        status["blocker"] = f"{role}_fee_product_mismatch"
         return status
     applicability = evidence.get("applicability") or evidence.get("liquidity_role")
     if applicability not in (None, "", "all", role):

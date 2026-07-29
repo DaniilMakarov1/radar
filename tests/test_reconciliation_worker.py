@@ -172,6 +172,111 @@ def test_duplicate_reconciliation_no_double_cash(tmp_path):
     assert len([r for r in ledger2 if r["event_type"] == "funding"]) == 2
 
 
+@pytest.mark.parametrize(
+    "fault_after",
+    ["reconciliation_row", "ledger_insert", "cash_update"],
+)
+def test_reconciliation_atomic_fault_retries_once(tmp_path, fault_after):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    _seed_closed_pending_position(store, quantity=5.0)
+    row = next(
+        r for r in store.funding_settlement_reconciliation_rows("fc-recon-test")
+        if r["venue"] == "binance"
+    )
+    reconciled = {
+        **row,
+        "status": "RATE_AND_MARK_RECONCILED",
+        "confirmed_funding_rate": 0.001,
+        "settlement_mark_price": 100.0,
+        "funding_pnl": -0.5,
+        "rate_status": "CONFIRMED",
+        "mark_status": "CONFIRMED",
+        "evidence": {"payment_reconciliation_state": "PAYMENT_RECONCILED"},
+    }
+    ledger = make_ledger_entry(
+        funding_event_key("fc-recon-test", "binance", SCHEDULED),
+        position_id="fc-recon-test",
+        cycle_id="fc-recon-test:1",
+        venue="binance",
+        event_type="funding",
+        cash_delta=-0.5,
+        payload={"side": "long"},
+    )
+
+    with pytest.raises(RuntimeError):
+        store.apply_reconciled_funding_effect(
+            reconciled,
+            ledger,
+            fault_after=fault_after,
+        )
+
+    assert [r for r in store.paper_event_ledger_rows("fc-recon-test") if r["event_type"] == "funding"] == []
+    assert next(
+        r for r in store.funding_settlement_reconciliation_rows("fc-recon-test")
+        if r["venue"] == "binance"
+    )["status"] == "PENDING"
+
+    provider = FakeFundingSettlementDataProvider(
+        public_events=[
+            {"venue": "binance", "symbol": "BTCUSDT", "scheduled_at": SCHEDULED, "funding_rate": 0.001},
+            {"venue": "bybit", "symbol": "BTCUSDT", "scheduled_at": SCHEDULED, "funding_rate": 0.001},
+        ],
+        mark_snapshots=[
+            {"venue": "binance", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+            {"venue": "bybit", "symbol": "BTCUSDT", "observed_at": SCHEDULED, "mark_price": 100.0},
+        ],
+    )
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30), provider)
+    result = runtime.process_pending_reconciliations(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    assert result["reconciled"] == 2
+    assert len([r for r in store.paper_event_ledger_rows("fc-recon-test") if r["event_type"] == "funding"]) == 2
+    accounts = {row["venue"]: row for row in store.funding_paper_account_rows()}
+    assert accounts["binance"]["cash_balance"] - accounts["binance"]["starting_balance"] == pytest.approx(-0.5)
+    assert accounts["bybit"]["cash_balance"] - accounts["bybit"]["starting_balance"] == pytest.approx(0.5)
+
+
+def test_reconciliation_recovery_finalizes_after_row_ledger_cash_without_cycle_finalization(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    _seed_closed_pending_position(store, quantity=5.0)
+    for row in store.funding_settlement_reconciliation_rows("fc-recon-test"):
+        pnl = -0.5 if row["side"] == "long" else 0.5
+        reconciled = {
+            **row,
+            "status": "RATE_AND_MARK_RECONCILED",
+            "confirmed_funding_rate": 0.001,
+            "settlement_mark_price": 100.0,
+            "funding_pnl": pnl,
+            "rate_status": "CONFIRMED",
+            "mark_status": "CONFIRMED",
+            "evidence": {"payment_reconciliation_state": "PAYMENT_RECONCILED"},
+        }
+        store.apply_reconciled_funding_effect(
+            reconciled,
+            make_ledger_entry(
+                funding_event_key("fc-recon-test", row["venue"], SCHEDULED),
+                position_id="fc-recon-test",
+                cycle_id="fc-recon-test:1",
+                venue=row["venue"],
+                event_type="funding",
+                cash_delta=pnl,
+                payload={"side": row["side"]},
+            ),
+        )
+    assert store.funding_capture_cycles_for_position("fc-recon-test")[0]["state"] == "SETTLEMENT_CROSSED"
+
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30))
+    recovery = runtime.recover_runtime_state(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    assert recovery["reconciliation"]["finalized_cycles"] == 1
+    assert store.funding_capture_cycles_for_position("fc-recon-test")[0]["state"] == "RECONCILED"
+    assert store.funding_capture_position_by_id("fc-recon-test")["state"] == "RECONCILED"
+
+
 def test_reconciliation_timeout_marks_unreconciled(tmp_path):
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
