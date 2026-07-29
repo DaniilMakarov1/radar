@@ -5839,6 +5839,7 @@ def test_active_cycle_event_mismatch_does_not_cross_or_create_obligations(tmp_pa
 
 def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monkeypatch) -> None:
     from smart_money_radar.funding.trader import CaptureRouteRefreshResult
+    from smart_money_radar.funding.presentation import filter_deactivated_funding_paper_payload
 
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
@@ -5879,6 +5880,43 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
     assert position["state"] == "SETTLEMENT_PLAN_MISMATCH"
     assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
     assert store.funding_settlement_reconciliation_rows(capture_id) == []
+    snapshot = store.record_funding_paper_equity_snapshot()
+    assert snapshot["legacy_open_position_count"] == 0
+    assert snapshot["v2_open_position_count"] == 1
+    assert snapshot["total_open_position_count"] == 1
+    assert snapshot["open_position_count"] == 1
+    with store.connect() as connection:
+        persisted = connection.execute(
+            """
+            SELECT open_position_count, payload_json
+            FROM funding_paper_equity_snapshots
+            ORDER BY funding_paper_equity_snapshot_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert persisted["open_position_count"] == 1
+    persisted_payload = json.loads(persisted["payload_json"])
+    assert persisted_payload["v2_open_position_count"] == 1
+    assert persisted_payload["total_open_position_count"] == 1
+    dashboard = filter_deactivated_funding_paper_payload(
+        store.funding_paper_dashboard(refresh_estimates=False)
+    )
+    assert dashboard["summary"]["v2_open_position_count"] == 1
+    assert dashboard["summary"]["open_position_count"] == 1
+    assert dashboard["v2_open_positions"][0]["position_id"] == capture_id
+
+    original_process_open_positions = bot.process_open_positions
+    open_poll_calls: list[str] = []
+    bot.process_open_positions = lambda: open_poll_calls.append("open") or []  # type: ignore[method-assign]
+    bot.process_entry_candidates = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("new entry must not run while settlement mismatch remains open")
+    )
+    blocked = bot.run_iteration()
+    assert open_poll_calls == ["open"]
+    assert blocked["mode"] == "open_positions"
+    assert blocked["open_position_count"] == 1
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    bot.process_open_positions = original_process_open_positions  # type: ignore[method-assign]
 
     good_route = _fresh_route_for_open_position(route, bot.clock.now())
     bot.refresh_open_capture_route = lambda position, now: CaptureRouteRefreshResult(  # type: ignore[method-assign]

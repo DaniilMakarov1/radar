@@ -996,8 +996,7 @@ class PaperBot:
                 1 for event in close_events if event == "settlement_pending"
             ),
             "held_count": sum(1 for event in close_events if event == "held"),
-            "open_position_count": len(self.store.funding_capture_open_positions())
-            + snapshot["open_position_count"],
+            "open_position_count": snapshot["open_position_count"],
             "hot_route_count": len(self.hot_routes),
             "urgent_route_count": count_urgent_routes(
                 list(self.hot_routes.values()),

@@ -2094,10 +2094,25 @@ def test_risex_public_probe_confirms_boundary_only_from_history(
     tmp_path,
     monkeypatch,
 ) -> None:
+    started = datetime(2026, 7, 28, 12, 0, 0, 900_000, tzinfo=UTC)
+    scheduled = started + timedelta(seconds=0.25)
+
+    class ProbeClock:
+        def __init__(self, current: datetime) -> None:
+            self.current = current
+
+        def now(self) -> datetime:
+            return self.current
+
+        def sleep(self, seconds: float) -> None:
+            self.current += timedelta(seconds=max(0.0, float(seconds)))
+
+    clock = ProbeClock(started)
+
     class FakeRiseXClient:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.venue = "risex"
-            self.scheduled = datetime.now(UTC) + timedelta(seconds=0.25)
+            self.scheduled = scheduled
 
         def catalog_and_markets(self, observed_at: str):
             market = complete_market(
@@ -2127,7 +2142,9 @@ def test_risex_public_probe_confirms_boundary_only_from_history(
             db_path=tmp_path / "probe.sqlite",
             mode="public",
             max_wait_seconds=1.0,
-        )
+        ),
+        now_provider=clock.now,
+        sleep_func=clock.sleep,
     )
 
     assert result["status"] == "PUBLIC_BOUNDARY_OBSERVED"

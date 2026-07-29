@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -131,11 +132,23 @@ def classify_risex_funding_semantics_observation(
     }
 
 
-def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
+def run_risex_funding_probe(
+    config: RiseXProbeConfig,
+    *,
+    now_provider: Callable[[], datetime] | None = None,
+    sleep_func: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    def probe_now() -> datetime:
+        if now_provider is None:
+            return datetime.now(UTC)
+        current = now_provider()
+        return current.astimezone(UTC) if current.tzinfo else current.replace(tzinfo=UTC)
+
+    probe_sleep = sleep_func or time.sleep
     resolved = config.validated()
     store = SQLiteStore(resolved.db_path)
     store.init_db()
-    started_dt = datetime.now(UTC).replace(microsecond=0)
+    started_dt = probe_now()
     started_at = started_dt.isoformat()
     probe_run_id = hashlib.sha256(
         "|".join(["risex", resolved.environment, resolved.mode, started_at]).encode("utf-8")
@@ -164,7 +177,7 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
             if canary_guard:
                 completed = {
                     **run_row,
-                    "completed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                    "completed_at": probe_now().replace(microsecond=0).isoformat(),
                     "status": canary_guard["status"],
                     "error": canary_guard["reason"],
                     "payload": canary_guard,
@@ -173,7 +186,7 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
                 return {"probe_run_id": probe_run_id, **canary_guard}
 
         client = RiseXFundingClient(base_url=resolved.base_url, environment="testnet")
-        observed_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+        observed_at = probe_now().isoformat()
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
         market = select_risex_probe_market(markets, resolved.symbol)
         observation_count = 0
@@ -205,13 +218,13 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
                     checkpoint_dt = scheduled_dt + timedelta(seconds=checkpoint_offset)
                     if checkpoint_dt > deadline_dt:
                         break
-                    now_dt = datetime.now(UTC)
+                    now_dt = probe_now()
                     if checkpoint_dt < now_dt and checkpoint_offset < 0:
                         continue
                     sleep_seconds = (checkpoint_dt - now_dt).total_seconds()
                     if sleep_seconds > 0:
-                        time.sleep(min(sleep_seconds, max(0.0, (deadline_dt - now_dt).total_seconds())))
-                    actual_dt = datetime.now(UTC)
+                        probe_sleep(min(sleep_seconds, max(0.0, (deadline_dt - now_dt).total_seconds())))
+                    actual_dt = probe_now()
                     if actual_dt > deadline_dt:
                         break
                     actual_offset = (actual_dt - scheduled_dt).total_seconds()
@@ -264,7 +277,7 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
                                 actual_offset_seconds=actual_offset,
                             )
                         )
-        completed_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+        completed_at = probe_now().replace(microsecond=0).isoformat()
         status = (
             "PUBLIC_BOUNDARY_OBSERVED"
             if public_settlements_confirmed
@@ -305,7 +318,7 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
     except Exception as exc:
         completed = {
             **run_row,
-            "completed_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            "completed_at": probe_now().replace(microsecond=0).isoformat(),
             "status": "FAILED",
             "error": str(exc),
             "payload": {"orders_enabled": False},

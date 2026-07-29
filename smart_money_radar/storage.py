@@ -23,6 +23,18 @@ from smart_money_radar.funding.normalization import CANONICAL_ASSET_UNIT_MULTIPL
 
 FUNDING_UNIT_MULTIPLIERS = CANONICAL_ASSET_UNIT_MULTIPLIERS
 
+FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = {
+    "OPEN",
+    "SETTLEMENT_CROSSED",
+    "POST_SETTLEMENT_EVALUATION",
+    "HOLDING_NEXT_CYCLE",
+    "EXIT_SCHEDULED",
+    "EXIT_SUBMITTED",
+    "PARTIALLY_CLOSED",
+    "EMERGENCY_UNWIND",
+    "SETTLEMENT_PLAN_MISMATCH",
+}
+
 
 def funding_unit_multiplier(row: dict[str, Any]) -> float:
     values = (
@@ -1433,17 +1445,7 @@ class SQLiteStore:
 
     def funding_capture_open_positions(self) -> list[dict[str, Any]]:
         return self.funding_capture_position_rows(
-            states={
-                "OPEN",
-                "SETTLEMENT_CROSSED",
-                "POST_SETTLEMENT_EVALUATION",
-                "HOLDING_NEXT_CYCLE",
-                "EXIT_SCHEDULED",
-                "EXIT_SUBMITTED",
-                "PARTIALLY_CLOSED",
-                "EMERGENCY_UNWIND",
-                "SETTLEMENT_PLAN_MISMATCH",
-            }
+            states=set(FUNDING_CAPTURE_OPEN_EXPOSURE_STATES)
         )
 
     def funding_capture_open_position_by_route_key(
@@ -10234,16 +10236,15 @@ class SQLiteStore:
                     """
                 ).fetchone()
             )
+            v2_open_states = sorted(FUNDING_CAPTURE_OPEN_EXPOSURE_STATES)
+            v2_state_placeholders = ",".join("?" for _ in v2_open_states)
             v2_rows = connection.execute(
-                """
+                f"""
                 SELECT p.*, p.config_json
                 FROM funding_capture_positions p
-                WHERE p.state IN (
-                    'OPEN', 'SETTLEMENT_CROSSED', 'POST_SETTLEMENT_EVALUATION',
-                    'HOLDING_NEXT_CYCLE', 'EXIT_SCHEDULED', 'EXIT_SUBMITTED',
-                    'PARTIALLY_CLOSED', 'EMERGENCY_UNWIND'
-                )
-                """
+                WHERE p.state IN ({v2_state_placeholders})
+                """,
+                v2_open_states,
             ).fetchall()
             v2_unrealized_price_pnl = 0.0
             v2_estimated_close_fees = 0.0
@@ -10720,6 +10721,10 @@ class SQLiteStore:
         total_cash = float(summary.get("total_cash") or 0.0)
         closed_count = int(trade_summary.get("closed_trade_count") or 0)
         win_count = int(trade_summary.get("win_count") or 0)
+        v2_open_positions = self.funding_capture_open_positions()
+        legacy_open_count = len(open_positions)
+        v2_open_count = len(v2_open_positions)
+        total_open_count = legacy_open_count + v2_open_count
         return {
             "summary": {
                 "starting_capital": starting,
@@ -10731,7 +10736,10 @@ class SQLiteStore:
                 "return_pct": (total_cash - starting) / starting
                 if starting > 0
                 else 0.0,
-                "open_position_count": len(open_positions),
+                "legacy_open_position_count": legacy_open_count,
+                "v2_open_position_count": v2_open_count,
+                "total_open_position_count": total_open_count,
+                "open_position_count": total_open_count,
                 "closed_trade_count": closed_count,
                 "win_rate": win_count / closed_count if closed_count > 0 else None,
                 "average_net_pnl": trade_summary.get("average_net_pnl"),
@@ -10740,6 +10748,7 @@ class SQLiteStore:
             },
             "accounts": accounts,
             "open_positions": open_positions,
+            "v2_open_positions": v2_open_positions,
             "closed_positions": closed_positions,
             "events": events,
             "trade_events": trade_events,

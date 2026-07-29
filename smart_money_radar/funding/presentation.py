@@ -74,6 +74,11 @@ def filter_deactivated_funding_paper_payload(
         for row in payload.get("open_positions", [])
         if not funding_position_uses_deactivated_venue(row, blocked)
     ]
+    v2_open_positions = [
+        row
+        for row in payload.get("v2_open_positions", [])
+        if not funding_position_uses_deactivated_venue(row, blocked)
+    ]
     closed_positions = [
         row
         for row in payload.get("closed_positions", [])
@@ -96,6 +101,7 @@ def filter_deactivated_funding_paper_payload(
     ]
     filtered["accounts"] = accounts
     filtered["open_positions"] = open_positions
+    filtered["v2_open_positions"] = v2_open_positions
     filtered["closed_positions"] = closed_positions
     filtered["events"] = events
     filtered["trade_events"] = trade_events
@@ -105,6 +111,7 @@ def filter_deactivated_funding_paper_payload(
         accounts,
         open_positions,
         closed_positions,
+        v2_open_positions,
     )
     return filtered
 
@@ -250,7 +257,17 @@ def filtered_funding_paper_summary(
     accounts: list[dict[str, Any]],
     open_positions: list[dict[str, Any]],
     closed_positions: list[dict[str, Any]],
+    v2_open_positions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     summary = dict(original)
-    summary["open_position_count"] = len(open_positions)
+    legacy_open_count = len(open_positions)
+    if v2_open_positions is None:
+        v2_open_count = int(summary.get("v2_open_position_count") or 0)
+    else:
+        v2_open_count = len(v2_open_positions)
+    total_open_count = legacy_open_count + v2_open_count
+    summary["legacy_open_position_count"] = legacy_open_count
+    summary["v2_open_position_count"] = v2_open_count
+    summary["total_open_position_count"] = total_open_count
+    summary["open_position_count"] = total_open_count
     return summary

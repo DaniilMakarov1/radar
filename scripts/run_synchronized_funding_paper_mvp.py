@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
 from smart_money_radar.paper_bot.clock import FakeClock
