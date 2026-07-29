@@ -175,6 +175,8 @@ def build_focused_observation(
     *,
     now: datetime,
     phase: str = "entry",
+    max_age_seconds: float = 5.0,
+    max_response_skew_seconds: float = 1.0,
 ) -> dict[str, Any]:
     legs = route.get("legs") or []
     long_leg = leg_by_side(legs, "long") or {}
@@ -265,7 +267,12 @@ def build_focused_observation(
         "short_book_executable": short_book_executable,
         "capabilities_passed": capabilities_passed,
     }
-    validation = validate_focused_observation(raw, now=now)
+    validation = validate_focused_observation(
+        raw,
+        now=now,
+        max_age_seconds=max_age_seconds,
+        max_response_skew_seconds=max_response_skew_seconds,
+    )
     raw["snapshot_valid"] = bool(validation["valid"])
     raw["invalid_reason"] = ",".join(validation["reasons"]) if validation["reasons"] else None
     return raw
@@ -1858,7 +1865,14 @@ class SynchronizedFundingRuntimeV2:
         missing_data = self._missing_required_route_data(route)
         if missing_data:
             return {"opened": False, "reason": "required_route_data_missing", "missing": missing_data}
-        observation = build_focused_observation(route, now=now)
+        observation = build_focused_observation(
+            route,
+            now=now,
+            max_age_seconds=float(self.config.max_entry_snapshot_age_seconds),
+            max_response_skew_seconds=float(
+                self.config.max_cross_venue_snapshot_skew_seconds
+            ),
+        )
         route_plan_gross = optional_float(route_plan.get("conservative_funding_cashflow_usd"))
         if route_plan_gross is not None:
             observation["gross_funding_pnl"] = float(route_plan_gross)
@@ -1866,14 +1880,27 @@ class SynchronizedFundingRuntimeV2:
             observation["route_plan_expected_funding_cashflow_usd"] = route_plan.get(
                 "expected_funding_cashflow_usd"
             )
-            validation = validate_focused_observation(observation, now=now)
+            validation = validate_focused_observation(
+                observation,
+                now=now,
+                max_age_seconds=float(self.config.max_entry_snapshot_age_seconds),
+                max_response_skew_seconds=float(
+                    self.config.max_cross_venue_snapshot_skew_seconds
+                ),
+            )
             observation["snapshot_valid"] = bool(validation["valid"])
             observation["invalid_reason"] = (
                 ",".join(validation["reasons"]) if validation["reasons"] else None
             )
         self._store_observation(route, capture_id, settlement_at, observation, phase="entry")
         observations = self._valid_observations(route, now, phase="entry", cycle_id=f"{capture_id}:1")
-        underwriting = entry_underwriting(observations, now=now)
+        underwriting = entry_underwriting(
+            observations,
+            now=now,
+            max_latest_age_seconds=float(
+                self.config.max_entry_snapshot_age_seconds
+            ),
+        )
         if not underwriting["eligible"]:
             return {
                 "opened": False,
@@ -2486,7 +2513,19 @@ class SynchronizedFundingRuntimeV2:
                 continue
             if not _observation_timestamp_match(row, route):
                 continue
-            if validate_focused_observation(row, now=now)["valid"]:
+            max_age_seconds = (
+                float(self.config.max_entry_snapshot_age_seconds)
+                if phase == "entry"
+                else 2.0
+            )
+            if validate_focused_observation(
+                row,
+                now=now,
+                max_age_seconds=max_age_seconds,
+                max_response_skew_seconds=float(
+                    self.config.max_cross_venue_snapshot_skew_seconds
+                ),
+            )["valid"]:
                 valid.append(row)
         return valid
 
@@ -3317,7 +3356,15 @@ class SynchronizedFundingRuntimeV2:
         position_id = str(position["position_id"])
         cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
         scheduled = parse_time(position.get("current_cycle_scheduled_funding_at")) or now
-        observation = build_focused_observation(route, now=now, phase="hold")
+        observation = build_focused_observation(
+            route,
+            now=now,
+            phase="hold",
+            max_age_seconds=2.0,
+            max_response_skew_seconds=float(
+                self.config.max_cross_venue_snapshot_skew_seconds
+            ),
+        )
         self._store_observation(
             route,
             position_id,

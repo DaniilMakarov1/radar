@@ -584,6 +584,37 @@ def test_entry_rejects_stale_snapshot_inside_final_window() -> None:
     assert "entry_snapshot_stale" in decision["reasons"]
 
 
+def test_default_entry_snapshot_age_boundary_is_five_seconds() -> None:
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    config = PaperBotConfig(
+        entry_min_lead_seconds=0,
+        entry_max_lead_seconds=60,
+    ).validated()
+    at_boundary = paper_route(now, long_lead=30, short_lead=30)
+    at_boundary["observed_at"] = (now - timedelta(seconds=5)).isoformat()
+    over_boundary = paper_route(now, long_lead=30, short_lead=30)
+    over_boundary["observed_at"] = (
+        now - timedelta(seconds=5.001)
+    ).isoformat()
+
+    accepted = route_entry_decision(
+        at_boundary,
+        accounts(),
+        now,
+        config,
+    )
+    rejected = route_entry_decision(
+        over_boundary,
+        accounts(),
+        now,
+        config,
+    )
+
+    assert config.max_entry_snapshot_age_seconds == 5.0
+    assert "entry_snapshot_stale" not in accepted["reasons"]
+    assert "entry_snapshot_stale" in rejected["reasons"]
+
+
 def test_entry_requires_route_actionable_profit_threshold() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(

@@ -785,8 +785,8 @@ def build_parser() -> argparse.ArgumentParser:
     funding_paper_trader.add_argument(
         "--max-entry-snapshot-age-seconds",
         type=float,
-        default=2.0,
-        help="Maximum fresh route snapshot age usable for paper entry.",
+        default=5.0,
+        help="Maximum route and focused-observation age usable for paper entry.",
     )
     funding_paper_trader.add_argument(
         "--settlement-alignment-tolerance-seconds",

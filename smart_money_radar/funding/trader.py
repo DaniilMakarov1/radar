@@ -223,7 +223,7 @@ class PaperBotConfig:
     settlement_alignment_tolerance_seconds: float = 1.0
     arm_window_seconds: int = 120
     final_recheck_freeze_seconds: int = 0
-    max_entry_snapshot_age_seconds: float = 2.0
+    max_entry_snapshot_age_seconds: float = 5.0
     max_cross_venue_snapshot_skew_seconds: float = 1.0
     settlement_grace_seconds: int = 30
     max_settlement_publication_lag_seconds: int = 300

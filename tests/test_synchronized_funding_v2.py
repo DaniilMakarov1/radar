@@ -974,6 +974,43 @@ def test_response_skew_boundary_1_000_valid_1_001_invalid() -> None:
     assert any("response_skew" in r for r in invalid["reasons"])
 
 
+def test_focused_observation_age_boundary_5_000_valid_5_001_invalid() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    funding_at = "2026-07-28T16:00:00+00:00"
+    base_observation = {
+        "long_response_received_at": now.isoformat(),
+        "short_response_received_at": now.isoformat(),
+        "long_next_funding_at": funding_at,
+        "short_next_funding_at": funding_at,
+        "long_book_executable": True,
+        "short_book_executable": True,
+        "capabilities_passed": True,
+        "gross_funding_pnl": 1.0,
+        "observed_at": now.isoformat(),
+    }
+
+    valid = validate_focused_observation(
+        {
+            **base_observation,
+            "long_age_seconds": 5.0,
+            "short_age_seconds": 5.0,
+        },
+        now=now,
+    )
+    invalid = validate_focused_observation(
+        {
+            **base_observation,
+            "long_age_seconds": 5.001,
+            "short_age_seconds": 5.001,
+        },
+        now=now,
+    )
+
+    assert valid["valid"], f"Expected valid but got reasons: {valid['reasons']}"
+    assert not invalid["valid"]
+    assert any("age_exceeds_5.0s" in reason for reason in invalid["reasons"])
+
+
 def test_nine_observations_no_entry() -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     observations = [

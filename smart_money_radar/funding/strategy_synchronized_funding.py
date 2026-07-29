@@ -1698,7 +1698,7 @@ def validate_focused_observation(
     observation: dict[str, Any],
     *,
     now: datetime,
-    max_age_seconds: float = 2.0,
+    max_age_seconds: float = 5.0,
     max_response_skew_seconds: float = 1.0,
 ) -> dict[str, Any]:
     reasons: list[str] = []
@@ -1749,7 +1749,7 @@ def entry_underwriting(
     now: datetime,
     minimum_observations: int = 10,
     minimum_span_seconds: float = 20.0,
-    max_latest_age_seconds: float = 2.0,
+    max_latest_age_seconds: float = 5.0,
     conservative_fraction: float = 0.9,
     latest_vs_median_fraction: float = 0.8,
 ) -> dict[str, Any]:
