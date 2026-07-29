@@ -4,6 +4,7 @@ import math
 import hashlib
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Any
 
@@ -46,7 +47,7 @@ def funding_leg_pnl(side: str, quantity: float, mark_price: float, funding_rate:
 @dataclass(frozen=True)
 class EventWindowPlannerConfig:
     max_strategy_hold_seconds: float = 180.0
-    max_gap_between_settlements_seconds: float = 60.0
+    max_gap_between_settlements_seconds: float = 180.0
     entry_safety_buffer_seconds: float = 30.0
     exit_safety_buffer_seconds: float = 5.0
     settlement_confirmation_timeout_seconds: float = 5.0
@@ -78,20 +79,100 @@ class FundingSettlementEvent:
     settlement_interval_seconds: float | None
     displayed_rate_period_seconds: float | None
     raw_api_rate: float | None
+    raw_rate_unit: str | None
+    raw_rate_scale: str | None
     normalized_rate: float | None
     rate_per_next_settlement: float | None
     receiver_side: str
+    payer_side: str
     expected_cashflow_usd: float
     conservative_cashflow_usd: float
     rate_status: str
     source_event_at: str | None
     response_received_at: str | None
+    source_sequence: str | None
     confirmation_source: str | None
     settlement_semantics_status: str
+    semantics_verification_level: str | None
     evidence_version: str
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class FundingRoutePlan:
+    strategy_name: str
+    compatibility_alias: str
+    strategy_version: str
+    opportunity_shape: str
+    leg_a: dict[str, Any]
+    leg_b: dict[str, Any]
+    orientation: dict[str, Any]
+    planned_entry_at: str
+    entry_window_opens_at: str
+    entry_deadline_at: str
+    planned_exit_at: str
+    monitor_until: str
+    included_settlement_events: list[FundingSettlementEvent]
+    excluded_settlement_events: list[FundingSettlementEvent]
+    ambiguous_settlement_events: list[FundingSettlementEvent]
+    expected_funding_cashflow_usd: Decimal
+    conservative_funding_cashflow_usd: Decimal
+    expected_costs_usd: Decimal
+    conservative_costs_usd: Decimal
+    expected_net_usd: Decimal
+    conservative_net_usd: Decimal
+    conservative_net_bps: Decimal
+    blockers: list[str]
+    confidence: str
+    eligibility_status: str
+    lifecycle_state: str
+    expires_at: str
+    evidence_version: str
+    planner: dict[str, Any]
+    modeled_costs: dict[str, float]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "strategy_name": self.strategy_name,
+            "external_strategy_name": self.compatibility_alias,
+            "compatibility_alias": self.compatibility_alias,
+            "strategy_version": self.strategy_version,
+            "opportunity_shape": self.opportunity_shape,
+            "leg_a": self.leg_a,
+            "leg_b": self.leg_b,
+            "orientation": self.orientation,
+            "planned_entry_at": self.planned_entry_at,
+            "entry_window_opens_at": self.entry_window_opens_at,
+            "entry_deadline_at": self.entry_deadline_at,
+            "planned_exit_at": self.planned_exit_at,
+            "monitor_until": self.monitor_until,
+            "included_settlement_events": [
+                event.as_dict() for event in self.included_settlement_events
+            ],
+            "excluded_settlement_events": [
+                event.as_dict() for event in self.excluded_settlement_events
+            ],
+            "ambiguous_settlement_events": [
+                event.as_dict() for event in self.ambiguous_settlement_events
+            ],
+            "expected_funding_cashflow_usd": float(self.expected_funding_cashflow_usd),
+            "conservative_funding_cashflow_usd": float(self.conservative_funding_cashflow_usd),
+            "expected_costs_usd": float(self.expected_costs_usd),
+            "conservative_costs_usd": float(self.conservative_costs_usd),
+            "expected_net_usd": float(self.expected_net_usd),
+            "conservative_net_usd": float(self.conservative_net_usd),
+            "conservative_net_bps": float(self.conservative_net_bps),
+            "blockers": self.blockers,
+            "confidence": self.confidence,
+            "eligibility_status": self.eligibility_status,
+            "lifecycle_state": self.lifecycle_state,
+            "expires_at": self.expires_at,
+            "evidence_version": self.evidence_version,
+            "modeled_costs": self.modeled_costs,
+            "planner": self.planner,
+        }
 
 
 def _event_id(
@@ -114,6 +195,28 @@ def _optional_float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed
+
+
+def _decimal(value: Any, default: str = "0") -> Decimal:
+    parsed = _optional_decimal(value)
+    return parsed if parsed is not None else Decimal(default)
+
+
+def _event_sort_key(event: FundingSettlementEvent) -> tuple[datetime, str, str]:
+    scheduled = parse_time(event.scheduled_at) or datetime.max.replace(tzinfo=UTC)
+    return scheduled.astimezone(UTC), event.venue, event.event_id
+
+
 def _market_notional(mark_price: float | None, target_notional: float) -> float:
     if mark_price is None or mark_price <= 0:
         return max(0.0, float(target_notional))
@@ -125,6 +228,15 @@ def funding_receiver_side(rate_per_next_settlement: float | None) -> str:
     if rate > 0:
         return "short"
     if rate < 0:
+        return "long"
+    return "none"
+
+
+def funding_payer_side(rate_per_next_settlement: float | None) -> str:
+    receiver = funding_receiver_side(rate_per_next_settlement)
+    if receiver == "long":
+        return "short"
+    if receiver == "short":
         return "long"
     return "none"
 
@@ -208,18 +320,107 @@ def funding_event_from_market(
         settlement_interval_seconds=resolved_contract.settlement_interval_seconds,
         displayed_rate_period_seconds=resolved_contract.displayed_rate_period_seconds,
         raw_api_rate=raw_rate,
+        raw_rate_unit=market.get("raw_funding_rate_unit") or market.get("funding_rate_unit"),
+        raw_rate_scale=str(market.get("raw_funding_rate_scale") or "fraction"),
         normalized_rate=normalized_rate,
         rate_per_next_settlement=rate,
         receiver_side=funding_receiver_side(rate),
+        payer_side=funding_payer_side(rate),
         expected_cashflow_usd=expected,
         conservative_cashflow_usd=_conservative_cashflow(expected, planner_config),
         rate_status=str(market.get("rate_status") or "predicted"),
         source_event_at=market.get("source_event_at"),
         response_received_at=market.get("response_received_at"),
+        source_sequence=(
+            str(market.get("source_sequence"))
+            if market.get("source_sequence") is not None
+            else None
+        ),
         confirmation_source=resolved_contract.settlement_confirmation_source,
         settlement_semantics_status=resolved_contract.verification_level,
+        semantics_verification_level=resolved_contract.verification_level,
         evidence_version=resolved_contract.evidence_checked_at,
     )
+
+
+def funding_events_from_market(
+    market: dict[str, Any],
+    *,
+    side: str,
+    leg_id: str,
+    target_notional: float,
+    config: EventWindowPlannerConfig | None = None,
+    contract: FundingSettlementContract | None = None,
+) -> list[FundingSettlementEvent]:
+    raw_events = (
+        market.get("funding_settlement_events")
+        or market.get("settlement_events")
+        or []
+    )
+    if not raw_events:
+        event = funding_event_from_market(
+            market,
+            side=side,
+            leg_id=leg_id,
+            target_notional=target_notional,
+            config=config,
+            contract=contract,
+        )
+        return [event] if event is not None else []
+    events: list[FundingSettlementEvent] = []
+    for index, raw_event in enumerate(raw_events):
+        if not isinstance(raw_event, dict):
+            continue
+        event_market = {**market}
+        event_market["next_funding_at"] = (
+            raw_event.get("scheduled_at")
+            or raw_event.get("next_funding_at")
+            or raw_event.get("funding_time")
+            or market.get("next_funding_at")
+        )
+        event_market["funding_rate"] = raw_event.get(
+            "funding_rate",
+            raw_event.get("rate", market.get("funding_rate")),
+        )
+        event_market["normalized_next_funding_rate"] = raw_event.get(
+            "normalized_next_funding_rate",
+            raw_event.get("rate_per_next_settlement", event_market.get("funding_rate")),
+        )
+        event_market["raw_funding_rate"] = raw_event.get(
+            "raw_api_rate",
+            raw_event.get("raw_funding_rate", event_market.get("funding_rate")),
+        )
+        event_market["raw_funding_rate_unit"] = raw_event.get(
+            "raw_rate_unit",
+            event_market.get("raw_funding_rate_unit") or event_market.get("funding_rate_unit"),
+        )
+        event_market["raw_funding_rate_scale"] = raw_event.get(
+            "raw_rate_scale",
+            event_market.get("raw_funding_rate_scale"),
+        )
+        event_market["source_event_at"] = raw_event.get(
+            "source_event_at",
+            event_market.get("source_event_at"),
+        )
+        event_market["response_received_at"] = raw_event.get(
+            "response_received_at",
+            event_market.get("response_received_at"),
+        )
+        event_market["source_sequence"] = raw_event.get(
+            "source_sequence",
+            event_market.get("source_sequence"),
+        )
+        event = funding_event_from_market(
+            event_market,
+            side=side,
+            leg_id=f"{leg_id}:event:{index + 1}",
+            target_notional=target_notional,
+            config=config,
+            contract=contract,
+        )
+        if event is not None:
+            events.append(event)
+    return sorted(events, key=_event_sort_key)
 
 
 def _event_time_range(event: FundingSettlementEvent) -> tuple[datetime, datetime]:
@@ -304,6 +505,8 @@ def _build_hold_plan(
     planned_exit_at = exit_after + timedelta(
         seconds=max(0.0, float(config.settlement_confirmation_timeout_seconds))
     )
+    entry_window_opens_at = planned_entry_at - timedelta(seconds=5.0)
+    entry_deadline_at = planned_entry_at + timedelta(seconds=10.0)
     included: list[FundingSettlementEvent] = []
     excluded: list[FundingSettlementEvent] = []
     ambiguous: list[FundingSettlementEvent] = []
@@ -320,18 +523,26 @@ def _build_hold_plan(
             excluded.append(event)
         else:
             ambiguous.append(event)
+    included_sorted = sorted(included, key=_event_sort_key)
     costs = _planned_costs(
         long_market=long_market,
         short_market=short_market,
         target_notional=target_notional,
         config=config,
     )
-    expected_cashflow = sum(event.expected_cashflow_usd for event in included)
-    conservative_cashflow = sum(event.conservative_cashflow_usd for event in included)
-    total_cost = sum(costs.values())
+    expected_cashflow = sum(
+        (_decimal(event.expected_cashflow_usd) for event in included),
+        Decimal("0"),
+    )
+    conservative_cashflow = sum(
+        (_decimal(event.conservative_cashflow_usd) for event in included),
+        Decimal("0"),
+    )
+    total_cost = sum((_decimal(value) for value in costs.values()), Decimal("0"))
     expected_net = expected_cashflow - total_cost
     conservative_net = conservative_cashflow - total_cost
     reference = max(0.0, float(target_notional))
+    reference_decimal = _decimal(reference)
     blockers: list[str] = []
     hold_seconds = (planned_exit_at - planned_entry_at).total_seconds()
     if hold_seconds > float(config.max_strategy_hold_seconds):
@@ -342,15 +553,33 @@ def _build_hold_plan(
         blockers.append("conservative_net_not_positive")
     min_net_bps = max(0.0, float(config.configured_min_net_bps))
     conservative_net_bps = (
-        conservative_net / reference * 10_000.0 if reference > 0 else 0.0
+        conservative_net / reference_decimal * Decimal("10000")
+        if reference_decimal > 0
+        else Decimal("0")
     )
-    if conservative_net_bps < min_net_bps:
+    if conservative_net_bps < _decimal(min_net_bps):
         blockers.append("conservative_net_bps_below_minimum")
-    included_sorted = sorted(included, key=lambda event: event.scheduled_at)
+    if included_sorted:
+        last_latest = max(
+            _event_time_range(event)[1]
+            for event in included_sorted
+        )
+    else:
+        last_latest = planned_exit_at
+    monitor_until = last_latest + timedelta(
+        seconds=max(
+            0.0,
+            float(config.settlement_confirmation_timeout_seconds)
+            + float(config.exit_safety_buffer_seconds),
+        )
+    )
     return {
         "plan_name": plan_name,
         "planned_entry_at": planned_entry_at.astimezone(UTC).isoformat(),
+        "entry_window_opens_at": entry_window_opens_at.astimezone(UTC).isoformat(),
+        "entry_deadline_at": entry_deadline_at.astimezone(UTC).isoformat(),
         "planned_exit_at": planned_exit_at.astimezone(UTC).isoformat(),
+        "monitor_until": monitor_until.astimezone(UTC).isoformat(),
         "max_hold_seconds": float(config.max_strategy_hold_seconds),
         "planned_hold_seconds": hold_seconds,
         "opportunity_shape": (
@@ -358,17 +587,19 @@ def _build_hold_plan(
         ),
         "included_settlement_events": [event.as_dict() for event in included_sorted],
         "excluded_settlement_events": [
-            event.as_dict() for event in sorted(excluded, key=lambda event: event.scheduled_at)
+            event.as_dict() for event in sorted(excluded, key=_event_sort_key)
         ],
         "ambiguous_settlement_events": [
-            event.as_dict() for event in sorted(ambiguous, key=lambda event: event.scheduled_at)
+            event.as_dict() for event in sorted(ambiguous, key=_event_sort_key)
         ],
-        "expected_funding_cashflow_usd": expected_cashflow,
-        "conservative_funding_cashflow_usd": conservative_cashflow,
+        "expected_funding_cashflow_usd": float(expected_cashflow),
+        "conservative_funding_cashflow_usd": float(conservative_cashflow),
         "modeled_costs": costs,
-        "expected_net_usd": expected_net,
-        "conservative_net_usd": conservative_net,
-        "conservative_net_bps": conservative_net_bps,
+        "expected_costs_usd": float(total_cost),
+        "conservative_costs_usd": float(total_cost),
+        "expected_net_usd": float(expected_net),
+        "conservative_net_usd": float(conservative_net),
+        "conservative_net_bps": float(conservative_net_bps),
         "blockers": list(dict.fromkeys(blockers)),
     }
 
@@ -398,6 +629,295 @@ def _freshness_blockers(
     return blockers
 
 
+def _lifecycle_state(
+    *,
+    now: datetime,
+    entry_window_opens_at: str | None,
+    entry_deadline_at: str | None,
+) -> str:
+    opens = parse_time(entry_window_opens_at)
+    deadline = parse_time(entry_deadline_at)
+    now_utc = now.astimezone(UTC)
+    if opens is not None and now_utc < opens.astimezone(UTC):
+        return "ENTRY_PENDING"
+    if deadline is not None and now_utc > deadline.astimezone(UTC):
+        return "ENTRY_WINDOW_MISSED"
+    return "ENTRY_WINDOW_OPEN"
+
+
+def _eligibility_status(blockers: list[str], *, lifecycle_state: str) -> str:
+    if lifecycle_state == "ENTRY_WINDOW_MISSED":
+        return "WATCH"
+    if any("stale" in reason for reason in blockers):
+        return "DATA_STALE"
+    if any(
+        token in reason
+        for reason in blockers
+        for token in ("environment", "capability", "contract", "semantics", "continuous")
+    ):
+        return "CAPABILITY_BLOCKED"
+    if blockers:
+        return "RESEARCH_ONLY"
+    return "SHADOW_CANDIDATE"
+
+
+class FundingSettlementPlanner:
+    """Side-effect-free funding settlement capture planner used by shadow and PaperBot."""
+
+    def __init__(
+        self,
+        config: EventWindowPlannerConfig | None = None,
+        *,
+        max_response_age_seconds: float = 5.0,
+        max_source_age_seconds: float = 60.0,
+    ) -> None:
+        self.config = config or EventWindowPlannerConfig()
+        self.max_response_age_seconds = max_response_age_seconds
+        self.max_source_age_seconds = max_source_age_seconds
+
+    def plan(
+        self,
+        *,
+        long_market: dict[str, Any],
+        short_market: dict[str, Any],
+        now: datetime,
+        target_notional: float,
+    ) -> FundingRoutePlan:
+        config = self.config
+        long_venue = str(long_market.get("venue") or "").lower()
+        short_venue = str(short_market.get("venue") or "").lower()
+        long_contract = settlement_contract_from_market(long_market)
+        short_contract = settlement_contract_from_market(short_market)
+        blockers: list[str] = []
+        if long_venue == "paradex" or short_venue == "paradex":
+            blockers.append("funding_continuous_pro_rata")
+        long_env = str(long_market.get("environment") or "").lower()
+        short_env = str(short_market.get("environment") or "").lower()
+        if long_env not in {"mainnet", "testnet"} or short_env not in {"mainnet", "testnet"}:
+            blockers.append("environment_unverified")
+        elif long_env != short_env:
+            blockers.append("environment_mismatch")
+        long_asset = str(long_market.get("canonical_asset") or long_market.get("canonical_underlying") or "").upper()
+        short_asset = str(short_market.get("canonical_asset") or short_market.get("canonical_underlying") or "").upper()
+        if not long_asset or long_asset != short_asset:
+            blockers.append("canonical_underlying_mismatch")
+
+        long_events = funding_events_from_market(
+            long_market,
+            side="long",
+            leg_id=f"{long_venue}:{long_market.get('symbol')}:long",
+            target_notional=target_notional,
+            config=config,
+            contract=long_contract,
+        )
+        short_events = funding_events_from_market(
+            short_market,
+            side="short",
+            leg_id=f"{short_venue}:{short_market.get('symbol')}:short",
+            target_notional=target_notional,
+            config=config,
+            contract=short_contract,
+        )
+        blockers.extend(
+            f"long_{reason}"
+            for reason in settlement_contract_blockers(
+                long_contract,
+                next_settlement_at=long_market.get("next_funding_at"),
+            )
+        )
+        blockers.extend(
+            f"short_{reason}"
+            for reason in settlement_contract_blockers(
+                short_contract,
+                next_settlement_at=short_market.get("next_funding_at"),
+            )
+        )
+        blockers.extend(
+            f"long_{reason}"
+            for reason in _freshness_blockers(
+                long_market,
+                now=now,
+                max_response_age_seconds=self.max_response_age_seconds,
+                max_source_age_seconds=self.max_source_age_seconds,
+            )
+        )
+        blockers.extend(
+            f"short_{reason}"
+            for reason in _freshness_blockers(
+                short_market,
+                now=now,
+                max_response_age_seconds=self.max_response_age_seconds,
+                max_source_age_seconds=self.max_source_age_seconds,
+            )
+        )
+        if not long_events:
+            blockers.append("long_next_settlement_time_missing")
+        if not short_events:
+            blockers.append("short_next_settlement_time_missing")
+        events = sorted([*long_events, *short_events], key=_event_sort_key)
+        if not events:
+            blockers = list(dict.fromkeys(blockers))
+            return FundingRoutePlan(
+                strategy_name=INTERNAL_STRATEGY_NAME,
+                compatibility_alias=STRATEGY_NAME,
+                strategy_version=STRATEGY_VERSION,
+                opportunity_shape=ONE_SETTLEMENT,
+                leg_a=long_market,
+                leg_b=short_market,
+                orientation={"long_venue": long_venue, "short_venue": short_venue},
+                planned_entry_at="",
+                entry_window_opens_at="",
+                entry_deadline_at="",
+                planned_exit_at="",
+                monitor_until="",
+                included_settlement_events=[],
+                excluded_settlement_events=[],
+                ambiguous_settlement_events=[],
+                expected_funding_cashflow_usd=Decimal("0"),
+                conservative_funding_cashflow_usd=Decimal("0"),
+                expected_costs_usd=Decimal("0"),
+                conservative_costs_usd=Decimal("0"),
+                expected_net_usd=Decimal("0"),
+                conservative_net_usd=Decimal("0"),
+                conservative_net_bps=Decimal("0"),
+                blockers=blockers,
+                confidence="blocked",
+                eligibility_status="CAPABILITY_BLOCKED",
+                lifecycle_state="DISCOVERED",
+                expires_at="",
+                evidence_version="",
+                planner={"plans": [], "config": asdict(config)},
+                modeled_costs={},
+            )
+
+        first_event = events[0]
+        first_time = parse_time(first_event.scheduled_at) or now.astimezone(UTC)
+        planned_entry_at = first_time - timedelta(
+            seconds=max(0.0, float(config.entry_safety_buffer_seconds))
+        )
+        plans: list[dict[str, Any]] = []
+        first_event_time = parse_time(first_event.scheduled_at) or first_time
+        for index, event in enumerate(events):
+            event_time = parse_time(event.scheduled_at)
+            if event_time is None:
+                continue
+            gap = abs((event_time.astimezone(UTC) - first_event_time.astimezone(UTC)).total_seconds())
+            if gap > min(
+                float(config.max_strategy_hold_seconds),
+                float(config.max_gap_between_settlements_seconds),
+            ):
+                continue
+            plan_name = {
+                0: "exit_after_first_settlement",
+                1: "exit_after_second_settlement",
+                2: "exit_after_third_settlement",
+            }.get(index, f"exit_after_{index + 1}_settlement")
+            plans.append(
+                _build_hold_plan(
+                    plan_name=plan_name,
+                    exit_after_event=event,
+                    events=events,
+                    planned_entry_at=planned_entry_at,
+                    long_market=long_market,
+                    short_market=short_market,
+                    target_notional=target_notional,
+                    config=config,
+                )
+            )
+        if not plans:
+            plans.append(
+                _build_hold_plan(
+                    plan_name="exit_after_first_settlement",
+                    exit_after_event=first_event,
+                    events=events,
+                    planned_entry_at=planned_entry_at,
+                    long_market=long_market,
+                    short_market=short_market,
+                    target_notional=target_notional,
+                    config=config,
+                )
+            )
+        feasible = [plan for plan in plans if not plan["blockers"]]
+        selected = max(
+            feasible or plans,
+            key=lambda plan: (
+                not plan["blockers"],
+                float(plan["conservative_net_usd"]),
+                float(plan["expected_net_usd"]),
+            ),
+        )
+        blockers.extend(selected.get("blockers") or [])
+        lifecycle_state = _lifecycle_state(
+            now=now,
+            entry_window_opens_at=selected.get("entry_window_opens_at"),
+            entry_deadline_at=selected.get("entry_deadline_at"),
+        )
+        if lifecycle_state == "ENTRY_WINDOW_MISSED":
+            blockers.append("entry_window_missed")
+        blockers = list(dict.fromkeys(blockers))
+        eligibility_status = _eligibility_status(blockers, lifecycle_state=lifecycle_state)
+        confidence = "candidate" if eligibility_status == "SHADOW_CANDIDATE" else "research"
+        included_events = [
+            FundingSettlementEvent(**event)
+            for event in selected.get("included_settlement_events", [])
+        ]
+        excluded_events = [
+            FundingSettlementEvent(**event)
+            for event in selected.get("excluded_settlement_events", [])
+        ]
+        ambiguous_events = [
+            FundingSettlementEvent(**event)
+            for event in selected.get("ambiguous_settlement_events", [])
+        ]
+        evidence_versions = [
+            str(event.evidence_version)
+            for event in included_events
+            if event.evidence_version
+        ]
+        monitor_until = str(selected.get("monitor_until") or selected.get("planned_exit_at") or "")
+        return FundingRoutePlan(
+            strategy_name=INTERNAL_STRATEGY_NAME,
+            compatibility_alias=STRATEGY_NAME,
+            strategy_version=STRATEGY_VERSION,
+            opportunity_shape=str(selected["opportunity_shape"]),
+            leg_a=long_market,
+            leg_b=short_market,
+            orientation={
+                "long_venue": long_venue,
+                "long_symbol": long_market.get("symbol"),
+                "short_venue": short_venue,
+                "short_symbol": short_market.get("symbol"),
+            },
+            planned_entry_at=str(selected.get("planned_entry_at") or ""),
+            entry_window_opens_at=str(selected.get("entry_window_opens_at") or ""),
+            entry_deadline_at=str(selected.get("entry_deadline_at") or ""),
+            planned_exit_at=str(selected.get("planned_exit_at") or ""),
+            monitor_until=monitor_until,
+            included_settlement_events=included_events,
+            excluded_settlement_events=excluded_events,
+            ambiguous_settlement_events=ambiguous_events,
+            expected_funding_cashflow_usd=_decimal(selected.get("expected_funding_cashflow_usd")),
+            conservative_funding_cashflow_usd=_decimal(selected.get("conservative_funding_cashflow_usd")),
+            expected_costs_usd=_decimal(selected.get("expected_costs_usd")),
+            conservative_costs_usd=_decimal(selected.get("conservative_costs_usd")),
+            expected_net_usd=_decimal(selected.get("expected_net_usd")),
+            conservative_net_usd=_decimal(selected.get("conservative_net_usd")),
+            conservative_net_bps=_decimal(selected.get("conservative_net_bps")),
+            blockers=blockers,
+            confidence=confidence,
+            eligibility_status=eligibility_status,
+            lifecycle_state=lifecycle_state,
+            expires_at=monitor_until,
+            evidence_version="|".join(sorted(set(evidence_versions))),
+            modeled_costs=dict(selected.get("modeled_costs") or {}),
+            planner={
+                "selected_plan": selected["plan_name"],
+                "plans": plans,
+                "config": asdict(config),
+            },
+        )
+
+
 def build_settlement_capture_opportunity(
     *,
     long_market: dict[str, Any],
@@ -408,183 +928,17 @@ def build_settlement_capture_opportunity(
     max_response_age_seconds: float = 5.0,
     max_source_age_seconds: float = 60.0,
 ) -> dict[str, Any]:
-    config = planner_config or EventWindowPlannerConfig()
-    long_venue = str(long_market.get("venue") or "").lower()
-    short_venue = str(short_market.get("venue") or "").lower()
-    long_contract = settlement_contract_from_market(long_market)
-    short_contract = settlement_contract_from_market(short_market)
-    blockers: list[str] = []
-    if long_venue == "paradex" or short_venue == "paradex":
-        blockers.append("funding_continuous_pro_rata")
-    long_env = str(long_market.get("environment") or "").lower()
-    short_env = str(short_market.get("environment") or "").lower()
-    if long_env not in {"mainnet", "testnet"} or short_env not in {"mainnet", "testnet"}:
-        blockers.append("environment_unverified")
-    elif long_env != short_env:
-        blockers.append("environment_mismatch")
-    long_asset = str(long_market.get("canonical_asset") or "").upper()
-    short_asset = str(short_market.get("canonical_asset") or "").upper()
-    if not long_asset or long_asset != short_asset:
-        blockers.append("canonical_underlying_mismatch")
-    long_event = funding_event_from_market(
-        long_market,
-        side="long",
-        leg_id=f"{long_venue}:{long_market.get('symbol')}:long",
+    planner = FundingSettlementPlanner(
+        planner_config,
+        max_response_age_seconds=max_response_age_seconds,
+        max_source_age_seconds=max_source_age_seconds,
+    )
+    return planner.plan(
+        long_market=long_market,
+        short_market=short_market,
+        now=now,
         target_notional=target_notional,
-        config=config,
-        contract=long_contract,
-    )
-    short_event = funding_event_from_market(
-        short_market,
-        side="short",
-        leg_id=f"{short_venue}:{short_market.get('symbol')}:short",
-        target_notional=target_notional,
-        config=config,
-        contract=short_contract,
-    )
-    blockers.extend(
-        f"long_{reason}"
-        for reason in settlement_contract_blockers(
-            long_contract,
-            next_settlement_at=long_market.get("next_funding_at"),
-        )
-    )
-    blockers.extend(
-        f"short_{reason}"
-        for reason in settlement_contract_blockers(
-            short_contract,
-            next_settlement_at=short_market.get("next_funding_at"),
-        )
-    )
-    blockers.extend(
-        f"long_{reason}"
-        for reason in _freshness_blockers(
-            long_market,
-            now=now,
-            max_response_age_seconds=max_response_age_seconds,
-            max_source_age_seconds=max_source_age_seconds,
-        )
-    )
-    blockers.extend(
-        f"short_{reason}"
-        for reason in _freshness_blockers(
-            short_market,
-            now=now,
-            max_response_age_seconds=max_response_age_seconds,
-            max_source_age_seconds=max_source_age_seconds,
-        )
-    )
-    if long_event is None:
-        blockers.append("long_next_settlement_time_missing")
-    if short_event is None:
-        blockers.append("short_next_settlement_time_missing")
-    events = [event for event in (long_event, short_event) if event is not None]
-    if not events:
-        return {
-            "strategy_name": INTERNAL_STRATEGY_NAME,
-            "strategy_version": STRATEGY_VERSION,
-            "opportunity_shape": ONE_SETTLEMENT,
-            "leg_a": long_market,
-            "leg_b": short_market,
-            "orientation": {"long_venue": long_venue, "short_venue": short_venue},
-            "included_settlement_events": [],
-            "excluded_settlement_events": [],
-            "ambiguous_settlement_events": [],
-            "expected_funding_cashflow_usd": 0.0,
-            "conservative_funding_cashflow_usd": 0.0,
-            "expected_net_usd": 0.0,
-            "conservative_net_usd": 0.0,
-            "conservative_net_bps": 0.0,
-            "blockers": list(dict.fromkeys(blockers)),
-            "confidence": "blocked",
-            "expires_at": None,
-            "planner": {"plans": []},
-        }
-    ordered_events = sorted(events, key=lambda event: event.scheduled_at)
-    first_event = ordered_events[0]
-    first_time = parse_time(first_event.scheduled_at) or now.astimezone(UTC)
-    planned_entry_at = first_time - timedelta(
-        seconds=max(0.0, float(config.entry_safety_buffer_seconds))
-    )
-    plans = [
-        _build_hold_plan(
-            plan_name="exit_after_first_settlement",
-            exit_after_event=first_event,
-            events=ordered_events,
-            planned_entry_at=planned_entry_at,
-            long_market=long_market,
-            short_market=short_market,
-            target_notional=target_notional,
-            config=config,
-        )
-    ]
-    if len(ordered_events) > 1:
-        second_time = parse_time(ordered_events[1].scheduled_at)
-        gap = (
-            abs((second_time - first_time).total_seconds())
-            if second_time is not None
-            else math.inf
-        )
-        if gap <= float(config.max_gap_between_settlements_seconds):
-            plans.append(
-                _build_hold_plan(
-                    plan_name="exit_after_second_settlement",
-                    exit_after_event=ordered_events[1],
-                    events=ordered_events,
-                    planned_entry_at=planned_entry_at,
-                    long_market=long_market,
-                    short_market=short_market,
-                    target_notional=target_notional,
-                    config=config,
-                )
-            )
-    feasible = [plan for plan in plans if not plan["blockers"]]
-    selected = max(
-        feasible or plans,
-        key=lambda plan: (
-            not plan["blockers"],
-            float(plan["conservative_net_usd"]),
-            float(plan["expected_net_usd"]),
-        ),
-    )
-    blockers.extend(selected.get("blockers") or [])
-    blockers = list(dict.fromkeys(blockers))
-    confidence = "candidate" if not blockers else "research"
-    return {
-        "strategy_name": INTERNAL_STRATEGY_NAME,
-        "external_strategy_name": STRATEGY_NAME,
-        "strategy_version": STRATEGY_VERSION,
-        "opportunity_shape": selected["opportunity_shape"],
-        "leg_a": long_market,
-        "leg_b": short_market,
-        "orientation": {
-            "long_venue": long_venue,
-            "long_symbol": long_market.get("symbol"),
-            "short_venue": short_venue,
-            "short_symbol": short_market.get("symbol"),
-        },
-        "planned_entry_at": selected["planned_entry_at"],
-        "planned_exit_at": selected["planned_exit_at"],
-        "max_hold_seconds": selected["max_hold_seconds"],
-        "planned_hold_seconds": selected["planned_hold_seconds"],
-        "included_settlement_events": selected["included_settlement_events"],
-        "excluded_settlement_events": selected["excluded_settlement_events"],
-        "ambiguous_settlement_events": selected["ambiguous_settlement_events"],
-        "expected_funding_cashflow_usd": selected["expected_funding_cashflow_usd"],
-        "conservative_funding_cashflow_usd": selected["conservative_funding_cashflow_usd"],
-        "expected_net_usd": selected["expected_net_usd"],
-        "conservative_net_usd": selected["conservative_net_usd"],
-        "conservative_net_bps": selected["conservative_net_bps"],
-        "modeled_costs": selected["modeled_costs"],
-        "blockers": blockers,
-        "confidence": confidence,
-        "expires_at": first_event.scheduled_at,
-        "planner": {
-            "selected_plan": selected["plan_name"],
-            "plans": plans,
-            "config": asdict(config),
-        },
-    }
+    ).as_dict()
 
 
 def gross_funding_pnl(
@@ -887,13 +1241,7 @@ def validate_focused_observation(
             )
     elif long_response_at is None or short_response_at is None:
         reasons.append("response_timestamp_missing")
-    if long_next_funding is not None and short_next_funding is not None:
-        funding_skew = abs(
-            (long_next_funding.astimezone(UTC) - short_next_funding.astimezone(UTC)).total_seconds()
-        )
-        if funding_skew > 1.0:
-            reasons.append("funding_timestamps_not_same_cycle")
-    elif long_next_funding is None or short_next_funding is None:
+    if long_next_funding is None or short_next_funding is None:
         reasons.append("funding_timestamp_missing")
     if not long_book_executable:
         reasons.append("long_book_not_executable")

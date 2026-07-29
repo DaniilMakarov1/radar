@@ -515,6 +515,52 @@ def test_unavoidable_negative_second_settlement_is_deducted() -> None:
     assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(1.0)
 
 
+def test_three_settlement_events_are_considered_as_timeline() -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    first = now + timedelta(seconds=30)
+    second = first + timedelta(seconds=20)
+    third = first + timedelta(seconds=60)
+    long_market = complete_market(
+        venue="binance",
+        funding_rate=-0.004,
+        settlement=first.isoformat(),
+        observed_at=now.isoformat(),
+    )
+    long_market["funding_settlement_events"] = [
+        {"scheduled_at": first.isoformat(), "funding_rate": -0.004},
+        {"scheduled_at": third.isoformat(), "funding_rate": -0.003},
+    ]
+    short_market = complete_market(
+        venue="bybit",
+        funding_rate=0.002,
+        settlement=second.isoformat(),
+        observed_at=now.isoformat(),
+    )
+    short_market["funding_settlement_events"] = [
+        {"scheduled_at": second.isoformat(), "funding_rate": 0.002},
+    ]
+
+    opportunity = build_settlement_capture_opportunity(
+        long_market=long_market,
+        short_market=short_market,
+        now=now,
+        target_notional=500.0,
+    )
+
+    assert opportunity["planner"]["selected_plan"] == "exit_after_third_settlement"
+    assert opportunity["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
+    assert len(opportunity["included_settlement_events"]) == 3
+    assert [
+        (event["venue"], event["scheduled_at"])
+        for event in opportunity["included_settlement_events"]
+    ] == [
+        ("binance", first.isoformat()),
+        ("bybit", second.isoformat()),
+        ("binance", third.isoformat()),
+    ]
+    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(4.5)
+
+
 def test_second_settlement_too_far_does_not_extend_hold() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     first = now + timedelta(seconds=30)

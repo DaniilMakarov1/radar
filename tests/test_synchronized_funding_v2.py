@@ -9,7 +9,9 @@ import pytest
 
 from smart_money_radar.funding.profiles import funding_bot_profile
 from smart_money_radar.funding.strategy_synchronized_funding import (
+    FundingSettlementPlanner,
     STRATEGY_NAME,
+    build_settlement_capture_opportunity,
     basis_duration_floor_bps,
     entry_underwriting,
     entry_window_passed,
@@ -496,6 +498,7 @@ def test_position_hold_decision_detects_interval_mismatch() -> None:
             {
                 "side": "long",
                 "venue": "binance",
+                "environment": "mainnet",
                 "symbol": "BTCUSDT",
                 "next_funding_at": "2026-07-19T13:00:00+00:00",
                 "funding_interval_hours": 1.0,
@@ -966,6 +969,7 @@ def test_arm_decision_requires_ten_observations() -> None:
             {
                 "side": "long",
                 "venue": "binance",
+                "environment": "mainnet",
                 "symbol": "BTCUSDT",
                 "next_funding_at": "2026-07-28T16:00:00+00:00",
             },
@@ -1542,6 +1546,8 @@ def _v2_runtime_route(
             {
                 "side": "long",
                 "venue": "binance",
+                "environment": "mainnet",
+                "canonical_asset": "BTC",
                 "symbol": "BTCUSDT",
                 "next_funding_at": next_at.isoformat(),
                 "funding_rate": -0.008,
@@ -1575,6 +1581,7 @@ def _v2_runtime_route(
                 "exit_safety_buffer_seconds": 20,
                 "timing_policy_source": "adapter_binance_test",
                 "response_received_at": response_at.isoformat(),
+                "source_event_at": response_at.isoformat(),
                 "orderbook_response_received_at": response_at.isoformat(),
                 "asks": [[100.02, 20.0]],
                 "bids": [[99.98, 20.0]],
@@ -1582,6 +1589,8 @@ def _v2_runtime_route(
             {
                 "side": "short",
                 "venue": "bybit",
+                "environment": "mainnet",
+                "canonical_asset": "BTC",
                 "symbol": "BTCUSDT",
                 "next_funding_at": short_next_at.isoformat(),
                 "funding_rate": 0.010,
@@ -1615,6 +1624,7 @@ def _v2_runtime_route(
                 "exit_safety_buffer_seconds": 20,
                 "timing_policy_source": "adapter_bybit_test",
                 "response_received_at": (response_at + timedelta(milliseconds=500)).isoformat(),
+                "source_event_at": (response_at + timedelta(milliseconds=500)).isoformat(),
                 "orderbook_response_received_at": (response_at + timedelta(milliseconds=500)).isoformat(),
                 "asks": [[100.02, 20.0]],
                 "bids": [[99.98, 20.0]],
@@ -1637,7 +1647,15 @@ def _v2_runtime_route(
     }
 
 
-def _valid_v2_observation(at: datetime, next_at: datetime, *, phase: str = "entry") -> dict:
+def _valid_v2_observation(
+    at: datetime,
+    next_at: datetime,
+    *,
+    phase: str = "entry",
+    short_next_at: datetime | None = None,
+    gross_funding_pnl: float = 9.0,
+) -> dict:
+    short_next = short_next_at or next_at
     return {
         "phase": phase,
         "observed_at": at.isoformat(),
@@ -1652,10 +1670,10 @@ def _valid_v2_observation(at: datetime, next_at: datetime, *, phase: str = "entr
         "long_index": 100.0,
         "short_index": 100.0,
         "long_next_funding_at": next_at.isoformat(),
-        "short_next_funding_at": next_at.isoformat(),
+        "short_next_funding_at": short_next.isoformat(),
         "long_next_funding_rate": -0.008,
         "short_next_funding_rate": 0.010,
-        "gross_funding_pnl": 9.0,
+        "gross_funding_pnl": gross_funding_pnl,
         "long_open_vwap": 100.02,
         "short_open_vwap": 99.98,
         "long_close_vwap": 99.98,
@@ -1704,6 +1722,55 @@ def _open_v2_runtime_position(tmp_path, monkeypatch, now: datetime):
     opened = bot.process_entry_candidates([route], recheck_before_open=False)
     _install_targeted_refresh_clients(bot, route["route_key"], route)
     return store, bot, route, capture_id, opened
+
+
+def _seed_v2_entry_observations(
+    bot,
+    route: dict,
+    now: datetime,
+    *,
+    long_next_at: datetime,
+    short_next_at: datetime | None = None,
+    gross_funding_pnl: float = 9.0,
+) -> None:
+    bot.v2_observations_by_route[route_entry_key(route)] = [
+        _valid_v2_observation(
+            now - timedelta(seconds=20 - index * 2),
+            long_next_at,
+            short_next_at=short_next_at,
+            gross_funding_pnl=gross_funding_pnl,
+        )
+        for index in range(9)
+    ]
+
+
+def _fresh_route_for_open_position(route: dict, observed_at: datetime) -> dict:
+    fresh = {**route, "observed_at": observed_at.astimezone(UTC).isoformat()}
+    fresh_legs: list[dict] = []
+    for leg in route.get("legs") or []:
+        fresh_leg = dict(leg)
+        fresh_leg["response_received_at"] = observed_at.astimezone(UTC).isoformat()
+        fresh_leg["source_event_at"] = observed_at.astimezone(UTC).isoformat()
+        fresh_leg["orderbook_response_received_at"] = observed_at.astimezone(UTC).isoformat()
+        fresh_legs.append(fresh_leg)
+    fresh["legs"] = fresh_legs
+    return fresh
+
+
+def _paper_bot_for_route(tmp_path, now: datetime):
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    config = PaperBotConfig(
+        telegram_enabled=False,
+        focused_recheck_enabled=False,
+        venue_starting_balance=10_000.0,
+        target_notional_per_leg=500.0,
+    ).validated()
+    return store, PaperBot(store, config, clock=FakeClock(now))
 
 
 def _install_fresh_hot_route(bot, route: dict, *, next_lead_seconds: float = 3600.0) -> dict:
@@ -1830,6 +1897,153 @@ def test_paperbot_v2_entry_uses_new_runtime_not_legacy_open(tmp_path, monkeypatc
     assert event_types.count("collateral_reserve") == 2
 
 
+def test_paperbot_v2_accepts_one_settlement_alignment_mismatch(tmp_path) -> None:
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    first = now + timedelta(seconds=30)
+    far = now + timedelta(hours=4)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now, short_next_lead_seconds=4 * 3600)
+    route["legs"][0]["funding_rate"] = -0.014
+    route["legs"][0]["normalized_next_funding_rate"] = -0.014
+    route["legs"][0]["hourly_funding_rate"] = -0.014
+    capture_id = capture_position_id_for_route(route)
+    _seed_v2_entry_observations(
+        bot,
+        route,
+        now,
+        long_next_at=first,
+        short_next_at=far,
+        gross_funding_pnl=6.3,
+    )
+
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+
+    assert opened == [capture_id]
+    position = store.funding_capture_position_by_id(capture_id)
+    plan = position["config"]["funding_route_plan"]
+    assert plan["opportunity_shape"] == "ONE_SETTLEMENT"
+    assert [event["venue"] for event in plan["included_settlement_events"]] == ["binance"]
+    assert [event["venue"] for event in plan["excluded_settlement_events"]] == ["bybit"]
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == 1
+
+
+def test_paperbot_v2_actually_calls_shared_planner(tmp_path) -> None:
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    class SpyPlanner:
+        def __init__(self) -> None:
+            self.delegate = FundingSettlementPlanner()
+            self.calls: list[dict] = []
+
+        def plan(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.delegate.plan(**kwargs)
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    settlement_at = now + timedelta(seconds=30)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now)
+    spy = SpyPlanner()
+    bot.synchronized_runtime.planner = spy
+    _seed_v2_entry_observations(bot, route, now, long_next_at=settlement_at)
+
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+
+    assert opened == [capture_position_id_for_route(route)]
+    assert spy.calls
+    assert spy.calls[0]["long_market"]["venue"] == "binance"
+    assert store.funding_capture_position_by_id(opened[0])["state"] == "OPEN"
+
+
+def test_shadow_and_paperbot_route_plan_parity(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now, short_next_lead_seconds=50)
+    paper_plan = bot.synchronized_runtime._plan_dict_for_route(route, now)
+    long_leg = next(leg for leg in route["legs"] if leg["side"] == "long")
+    short_leg = next(leg for leg in route["legs"] if leg["side"] == "short")
+    shadow_plan = build_settlement_capture_opportunity(
+        long_market=long_leg,
+        short_market=short_leg,
+        now=now,
+        target_notional=500.0,
+    )
+
+    assert paper_plan["planner"]["selected_plan"] == shadow_plan["planner"]["selected_plan"]
+    assert paper_plan["opportunity_shape"] == shadow_plan["opportunity_shape"]
+    assert paper_plan["conservative_net_usd"] == pytest.approx(shadow_plan["conservative_net_usd"])
+    assert [
+        event["event_id"] for event in paper_plan["included_settlement_events"]
+    ] == [event["event_id"] for event in shadow_plan["included_settlement_events"]]
+
+
+def test_paperbot_v2_multi_event_survives_first_event_and_closes_after_last(tmp_path) -> None:
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    first = now + timedelta(seconds=30)
+    second = first + timedelta(seconds=20)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now, short_next_lead_seconds=50)
+    route["legs"][0]["funding_settlement_events"] = [
+        {"scheduled_at": first.isoformat(), "funding_rate": -0.008},
+    ]
+    route["legs"][1]["funding_settlement_events"] = [
+        {"scheduled_at": second.isoformat(), "funding_rate": 0.010},
+    ]
+    capture_id = capture_position_id_for_route(route)
+    _seed_v2_entry_observations(
+        bot,
+        route,
+        now,
+        long_next_at=first,
+        short_next_at=second,
+        gross_funding_pnl=8.1,
+    )
+
+    opened = bot.process_entry_candidates([route], recheck_before_open=False)
+
+    assert opened == [capture_id]
+    plan = store.funding_capture_position_by_id(capture_id)["config"]["funding_route_plan"]
+    assert plan["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
+    assert len(plan["included_settlement_events"]) == 2
+    cycles = store.funding_capture_cycles_for_position(capture_id)
+    assert [cycle["scheduled_funding_at"] for cycle in cycles] == [
+        first.isoformat(),
+        second.isoformat(),
+    ]
+    _install_targeted_refresh_clients(bot, route["route_key"], route)
+
+    bot.clock.advance(31)
+    bot.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, bot.clock.now())
+    assert bot.process_open_positions() == ["settlement_crossed"]
+    cycles = store.funding_capture_cycles_for_position(capture_id)
+    assert [(cycle["cycle_number"], cycle["state"]) for cycle in cycles] == [
+        (1, "SETTLEMENT_CROSSED"),
+        (2, "OPEN"),
+    ]
+
+    bot.clock.advance(19)
+    bot.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, bot.clock.now())
+    assert bot.process_open_positions() == ["settlement_crossed"]
+    cycles = store.funding_capture_cycles_for_position(capture_id)
+    assert [(cycle["cycle_number"], cycle["state"]) for cycle in cycles] == [
+        (1, "SETTLEMENT_CROSSED"),
+        (2, "SETTLEMENT_CROSSED"),
+    ]
+
+    bot.clock.advance(5)
+    bot.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, bot.clock.now())
+    assert bot.process_open_positions() == ["closed"]
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_PENDING_RECONCILIATION"
+    assert (
+        store.funding_capture_position_by_id(capture_id)["config"]["payment_reconciliation_source"]
+        == "SIMULATED"
+    )
+
+
 def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
@@ -1848,7 +2062,7 @@ def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp
     assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
 
 
-def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_closes_after_planned_event_window_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -1858,6 +2072,7 @@ def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp
 
     next_settlement = settlement_at + timedelta(seconds=3600)
     outcomes: list[str] = []
+    all_outcomes: list[str] = []
     for offset in range(5, 31):
         target = settlement_at + timedelta(seconds=offset)
         bot.clock.advance((target - bot.clock.now()).total_seconds())
@@ -1871,29 +2086,19 @@ def test_paperbot_v2_holds_aligned_next_cycle_without_reconciled_prior_cycle(tmp
         _boost_next_cycle_funding(next_route)
         bot.hot_routes[route["route_key"]] = next_route
         outcomes = bot.process_open_positions()
+        all_outcomes.extend(outcomes)
+        if outcomes:
+            break
 
-    assert outcomes == ["hold"]
-    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
-    assert held["position_id"] == capture_id
+    assert all_outcomes == ["closed"]
+    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
+    assert closed["position_id"] == capture_id
     with store.connect() as conn:
         cycles = conn.execute(
             "SELECT cycle_number, state FROM funding_capture_cycles WHERE position_id = ? ORDER BY cycle_number",
             (capture_id,),
         ).fetchall()
-        hold_rows = conn.execute(
-            """
-            SELECT observed_at
-            FROM funding_capture_observations
-            WHERE position_id = ? AND phase = 'hold'
-            ORDER BY observed_at
-            """,
-            (capture_id,),
-        ).fetchall()
-    assert [(row[0], row[1]) for row in cycles] == [(1, "SETTLEMENT_CROSSED"), (2, "HOLDING_NEXT_CYCLE")]
-    assert len(hold_rows) >= 15
-    hold_start = datetime.fromisoformat(hold_rows[0][0])
-    hold_end = datetime.fromisoformat(hold_rows[-1][0])
-    assert (hold_end - hold_start).total_seconds() >= 20
+    assert [(row[0], row[1]) for row in cycles] == [(1, "SETTLEMENT_CROSSED")]
     assert all(row["status"] == "PENDING" for row in store.funding_settlement_reconciliation_rows(capture_id))
 
 
@@ -1922,7 +2127,7 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
         if outcomes:
             break
 
-    assert outcomes == ["emergency_unwind"]
+    assert outcomes == ["closed"]
     closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
     assert closed["paper_net_pnl_estimated"] is not None
     assert len(store.funding_paper_order_rows(capture_id)) == 4
@@ -1932,7 +2137,7 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     assert "funding" not in ledger_types
 
 
-def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_closes_different_intervals_after_planned_event_window(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -1941,7 +2146,7 @@ def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tm
     assert bot.process_open_positions() == ["settlement_crossed"]
 
     next_settlement = settlement_at + timedelta(seconds=3600)
-    outcomes: list[str] = []
+    all_outcomes: list[str] = []
     for offset in range(5, 31):
         target = settlement_at + timedelta(seconds=offset)
         bot.clock.advance((target - bot.clock.now()).total_seconds())
@@ -1957,10 +2162,13 @@ def test_paperbot_v2_holds_different_intervals_with_same_exact_next_timestamp(tm
         _boost_next_cycle_funding(next_route)
         bot.hot_routes[route["route_key"]] = next_route
         outcomes = bot.process_open_positions()
+        all_outcomes.extend(outcomes)
+        if outcomes:
+            break
 
-    assert outcomes == ["hold"]
-    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
-    assert held["position_id"] == capture_id
+    assert all_outcomes == ["closed"]
+    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
+    assert closed["position_id"] == capture_id
 
 
 def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tmp_path, monkeypatch) -> None:
@@ -2660,6 +2868,7 @@ class _LightweightDiscoveryClient:
         self.catalog_calls += 1
         instrument = {
             "venue": self.venue,
+            "environment": "mainnet",
             "symbol": self.symbol,
             "canonical_asset": self.asset,
             "base_asset": self.asset,
@@ -2678,6 +2887,7 @@ class _LightweightDiscoveryClient:
         }
         market = {
             "venue": self.venue,
+            "environment": "mainnet",
             "symbol": self.symbol,
             "canonical_asset": self.asset,
             "funding_rate": self.funding_rate,
@@ -2706,6 +2916,8 @@ class _LightweightDiscoveryClient:
             "exit_safety_buffer_seconds": 20,
             "timing_policy_source": f"adapter_{self.venue}_test",
             "observed_at": observed_at,
+            "response_received_at": observed_at,
+            "source_event_at": observed_at,
         }
         if self.include_fee:
             market["taker_fee_rate"] = 0.0005
@@ -2739,13 +2951,13 @@ def test_lightweight_discovery_adds_watch_route_without_orderbook(tmp_path) -> N
     now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
     long_client = _LightweightDiscoveryClient(
-        "venue_a",
+        "binance",
         funding_rate=-0.004,
         next_funding_at=settlement,
         interval_hours=1.0,
     )
     short_client = _LightweightDiscoveryClient(
-        "venue_b",
+        "bybit",
         funding_rate=0.004,
         next_funding_at=settlement,
         interval_hours=4.0,
@@ -2778,13 +2990,13 @@ def test_lightweight_discovery_fail_closed_route_is_research_only(tmp_path) -> N
         now,
         [
             _LightweightDiscoveryClient(
-                "venue_a",
+                "binance",
                 funding_rate=-0.004,
                 next_funding_at=settlement,
                 include_fee=False,
             ),
             _LightweightDiscoveryClient(
-                "venue_b",
+                "bybit",
                 funding_rate=0.004,
                 next_funding_at=settlement,
             ),
@@ -2808,8 +3020,8 @@ def test_lightweight_discovery_zero_or_negative_gross_not_watch(tmp_path) -> Non
         tmp_path,
         now,
         [
-            _LightweightDiscoveryClient("venue_a", funding_rate=0.0, next_funding_at=settlement),
-            _LightweightDiscoveryClient("venue_b", funding_rate=0.0, next_funding_at=settlement),
+            _LightweightDiscoveryClient("binance", funding_rate=0.0, next_funding_at=settlement),
+            _LightweightDiscoveryClient("bybit", funding_rate=0.0, next_funding_at=settlement),
         ],
     )
 
@@ -2818,7 +3030,7 @@ def test_lightweight_discovery_zero_or_negative_gross_not_watch(tmp_path) -> Non
     assert summary is not None
     assert summary["watch_routes_added"] == 0
     assert not bot.hot_routes
-    assert summary["rejection_reasons"]["preliminary_gross_funding_not_positive"] == 2
+    assert summary["rejection_reasons"]["conservative_net_not_positive"] == 2
 
 
 def test_lightweight_discovery_does_not_call_legacy_strategy_builder(
@@ -2837,8 +3049,8 @@ def test_lightweight_discovery_does_not_call_legacy_strategy_builder(
         tmp_path,
         now,
         [
-            _LightweightDiscoveryClient("venue_a", funding_rate=-0.004, next_funding_at=settlement),
-            _LightweightDiscoveryClient("venue_b", funding_rate=0.004, next_funding_at=settlement),
+            _LightweightDiscoveryClient("binance", funding_rate=-0.004, next_funding_at=settlement),
+            _LightweightDiscoveryClient("bybit", funding_rate=0.004, next_funding_at=settlement),
         ],
     )
 
@@ -3858,8 +4070,8 @@ def test_background_full_scan_does_not_suppress_light_discovery(tmp_path) -> Non
     now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
     clients = [
-        _LightweightDiscoveryClient("venue_a", funding_rate=-0.004, next_funding_at=settlement),
-        _LightweightDiscoveryClient("venue_b", funding_rate=0.004, next_funding_at=settlement),
+        _LightweightDiscoveryClient("binance", funding_rate=-0.004, next_funding_at=settlement),
+        _LightweightDiscoveryClient("bybit", funding_rate=0.004, next_funding_at=settlement),
     ]
     bot = _lightweight_bot(tmp_path, now, clients)
     bot._last_lightweight_discovery_monotonic = bot.clock.monotonic() - 31.0

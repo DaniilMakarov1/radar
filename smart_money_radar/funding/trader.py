@@ -72,6 +72,7 @@ from smart_money_radar.funding.shadow_monitor import (
     adaptive_broad_sweep_interval_seconds,
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
+    build_settlement_capture_opportunity,
     gross_funding_pnl,
     settlement_alignment_passed,
     settlement_skew_seconds,
@@ -1775,7 +1776,66 @@ class PaperBot:
         for route in routes:
             route_key = str(route.get("route_key") or "")
             active_route = route
-            monitor = route_monitor_decision(route, self.clock.now(), self.config)
+            now = self.clock.now()
+            route_plan = self.synchronized_runtime._plan_dict_for_route(route, now)
+            monitor = route_monitor_decision(route, now, self.config)
+            if route_plan is not None:
+                included_events = [
+                    event
+                    for event in list(route_plan.get("included_settlement_events") or [])
+                    if isinstance(event, dict)
+                ]
+                first_event_at = min(
+                    (
+                        parse_iso(event.get("scheduled_at"))
+                        for event in included_events
+                        if parse_iso(event.get("scheduled_at")) is not None
+                    ),
+                    default=None,
+                )
+                first_lead = (
+                    (first_event_at - now).total_seconds()
+                    if first_event_at is not None
+                    else None
+                )
+                plan_blockers = list(route_plan.get("blockers") or [])
+                event_window_hot = bool(
+                    not plan_blockers
+                    and route_plan.get("lifecycle_state") == "ENTRY_WINDOW_OPEN"
+                    and route_plan.get("eligibility_status") == "SHADOW_CANDIDATE"
+                    and optional_float(route_plan.get("conservative_net_usd")) is not None
+                    and float(route_plan.get("conservative_net_usd") or 0.0) > 0.0
+                    and first_lead is not None
+                    and first_lead >= 0.0
+                    and route.get("status") in {"paper_candidate", "watch"}
+                )
+                if event_window_hot:
+                    monitor = {
+                        **monitor,
+                        "hot": True,
+                        "urgent": bool(
+                            first_lead is not None
+                            and first_lead <= float(self.config.entry_max_lead_seconds)
+                        ),
+                        "leads": {**(monitor.get("leads") or {}), "route_plan": first_lead},
+                        "reasons": [
+                            reason
+                            for reason in list(monitor.get("reasons") or [])
+                            if reason
+                            not in {
+                                "settlement_alignment_mismatch",
+                                "long_settlement_outside_arm_window",
+                                "short_settlement_outside_arm_window",
+                            }
+                        ],
+                        "event_window_plan": {
+                            "opportunity_shape": route_plan.get("opportunity_shape"),
+                            "selected_plan": (route_plan.get("planner") or {}).get("selected_plan"),
+                            "first_included_settlement_at": first_event_at.isoformat()
+                            if first_event_at is not None
+                            else None,
+                        },
+                    }
             if monitor["hot"] and route_key and route_key not in self.armed_routes:
                 self.armed_routes.add(route_key)
                 self.record_event(
@@ -2441,9 +2501,6 @@ class PaperBot:
                         long_market.get("next_funding_at"),
                         short_market.get("next_funding_at"),
                     )
-                    if skew is None or skew > float(self.config.settlement_alignment_tolerance_seconds):
-                        reject("settlement_alignment_mismatch")
-                        continue
                     capability = self._lightweight_capability_check(
                         long_market,
                         short_market,
@@ -2454,6 +2511,18 @@ class PaperBot:
                         for reason in capability["all_reasons"]:
                             reject(reason)
                         continue
+                    plan = build_settlement_capture_opportunity(
+                        long_market=long_market,
+                        short_market=short_market,
+                        now=now,
+                        target_notional=float(self.config.target_notional_per_leg),
+                    )
+                    plan_blockers = list(plan.get("blockers") or [])
+                    if plan_blockers:
+                        research_only_routes += 1
+                        for reason in plan_blockers:
+                            reject(str(reason))
+                        continue
                     long_mark = float(optional_float(long_market.get("mark_price")) or 0.0)
                     short_mark = float(optional_float(short_market.get("mark_price")) or 0.0)
                     if long_mark <= 0 or short_mark <= 0:
@@ -2461,13 +2530,7 @@ class PaperBot:
                         continue
                     target_notional = float(self.config.target_notional_per_leg)
                     quantity = min(target_notional / long_mark, target_notional / short_mark)
-                    gross = gross_funding_pnl(
-                        quantity=quantity,
-                        long_mark=long_mark,
-                        short_mark=short_mark,
-                        long_funding_rate=float(long_market["normalized_next_funding_rate"]),
-                        short_funding_rate=float(short_market["normalized_next_funding_rate"]),
-                    )
+                    gross = float(plan.get("conservative_funding_cashflow_usd") or 0.0)
                     if gross <= 0:
                         reject("preliminary_gross_funding_not_positive")
                         continue
@@ -2479,6 +2542,8 @@ class PaperBot:
                         gross,
                         capability,
                         now,
+                        route_plan=plan,
+                        settlement_skew_seconds_value=skew,
                     )
                     route_key = str(route["route_key"])
                     existing = routes_by_key.get(route_key)
@@ -2544,6 +2609,9 @@ class PaperBot:
         preliminary_gross: float,
         capability: dict[str, Any],
         now: datetime,
+        *,
+        route_plan: dict[str, Any] | None = None,
+        settlement_skew_seconds_value: float | None = None,
     ) -> dict[str, Any]:
         long_venue = str(long_market["venue"])
         short_venue = str(short_market["venue"])
@@ -2594,7 +2662,7 @@ class PaperBot:
                 self._lightweight_route_leg("short", short_market, quantity, short_mark),
             ],
             "rationale": [
-                "Lightweight discovery found aligned next funding timestamps and positive gross funding.",
+                "Lightweight discovery found a positive event-window funding plan.",
                 "No orderbooks were fetched; focused underwriting remains mandatory before entry.",
             ],
             "risk_flags": ["lightweight_only_requires_focused_underwriting"],
@@ -2606,7 +2674,9 @@ class PaperBot:
                     "preliminary_gross_funding": preliminary_gross,
                     "target_notional": target_notional,
                     "quantity": quantity,
+                    "settlement_skew_seconds": settlement_skew_seconds_value,
                 },
+                "funding_route_plan": route_plan,
                 "strategy_candidates": [selected_strategy],
                 "selected_strategy": selected_strategy,
                 "strategy_classification": selected_strategy,
@@ -2651,7 +2721,9 @@ class PaperBot:
         return {
             "side": side,
             "venue": market["venue"],
+            "environment": market.get("environment"),
             "symbol": market["symbol"],
+            "canonical_asset": market.get("canonical_asset"),
             "notional": quantity * mark_price,
             "base_quantity": quantity,
             "funding_rate": market.get("funding_rate"),
@@ -2910,6 +2982,7 @@ class PaperBot:
         leg = {
             "side": side,
             "venue": venue,
+            "environment": market.get("environment"),
             "symbol": symbol,
             "funding_rate": market.get("funding_rate"),
             "raw_funding_rate": market.get("raw_funding_rate", market.get("funding_rate")),
@@ -3021,12 +3094,6 @@ class PaperBot:
         cross_skew = abs((long_response - short_response).total_seconds())
         if long_age > 2.0 or short_age > 2.0 or cross_skew > 1.0:
             return "STALE", "response_stale_or_skewed"
-        if not settlement_alignment_passed(
-            parse_iso(long_leg.get("next_funding_at")),
-            parse_iso(short_leg.get("next_funding_at")),
-            tolerance_seconds=float(self.config.settlement_alignment_tolerance_seconds),
-        ):
-            return "PARTIAL", "settlement_alignment_mismatch"
         return "FRESH", None
 
     def process_open_positions(self) -> list[str]:
@@ -3200,7 +3267,12 @@ class PaperBot:
                 )
                 outcomes.append("emergency_unwind")
                 continue
-            if state in {"OPEN", "HOLDING_NEXT_CYCLE"}:
+            if state in {
+                "OPEN",
+                "HOLDING_NEXT_CYCLE",
+                "SETTLEMENT_CROSSED",
+                "POST_SETTLEMENT_EVALUATION",
+            }:
                 crossed = self.synchronized_runtime.mark_settlement_crossed(position, now)
             else:
                 crossed = None
