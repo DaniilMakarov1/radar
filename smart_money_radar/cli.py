@@ -823,6 +823,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum focused route rechecks to run in parallel during hot monitoring.",
     )
     funding_paper_trader.add_argument(
+        "--lightweight-foreground-budget-seconds",
+        type=float,
+        default=8.0,
+        help=(
+            "Maximum time one broad pass waits for venue catalogs. "
+            "Late requests continue and are harvested on a later pass."
+        ),
+    )
+    funding_paper_trader.add_argument(
+        "--lightweight-cache-ttl-seconds",
+        type=float,
+        default=180.0,
+        help="Maximum age of a venue catalog used only for preliminary discovery.",
+    )
+    funding_paper_trader.add_argument(
+        "--lightweight-route-horizon-seconds",
+        type=float,
+        default=3_600.0,
+        help="How far before settlement preliminary routes are detected.",
+    )
+    funding_paper_trader.add_argument(
+        "--lightweight-watch-window-seconds",
+        type=float,
+        default=600.0,
+        help="Lead time at which an early route moves into the watch stage.",
+    )
+    funding_paper_trader.add_argument(
         "--status-report-interval-seconds",
         type=int,
         default=3_600,
@@ -1189,6 +1216,12 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         monitor_interval_seconds=args.monitor_interval_seconds,
         hot_interval_seconds=args.hot_interval_seconds,
         hot_route_recheck_workers=args.hot_route_recheck_workers,
+        lightweight_foreground_budget_seconds=(
+            args.lightweight_foreground_budget_seconds
+        ),
+        lightweight_cache_ttl_seconds=args.lightweight_cache_ttl_seconds,
+        lightweight_route_horizon_seconds=args.lightweight_route_horizon_seconds,
+        lightweight_watch_window_seconds=args.lightweight_watch_window_seconds,
         status_report_interval_seconds=args.status_report_interval_seconds,
         status_report_max_routes=args.status_report_max_routes,
         min_live_net_profit=args.min_live_net_profit,

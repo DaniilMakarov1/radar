@@ -43,6 +43,21 @@ def status_report_message(
     )
     watched = ranked_status_routes(watch_routes)
     max_routes = int(config.status_report_max_routes)
+    venue_health = result.get("venue_health") or {}
+    requested_venues = int(venue_health.get("requested_count") or 0)
+    ready_venues = int(venue_health.get("ready_count") or 0)
+    pending_venues = int(venue_health.get("pending_count") or 0)
+    unavailable_venues = int(venue_health.get("unavailable_count") or 0)
+    detected_count = int(
+        result.get("detected_route_count")
+        if result.get("detected_route_count") is not None
+        else len(candidates) + len(watched)
+    )
+    early_count = int(result.get("early_route_count") or 0)
+    watch_count = int(result.get("watch_stage_route_count") or 0)
+    monitor_count = int(result.get("hot_route_count") or 0)
+    urgent_count = int(result.get("urgent_route_count") or 0)
+    qualified_count = len(candidates)
     universe_count = int(result.get("universe_route_count") or 0)
     route_count = int(result.get("route_count") or 0)
     full_depth_count = int(result.get("execution_shortlist_count") or route_count)
@@ -54,9 +69,12 @@ def status_report_message(
             f"{status_scan_label(result)}"
         ),
         (
-            f"<b>Candidates: {len(candidates)}</b> | "
-            f"Watch/internal: {len(watch_routes)} | Monitor: {result.get('hot_route_count') or 0} | "
-            f"Urgent: {result.get('urgent_route_count') or 0}"
+            f"<b>Routes detected: {detected_count}</b> | "
+            f"Qualified: <b>{qualified_count}</b>"
+        ),
+        (
+            f"Early: {early_count} | Watch: {watch_count} | "
+            f"Monitor: {monitor_count} | Urgent: {urgent_count}"
         ),
         (
             f"<b>Open:</b> {int(summary.get('open_position_count') or 0)} | "
@@ -64,6 +82,20 @@ def status_report_message(
             f"Realized PnL: <b>${float(summary.get('realized_pnl') or 0):.2f}</b>"
         ),
     ]
+    if requested_venues:
+        lines.extend(
+            [
+                "",
+                (
+                    f"<b>Venue coverage:</b> {ready_venues}/{requested_venues} ready | "
+                    f"{pending_venues} loading | {unavailable_venues} unavailable"
+                ),
+                (
+                    f"<b>Markets received:</b> "
+                    f"{int(result.get('markets_checked') or 0):,}"
+                ),
+            ]
+        )
     if universe_count or full_depth_count:
         lines.extend(
             [
@@ -79,7 +111,7 @@ def status_report_message(
         if filter_lines:
             lines.extend(filter_lines)
     if candidates:
-        lines.extend(["", "<b>Candidates</b>"])
+        lines.extend(["", "<b>Qualified candidates</b>"])
         lines.extend(
             status_route_line(route, index)
             for index, route in enumerate(candidates[:max_routes], start=1)
@@ -88,12 +120,16 @@ def status_report_message(
         if hidden > 0:
             lines.append(f"<i>...and {hidden} more</i>")
     else:
-        lines.extend(["", "<b>Candidates:</b> нет"])
-        if watched:
-            lines.append(
-                "<i>Watch routes are hidden from status: they are monitored "
-                "internally but are not trade candidates.</i>"
-            )
+        lines.extend(["", "<b>Qualified candidates:</b> нет"])
+    if watched:
+        lines.extend(["", "<b>Top detected routes</b>"])
+        lines.extend(
+            status_route_line(route, index)
+            for index, route in enumerate(watched[:max_routes], start=1)
+        )
+        hidden = len(watched) - max_routes
+        if hidden > 0:
+            lines.append(f"<i>...and {hidden} more detected routes</i>")
     return "\n".join(lines)
 
 
@@ -107,7 +143,18 @@ def status_scan_label(result: dict[str, Any]) -> str:
 
 
 def compact_filter_lines(result: dict[str, Any]) -> list[str]:
-    screen_reasons = list(result.get("screen_reasons") or [])[:4]
+    raw_screen_reasons = result.get("screen_reasons") or []
+    if isinstance(raw_screen_reasons, dict):
+        screen_reasons = [
+            {"execution_screen_reason": reason, "route_count": count}
+            for reason, count in sorted(
+                raw_screen_reasons.items(),
+                key=lambda item: int(item[1] or 0),
+                reverse=True,
+            )[:4]
+        ]
+    else:
+        screen_reasons = list(raw_screen_reasons)[:4]
     blocker_summary = list(result.get("blocker_summary") or [])[:4]
     lines: list[str] = []
     if screen_reasons:
@@ -176,7 +223,6 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     now = datetime.now(UTC)
     long_lead = lead_seconds(long_leg.get("next_funding_at"), now)
     short_lead = lead_seconds(short_leg.get("next_funding_at"), now)
-    live_net = float(evidence.get("current_nowcast_net") or 0.0)
     threshold = float(evidence.get("actionable_profit_threshold") or 0.0)
     long_display_rate, long_display_interval = leg_display_rate(long_leg)
     short_display_rate, short_display_interval = leg_display_rate(short_leg)
@@ -188,10 +234,14 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     short_hourly_label = f"{short_hourly * 100:.4f}%/h" if short_hourly is not None else ""
     long_rate_display = format_rate(long_display_rate)
     short_rate_display = format_rate(short_display_rate)
-    strategy = selected_route_strategy(
-        route,
-        ("funding_only", "spread_only", "combined", "opportunistic_any"),
+    strategy = evidence.get("selected_strategy") or evidence.get(
+        "strategy_classification"
     )
+    if not strategy:
+        strategy = selected_route_strategy(
+            route,
+            ("synchronized_funding_capture", "funding_only", "spread_only", "combined"),
+        )
     edge_name = opportunity_label(strategy)
     strategy_net = float(
         (strategy or {}).get("expected_net_pnl")
@@ -201,17 +251,38 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     )
     funding_component = optional_float((strategy or {}).get("funding_pnl_component"))
     spread_component = optional_float((strategy or {}).get("spread_pnl_component"))
+    lightweight = (
+        str((strategy or {}).get("selection_model") or "")
+        == "lightweight_discovery_v1"
+        or "lightweight_only_requires_focused_underwriting"
+        in (route.get("risk_flags") or [])
+    )
+    stage = str(
+        route.get("discovery_stage")
+        or ((evidence.get("lightweight_discovery") or {}).get("stage"))
+        or "qualified"
+    )
+    if lightweight:
+        pnl_line = (
+            "Preliminary funding before focused costs: "
+            f"<b>{format_signed_money(funding_component)}</b>\n"
+            "<i>Focused orderbooks, costs and entry observations: pending</i>"
+        )
+    else:
+        pnl_line = (
+            f"Net PnL after costs: <b>{format_signed_money(strategy_net)}</b> | "
+            f"Min: ${threshold:.2f}"
+        )
     return (
         f"\n<b>{index}. {tg(route.get('canonical_asset'))}</b>\n"
-        f"Edge: <code>{tg(edge_name)}</code>\n"
+        f"Stage: <code>{tg(stage)}</code> | Edge: <code>{tg(edge_name)}</code>\n"
         f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
         f"{long_rate_display}/{long_interval}"
         f"{f' ({long_hourly_label})' if long_hourly_label else ''}\n"
         f"SHORT <code>{tg(route.get('short_venue'))} {tg(route.get('short_symbol'))}</code> "
         f"{short_rate_display}/{short_interval}"
         f"{f' ({short_hourly_label})' if short_hourly_label else ''}\n"
-        f"Next net PnL after costs: <b>{format_signed_money(strategy_net)}</b> | "
-        f"Min: ${threshold:.2f}\n"
+        f"{pnl_line}\n"
         f"Funding {format_signed_money(funding_component)} | "
         f"Spread {format_signed_money(spread_component)}\n"
         f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"

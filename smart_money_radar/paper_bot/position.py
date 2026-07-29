@@ -215,6 +215,48 @@ def route_monitor_decision(
     }
 
 
+def route_discovery_stage(
+    route: dict[str, Any],
+    now: datetime,
+    config: PaperBotConfig,
+) -> dict[str, Any]:
+    leads: dict[str, float | None] = {"long": None, "short": None}
+    for side in ("long", "short"):
+        leg = leg_by_side(route.get("legs") or [], side)
+        settlement = parse_iso((leg or {}).get("next_funding_at"))
+        if settlement is not None:
+            leads[side] = (settlement - now).total_seconds()
+    present_leads = [lead for lead in leads.values() if lead is not None]
+    if len(present_leads) != 2:
+        stage = "unavailable"
+    elif any(lead < 0 for lead in present_leads):
+        stage = "expired"
+    elif status_publishable_candidate(route, config):
+        stage = "qualified"
+    elif all(lead <= config.entry_max_lead_seconds for lead in present_leads):
+        stage = "urgent"
+    elif all(lead <= config.arm_window_seconds for lead in present_leads):
+        stage = "monitor"
+    elif all(
+        lead <= config.lightweight_watch_window_seconds
+        for lead in present_leads
+    ):
+        stage = "watch"
+    elif all(
+        lead <= config.lightweight_route_horizon_seconds
+        for lead in present_leads
+    ):
+        stage = "early"
+    else:
+        stage = "outside_horizon"
+    return {
+        "stage": stage,
+        "lead_seconds": leads,
+        "nearest_lead_seconds": min(present_leads, default=None),
+        "furthest_lead_seconds": max(present_leads, default=None),
+    }
+
+
 def build_position_from_route(
     route: dict[str, Any],
     decision: dict[str, Any],

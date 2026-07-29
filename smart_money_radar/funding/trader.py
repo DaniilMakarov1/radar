@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from types import FrameType
 from typing import Any
 
@@ -124,6 +124,7 @@ from smart_money_radar.paper_bot.position import (
     normalize_strategy_set,
     position_hold_decision,
     required_live_net_profit,
+    route_discovery_stage,
     route_entry_decision,
     route_monitor_decision,
     selected_route_strategy,
@@ -249,6 +250,10 @@ class PaperBotConfig:
     monitor_interval_seconds: float = 2.0
     hot_interval_seconds: float = 1.0
     hot_route_recheck_workers: int = 6
+    lightweight_foreground_budget_seconds: float = 8.0
+    lightweight_cache_ttl_seconds: float = 180.0
+    lightweight_route_horizon_seconds: float = 3_600.0
+    lightweight_watch_window_seconds: float = 600.0
     status_report_interval_seconds: int = 3_600
     status_report_max_routes: int = 5
     retention_interval_seconds: int = 300
@@ -269,6 +274,17 @@ class PaperBotConfig:
             for strategy in ("spread_only", "combined", "opportunistic_any"):
                 if strategy not in strategies:
                     strategies.append(strategy)
+        lightweight_route_horizon_seconds = max(
+            600.0,
+            min(float(self.lightweight_route_horizon_seconds), 14_400.0),
+        )
+        lightweight_watch_window_seconds = min(
+            lightweight_route_horizon_seconds,
+            max(
+                120.0,
+                min(float(self.lightweight_watch_window_seconds), 3_600.0),
+            ),
+        )
         return PaperBotConfig(
             profile_name=str(self.profile_name or "default"),
             strategy_set=tuple(strategies),
@@ -386,6 +402,16 @@ class PaperBotConfig:
                 1,
                 min(int(self.hot_route_recheck_workers), 16),
             ),
+            lightweight_foreground_budget_seconds=max(
+                0.05,
+                min(float(self.lightweight_foreground_budget_seconds), 30.0),
+            ),
+            lightweight_cache_ttl_seconds=max(
+                30.0,
+                min(float(self.lightweight_cache_ttl_seconds), 900.0),
+            ),
+            lightweight_route_horizon_seconds=lightweight_route_horizon_seconds,
+            lightweight_watch_window_seconds=lightweight_watch_window_seconds,
             status_report_interval_seconds=max(
                 0,
                 min(int(self.status_report_interval_seconds), 86_400),
@@ -468,6 +494,7 @@ class PaperBot:
         self.armed_routes: set[str] = set()
         self.skipped_notified_routes: set[str] = set()
         self.hot_routes: dict[str, dict[str, Any]] = {}
+        self.discovered_routes: dict[str, dict[str, Any]] = {}
         self.last_full_scan_monotonic = 0.0
         self.last_status_report_monotonic = 0.0
         self.last_retention_monotonic = 0.0
@@ -496,7 +523,13 @@ class PaperBot:
         self._foreground_venues: set[str] = set()
         self._background_venues: set[str] = set()
         self._last_lightweight_nearest_settlement_seconds: float | None = None
-        self._lightweight_pending_futures: dict[Future[Any], str] = {}
+        self._lightweight_pending_futures: dict[
+            Future[Any],
+            tuple[str, str],
+        ] = {}
+        self._lightweight_venue_cache: dict[str, dict[str, Any]] = {}
+        self._lightweight_state_lock = Lock()
+        self._last_lightweight_venue_health: dict[str, Any] = {}
         self.last_runtime_recovery: dict[str, Any] | None = None
         self.store.init_db()
         self.last_runtime_recovery = self.synchronized_runtime.recover_runtime_state(
@@ -835,7 +868,8 @@ class PaperBot:
             venues,
             self.config.venue_starting_balance,
         )
-        self.update_hot_routes([*routes, *watch_routes])
+        self.update_hot_routes(routes)
+        self.update_discovered_routes(watch_routes)
         self.apply_watch_scan_retention(
             minimum_keep_latest_scans=max(1, len(routes) + 1)
         )
@@ -862,6 +896,11 @@ class PaperBot:
         self.background_full_scan_cancel_event = None
 
     def shutdown_foreground_executors(self) -> None:
+        with self._lightweight_state_lock:
+            pending_futures = list(self._lightweight_pending_futures)
+            self._lightweight_pending_futures.clear()
+        for future in pending_futures:
+            future.cancel()
         for name in ("focused_executor", "lightweight_executor"):
             executor = getattr(self, name)
             if executor is not None:
@@ -932,14 +971,30 @@ class PaperBot:
             "pending_count": 0,
             "held_count": 0,
             "open_position_count": 0,
-            "hot_route_count": 0 if cancelled else count_hot_routes(watch_routes, self.config),
-            "urgent_route_count": 0 if cancelled else count_urgent_routes(watch_routes, self.config),
+            "detected_route_count": 0 if cancelled else len(watch_routes),
+            "early_route_count": (
+                0 if cancelled else summary.get("early_route_count", 0)
+            ),
+            "watch_stage_route_count": (
+                0 if cancelled else summary.get("watch_stage_route_count", 0)
+            ),
+            "hot_route_count": (
+                0 if cancelled else summary.get("monitor_route_count", 0)
+            ),
+            "urgent_route_count": (
+                0 if cancelled else summary.get("urgent_route_count", 0)
+            ),
+            "qualified_route_count": (
+                0 if cancelled else summary.get("qualified_route_count", 0)
+            ),
+            "markets_checked": summary.get("markets_checked", 0),
             "universe_route_count": summary["routes_structurally_matched"],
             "execution_shortlist_count": 0,
             "route_count": len(watch_routes),
             "screen_reasons": summary.get("rejection_reasons") or {},
             "blocker_summary": [],
             "warnings": warnings,
+            "venue_health": dict(self._last_lightweight_venue_health),
             "background_skip_reasons": dict(self.background_full_scan_skip_reasons),
             "cancelled": cancelled,
             "started_monotonic": started,
@@ -1203,6 +1258,47 @@ class PaperBot:
         publishable_routes = [
             route for route in routes if status_publishable_candidate(route, self.config)
         ]
+        publishable_route_keys = {
+            str(route.get("route_key") or "")
+            for route in publishable_routes
+            if route.get("route_key")
+        }
+        visible_watch_routes_by_key = {
+            str(route.get("route_key") or f"watch-{index}"): route
+            for index, route in enumerate(
+                [*self.discovered_routes.values(), *watch_routes]
+            )
+            if str(route.get("route_key") or "") not in publishable_route_keys
+        }
+        visible_watch_routes = list(visible_watch_routes_by_key.values())
+        stage_counts = {
+            "early": 0,
+            "watch": 0,
+            "monitor": 0,
+            "urgent": 0,
+            "qualified": len(publishable_routes),
+        }
+        report_now = self.clock.now().astimezone(UTC)
+        for route in visible_watch_routes:
+            stage = route_discovery_stage(route, report_now, self.config)["stage"]
+            route["discovery_stage"] = stage
+            if stage in stage_counts and stage != "qualified":
+                stage_counts[stage] += 1
+        result["detected_route_count"] = len(
+            {
+                str(route.get("route_key") or id(route))
+                for route in [*publishable_routes, *visible_watch_routes]
+            }
+        )
+        result["early_route_count"] = stage_counts["early"]
+        result["watch_stage_route_count"] = stage_counts["watch"]
+        result["hot_route_count"] = stage_counts["monitor"]
+        result["urgent_route_count"] = stage_counts["urgent"]
+        result["qualified_route_count"] = stage_counts["qualified"]
+        result.setdefault(
+            "venue_health",
+            dict(self._last_lightweight_venue_health),
+        )
         payload = {
             "result": result,
             "summary": dashboard.get("summary") or {},
@@ -1212,14 +1308,22 @@ class PaperBot:
                     : self.config.status_report_max_routes
                 ]
             ],
-            "internal_watch_count": len(watch_routes),
+            "detected_routes": [
+                route_summary(route)
+                for route in ranked_status_routes(visible_watch_routes)[
+                    : self.config.status_report_max_routes
+                ]
+            ],
+            "internal_watch_count": len(visible_watch_routes),
+            "discovery_funnel": stage_counts,
+            "venue_health": result.get("venue_health") or {},
         }
         self.record_event(
             "status_report",
             status_report_message(
                 result,
                 routes,
-                watch_routes,
+                visible_watch_routes,
                 dashboard.get("summary") or {},
                 self.config,
             ),
@@ -1284,6 +1388,42 @@ class PaperBot:
             if not route_monitor_decision(route, now, self.config)["hot"]:
                 self.hot_routes.pop(route_key, None)
 
+    def update_discovered_routes(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        observed_now = (now or self.clock.now()).astimezone(UTC)
+        current_route_keys: set[str] = set()
+        for route in routes:
+            route_key = str(route.get("route_key") or "")
+            if not route_key:
+                continue
+            current_route_keys.add(route_key)
+            existing = self.discovered_routes.get(route_key)
+            if existing is not None and route_is_older_than(route, existing):
+                continue
+            stage = route_discovery_stage(route, observed_now, self.config)["stage"]
+            route["discovery_stage"] = stage
+            self.discovered_routes[route_key] = route
+            if stage in {"monitor", "urgent", "qualified"}:
+                self.hot_routes[route_key] = route
+            else:
+                self.hot_routes.pop(route_key, None)
+        for route_key, route in list(self.discovered_routes.items()):
+            if route_key in current_route_keys:
+                continue
+            stage = route_discovery_stage(route, observed_now, self.config)["stage"]
+            age = route_data_age_seconds(route, observed_now)
+            if (
+                stage in {"expired", "outside_horizon", "unavailable"}
+                or age is None
+                or age > self.config.lightweight_cache_ttl_seconds
+            ):
+                self.discovered_routes.pop(route_key, None)
+                self.hot_routes.pop(route_key, None)
+
     def refresh_hot_routes(self) -> list[dict[str, Any]]:
         route_items = list(self.hot_routes.items())
         if not route_items:
@@ -1301,6 +1441,7 @@ class PaperBot:
             decision = route_monitor_decision(fresh, datetime.now(UTC), self.config)
             if decision["hot"]:
                 self.hot_routes[route_key] = fresh
+                self.discovered_routes[route_key] = fresh
                 refreshed_by_key[route_key] = fresh
             else:
                 self.hot_routes.pop(route_key, None)
@@ -2251,17 +2392,13 @@ class PaperBot:
         self._last_lightweight_nearest_settlement_seconds = summary.get(
             "nearest_settlement_seconds"
         )
-        for route in routes:
-            route_key = str(route.get("route_key") or "")
-            if not route_key:
-                continue
-            existing = self.hot_routes.get(route_key)
-            if existing is not None and route_is_older_than(route, existing):
-                continue
-            self.hot_routes[route_key] = route
+        self.update_discovered_routes(routes, now=now)
         return {
             "status": "success",
-            "watch_route_count": len(self.hot_routes),
+            "detected_route_count": len(self.discovered_routes),
+            "watch_route_count": len(self.discovered_routes),
+            "hot_route_count": len(self.hot_routes),
+            "venue_health": dict(self._last_lightweight_venue_health),
             "warnings": warnings,
             **summary,
         }
@@ -2275,120 +2412,164 @@ class PaperBot:
         cancel_event: Event | None = None,
         work_mode: str = "foreground_lightweight",
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        catalog_results: dict[
-            str,
-            tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], str, str],
-        ] = {}
         warnings: list[str] = []
-        worker_count = max(1, min(int(max_workers or len(clients) or 1), len(clients) or 1))
-        if work_mode == "background_full_scan":
-            executor = ThreadPoolExecutor(
-                max_workers=worker_count,
-                thread_name_prefix="funding-background-venue",
+        clients_by_venue = {
+            str(getattr(client, "venue", "")).lower(): client
+            for client in clients
+            if str(getattr(client, "venue", "")).lower()
+        }
+        requested_venues = set(clients_by_venue)
+        completed_venues = self._harvest_lightweight_market_requests(warnings)
+
+        if (
+            work_mode != "background_full_scan"
+            and not (cancel_event is not None and cancel_event.is_set())
+        ):
+            worker_count = max(
+                1,
+                min(
+                    int(max_workers or len(clients_by_venue) or 1),
+                    len(clients_by_venue) or 1,
+                ),
             )
-        else:
             executor = self._ensure_lightweight_executor(workers=worker_count)
-        futures = {}
-        foreground_venues: set[str] = set()
-        try:
-            if work_mode != "background_full_scan":
-                for pending_future, pending_venue in list(
-                    self._lightweight_pending_futures.items()
-                ):
-                    if pending_future.done() or pending_future.cancelled():
-                        self._lightweight_pending_futures.pop(pending_future, None)
-                inflight_venues = set(self._lightweight_pending_futures.values())
-            else:
-                inflight_venues = set()
-            for client in clients:
-                if cancel_event is not None and cancel_event.is_set():
-                    break
-                venue = str(getattr(client, "venue", "")).lower()
-                if venue in inflight_venues:
-                    warnings.append(f"{venue} lightweight catalog skipped: request_in_flight")
+            with self._lightweight_state_lock:
+                inflight_venues = {
+                    metadata[0]
+                    for metadata in self._lightweight_pending_futures.values()
+                }
+            for venue, client in clients_by_venue.items():
+                if venue in inflight_venues or venue in completed_venues:
                     continue
-                if (
-                    work_mode == "background_full_scan"
-                    and not bool(getattr(client, "thread_safe", False))
-                    and venue in self._foreground_venues
-                ):
-                    reason = "foreground_venue_work_active"
-                    self.background_full_scan_skip_reasons[venue] = reason
-                    warnings.append(f"{venue} background catalog skipped: {reason}")
-                    continue
-                if work_mode != "background_full_scan":
-                    self._foreground_venues.add(venue)
-                    foreground_venues.add(venue)
-                else:
-                    self._background_venues.add(venue)
                 request_started_at = self.clock.now().isoformat()
-                futures[
-                    executor.submit(
+                self._foreground_venues.add(venue)
+                try:
+                    future = executor.submit(
                         self._cancelable_catalog_and_markets,
                         client,
                         observed_at,
                         cancel_event,
                     )
-                ] = (
-                    venue,
-                    request_started_at,
+                except Exception:
+                    self._foreground_venues.discard(venue)
+                    raise
+                with self._lightweight_state_lock:
+                    self._lightweight_pending_futures[future] = (
+                        venue,
+                        request_started_at,
+                    )
+
+            with self._lightweight_state_lock:
+                pending_futures = [
+                    future
+                    for future, metadata in self._lightweight_pending_futures.items()
+                    if metadata[0] in requested_venues
+                ]
+            if pending_futures:
+                wait(
+                    pending_futures,
+                    timeout=float(self.config.lightweight_foreground_budget_seconds),
                 )
-            if work_mode != "background_full_scan":
-                for future, (venue, _request_started_at) in futures.items():
-                    self._lightweight_pending_futures[future] = venue
-            done, pending = wait(
-                futures,
-                timeout=2.0,
+            completed_venues.update(
+                self._harvest_lightweight_market_requests(warnings)
             )
-            for future in pending:
-                venue, _request_started_at = futures[future]
-                future.cancel()
-                warnings.append(f"{venue} lightweight catalog skipped: venue_deadline_2s")
-            for future in done:
-                venue, request_started_at = futures[future]
-                if work_mode != "background_full_scan":
-                    self._lightweight_pending_futures.pop(future, None)
-                if cancel_event is not None and cancel_event.is_set():
-                    future.cancel()
-                    continue
-                try:
-                    instruments, markets, venue_warnings = future.result()
-                except FundingDataError as exc:
-                    warnings.append(f"{venue} lightweight catalog skipped: {exc}")
-                    continue
-                response_received_at = self.clock.now().isoformat()
-                catalog_results[venue] = (
-                    instruments,
-                    markets,
-                    venue_warnings,
-                    request_started_at,
-                    response_received_at,
-                )
-        finally:
-            for venue in foreground_venues:
-                self._foreground_venues.discard(venue)
-            if work_mode == "background_full_scan":
-                for client in clients:
-                    self._background_venues.discard(str(getattr(client, "venue", "")).lower())
-            if work_mode == "background_full_scan":
-                executor.shutdown(wait=False, cancel_futures=True)
+        elif cancel_event is not None and cancel_event.is_set():
+            warnings.append("background scan cancelled before cache read")
+
+        now = self.clock.now().astimezone(UTC)
+        catalog_results: dict[str, dict[str, Any]] = {}
+        stale_venues: set[str] = set()
+        with self._lightweight_state_lock:
+            cache_snapshot = {
+                venue: dict(entry)
+                for venue, entry in self._lightweight_venue_cache.items()
+                if venue in requested_venues
+            }
+            pending_venues = {
+                metadata[0]
+                for metadata in self._lightweight_pending_futures.values()
+                if metadata[0] in requested_venues
+            }
+        for venue, entry in cache_snapshot.items():
+            response_received_at = parse_iso(entry.get("response_received_at"))
+            cache_age_seconds = (
+                max(0.0, (now - response_received_at).total_seconds())
+                if response_received_at is not None
+                else float("inf")
+            )
+            if cache_age_seconds > self.config.lightweight_cache_ttl_seconds:
+                stale_venues.add(venue)
+                continue
+            catalog_results[venue] = {
+                **entry,
+                "cache_age_seconds": cache_age_seconds,
+            }
+
+        ready_venues = set(catalog_results)
+        unavailable_venues = requested_venues - ready_venues - pending_venues
+        for venue in sorted(pending_venues):
+            cache_note = (
+                "cached snapshot used"
+                if venue in ready_venues
+                else "no cached snapshot yet"
+            )
+            warnings.append(
+                f"{venue} lightweight catalog still loading after "
+                f"{self.config.lightweight_foreground_budget_seconds:g}s: {cache_note}"
+            )
+        for venue in sorted(stale_venues - pending_venues):
+            warnings.append(f"{venue} lightweight catalog unavailable: cache_stale")
+
+        venue_health = {
+            "requested_count": len(requested_venues),
+            "ready_count": len(ready_venues),
+            "fresh_count": len(ready_venues & completed_venues),
+            "cached_count": len(ready_venues - completed_venues),
+            "pending_count": len(pending_venues),
+            "unavailable_count": len(unavailable_venues),
+            "ready_venues": sorted(ready_venues),
+            "fresh_venues": sorted(ready_venues & completed_venues),
+            "cached_venues": sorted(ready_venues - completed_venues),
+            "pending_venues": sorted(pending_venues),
+            "unavailable_venues": sorted(unavailable_venues),
+            "stale_venues": sorted(stale_venues),
+            "foreground_budget_seconds": float(
+                self.config.lightweight_foreground_budget_seconds
+            ),
+            "cache_ttl_seconds": float(self.config.lightweight_cache_ttl_seconds),
+        }
+        with self._lightweight_state_lock:
+            self._last_lightweight_venue_health = venue_health
 
         instruments: list[dict[str, Any]] = []
         markets: list[dict[str, Any]] = []
-        request_times: dict[tuple[str, str], tuple[str, str]] = {}
+        request_times: dict[tuple[str, str], tuple[str, str, float]] = {}
         for venue, result in catalog_results.items():
-            venue_instruments, venue_markets, venue_warnings, started_at, received_at = result
+            venue_instruments = [
+                dict(row) for row in result.get("instruments") or []
+            ]
+            venue_markets = [dict(row) for row in result.get("markets") or []]
             venue_instruments, venue_markets = normalize_catalog_canonical_units(
                 venue_instruments,
                 venue_markets,
             )
-            warnings.extend(venue_warnings)
+            warnings.extend(result.get("warnings") or [])
+            started_at = str(result.get("request_started_at") or observed_at)
+            received_at = str(result.get("response_received_at") or observed_at)
+            cache_age_seconds = float(result.get("cache_age_seconds") or 0.0)
             for row in venue_instruments:
                 key = (str(row.get("venue") or venue).lower(), str(row.get("symbol") or ""))
-                request_times[key] = (started_at, received_at)
+                request_times[key] = (
+                    started_at,
+                    received_at,
+                    cache_age_seconds,
+                )
             for row in venue_markets:
                 key = (str(row.get("venue") or venue).lower(), str(row.get("symbol") or ""))
-                request_times.setdefault(key, (started_at, received_at))
+                request_times.setdefault(
+                    key,
+                    (started_at, received_at, cache_age_seconds),
+                )
             instruments.extend(venue_instruments)
             markets.extend(venue_markets)
 
@@ -2404,10 +2585,14 @@ class PaperBot:
             )
             instrument = instrument_by_key.get(key, {})
             row = {**instrument, **market}
-            started_at, received_at = request_times.get(key, (observed_at, observed_at))
+            started_at, received_at, cache_age_seconds = request_times.get(
+                key,
+                (observed_at, observed_at, 0.0),
+            )
             row.setdefault("request_started_at", started_at)
             row.setdefault("response_received_at", received_at)
             row.setdefault("normalized_at", received_at)
+            row["lightweight_cache_age_seconds"] = cache_age_seconds
             row = apply_declared_venue_capability_contract(row)
             row.setdefault(
                 "normalization_evidence",
@@ -2416,15 +2601,73 @@ class PaperBot:
             enriched_markets.append(row)
         return enriched_markets, warnings
 
+    def _harvest_lightweight_market_requests(
+        self,
+        warnings: list[str],
+    ) -> set[str]:
+        completed: list[tuple[Future[Any], tuple[str, str]]] = []
+        with self._lightweight_state_lock:
+            for future, metadata in list(self._lightweight_pending_futures.items()):
+                if not future.done() and not future.cancelled():
+                    continue
+                self._lightweight_pending_futures.pop(future, None)
+                completed.append((future, metadata))
+
+        completed_venues: set[str] = set()
+        for future, (venue, request_started_at) in completed:
+            self._foreground_venues.discard(venue)
+            if future.cancelled():
+                warnings.append(f"{venue} lightweight catalog cancelled")
+                continue
+            try:
+                result = future.result()
+                instruments, markets, venue_warnings, response_received_at = result
+            except FundingDataError as exc:
+                warnings.append(f"{venue} lightweight catalog unavailable: {exc}")
+                continue
+            except Exception as exc:
+                warnings.append(
+                    f"{venue} lightweight catalog unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            cache_entry = {
+                "instruments": instruments,
+                "markets": markets,
+                "warnings": list(venue_warnings or []),
+                "request_started_at": request_started_at,
+                "response_received_at": response_received_at,
+            }
+            with self._lightweight_state_lock:
+                self._lightweight_venue_cache[venue] = cache_entry
+            completed_venues.add(venue)
+        return completed_venues
+
     def _cancelable_catalog_and_markets(
         self,
         client: FundingVenueClient,
         observed_at: str,
         cancel_event: Event | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[str],
+        str,
+    ]:
         if cancel_event is not None and cancel_event.is_set():
-            return [], [], ["background scan cancelled before venue fetch"]
-        return client.catalog_and_markets(observed_at)
+            return (
+                [],
+                [],
+                ["background scan cancelled before venue fetch"],
+                self.clock.now().astimezone(UTC).isoformat(),
+            )
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        return (
+            instruments,
+            markets,
+            warnings,
+            self.clock.now().astimezone(UTC).isoformat(),
+        )
 
     def _build_lightweight_watch_routes(
         self,
@@ -2456,8 +2699,12 @@ class PaperBot:
                     if nearest_settlement_seconds is None
                     else min(nearest_settlement_seconds, seconds_to_settlement)
                 )
-            if seconds_to_settlement < 55 or seconds_to_settlement > 600:
-                reject("outside_lightweight_settlement_window")
+            if (
+                seconds_to_settlement < 0
+                or seconds_to_settlement
+                > self.config.lightweight_route_horizon_seconds
+            ):
+                reject("outside_lightweight_route_horizon")
                 continue
             asset = str(market.get("canonical_asset") or "").upper()
             if not asset:
@@ -2508,6 +2755,12 @@ class PaperBot:
                         short_market=short_market,
                         now=now,
                         target_notional=float(self.config.target_notional_per_leg),
+                        max_response_age_seconds=float(
+                            self.config.lightweight_cache_ttl_seconds
+                        ),
+                        max_source_age_seconds=float(
+                            self.config.lightweight_cache_ttl_seconds
+                        ),
                     )
                     plan_blockers = list(plan.get("blockers") or [])
                     if plan_blockers:
@@ -2547,10 +2800,36 @@ class PaperBot:
                     ):
                         routes_by_key[route_key] = route
 
-        return list(routes_by_key.values()), {
+        routes = list(routes_by_key.values())
+        stage_counts = {
+            "early": 0,
+            "watch": 0,
+            "monitor": 0,
+            "urgent": 0,
+            "qualified": 0,
+        }
+        for route in routes:
+            stage_decision = route_discovery_stage(route, now, self.config)
+            stage = str(stage_decision["stage"])
+            route["discovery_stage"] = stage
+            lightweight_evidence = (
+                route.setdefault("evidence", {})
+                .setdefault("lightweight_discovery", {})
+            )
+            lightweight_evidence["stage"] = stage
+            lightweight_evidence["lead_seconds"] = stage_decision["lead_seconds"]
+            if stage in stage_counts:
+                stage_counts[stage] += 1
+        return routes, {
             "markets_checked": markets_checked,
             "routes_structurally_matched": structurally_matched,
-            "watch_routes_added": len(routes_by_key),
+            "routes_detected": len(routes),
+            "watch_routes_added": len(routes),
+            "early_route_count": stage_counts["early"],
+            "watch_stage_route_count": stage_counts["watch"],
+            "monitor_route_count": stage_counts["monitor"],
+            "urgent_route_count": stage_counts["urgent"],
+            "qualified_route_count": stage_counts["qualified"],
             "research_only_routes": research_only_routes,
             "nearest_settlement_seconds": nearest_settlement_seconds,
             "rejection_reasons": dict(sorted(rejection_reasons.items())),
@@ -2741,6 +3020,9 @@ class PaperBot:
             "market_response_received_at": market.get("response_received_at"),
             "response_received_at": market.get("response_received_at"),
             "normalized_at": market.get("normalized_at"),
+            "lightweight_cache_age_seconds": market.get(
+                "lightweight_cache_age_seconds"
+            ),
             "venue_server_time": market.get("venue_server_time"),
             "source_event_at": market.get("source_event_at"),
             "mark_price": mark_price,

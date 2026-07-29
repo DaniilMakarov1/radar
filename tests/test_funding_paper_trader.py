@@ -278,6 +278,23 @@ def test_default_entry_window_targets_t_minus_thirty_seconds() -> None:
     assert "long_settlement_inside_final_deadline" in too_late["reasons"]
 
 
+def test_lightweight_discovery_defaults_and_window_validation() -> None:
+    default = PaperBotConfig().validated()
+    constrained = PaperBotConfig(
+        lightweight_foreground_budget_seconds=120.0,
+        lightweight_cache_ttl_seconds=5.0,
+        lightweight_route_horizon_seconds=900.0,
+        lightweight_watch_window_seconds=1_200.0,
+    ).validated()
+
+    assert default.lightweight_foreground_budget_seconds == pytest.approx(8.0)
+    assert default.lightweight_route_horizon_seconds == pytest.approx(3_600.0)
+    assert constrained.lightweight_foreground_budget_seconds == pytest.approx(30.0)
+    assert constrained.lightweight_cache_ttl_seconds == pytest.approx(30.0)
+    assert constrained.lightweight_route_horizon_seconds == pytest.approx(900.0)
+    assert constrained.lightweight_watch_window_seconds == pytest.approx(900.0)
+
+
 def test_selected_route_strategy_supports_all_strategy_classes() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
 
@@ -1442,14 +1459,21 @@ def test_status_report_sends_once_per_interval(tmp_path) -> None:
         "hot_route_count": 1,
         "urgent_route_count": 1,
     }
+    preliminary = paper_route(now, 45, 45)
+    preliminary["status"] = "watch"
+    trader.discovered_routes[preliminary["route_key"]] = preliminary
+    candidate = paper_route(now, 45, 45)
 
-    trader.maybe_record_status_report(result, [paper_route(now, 45, 45)], [])
-    trader.maybe_record_status_report(result, [paper_route(now, 45, 45)], [])
+    trader.maybe_record_status_report(result, [candidate], [])
+    trader.maybe_record_status_report(result, [candidate], [])
 
     assert len(notifier.messages) == 1
     assert "Paper Bot STATUS" in notifier.messages[0]
     assert "DB scan" in notifier.messages[0]
-    assert "Candidates: 1" in notifier.messages[0]
+    assert "Qualified: <b>1</b>" in notifier.messages[0]
+    assert "Qualified candidates" in notifier.messages[0]
+    assert notifier.messages[0].count("LONG <code>aster BTCUSDT</code>") == 1
+    assert "Top detected routes" not in notifier.messages[0]
     event_types = [row["event_type"] for row in store.funding_paper_dashboard()["events"]]
     assert event_types.count("status_report") == 1
 
@@ -1526,7 +1550,7 @@ def test_status_report_uses_published_risex_8h_display_with_hourly_cashflow() ->
     assert "LONG <code>risex BTC/USDC</code> -0.8000%/8h (-0.1000%/h)" in message
 
 
-def test_status_report_does_not_publish_watch_routes(tmp_path) -> None:
+def test_status_report_publishes_detected_route_as_preliminary(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     notifier = FakeNotifier()
@@ -1536,8 +1560,20 @@ def test_status_report_does_not_publish_watch_routes(tmp_path) -> None:
         notifier=notifier,
     )
     now = datetime.now(UTC)
-    watch = paper_route(now, 45, 45, live_net=3.0)
+    watch = strategy_route(
+        now,
+        "funding_only",
+        expected_net=3.0,
+        funding_component=3.0,
+        spread_component=0.0,
+    )
     watch["status"] = "watch"
+    watch["discovery_stage"] = "monitor"
+    watch["risk_flags"] = ["lightweight_only_requires_focused_underwriting"]
+    watch["evidence"]["selected_strategy"]["selection_model"] = (
+        "lightweight_discovery_v1"
+    )
+    watch["evidence"]["selected_strategy"]["funding_pnl_component"] = 3.0
 
     trader.maybe_record_status_report(
         {
@@ -1550,15 +1586,26 @@ def test_status_report_does_not_publish_watch_routes(tmp_path) -> None:
             "pending_count": 0,
             "hot_route_count": 1,
             "urgent_route_count": 1,
+            "markets_checked": 1_234,
+            "venue_health": {
+                "requested_count": 30,
+                "ready_count": 27,
+                "pending_count": 2,
+                "unavailable_count": 1,
+            },
         },
         [],
         [watch],
     )
 
     assert len(notifier.messages) == 1
-    assert "Watch/internal: 1" in notifier.messages[0]
-    assert "Closest watch" not in notifier.messages[0]
-    assert "LONG <code>aster BTCUSDT</code>" not in notifier.messages[0]
+    assert "Routes detected: 1" in notifier.messages[0]
+    assert "Venue coverage:</b> 27/30 ready | 2 loading | 1 unavailable" in notifier.messages[0]
+    assert "Markets received:</b> 1,234" in notifier.messages[0]
+    assert "Top detected routes" in notifier.messages[0]
+    assert "LONG <code>aster BTCUSDT</code>" in notifier.messages[0]
+    assert "Preliminary funding before focused costs" in notifier.messages[0]
+    assert "Focused orderbooks, costs and entry observations: pending" in notifier.messages[0]
 
 
 def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) -> None:
@@ -1589,7 +1636,7 @@ def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) ->
     )
 
     assert len(notifier.messages) == 1
-    assert "Candidates: 0" in notifier.messages[0]
+    assert "Qualified: <b>0</b>" in notifier.messages[0]
     assert "LONG <code>aster BTCUSDT</code>" not in notifier.messages[0]
     assert "-$0.25" not in notifier.messages[0]
 
@@ -1764,13 +1811,21 @@ def test_background_discovery_scan_uses_lightweight_clients_only(tmp_path, monke
     )
     trader.build_venue_clients = lambda: clients  # type: ignore[method-assign]
 
+    foreground_markets, _warnings = trader._fetch_lightweight_market_snapshots(
+        clients,
+        now.isoformat(),
+    )
+    assert len(foreground_markets) == 2
+    calls_before_background = [client.catalog_calls for client in clients]
     result = trader.run_discovery_full_scan()
 
     assert result["mode"] == "background_full_market"
     assert result["watch_count"] == 1
     assert result["funding_scan_id"] is None
+    assert [client.catalog_calls for client in clients] == calls_before_background
     assert all(client.orderbook_calls == 0 for client in clients)
     assert all(client.history_calls == 0 for client in clients)
+    trader.shutdown_foreground_executors()
 
 
 def test_hot_route_rechecks_are_parallelized(tmp_path) -> None:
@@ -2037,8 +2092,10 @@ class LightweightFundingClient:
         self.next_funding_at = next_funding_at
         self.orderbook_calls = 0
         self.history_calls = 0
+        self.catalog_calls = 0
 
     def catalog_and_markets(self, observed_at: str):
+        self.catalog_calls += 1
         instrument = {
             "venue": self.venue,
             "environment": "mainnet",

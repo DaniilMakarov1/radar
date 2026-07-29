@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -3015,7 +3016,13 @@ class _LightweightDiscoveryClient:
         raise AssertionError("lightweight discovery must not fetch history")
 
 
-def _lightweight_bot(tmp_path, now: datetime, clients: list[_LightweightDiscoveryClient]):
+def _lightweight_bot(
+    tmp_path,
+    now: datetime,
+    clients: list[_LightweightDiscoveryClient],
+    *,
+    foreground_budget_seconds: float = 8.0,
+):
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
 
@@ -3025,6 +3032,7 @@ def _lightweight_bot(tmp_path, now: datetime, clients: list[_LightweightDiscover
         telegram_enabled=False,
         arm_window_seconds=120,
         scan_interval_seconds=300,
+        lightweight_foreground_budget_seconds=foreground_budget_seconds,
     ).validated()
     bot = PaperBot(store, config, clock=FakeClock(now, monotonic_start=100.0))
     bot.build_venue_clients = lambda: clients  # type: ignore[method-assign]
@@ -3064,6 +3072,147 @@ def test_lightweight_discovery_adds_watch_route_without_orderbook(tmp_path) -> N
     assert {leg["funding_interval_hours"] for leg in route["legs"]} == {1.0, 4.0}
     assert long_client.orderbook_calls == 0
     assert short_client.orderbook_calls == 0
+
+
+def test_lightweight_discovery_keeps_late_venue_and_uses_it_next_pass(tmp_path) -> None:
+    class DelayedClient(_LightweightDiscoveryClient):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+
+        def catalog_and_markets(self, observed_at: str):
+            self.started.set()
+            if not self.release.wait(2.0):
+                raise AssertionError("test did not release delayed venue")
+            result = super().catalog_and_markets(observed_at)
+            self.finished.set()
+            return result
+
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=300)
+    fast = _LightweightDiscoveryClient(
+        "binance",
+        funding_rate=-0.004,
+        next_funding_at=settlement,
+    )
+    slow = DelayedClient(
+        "bybit",
+        funding_rate=0.004,
+        next_funding_at=settlement,
+    )
+    bot = _lightweight_bot(
+        tmp_path,
+        now,
+        [fast, slow],
+        foreground_budget_seconds=0.05,
+    )
+
+    first_markets, first_warnings = bot._fetch_lightweight_market_snapshots(
+        [fast, slow],
+        now.isoformat(),
+    )
+
+    assert slow.started.wait(1.0)
+    assert {market["venue"] for market in first_markets} == {"binance"}
+    assert bot._last_lightweight_venue_health["pending_venues"] == ["bybit"]
+    assert any("bybit lightweight catalog still loading" in row for row in first_warnings)
+    assert slow.catalog_calls == 0
+
+    slow.release.set()
+    assert slow.finished.wait(1.0)
+    second_markets, _second_warnings = bot._fetch_lightweight_market_snapshots(
+        [fast, slow],
+        now.isoformat(),
+    )
+    routes, summary = bot._build_lightweight_watch_routes(
+        second_markets,
+        {"binance": fast, "bybit": slow},
+        now,
+    )
+
+    assert {market["venue"] for market in second_markets} == {"binance", "bybit"}
+    assert bot._last_lightweight_venue_health["ready_count"] == 2
+    assert bot._last_lightweight_venue_health["pending_count"] == 0
+    assert slow.catalog_calls == 1
+    assert summary["routes_detected"] == 1
+    assert len(routes) == 1
+    bot.shutdown_foreground_executors()
+
+
+def test_lightweight_discovery_records_early_route_without_hot_loop(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(minutes=30)
+    clients = [
+        _LightweightDiscoveryClient(
+            "binance",
+            funding_rate=-0.004,
+            next_funding_at=settlement,
+        ),
+        _LightweightDiscoveryClient(
+            "bybit",
+            funding_rate=0.004,
+            next_funding_at=settlement,
+        ),
+    ]
+    bot = _lightweight_bot(tmp_path, now, clients)
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["routes_detected"] == 1
+    assert summary["early_route_count"] == 1
+    assert summary["hot_route_count"] == 0
+    assert len(bot.discovered_routes) == 1
+    assert not bot.hot_routes
+    route = next(iter(bot.discovered_routes.values()))
+    assert route["discovery_stage"] == "early"
+    bot.shutdown_foreground_executors()
+
+
+def test_lightweight_discovery_tracks_different_settlement_times(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    clients = [
+        _LightweightDiscoveryClient(
+            "binance",
+            asset="NEAR",
+            funding_rate=-0.004,
+            next_funding_at=now + timedelta(minutes=5),
+        ),
+        _LightweightDiscoveryClient(
+            "bybit",
+            asset="NEAR",
+            funding_rate=0.004,
+            next_funding_at=now + timedelta(minutes=5),
+        ),
+        _LightweightDiscoveryClient(
+            "okx",
+            asset="LATER",
+            funding_rate=-0.004,
+            next_funding_at=now + timedelta(minutes=30),
+        ),
+        _LightweightDiscoveryClient(
+            "hyperliquid",
+            asset="LATER",
+            funding_rate=0.004,
+            next_funding_at=now + timedelta(minutes=30),
+        ),
+    ]
+    bot = _lightweight_bot(tmp_path, now, clients)
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["routes_detected"] == 2, summary
+    assert summary["watch_stage_route_count"] == 1
+    assert summary["early_route_count"] == 1
+    assert {
+        route["canonical_asset"]: route["discovery_stage"]
+        for route in bot.discovered_routes.values()
+    } == {"NEAR": "watch", "LATER": "early"}
+    assert not bot.hot_routes
+    bot.shutdown_foreground_executors()
 
 
 def test_lightweight_discovery_fail_closed_route_is_research_only(tmp_path) -> None:
@@ -4260,7 +4409,7 @@ def test_background_full_scan_does_not_delay_critical_hot_recheck(tmp_path, monk
     assert result["background_full_scan_running"]
 
 
-def test_background_non_threadsafe_venue_skipped_when_foreground_active(tmp_path) -> None:
+def test_background_cache_read_does_not_duplicate_foreground_requests(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
     clients = [
@@ -4268,6 +4417,11 @@ def test_background_non_threadsafe_venue_skipped_when_foreground_active(tmp_path
         _LightweightDiscoveryClient("venue_b", funding_rate=0.004, next_funding_at=settlement),
     ]
     bot = _lightweight_bot(tmp_path, now, clients)
+    foreground_markets, _foreground_warnings = bot._fetch_lightweight_market_snapshots(
+        clients,
+        now.isoformat(),
+    )
+    assert len(foreground_markets) == 2
     bot._foreground_venues.add("venue_a")
 
     markets, warnings = bot._fetch_lightweight_market_snapshots(
@@ -4276,11 +4430,12 @@ def test_background_non_threadsafe_venue_skipped_when_foreground_active(tmp_path
         work_mode="background_full_scan",
     )
 
-    assert [market["venue"] for market in markets] == ["venue_b"]
-    assert bot.background_full_scan_skip_reasons == {"venue_a": "foreground_venue_work_active"}
-    assert warnings == ["venue_a background catalog skipped: foreground_venue_work_active"]
-    assert clients[0].catalog_calls == 0
+    assert {market["venue"] for market in markets} == {"venue_a", "venue_b"}
+    assert bot.background_full_scan_skip_reasons == {}
+    assert warnings == []
+    assert clients[0].catalog_calls == 1
     assert clients[1].catalog_calls == 1
+    bot.shutdown_foreground_executors()
 
 
 def test_old_settlement_observations_do_not_qualify_new_settlement(tmp_path) -> None:
