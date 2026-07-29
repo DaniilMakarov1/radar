@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from datetime import UTC, datetime
+import hashlib
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from statistics import median
 from typing import Any
 
+from smart_money_radar.funding.settlement_contracts import (
+    FundingSettlementContract,
+    settlement_contract_blockers,
+    settlement_contract_from_market,
+)
+
 STRATEGY_NAME = "synchronized_funding_capture"
 STRATEGY_VERSION = "synchronized_funding_capture_v2"
+INTERNAL_STRATEGY_NAME = "FUNDING_SETTLEMENT_CAPTURE"
+ONE_SETTLEMENT = "ONE_SETTLEMENT"
+MULTIPLE_SETTLEMENTS = "MULTIPLE_SETTLEMENTS"
 
 
 def clamp(minimum: float, maximum: float, value: float) -> float:
@@ -31,6 +41,550 @@ def funding_leg_pnl(side: str, quantity: float, mark_price: float, funding_rate:
     if str(side).lower() == "long":
         return -notional * float(funding_rate)
     return notional * float(funding_rate)
+
+
+@dataclass(frozen=True)
+class EventWindowPlannerConfig:
+    max_strategy_hold_seconds: float = 180.0
+    max_gap_between_settlements_seconds: float = 60.0
+    entry_safety_buffer_seconds: float = 30.0
+    exit_safety_buffer_seconds: float = 5.0
+    settlement_confirmation_timeout_seconds: float = 5.0
+    max_clock_uncertainty_ms: float = 500.0
+    conservative_positive_cashflow_fraction: float = 0.90
+    conservative_negative_cashflow_multiplier: float = 1.0
+    configured_min_net_bps: float = 0.0
+    entry_slippage_bps: float = 0.0
+    exit_slippage_bps: float = 0.0
+    basis_movement_reserve_bps: float = 0.0
+    stablecoin_reserve_usd: float = 0.0
+    execution_failure_reserve_bps: float = 0.0
+    partial_fill_reserve_bps: float = 0.0
+    timing_uncertainty_reserve_bps: float = 0.0
+    operational_reserve_bps: float = 0.0
+
+
+@dataclass(frozen=True)
+class FundingSettlementEvent:
+    event_id: str
+    venue: str
+    environment: str
+    symbol: str
+    canonical_underlying: str
+    leg_id: str
+    scheduled_at: str
+    earliest_possible_assessment_at: str
+    latest_possible_assessment_at: str
+    settlement_interval_seconds: float | None
+    displayed_rate_period_seconds: float | None
+    raw_api_rate: float | None
+    normalized_rate: float | None
+    rate_per_next_settlement: float | None
+    receiver_side: str
+    expected_cashflow_usd: float
+    conservative_cashflow_usd: float
+    rate_status: str
+    source_event_at: str | None
+    response_received_at: str | None
+    confirmation_source: str | None
+    settlement_semantics_status: str
+    evidence_version: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _event_id(
+    *,
+    venue: str,
+    environment: str,
+    symbol: str,
+    side: str,
+    scheduled_at: str,
+) -> str:
+    raw = "|".join([venue, environment, symbol, side, scheduled_at])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _market_notional(mark_price: float | None, target_notional: float) -> float:
+    if mark_price is None or mark_price <= 0:
+        return max(0.0, float(target_notional))
+    return max(0.0, float(target_notional))
+
+
+def funding_receiver_side(rate_per_next_settlement: float | None) -> str:
+    rate = float(rate_per_next_settlement or 0.0)
+    if rate > 0:
+        return "short"
+    if rate < 0:
+        return "long"
+    return "none"
+
+
+def position_funding_cashflow_usd(
+    *,
+    side: str,
+    notional: float,
+    rate_per_next_settlement: float | None,
+) -> float:
+    rate = float(rate_per_next_settlement or 0.0)
+    if str(side).lower() == "long":
+        return -float(notional) * rate
+    return float(notional) * rate
+
+
+def _conservative_cashflow(value: float, config: EventWindowPlannerConfig) -> float:
+    if value > 0:
+        return value * float(config.conservative_positive_cashflow_fraction)
+    if value < 0:
+        return value * float(config.conservative_negative_cashflow_multiplier)
+    return 0.0
+
+
+def funding_event_from_market(
+    market: dict[str, Any],
+    *,
+    side: str,
+    leg_id: str,
+    target_notional: float,
+    config: EventWindowPlannerConfig | None = None,
+    contract: FundingSettlementContract | None = None,
+) -> FundingSettlementEvent | None:
+    planner_config = config or EventWindowPlannerConfig()
+    scheduled = parse_time(market.get("next_funding_at"))
+    if scheduled is None:
+        return None
+    resolved_contract = contract or settlement_contract_from_market(market)
+    uncertainty = float(planner_config.max_clock_uncertainty_ms) / 1000.0
+    jitter_before = (
+        float(resolved_contract.assessment_jitter_before_seconds)
+        if resolved_contract.assessment_jitter_before_seconds is not None
+        else 0.0
+    )
+    jitter_after = (
+        float(resolved_contract.assessment_jitter_after_seconds)
+        if resolved_contract.assessment_jitter_after_seconds is not None
+        else 0.0
+    )
+    earliest = scheduled - timedelta(seconds=jitter_before + uncertainty)
+    latest = scheduled + timedelta(seconds=jitter_after + uncertainty)
+    mark = _optional_float(market.get("mark_price"))
+    notional = _market_notional(mark, target_notional)
+    raw_rate = _optional_float(market.get("funding_rate"))
+    normalized_rate = _optional_float(market.get("normalized_next_funding_rate"))
+    rate = normalized_rate if normalized_rate is not None else raw_rate
+    expected = position_funding_cashflow_usd(
+        side=side,
+        notional=notional,
+        rate_per_next_settlement=rate,
+    )
+    scheduled_iso = scheduled.astimezone(UTC).isoformat()
+    return FundingSettlementEvent(
+        event_id=_event_id(
+            venue=str(market.get("venue") or "").lower(),
+            environment=str(market.get("environment") or "unknown").lower(),
+            symbol=str(market.get("symbol") or ""),
+            side=side,
+            scheduled_at=scheduled_iso,
+        ),
+        venue=str(market.get("venue") or "").lower(),
+        environment=str(market.get("environment") or "unknown").lower(),
+        symbol=str(market.get("symbol") or ""),
+        canonical_underlying=str(
+            market.get("canonical_asset") or market.get("canonical_underlying") or ""
+        ).upper(),
+        leg_id=leg_id,
+        scheduled_at=scheduled_iso,
+        earliest_possible_assessment_at=earliest.astimezone(UTC).isoformat(),
+        latest_possible_assessment_at=latest.astimezone(UTC).isoformat(),
+        settlement_interval_seconds=resolved_contract.settlement_interval_seconds,
+        displayed_rate_period_seconds=resolved_contract.displayed_rate_period_seconds,
+        raw_api_rate=raw_rate,
+        normalized_rate=normalized_rate,
+        rate_per_next_settlement=rate,
+        receiver_side=funding_receiver_side(rate),
+        expected_cashflow_usd=expected,
+        conservative_cashflow_usd=_conservative_cashflow(expected, planner_config),
+        rate_status=str(market.get("rate_status") or "predicted"),
+        source_event_at=market.get("source_event_at"),
+        response_received_at=market.get("response_received_at"),
+        confirmation_source=resolved_contract.settlement_confirmation_source,
+        settlement_semantics_status=resolved_contract.verification_level,
+        evidence_version=resolved_contract.evidence_checked_at,
+    )
+
+
+def _event_time_range(event: FundingSettlementEvent) -> tuple[datetime, datetime]:
+    earliest = parse_time(event.earliest_possible_assessment_at)
+    latest = parse_time(event.latest_possible_assessment_at)
+    if earliest is None or latest is None:
+        scheduled = parse_time(event.scheduled_at) or datetime.now(UTC)
+        return scheduled, scheduled
+    return earliest.astimezone(UTC), latest.astimezone(UTC)
+
+
+def classify_event_for_hold_window(
+    event: FundingSettlementEvent,
+    *,
+    planned_entry_at: datetime,
+    planned_exit_at: datetime,
+    exit_safety_buffer_seconds: float,
+) -> str:
+    earliest, latest = _event_time_range(event)
+    entry = planned_entry_at.astimezone(UTC)
+    exit_time = planned_exit_at.astimezone(UTC)
+    exit_safety = timedelta(seconds=max(0.0, float(exit_safety_buffer_seconds)))
+    if latest < entry:
+        return "excluded"
+    if earliest >= exit_time + exit_safety:
+        return "excluded"
+    if earliest >= entry and latest <= exit_time:
+        return "included"
+    return "ambiguous"
+
+
+def _fee_rate(market: dict[str, Any]) -> float:
+    value = _optional_float(market.get("taker_fee_rate"))
+    if value is None:
+        value = _optional_float(market.get("fee_rate"))
+    return float(value or 0.0)
+
+
+def _planned_costs(
+    *,
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+    target_notional: float,
+    config: EventWindowPlannerConfig,
+) -> dict[str, float]:
+    reference = max(0.0, float(target_notional))
+    entry_fees = reference * (_fee_rate(long_market) + _fee_rate(short_market))
+    exit_fees = entry_fees
+    entry_slippage = reference * max(0.0, float(config.entry_slippage_bps)) / 10_000.0
+    exit_slippage = reference * max(0.0, float(config.exit_slippage_bps)) / 10_000.0
+    basis_reserve = reference * max(0.0, float(config.basis_movement_reserve_bps)) / 10_000.0
+    execution_failure = reference * max(0.0, float(config.execution_failure_reserve_bps)) / 10_000.0
+    partial_fill = reference * max(0.0, float(config.partial_fill_reserve_bps)) / 10_000.0
+    timing = reference * max(0.0, float(config.timing_uncertainty_reserve_bps)) / 10_000.0
+    operational = reference * max(0.0, float(config.operational_reserve_bps)) / 10_000.0
+    return {
+        "entry_fees_usd": entry_fees,
+        "exit_fees_usd": exit_fees,
+        "entry_slippage_usd": entry_slippage,
+        "exit_slippage_usd": exit_slippage,
+        "basis_movement_reserve_usd": basis_reserve,
+        "stablecoin_reserve_usd": max(0.0, float(config.stablecoin_reserve_usd)),
+        "execution_failure_reserve_usd": execution_failure,
+        "partial_fill_reserve_usd": partial_fill,
+        "timing_uncertainty_reserve_usd": timing,
+        "operational_reserve_usd": operational,
+    }
+
+
+def _build_hold_plan(
+    *,
+    plan_name: str,
+    exit_after_event: FundingSettlementEvent,
+    events: list[FundingSettlementEvent],
+    planned_entry_at: datetime,
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+    target_notional: float,
+    config: EventWindowPlannerConfig,
+) -> dict[str, Any]:
+    exit_after = parse_time(exit_after_event.scheduled_at) or planned_entry_at
+    planned_exit_at = exit_after + timedelta(
+        seconds=max(0.0, float(config.settlement_confirmation_timeout_seconds))
+    )
+    included: list[FundingSettlementEvent] = []
+    excluded: list[FundingSettlementEvent] = []
+    ambiguous: list[FundingSettlementEvent] = []
+    for event in events:
+        classification = classify_event_for_hold_window(
+            event,
+            planned_entry_at=planned_entry_at,
+            planned_exit_at=planned_exit_at,
+            exit_safety_buffer_seconds=config.exit_safety_buffer_seconds,
+        )
+        if classification == "included":
+            included.append(event)
+        elif classification == "excluded":
+            excluded.append(event)
+        else:
+            ambiguous.append(event)
+    costs = _planned_costs(
+        long_market=long_market,
+        short_market=short_market,
+        target_notional=target_notional,
+        config=config,
+    )
+    expected_cashflow = sum(event.expected_cashflow_usd for event in included)
+    conservative_cashflow = sum(event.conservative_cashflow_usd for event in included)
+    total_cost = sum(costs.values())
+    expected_net = expected_cashflow - total_cost
+    conservative_net = conservative_cashflow - total_cost
+    reference = max(0.0, float(target_notional))
+    blockers: list[str] = []
+    hold_seconds = (planned_exit_at - planned_entry_at).total_seconds()
+    if hold_seconds > float(config.max_strategy_hold_seconds):
+        blockers.append("max_strategy_hold_seconds_exceeded")
+    if ambiguous:
+        blockers.append("settlement_timing_ambiguous")
+    if conservative_net <= 0:
+        blockers.append("conservative_net_not_positive")
+    min_net_bps = max(0.0, float(config.configured_min_net_bps))
+    conservative_net_bps = (
+        conservative_net / reference * 10_000.0 if reference > 0 else 0.0
+    )
+    if conservative_net_bps < min_net_bps:
+        blockers.append("conservative_net_bps_below_minimum")
+    included_sorted = sorted(included, key=lambda event: event.scheduled_at)
+    return {
+        "plan_name": plan_name,
+        "planned_entry_at": planned_entry_at.astimezone(UTC).isoformat(),
+        "planned_exit_at": planned_exit_at.astimezone(UTC).isoformat(),
+        "max_hold_seconds": float(config.max_strategy_hold_seconds),
+        "planned_hold_seconds": hold_seconds,
+        "opportunity_shape": (
+            MULTIPLE_SETTLEMENTS if len(included_sorted) > 1 else ONE_SETTLEMENT
+        ),
+        "included_settlement_events": [event.as_dict() for event in included_sorted],
+        "excluded_settlement_events": [
+            event.as_dict() for event in sorted(excluded, key=lambda event: event.scheduled_at)
+        ],
+        "ambiguous_settlement_events": [
+            event.as_dict() for event in sorted(ambiguous, key=lambda event: event.scheduled_at)
+        ],
+        "expected_funding_cashflow_usd": expected_cashflow,
+        "conservative_funding_cashflow_usd": conservative_cashflow,
+        "modeled_costs": costs,
+        "expected_net_usd": expected_net,
+        "conservative_net_usd": conservative_net,
+        "conservative_net_bps": conservative_net_bps,
+        "blockers": list(dict.fromkeys(blockers)),
+    }
+
+
+def _freshness_blockers(
+    market: dict[str, Any],
+    *,
+    now: datetime,
+    max_response_age_seconds: float,
+    max_source_age_seconds: float,
+) -> list[str]:
+    blockers: list[str] = []
+    response_at = parse_time(market.get("response_received_at"))
+    source_at = parse_time(market.get("source_event_at"))
+    if response_at is None:
+        blockers.append("response_timestamp_missing")
+    else:
+        age = (now.astimezone(UTC) - response_at.astimezone(UTC)).total_seconds()
+        if age < -max_response_age_seconds or age > max_response_age_seconds:
+            blockers.append("response_timestamp_stale")
+    if source_at is None:
+        blockers.append("source_event_timestamp_missing")
+    else:
+        age = (now.astimezone(UTC) - source_at.astimezone(UTC)).total_seconds()
+        if age < -max_source_age_seconds or age > max_source_age_seconds:
+            blockers.append("source_event_timestamp_stale")
+    return blockers
+
+
+def build_settlement_capture_opportunity(
+    *,
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+    now: datetime,
+    target_notional: float,
+    planner_config: EventWindowPlannerConfig | None = None,
+    max_response_age_seconds: float = 5.0,
+    max_source_age_seconds: float = 60.0,
+) -> dict[str, Any]:
+    config = planner_config or EventWindowPlannerConfig()
+    long_venue = str(long_market.get("venue") or "").lower()
+    short_venue = str(short_market.get("venue") or "").lower()
+    long_contract = settlement_contract_from_market(long_market)
+    short_contract = settlement_contract_from_market(short_market)
+    blockers: list[str] = []
+    if long_venue == "paradex" or short_venue == "paradex":
+        blockers.append("funding_continuous_pro_rata")
+    long_env = str(long_market.get("environment") or "").lower()
+    short_env = str(short_market.get("environment") or "").lower()
+    if long_env not in {"mainnet", "testnet"} or short_env not in {"mainnet", "testnet"}:
+        blockers.append("environment_unverified")
+    elif long_env != short_env:
+        blockers.append("environment_mismatch")
+    long_asset = str(long_market.get("canonical_asset") or "").upper()
+    short_asset = str(short_market.get("canonical_asset") or "").upper()
+    if not long_asset or long_asset != short_asset:
+        blockers.append("canonical_underlying_mismatch")
+    long_event = funding_event_from_market(
+        long_market,
+        side="long",
+        leg_id=f"{long_venue}:{long_market.get('symbol')}:long",
+        target_notional=target_notional,
+        config=config,
+        contract=long_contract,
+    )
+    short_event = funding_event_from_market(
+        short_market,
+        side="short",
+        leg_id=f"{short_venue}:{short_market.get('symbol')}:short",
+        target_notional=target_notional,
+        config=config,
+        contract=short_contract,
+    )
+    blockers.extend(
+        f"long_{reason}"
+        for reason in settlement_contract_blockers(
+            long_contract,
+            next_settlement_at=long_market.get("next_funding_at"),
+        )
+    )
+    blockers.extend(
+        f"short_{reason}"
+        for reason in settlement_contract_blockers(
+            short_contract,
+            next_settlement_at=short_market.get("next_funding_at"),
+        )
+    )
+    blockers.extend(
+        f"long_{reason}"
+        for reason in _freshness_blockers(
+            long_market,
+            now=now,
+            max_response_age_seconds=max_response_age_seconds,
+            max_source_age_seconds=max_source_age_seconds,
+        )
+    )
+    blockers.extend(
+        f"short_{reason}"
+        for reason in _freshness_blockers(
+            short_market,
+            now=now,
+            max_response_age_seconds=max_response_age_seconds,
+            max_source_age_seconds=max_source_age_seconds,
+        )
+    )
+    if long_event is None:
+        blockers.append("long_next_settlement_time_missing")
+    if short_event is None:
+        blockers.append("short_next_settlement_time_missing")
+    events = [event for event in (long_event, short_event) if event is not None]
+    if not events:
+        return {
+            "strategy_name": INTERNAL_STRATEGY_NAME,
+            "strategy_version": STRATEGY_VERSION,
+            "opportunity_shape": ONE_SETTLEMENT,
+            "leg_a": long_market,
+            "leg_b": short_market,
+            "orientation": {"long_venue": long_venue, "short_venue": short_venue},
+            "included_settlement_events": [],
+            "excluded_settlement_events": [],
+            "ambiguous_settlement_events": [],
+            "expected_funding_cashflow_usd": 0.0,
+            "conservative_funding_cashflow_usd": 0.0,
+            "expected_net_usd": 0.0,
+            "conservative_net_usd": 0.0,
+            "conservative_net_bps": 0.0,
+            "blockers": list(dict.fromkeys(blockers)),
+            "confidence": "blocked",
+            "expires_at": None,
+            "planner": {"plans": []},
+        }
+    ordered_events = sorted(events, key=lambda event: event.scheduled_at)
+    first_event = ordered_events[0]
+    first_time = parse_time(first_event.scheduled_at) or now.astimezone(UTC)
+    planned_entry_at = first_time - timedelta(
+        seconds=max(0.0, float(config.entry_safety_buffer_seconds))
+    )
+    plans = [
+        _build_hold_plan(
+            plan_name="exit_after_first_settlement",
+            exit_after_event=first_event,
+            events=ordered_events,
+            planned_entry_at=planned_entry_at,
+            long_market=long_market,
+            short_market=short_market,
+            target_notional=target_notional,
+            config=config,
+        )
+    ]
+    if len(ordered_events) > 1:
+        second_time = parse_time(ordered_events[1].scheduled_at)
+        gap = (
+            abs((second_time - first_time).total_seconds())
+            if second_time is not None
+            else math.inf
+        )
+        if gap <= float(config.max_gap_between_settlements_seconds):
+            plans.append(
+                _build_hold_plan(
+                    plan_name="exit_after_second_settlement",
+                    exit_after_event=ordered_events[1],
+                    events=ordered_events,
+                    planned_entry_at=planned_entry_at,
+                    long_market=long_market,
+                    short_market=short_market,
+                    target_notional=target_notional,
+                    config=config,
+                )
+            )
+    feasible = [plan for plan in plans if not plan["blockers"]]
+    selected = max(
+        feasible or plans,
+        key=lambda plan: (
+            not plan["blockers"],
+            float(plan["conservative_net_usd"]),
+            float(plan["expected_net_usd"]),
+        ),
+    )
+    blockers.extend(selected.get("blockers") or [])
+    blockers = list(dict.fromkeys(blockers))
+    confidence = "candidate" if not blockers else "research"
+    return {
+        "strategy_name": INTERNAL_STRATEGY_NAME,
+        "external_strategy_name": STRATEGY_NAME,
+        "strategy_version": STRATEGY_VERSION,
+        "opportunity_shape": selected["opportunity_shape"],
+        "leg_a": long_market,
+        "leg_b": short_market,
+        "orientation": {
+            "long_venue": long_venue,
+            "long_symbol": long_market.get("symbol"),
+            "short_venue": short_venue,
+            "short_symbol": short_market.get("symbol"),
+        },
+        "planned_entry_at": selected["planned_entry_at"],
+        "planned_exit_at": selected["planned_exit_at"],
+        "max_hold_seconds": selected["max_hold_seconds"],
+        "planned_hold_seconds": selected["planned_hold_seconds"],
+        "included_settlement_events": selected["included_settlement_events"],
+        "excluded_settlement_events": selected["excluded_settlement_events"],
+        "ambiguous_settlement_events": selected["ambiguous_settlement_events"],
+        "expected_funding_cashflow_usd": selected["expected_funding_cashflow_usd"],
+        "conservative_funding_cashflow_usd": selected["conservative_funding_cashflow_usd"],
+        "expected_net_usd": selected["expected_net_usd"],
+        "conservative_net_usd": selected["conservative_net_usd"],
+        "conservative_net_bps": selected["conservative_net_bps"],
+        "modeled_costs": selected["modeled_costs"],
+        "blockers": blockers,
+        "confidence": confidence,
+        "expires_at": first_event.scheduled_at,
+        "planner": {
+            "selected_plan": selected["plan_name"],
+            "plans": plans,
+            "config": asdict(config),
+        },
+    }
 
 
 def gross_funding_pnl(
