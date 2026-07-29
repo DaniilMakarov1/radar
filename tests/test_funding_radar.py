@@ -47,6 +47,10 @@ from smart_money_radar.funding.adapters.kraken import (
 )
 from smart_money_radar.funding.adapters.lighter import LighterFundingClient
 from smart_money_radar.funding.adapters.mexc import MEXCFundingClient
+from smart_money_radar.funding.adapters.nado import (
+    NadoFundingClient,
+    nado_rate_x18_to_decimal,
+)
 from smart_money_radar.funding.adapters.okx import (
     OKXFundingClient,
     okx_funding_snapshot,
@@ -131,6 +135,74 @@ class FundingRadarTest(unittest.TestCase):
 
         self.assertFalse(venues & DEACTIVATED_FUNDING_VENUES)
         self.assertIn("risex", venues)
+
+    def test_core_public_clients_expose_verified_endpoint_identity(self) -> None:
+        cases = [
+            (BinanceFundingClient(), "binance", "mainnet", "https://fapi.binance.com"),
+            (BybitFundingClient(), "bybit", "mainnet", "https://api.bybit.com"),
+            (OKXFundingClient(), "okx", "mainnet", "https://app.okx.com"),
+            (
+                PacificaFundingClient(),
+                "pacifica",
+                "mainnet",
+                "https://api.pacifica.fi/api/v1",
+            ),
+            (
+                NadoFundingClient(),
+                "nado",
+                "mainnet",
+                "https://gateway.prod.nado.xyz/v2",
+            ),
+            (
+                VariationalFundingClient(),
+                "variational",
+                "mainnet",
+                "https://omni-client-api.prod.ap-northeast-1.variational.io",
+            ),
+            (
+                RiseXFundingClient(),
+                "risex",
+                "testnet",
+                "https://api.testnet.rise.trade",
+            ),
+        ]
+
+        for client, venue, environment, base_url in cases:
+            with self.subTest(venue=venue):
+                identity = client.endpoint_identity
+                self.assertEqual(identity.venue, venue)
+                self.assertEqual(identity.environment, environment)
+                self.assertEqual(identity.base_url, base_url)
+                self.assertTrue(identity.environment_verified)
+
+    def test_core_public_parsers_propagate_endpoint_identity_to_market_rows(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        cases = [
+            (BinanceFundingClient(http=FakeBinanceHttp()), "binance", "mainnet"),
+            (BybitFundingClient(http=FakeBybitHttp()), "bybit", "mainnet"),
+            (
+                OKXFundingClient(http=FakeOKXHttp(), use_websocket=False),
+                "okx",
+                "mainnet",
+            ),
+            (PacificaFundingClient(http=FakePacificaHttp()), "pacifica", "mainnet"),
+            (NadoFundingClient(http=FakeNadoHttp()), "nado", "mainnet"),
+            (RiseXFundingClient(http=FakeRiseXHttp()), "risex", "testnet"),
+        ]
+
+        for client, venue, environment in cases:
+            with self.subTest(venue=venue):
+                instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+                self.assertGreaterEqual(len(instruments), 1)
+                self.assertGreaterEqual(len(markets), 1)
+                for row in (instruments[0], markets[0]):
+                    self.assertEqual(row["venue"], venue)
+                    self.assertEqual(row["environment"], environment)
+                    self.assertTrue(row["environment_verified"])
+                    self.assertEqual(
+                        row["endpoint_identity_provenance"],
+                        "official_public_rest",
+                    )
 
     def test_risex_points_profile_is_available_after_adapter_registration(self) -> None:
         self.assertIn("risex_points", funding_bot_profile_names())
@@ -3705,6 +3777,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(instruments), 1)
         self.assertEqual(markets[0]["venue"], "variational")
+        self.assertEqual(markets[0]["environment"], "mainnet")
+        self.assertTrue(markets[0]["environment_verified"])
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.00031145)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.00031145 / 8)
@@ -3712,6 +3786,13 @@ class FundingRadarTest(unittest.TestCase):
             markets[0]["funding_rate_kind"],
             "published_current_interval_estimate",
         )
+        self.assertEqual(markets[0]["execution_model"], "RFQ")
+        self.assertFalse(markets[0]["orderbook_depth_available"])
+        self.assertEqual(markets[0]["fee_source"], "fee_model_missing")
+        self.assertTrue(markets[0]["fee_model_missing"])
+        self.assertNotIn("taker_fee_rate", markets[0])
+        with self.assertRaises(FundingDataError):
+            client.orderbook("BTC", observed_at)
 
     def test_funding_rate_unit_outlier_blocks_implausible_units(self) -> None:
         self.assertTrue(
@@ -4071,12 +4152,37 @@ class FundingRadarTest(unittest.TestCase):
         )
         self.assertEqual(
             markets[0]["mark_price_kind"],
-            "orderbook_mid_at_route_evaluation",
+            "info_prices_mark",
         )
-        self.assertEqual(markets[0]["index_price_kind"], "orderbook_mid_proxy")
+        self.assertEqual(markets[0]["index_price_kind"], "info_prices_oracle")
+        self.assertAlmostEqual(markets[0]["mark_price"], 64132.5)
+        self.assertAlmostEqual(markets[0]["index_price"], 64131.9)
+        self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0005)
+        self.assertEqual(
+            markets[0]["fee_source"],
+            "info/fees_public_fee_levels_conservative_max",
+        )
         self.assertEqual(book_row["bids"][0], [64132.0, 0.785])
         self.assertEqual(book_row["asks"][0], [64133.0, 1.234])
-        self.assertEqual(history, [])
+        self.assertEqual(len(history), 1)
+        self.assertAlmostEqual(history[0]["funding_rate"], 0.0000125)
+
+    def test_pacifica_missing_fee_endpoint_is_not_zero_fee(self) -> None:
+        class MissingFeeHttp(FakePacificaHttp):
+            def get_json(self, url: str) -> Any:
+                if "/info/fees" in url:
+                    raise FundingDataError("fee endpoint unavailable")
+                return super().get_json(url)
+
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = PacificaFundingClient(http=MissingFeeHttp())
+
+        _instruments, markets, warnings = client.catalog_and_markets(observed_at)
+
+        self.assertTrue(any("fee levels unavailable" in row for row in warnings))
+        self.assertNotIn("taker_fee_rate", markets[0])
+        self.assertEqual(markets[0]["fee_source"], "fee_model_missing")
+        self.assertTrue(markets[0]["fee_model_missing"])
 
     def test_pacifica_full_depth_uses_orderbook_mid_as_reference_proxy(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -4122,7 +4228,46 @@ class FundingRadarTest(unittest.TestCase):
         self.assertNotIn("missing_reference_price", route["risk_flags"])
         self.assertEqual(
             route["evidence"]["reference_price_kinds"]["pacifica"],
-            "orderbook_mid",
+            "info_prices_mark",
+        )
+
+    def test_nado_adapter_uses_gateway_and_archive_public_endpoints(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = NadoFundingClient(http=FakeNadoHttp())
+
+        instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        book_row = client.orderbook("BTC-PERP_USDT0", observed_at, limit=2)
+        history = client.funding_history("BTC-PERP_USDT0", 1, 1, observed_at)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(instruments), 1)
+        self.assertEqual(markets[0]["venue"], "nado")
+        self.assertEqual(markets[0]["symbol"], "BTC-PERP_USDT0")
+        self.assertEqual(markets[0]["canonical_asset"], "BTC")
+        self.assertEqual(markets[0]["environment"], "mainnet")
+        self.assertTrue(markets[0]["environment_verified"])
+        self.assertEqual(markets[0]["raw_api_rate"], "24000000000000000")
+        self.assertEqual(markets[0]["raw_rate_scale"], "1e18")
+        self.assertEqual(markets[0]["displayed_rate_period_seconds"], 86400.0)
+        self.assertEqual(markets[0]["settlement_interval_seconds"], 3600.0)
+        self.assertAlmostEqual(float(markets[0]["funding_rate"]), 0.001)
+        self.assertEqual(markets[0]["funding_rate_semantics"], "unclear")
+        self.assertEqual(markets[0]["fee_source"], "fee_model_missing")
+        self.assertTrue(markets[0]["fee_model_missing"])
+        self.assertEqual(book_row["bids"][0], [116215.0, 0.128])
+        self.assertEqual(book_row["asks"][0], [116225.0, 0.043])
+        self.assertEqual(len(history), 2)
+        self.assertAlmostEqual(float(history[0]["funding_rate"]), -0.000313157879073748)
+        self.assertEqual(history[0]["raw_rate_unit"], "funding_rate_x18_hourly")
+
+    def test_nado_rate_normalization_uses_decimal_x18(self) -> None:
+        self.assertEqual(
+            str(nado_rate_x18_to_decimal("24000000000000000")),
+            "0.024",
+        )
+        self.assertEqual(
+            str(nado_rate_x18_to_decimal("-697407056090986")),
+            "-0.000697407056090986",
         )
 
     def test_reya_adapter_uses_summary_funding_and_empty_book(self) -> None:
@@ -5613,9 +5758,112 @@ class FakeExtendedHttp:
             }
         raise AssertionError(url)
 
+class FakeNadoHttp:
+    def get_json(self, url: str) -> Any:
+        if "/pairs?market=perp" in url:
+            return [
+                {
+                    "product_id": 1,
+                    "ticker_id": "BTC-PERP_USDT0",
+                    "base": "BTC-PERP",
+                    "quote": "USDT0",
+                }
+            ]
+        if "/contracts" in url:
+            return {
+                "BTC-PERP_USDT0": {
+                    "product_id": 1,
+                    "ticker_id": "BTC-PERP_USDT0",
+                    "base_currency": "BTC-PERP",
+                    "quote_currency": "USDT0",
+                    "last_price": 116220.0,
+                    "base_volume": 100.0,
+                    "quote_volume": 11622000.0,
+                    "product_type": "perpetual",
+                    "contract_price": 116220.0,
+                    "contract_price_currency": "USD",
+                    "open_interest": 1000.0,
+                    "open_interest_usd": 116220000.0,
+                    "index_price": 116219.0,
+                    "mark_price": 116221.0,
+                    "funding_rate": 0.024,
+                    "next_funding_rate_timestamp": 1784034000,
+                    "price_change_percent_24h": 0.1,
+                }
+            }
+        if "/orderbook" in url:
+            return {
+                "product_id": 1,
+                "ticker_id": "BTC-PERP_USDT0",
+                "bids": [[116215.0, 0.128], [116214.0, 0.172]],
+                "asks": [[116225.0, 0.043], [116226.0, 0.172]],
+                "timestamp": 1784030400000,
+            }
+        raise AssertionError(url)
+
+    def post_json(self, url: str, payload: Any) -> Any:
+        if "funding_rates" in payload:
+            return {
+                "1": {
+                    "product_id": 1,
+                    "funding_rate_x18": "24000000000000000",
+                    "update_time": "1784030400",
+                }
+            }
+        if "funding_rate_history" in payload:
+            return {
+                "funding_rates": [
+                    {
+                        "product_id": 1,
+                        "timestamp": "1784026800",
+                        "funding_rate_x18": "-313157879073748",
+                    },
+                    {
+                        "product_id": 1,
+                        "timestamp": "1784030400",
+                        "funding_rate_x18": "152340987120453",
+                    },
+                ]
+            }
+        raise AssertionError((url, payload))
+
+
 class FakePacificaHttp:
     def get_json(self, url: str) -> Any:
         if "/info" in url:
+            if "/info/prices" in url:
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "symbol": "BTC",
+                            "funding": "0.0000100",
+                            "next_funding": "0.0000125",
+                            "mark": "64132.5",
+                            "mid": "64132.5",
+                            "oracle": "64131.9",
+                            "open_interest": "1000000",
+                            "volume_24h": "5000000",
+                            "timestamp": 1784030400000,
+                        }
+                    ],
+                }
+            if "/info/fees" in url:
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "level": 0,
+                            "maker_fee_rate": "0.00020",
+                            "taker_fee_rate": "0.00050",
+                        },
+                        {
+                            "level": 1,
+                            "maker_fee_rate": "0.00010",
+                            "taker_fee_rate": "0.00040",
+                        },
+                    ],
+                }
             return {
                 "success": True,
                 "data": [
@@ -5644,6 +5892,22 @@ class FakePacificaHttp:
                         [{"p": "64133", "a": "1.234", "n": 3}],
                     ],
                 },
+            }
+        if "/funding_rate/history" in url:
+            return {
+                "success": True,
+                "data": [
+                    {
+                        "oracle_price": "64131.9",
+                        "bid_impact_price": "64120",
+                        "ask_impact_price": "64140",
+                        "funding_rate": "0.0000125",
+                        "next_funding_rate": "0.000013",
+                        "created_at": 1784026800000,
+                    }
+                ],
+                "next_cursor": None,
+                "has_more": False,
             }
         raise AssertionError(url)
 

@@ -1378,6 +1378,22 @@ class SynchronizedFundingRuntimeV2:
             reasons.append(status.lower())
         return list(dict.fromkeys(str(reason) for reason in reasons if reason))
 
+    def _paper_capability_blocking_reasons(
+        self,
+        plan: dict[str, Any] | None,
+    ) -> list[str]:
+        reasons: list[str] = []
+        for label in ("leg_a", "leg_b"):
+            leg = (plan or {}).get(label)
+            if not isinstance(leg, dict):
+                continue
+            if leg.get("paper_enabled") is False:
+                venue = str(leg.get("venue") or label)
+                reasons.append(f"{venue}_paper_disabled")
+            if leg.get("live_enabled") is True:
+                reasons.append("unexpected_live_enabled_in_paper_runtime")
+        return list(dict.fromkeys(reasons))
+
     def consider_route(
         self,
         route: dict[str, Any],
@@ -1389,6 +1405,8 @@ class SynchronizedFundingRuntimeV2:
             return {"opened": False, "reason": "route_key_missing"}
         route_plan = self._plan_dict_for_route(route, now)
         plan_blockers = self._route_plan_blocking_reasons(route_plan)
+        paper_blockers = self._paper_capability_blocking_reasons(route_plan)
+        plan_blockers = list(dict.fromkeys([*plan_blockers, *paper_blockers]))
         settlement_at = self._first_included_settlement_at(route_plan) or route_next_settlement(route)
         if settlement_at is None:
             return {

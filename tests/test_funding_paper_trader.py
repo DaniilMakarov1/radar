@@ -1747,8 +1747,8 @@ def test_background_discovery_scan_uses_lightweight_clients_only(tmp_path, monke
     now = datetime.now(UTC)
     settlement = now + timedelta(seconds=90)
     clients = [
-        LightweightFundingClient("venue_a", -0.004, settlement),
-        LightweightFundingClient("venue_b", 0.004, settlement),
+        LightweightFundingClient("binance", -0.004, settlement),
+        LightweightFundingClient("bybit", 0.004, settlement),
     ]
 
     def fake_run_funding_scan(scan_store, **kwargs):
@@ -1757,6 +1757,10 @@ def test_background_discovery_scan_uses_lightweight_clients_only(tmp_path, monke
     monkeypatch.setattr(
         "smart_money_radar.funding.trader.run_funding_scan",
         fake_run_funding_scan,
+    )
+    monkeypatch.setattr(
+        "smart_money_radar.funding.trader.funding_client_for_venue",
+        lambda *_args, **_kwargs: None,
     )
     trader.build_venue_clients = lambda: clients  # type: ignore[method-assign]
 
@@ -2042,6 +2046,10 @@ class LightweightFundingClient:
             "base_asset": "ABC",
             "quote_asset": "USDT",
             "collateral_asset": "USDT",
+            "price_quote_currency": "USDT",
+            "settlement_collateral": "USDT",
+            "environment": "mainnet",
+            "environment_verified": True,
             "contract_type": "linear_perpetual",
             "contract_kind": "linear_perpetual",
             "supports_perpetuals": True,
@@ -2050,6 +2058,8 @@ class LightweightFundingClient:
             "contract_multiplier": 0.01,
             "status": "active",
             "observed_at": observed_at,
+            "source_event_at": observed_at,
+            "response_received_at": observed_at,
         }
         market = {
             "venue": self.venue,
@@ -2077,10 +2087,16 @@ class LightweightFundingClient:
             "supports_discrete_funding": True,
             "collateral_asset": "USDT",
             "quote_asset": "USDT",
+            "price_quote_currency": "USDT",
+            "settlement_collateral": "USDT",
+            "environment": "mainnet",
+            "environment_verified": True,
             "position_inclusion_rule": "perp_position_at_settlement",
             "entry_safety_buffer_seconds": 20,
             "exit_safety_buffer_seconds": 20,
             "timing_policy_source": f"adapter_{self.venue}_test",
+            "source_event_at": observed_at,
+            "response_received_at": observed_at,
             "observed_at": observed_at,
         }
         return [instrument], [market], []
@@ -2601,7 +2617,7 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
         "bitget", "bybit", "deribit", "dydx",
         "edgex", "ethereal", "extended", "gate", "grvt",
         "hyperliquid", "kraken", "kucoin", "lighter", "mexc", "okx",
-        "paradex", "risex",
+        "nado", "pacifica", "paradex", "risex",
     ]
     for venue in active_venues:
         client = funding_client_for_venue(venue)
@@ -2612,9 +2628,18 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
 def test_funding_client_for_venue_rejects_deactivated() -> None:
     for venue in (
         "bingx", "bitmart", "bitunix", "blofin", "coinex", "drift",
-        "htx", "pacifica", "phemex", "reya", "variational", "vertex_base", "woox",
+        "htx", "phemex", "reya", "variational", "vertex_base", "woox",
     ):
         assert funding_client_for_venue(venue) is None
+
+
+def test_funding_client_factory_returns_verified_identity_for_research_data_venues() -> None:
+    for venue, environment in (("pacifica", "mainnet"), ("nado", "mainnet")):
+        client = funding_client_for_venue(venue)
+        assert client is not None
+        assert client.venue == venue
+        assert client.endpoint_identity.environment == environment
+        assert client.endpoint_identity.environment_verified is True
 
 
 def test_position_spread_fields_round_trip_through_db(tmp_path) -> None:

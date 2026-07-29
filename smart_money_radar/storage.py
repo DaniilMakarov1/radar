@@ -63,6 +63,51 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+SENSITIVE_TEXT_RE = re.compile(
+    r"(?i)(/bot)[^/\s]+|"
+    r"((?:api[_-]?key|secret|token|authorization|signature|auth)[=:]\s*)[^\s,;]+|"
+    r"(bearer\s+)[a-z0-9._~+/=-]+"
+)
+
+
+def redact_sensitive_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    text = SENSITIVE_TEXT_RE.sub(
+        lambda match: (
+            f"{match.group(1)}<redacted>"
+            if match.group(1)
+            else f"{match.group(2) or match.group(3)}<redacted>"
+        ),
+        text,
+    )
+    return text[:1_000]
+
+
+FUNDING_SHADOW_ALERT_STATES = {
+    "CLAIMED",
+    "SENT",
+    "FAILED_RETRYABLE",
+    "FAILED_PERMANENT",
+    "RETRY_SCHEDULED",
+}
+
+
+def _stored_alert_state(row: sqlite3.Row) -> str:
+    state = str(row["state"] or "").strip().upper() if "state" in row.keys() else ""
+    if state in FUNDING_SHADOW_ALERT_STATES:
+        return state
+    telegram_status = str(row["telegram_status"] or "").strip().lower()
+    if telegram_status == "sent":
+        return "SENT"
+    if telegram_status in {"disabled", "not_sent"}:
+        return "FAILED_PERMANENT"
+    if telegram_status in {"failed", "queued"}:
+        return "FAILED_RETRYABLE"
+    return "FAILED_RETRYABLE"
+
+
 class SQLiteStore:
     def __init__(self, db_path: Path = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
@@ -81,6 +126,7 @@ class SQLiteStore:
             connection.execute("PRAGMA synchronous = NORMAL")
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             self._ensure_funding_paper_position_columns(connection)
+            self._ensure_funding_shadow_columns(connection)
             self.upsert_chains(connection, CHAINS)
 
     def _ensure_funding_paper_position_columns(
@@ -96,6 +142,46 @@ class SQLiteStore:
             if name not in columns:
                 connection.execute(
                     f"ALTER TABLE funding_paper_positions ADD COLUMN {name} REAL"
+                )
+
+    def _ensure_funding_shadow_columns(self, connection: sqlite3.Connection) -> None:
+        alert_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(funding_shadow_alerts)")
+        }
+        alert_specs = {
+            "state": "TEXT NOT NULL DEFAULT 'CLAIMED'",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "claimed_at": "TEXT",
+            "claim_expires_at": "TEXT",
+            "sent_at": "TEXT",
+            "failed_at": "TEXT",
+            "next_retry_at": "TEXT",
+            "last_error_redacted": "TEXT",
+        }
+        for name, spec in alert_specs.items():
+            if name not in alert_columns:
+                connection.execute(
+                    f"ALTER TABLE funding_shadow_alerts ADD COLUMN {name} {spec}"
+                )
+
+        health_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(funding_shadow_venue_health)")
+        }
+        health_specs = {
+            "request_started_at": "TEXT",
+            "response_received_at": "TEXT",
+            "parsing_completed_at": "TEXT",
+            "network_latency_ms": "REAL",
+            "parsing_latency_ms": "REAL",
+            "total_latency_ms": "REAL",
+            "endpoint_class": "TEXT",
+        }
+        for name, spec in health_specs.items():
+            if name not in health_columns:
+                connection.execute(
+                    f"ALTER TABLE funding_shadow_venue_health ADD COLUMN {name} {spec}"
                 )
 
     def sqlite_maintenance(
@@ -8363,17 +8449,90 @@ class SQLiteStore:
             )
         return int(cursor.lastrowid)
 
-    def insert_funding_shadow_alert(self, row: dict[str, Any]) -> int | None:
-        now = utc_now_iso()
+    def claim_funding_shadow_alert(
+        self,
+        row: dict[str, Any],
+        *,
+        claim_ttl_seconds: float = 300.0,
+        retry_delay_seconds: float = 60.0,
+        now: datetime | None = None,
+    ) -> int | None:
+        now_dt = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+        now_iso = now_dt.isoformat()
+        claim_expires_at = (
+            now_dt + timedelta(seconds=max(1.0, float(claim_ttl_seconds)))
+        ).isoformat()
+        payload_json = json.dumps(row.get("payload") or {}, sort_keys=True)
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT *
+                  FROM funding_shadow_alerts
+                 WHERE alert_key = ?
+                """,
+                (row["alert_key"],),
+            ).fetchone()
+            if existing is not None:
+                state = _stored_alert_state(existing)
+                existing_claim_expires = _parse_iso_datetime(existing["claim_expires_at"])
+                existing_next_retry = _parse_iso_datetime(existing["next_retry_at"])
+                if state in {"SENT", "FAILED_PERMANENT"}:
+                    return None
+                if (
+                    state == "CLAIMED"
+                    and existing_claim_expires is not None
+                    and existing_claim_expires > now_dt
+                ):
+                    return None
+                if (
+                    state in {"FAILED_RETRYABLE", "RETRY_SCHEDULED"}
+                    and existing_next_retry is not None
+                    and existing_next_retry > now_dt
+                ):
+                    return None
+                attempt_count = int(existing["attempt_count"] or 0) + 1
+                connection.execute(
+                    """
+                    UPDATE funding_shadow_alerts
+                       SET opportunity_key = ?,
+                           environment = ?,
+                           status = ?,
+                           message = ?,
+                           telegram_status = ?,
+                           telegram_error = NULL,
+                           state = 'CLAIMED',
+                           attempt_count = ?,
+                           claimed_at = ?,
+                           claim_expires_at = ?,
+                           next_retry_at = NULL,
+                           payload_json = ?
+                     WHERE alert_key = ?
+                    """,
+                    (
+                        row["opportunity_key"],
+                        row.get("environment", "mainnet"),
+                        row["status"],
+                        row["message"],
+                        row.get("telegram_status") or "queued",
+                        attempt_count,
+                        now_iso,
+                        claim_expires_at,
+                        payload_json,
+                        row["alert_key"],
+                    ),
+                )
+                return int(existing["funding_shadow_alert_id"])
+
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO funding_shadow_alerts (
+                INSERT INTO funding_shadow_alerts (
                     alert_key, opportunity_key, environment, status,
                     message, telegram_status, telegram_error,
+                    state, attempt_count, claimed_at, claim_expires_at,
                     payload_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'CLAIMED', 1, ?, ?, ?, ?)
                 """,
                 (
                     row["alert_key"],
@@ -8383,26 +8542,72 @@ class SQLiteStore:
                     row["message"],
                     row.get("telegram_status") or "not_configured",
                     row.get("telegram_error"),
+                    now_iso,
+                    claim_expires_at,
                     json.dumps(row.get("payload") or {}, sort_keys=True),
-                    row.get("created_at") or now,
+                    row.get("created_at") or now_iso,
                 ),
             )
         return int(cursor.lastrowid) if cursor.lastrowid else None
+
+    def insert_funding_shadow_alert(self, row: dict[str, Any]) -> int | None:
+        return self.claim_funding_shadow_alert(row)
 
     def update_funding_shadow_alert_status(
         self,
         alert_key: str,
         telegram_status: str,
         telegram_error: str | None = None,
+        *,
+        retry_delay_seconds: float = 60.0,
+        now: datetime | None = None,
     ) -> None:
+        now_dt = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+        now_iso = now_dt.isoformat()
+        normalized_status = str(telegram_status or "").strip().lower()
+        redacted_error = redact_sensitive_text(telegram_error)
+        state = "FAILED_RETRYABLE"
+        sent_at = None
+        failed_at = now_iso
+        next_retry_at = (
+            now_dt + timedelta(seconds=max(1.0, float(retry_delay_seconds)))
+        ).isoformat()
+        if normalized_status == "sent":
+            state = "SENT"
+            sent_at = now_iso
+            failed_at = None
+            next_retry_at = None
+        elif normalized_status == "disabled":
+            state = "FAILED_PERMANENT"
+            next_retry_at = None
+        elif normalized_status in {"failed_permanent", "permanent_failure"}:
+            state = "FAILED_PERMANENT"
+            next_retry_at = None
+        elif normalized_status in {"retry_scheduled"}:
+            state = "RETRY_SCHEDULED"
         with self.connect() as connection:
             connection.execute(
                 """
                 UPDATE funding_shadow_alerts
-                   SET telegram_status = ?, telegram_error = ?
+                   SET telegram_status = ?,
+                       telegram_error = ?,
+                       state = ?,
+                       sent_at = COALESCE(?, sent_at),
+                       failed_at = ?,
+                       next_retry_at = ?,
+                       last_error_redacted = ?
                  WHERE alert_key = ?
                 """,
-                (telegram_status, telegram_error, alert_key),
+                (
+                    telegram_status,
+                    redacted_error,
+                    state,
+                    sent_at,
+                    failed_at,
+                    next_retry_at,
+                    redacted_error,
+                    alert_key,
+                ),
             )
 
     def upsert_funding_shadow_settlement_event(
@@ -8495,13 +8700,23 @@ class SQLiteStore:
             connection.execute(
                 """
                 INSERT INTO funding_shadow_venue_health (
-                    venue, environment, status, latency_ms, last_error,
-                    observed_at, updated_at
+                    venue, environment, status, latency_ms,
+                    request_started_at, response_received_at,
+                    parsing_completed_at, network_latency_ms,
+                    parsing_latency_ms, total_latency_ms, endpoint_class,
+                    last_error, observed_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(venue, environment) DO UPDATE SET
                     status = excluded.status,
                     latency_ms = excluded.latency_ms,
+                    request_started_at = excluded.request_started_at,
+                    response_received_at = excluded.response_received_at,
+                    parsing_completed_at = excluded.parsing_completed_at,
+                    network_latency_ms = excluded.network_latency_ms,
+                    parsing_latency_ms = excluded.parsing_latency_ms,
+                    total_latency_ms = excluded.total_latency_ms,
+                    endpoint_class = excluded.endpoint_class,
                     last_error = excluded.last_error,
                     observed_at = excluded.observed_at,
                     updated_at = excluded.updated_at
@@ -8512,6 +8727,13 @@ class SQLiteStore:
                     row.get("environment", "mainnet"),
                     row.get("status", "unknown"),
                     row.get("latency_ms"),
+                    row.get("request_started_at"),
+                    row.get("response_received_at"),
+                    row.get("parsing_completed_at"),
+                    row.get("network_latency_ms"),
+                    row.get("parsing_latency_ms"),
+                    row.get("total_latency_ms"),
+                    row.get("endpoint_class"),
                     row.get("last_error"),
                     row.get("observed_at") or now,
                     now,

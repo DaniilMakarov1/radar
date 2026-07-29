@@ -33,6 +33,7 @@ from smart_money_radar.funding.adapters import (
     KuCoinFundingClient,
     LighterFundingClient,
     MEXCFundingClient,
+    NadoFundingClient,
     OKXFundingClient,
     PacificaFundingClient,
     ParadexFundingClient,
@@ -40,6 +41,10 @@ from smart_money_radar.funding.adapters import (
     RiseXFundingClient,
     VertexFundingClient,
     WOOXFundingClient,
+)
+from smart_money_radar.funding.adapters.base import (
+    apply_endpoint_identity,
+    client_endpoint_identity,
 )
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.normalization import (
@@ -98,6 +103,7 @@ def active_default_funding_clients() -> list[FundingVenueClient]:
         AevoFundingClient(),
         ApexFundingClient(),
         PacificaFundingClient(),
+        NadoFundingClient(),
         ReyaFundingClient(),
         RiseXFundingClient(),
     ])
@@ -247,6 +253,13 @@ def run_funding_scan(
                     venue_instruments,
                     venue_markets,
                 )
+            if hasattr(clients[venue], "endpoint_identity"):
+                identity = client_endpoint_identity(clients[venue])
+                venue_instruments = apply_endpoint_identity(
+                    venue_instruments,
+                    identity,
+                )
+                venue_markets = apply_endpoint_identity(venue_markets, identity)
             venue_instruments = [
                 apply_declared_venue_capability_contract(row)
                 for row in venue_instruments

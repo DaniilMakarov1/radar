@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Any
 
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
@@ -65,6 +66,162 @@ VALID_CONTRACT_KINDS = {
 }
 
 
+class ExecutionModel(str, Enum):
+    CLOB = "CLOB"
+    RFQ = "RFQ"
+    POOL = "POOL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class VenueFundingCapabilities:
+    venue: str
+    data_enabled: bool
+    strategy_observation_enabled: bool
+    shadow_candidate_enabled: bool
+    paper_enabled: bool
+    live_enabled: bool
+    execution_model: ExecutionModel
+    settlement_verification_level: str
+    blockers: tuple[str, ...] = ()
+    evidence_version: str = "funding-capabilities-2026-07-29"
+    mandatory: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["execution_model"] = self.execution_model.value
+        return payload
+
+
+_APPROVED_SETTLEMENT_CAPTURE_VENUES = {
+    "binance",
+    "bybit",
+    "okx",
+    "hyperliquid",
+    "extended",
+    "edgex",
+    "ethereal",
+    "grvt",
+    "lighter",
+    "dydx",
+}
+
+
+_VENUE_FUNDING_CAPABILITIES: dict[str, VenueFundingCapabilities] = {
+    venue: VenueFundingCapabilities(
+        venue=venue,
+        data_enabled=True,
+        strategy_observation_enabled=True,
+        shadow_candidate_enabled=True,
+        paper_enabled=True,
+        live_enabled=False,
+        execution_model=ExecutionModel.CLOB,
+        settlement_verification_level="VERIFIED",
+        blockers=("live_disabled",),
+    )
+    for venue in _APPROVED_SETTLEMENT_CAPTURE_VENUES
+}
+_VENUE_FUNDING_CAPABILITIES.update(
+    {
+        "risex": VenueFundingCapabilities(
+            venue="risex",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="PUBLIC_OBSERVED",
+            blockers=("mainnet_canary_required", "reviewed_promotion_required"),
+            mandatory=True,
+        ),
+        "pacifica": VenueFundingCapabilities(
+            venue="pacifica",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="MAINNET_CANARY_REQUIRED",
+            blockers=("mainnet_canary_required", "reviewed_promotion_required"),
+        ),
+        "nado": VenueFundingCapabilities(
+            venue="nado",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="MAINNET_CANARY_REQUIRED",
+            blockers=("position_inclusion_rule_unverified", "reviewed_promotion_required"),
+        ),
+        "variational": VenueFundingCapabilities(
+            venue="variational",
+            data_enabled=True,
+            strategy_observation_enabled=False,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.RFQ,
+            settlement_verification_level="UNVERIFIED",
+            blockers=(
+                "rfq_execution_layer_missing",
+                "funding_mechanics_unverified",
+                "fee_model_missing",
+            ),
+        ),
+        "paradex": VenueFundingCapabilities(
+            venue="paradex",
+            data_enabled=True,
+            strategy_observation_enabled=False,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="CONTINUOUS_PRO_RATA",
+            blockers=("funding_continuous_pro_rata",),
+        ),
+    }
+)
+
+
+def venue_funding_capabilities(venue: str) -> VenueFundingCapabilities:
+    venue_key = str(venue or "").strip().lower()
+    configured = _VENUE_FUNDING_CAPABILITIES.get(venue_key)
+    if configured is not None:
+        return configured
+    return VenueFundingCapabilities(
+        venue=venue_key or "unknown",
+        data_enabled=False,
+        strategy_observation_enabled=False,
+        shadow_candidate_enabled=False,
+        paper_enabled=False,
+        live_enabled=False,
+        execution_model=ExecutionModel.UNKNOWN,
+        settlement_verification_level="UNVERIFIED",
+        blockers=("venue_capability_missing",),
+    )
+
+
+def apply_venue_funding_capabilities(market: dict[str, Any]) -> dict[str, Any]:
+    row = dict(market)
+    capabilities = venue_funding_capabilities(str(row.get("venue") or ""))
+    payload = capabilities.as_dict()
+    row["data_enabled"] = payload["data_enabled"]
+    row["strategy_observation_enabled"] = payload["strategy_observation_enabled"]
+    row["shadow_candidate_enabled"] = payload["shadow_candidate_enabled"]
+    row["paper_enabled"] = payload["paper_enabled"]
+    row["live_enabled"] = payload["live_enabled"]
+    row["execution_model"] = payload["execution_model"]
+    row["settlement_verification_level"] = payload["settlement_verification_level"]
+    row["evidence_version"] = payload["evidence_version"]
+    row["venue_capability_blockers"] = list(payload["blockers"])
+    row["mandatory_venue"] = payload["mandatory"]
+    return row
+
+
 @dataclass(frozen=True)
 class VenueCapability:
     venue: str
@@ -103,7 +260,7 @@ class VenueCapability:
 
 def apply_declared_venue_capability_contract(market: dict[str, Any]) -> dict[str, Any]:
     """Attach non-authoritative inventory metadata; adapters own eligibility fields."""
-    row = dict(market)
+    row = apply_venue_funding_capabilities(market)
     venue = str(row.get("venue") or "").lower()
     contract = DECLARED_NEXT_SETTLEMENT_VENUES.get(venue)
     if not contract:

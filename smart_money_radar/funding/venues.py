@@ -9,7 +9,6 @@ DEACTIVATED_FUNDING_VENUES = {
     "coinex",
     "drift",
     "htx",
-    "pacifica",
     "phemex",
     "reya",
     "variational",

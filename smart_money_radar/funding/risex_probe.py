@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ RISEX_TESTNET_CREDENTIAL_ENVS = (
     "RISEX_TESTNET_API_KEY",
     "RISEX_TESTNET_API_SECRET",
 )
+RISEX_PUBLIC_CHECKPOINT_OFFSETS_SECONDS = (-60, -30, -15, -10, -5, -2, 0, 2, 5, 15, 30)
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,7 @@ class RiseXProbeConfig:
     no_telegram: bool = True
     confirm_testnet_canary: bool = False
     base_url: str = RISEX_API_URL
+    symbol: str | None = None
 
     def validated(self) -> "RiseXProbeConfig":
         environment = str(self.environment or "").strip().lower()
@@ -54,6 +57,7 @@ class RiseXProbeConfig:
             no_telegram=True,
             confirm_testnet_canary=bool(self.confirm_testnet_canary),
             base_url=base_url,
+            symbol=(str(self.symbol).strip() if self.symbol else None),
         )
 
 
@@ -131,7 +135,8 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
     resolved = config.validated()
     store = SQLiteStore(resolved.db_path)
     store.init_db()
-    started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    started_dt = datetime.now(UTC).replace(microsecond=0)
+    started_at = started_dt.isoformat()
     probe_run_id = hashlib.sha256(
         "|".join(["risex", resolved.environment, resolved.mode, started_at]).encode("utf-8")
     ).hexdigest()[:24]
@@ -170,56 +175,101 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
         client = RiseXFundingClient(base_url=resolved.base_url, environment="testnet")
         observed_at = datetime.now(UTC).replace(microsecond=0).isoformat()
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        market = select_risex_probe_market(markets, resolved.symbol)
         observation_count = 0
-        for market in markets[:25]:
+        boundary_attempts = 0
+        boundary_observed = 0
+        public_settlements_confirmed = 0
+        latest_scheduled_settlement = market.get("next_funding_at") if market else None
+        confirmed_settlements: set[str] = set()
+        if market is not None:
             interval_seconds = float(market.get("funding_interval_hours") or 0.0) * 3600.0
             store.insert_funding_semantics_probe_observation(
-                {
-                    "probe_run_id": probe_run_id,
-                    "venue": "risex",
-                    "environment": "testnet",
-                    "symbol": market.get("symbol"),
-                    "scheduled_settlement_at": market.get("next_funding_at"),
-                    "actual_assessment_at": None,
-                    "actual_confirmation_at": None,
-                    "entry_lead_seconds": None,
-                    "hold_duration_seconds": None,
-                    "size": None,
-                    "predicted_rate": market.get("normalized_next_funding_rate"),
-                    "rate_period_seconds": interval_seconds,
-                    "expected_full_payment": None,
-                    "expected_prorata_payment": None,
-                    "realized_payment": None,
-                    "balance_delta": None,
-                    "classification": "PUBLIC_OBSERVED",
-                    "confidence": "low",
-                    "errors": None,
-                    "raw_evidence_metadata": redact_secret_payload(
-                        {
-                            "market": {
-                                key: market.get(key)
-                                for key in (
-                                    "venue",
-                                    "symbol",
-                                    "environment",
-                                    "next_funding_at",
-                                    "funding_rate",
-                                    "normalized_next_funding_rate",
-                                    "funding_interval_hours",
-                                    "published_funding_rate",
-                                    "published_funding_interval_hours",
-                                    "mark_price",
-                                    "index_price",
-                                )
-                            },
-                            "warnings": warnings,
-                        }
-                    ),
-                }
+                risex_probe_snapshot_observation(
+                    probe_run_id=probe_run_id,
+                    market=market,
+                    interval_seconds=interval_seconds,
+                    warnings=warnings,
+                    classification="MARKET_SNAPSHOT",
+                    actual_offset_seconds=None,
+                )
             )
-            observation_count += 1
+            observation_count = 1
+            scheduled_dt = parse_probe_datetime(latest_scheduled_settlement)
+            deadline_dt = started_dt + timedelta(seconds=float(resolved.max_wait_seconds))
+            lower_bound_dt = started_dt - timedelta(
+                seconds=float(resolved.confirmation_timeout_seconds)
+            )
+            if scheduled_dt is not None and scheduled_dt >= lower_bound_dt:
+                for checkpoint_offset in RISEX_PUBLIC_CHECKPOINT_OFFSETS_SECONDS:
+                    checkpoint_dt = scheduled_dt + timedelta(seconds=checkpoint_offset)
+                    if checkpoint_dt > deadline_dt:
+                        break
+                    now_dt = datetime.now(UTC)
+                    if checkpoint_dt < now_dt and checkpoint_offset < 0:
+                        continue
+                    sleep_seconds = (checkpoint_dt - now_dt).total_seconds()
+                    if sleep_seconds > 0:
+                        time.sleep(min(sleep_seconds, max(0.0, (deadline_dt - now_dt).total_seconds())))
+                    actual_dt = datetime.now(UTC)
+                    if actual_dt > deadline_dt:
+                        break
+                    actual_offset = (actual_dt - scheduled_dt).total_seconds()
+                    observed_at = actual_dt.isoformat()
+                    _checkpoint_instruments, checkpoint_markets, checkpoint_warnings = (
+                        client.catalog_and_markets(observed_at)
+                    )
+                    warnings.extend(checkpoint_warnings)
+                    checkpoint_market = select_risex_probe_market(
+                        checkpoint_markets,
+                        market.get("symbol"),
+                    )
+                    if checkpoint_market is None:
+                        continue
+                    latest_scheduled_settlement = checkpoint_market.get("next_funding_at") or latest_scheduled_settlement
+                    store.insert_funding_semantics_probe_observation(
+                        risex_probe_snapshot_observation(
+                            probe_run_id=probe_run_id,
+                            market=checkpoint_market,
+                            interval_seconds=interval_seconds,
+                            warnings=checkpoint_warnings,
+                            classification="MARKET_SNAPSHOT",
+                            actual_offset_seconds=actual_offset,
+                        )
+                    )
+                    observation_count += 1
+                    if actual_offset < 0:
+                        continue
+                    boundary_attempts += 1
+                    settlement_key = scheduled_dt.isoformat()
+                    if settlement_key in confirmed_settlements:
+                        continue
+                    if risex_public_settlement_confirmed(
+                        client,
+                        symbol=str(checkpoint_market.get("symbol") or ""),
+                        scheduled_settlement_at=scheduled_dt,
+                        interval_seconds=interval_seconds,
+                        observed_at=observed_at,
+                    ):
+                        confirmed_settlements.add(settlement_key)
+                        boundary_observed += 1
+                        public_settlements_confirmed += 1
+                        store.insert_funding_semantics_probe_observation(
+                            risex_probe_snapshot_observation(
+                                probe_run_id=probe_run_id,
+                                market=checkpoint_market,
+                                interval_seconds=interval_seconds,
+                                warnings=checkpoint_warnings,
+                                classification="PUBLIC_SETTLEMENT_CONFIRMED",
+                                actual_offset_seconds=actual_offset,
+                            )
+                        )
         completed_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-        status = "PUBLIC_OBSERVED" if observation_count else "NO_PUBLIC_MARKETS"
+        status = (
+            "PUBLIC_BOUNDARY_OBSERVED"
+            if public_settlements_confirmed
+            else ("PARTIAL_NO_BOUNDARY" if observation_count else "NO_PUBLIC_MARKETS")
+        )
         completed = {
             **run_row,
             "completed_at": completed_at,
@@ -227,7 +277,12 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
             "payload": {
                 "instrument_count": len(instruments),
                 "market_count": len(markets),
-                "observation_count": observation_count,
+                "market_snapshot_count": observation_count,
+                "boundary_event_attempt_count": boundary_attempts,
+                "boundary_event_observed_count": boundary_observed,
+                "public_settlement_confirmed_count": public_settlements_confirmed,
+                "latest_scheduled_settlement": latest_scheduled_settlement,
+                "symbol": market.get("symbol") if market else resolved.symbol,
                 "warnings": warnings,
                 "orders_enabled": False,
             },
@@ -238,7 +293,12 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
             "status": status,
             "instrument_count": len(instruments),
             "market_count": len(markets),
-            "observation_count": observation_count,
+            "market_snapshot_count": observation_count,
+            "boundary_event_attempt_count": boundary_attempts,
+            "boundary_event_observed_count": boundary_observed,
+            "public_settlement_confirmed_count": public_settlements_confirmed,
+            "latest_scheduled_settlement": latest_scheduled_settlement,
+            "symbol": market.get("symbol") if market else resolved.symbol,
             "warnings": warnings,
             "orders_enabled": False,
         }
@@ -259,6 +319,54 @@ def run_risex_funding_probe(config: RiseXProbeConfig) -> dict[str, Any]:
                 "orders_enabled": False,
             }
         raise
+
+
+def parse_probe_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def risex_public_settlement_confirmed(
+    client: RiseXFundingClient,
+    *,
+    symbol: str,
+    scheduled_settlement_at: datetime,
+    interval_seconds: float,
+    observed_at: str,
+) -> bool:
+    if not symbol:
+        return False
+    funding_history = getattr(client, "funding_history", None)
+    if not callable(funding_history):
+        return False
+    interval = max(1.0, float(interval_seconds or 0.0))
+    start_time_ms = int(
+        (scheduled_settlement_at - timedelta(seconds=interval * 2)).timestamp() * 1_000
+    )
+    try:
+        rows = funding_history(
+            symbol,
+            start_time_ms=start_time_ms,
+            interval_hours=interval / 3600.0,
+            observed_at=observed_at,
+        )
+    except Exception:
+        return False
+    tolerance_seconds = max(2.0, min(90.0, interval * 0.05))
+    for row in rows:
+        funding_at = parse_probe_datetime(row.get("funding_at"))
+        if funding_at is None:
+            continue
+        if abs((funding_at - scheduled_settlement_at).total_seconds()) <= tolerance_seconds:
+            return True
+    return False
 
 
 def _testnet_canary_guard(config: RiseXProbeConfig) -> dict[str, Any] | None:
@@ -282,12 +390,87 @@ def _testnet_canary_guard(config: RiseXProbeConfig) -> dict[str, Any] | None:
         }
     if not risex_testnet_credentials_present():
         return {
-            "status": "CANARY_SKIPPED",
+            "status": "CANARY_UNSUPPORTED",
             "reason": "risex_testnet_credentials_missing",
             "orders_enabled": False,
         }
     return {
-        "status": "CANARY_SKIPPED",
-        "reason": "private_testnet_order_client_not_implemented_in_this_pass",
+        "status": "CANARY_UNSUPPORTED",
+        "reason": "risex_eip712_session_key_order_and_ledger_flow_not_implemented",
         "orders_enabled": False,
+    }
+
+
+def select_risex_probe_market(
+    markets: list[dict[str, Any]],
+    symbol: str | None,
+) -> dict[str, Any] | None:
+    if symbol:
+        requested = str(symbol).strip().upper()
+        for market in markets:
+            if str(market.get("symbol") or "").upper() == requested:
+                return market
+    candidates = [market for market in markets if market.get("symbol")]
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda row: (
+            -float(row.get("volume_24h_usd") or 0.0),
+            str(row.get("symbol") or ""),
+        ),
+    )[0]
+
+
+def risex_probe_snapshot_observation(
+    *,
+    probe_run_id: str,
+    market: dict[str, Any],
+    interval_seconds: float,
+    warnings: list[str],
+    classification: str,
+    actual_offset_seconds: float | None,
+) -> dict[str, Any]:
+    return {
+        "probe_run_id": probe_run_id,
+        "venue": "risex",
+        "environment": "testnet",
+        "symbol": market.get("symbol"),
+        "scheduled_settlement_at": market.get("next_funding_at"),
+        "actual_assessment_at": None,
+        "actual_confirmation_at": None,
+        "entry_lead_seconds": actual_offset_seconds,
+        "hold_duration_seconds": None,
+        "size": None,
+        "predicted_rate": market.get("normalized_next_funding_rate"),
+        "rate_period_seconds": interval_seconds,
+        "expected_full_payment": None,
+        "expected_prorata_payment": None,
+        "realized_payment": None,
+        "balance_delta": None,
+        "classification": classification,
+        "confidence": "low",
+        "errors": None,
+        "raw_evidence_metadata": redact_secret_payload(
+            {
+                "market": {
+                    key: market.get(key)
+                    for key in (
+                        "venue",
+                        "symbol",
+                        "environment",
+                        "next_funding_at",
+                        "funding_rate",
+                        "normalized_next_funding_rate",
+                        "funding_interval_hours",
+                        "published_funding_rate",
+                        "published_funding_interval_hours",
+                        "mark_price",
+                        "index_price",
+                    )
+                },
+                "actual_offset_seconds": actual_offset_seconds,
+                "warnings": warnings,
+            }
+        ),
     }

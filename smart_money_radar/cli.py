@@ -485,7 +485,8 @@ def main(argv: list[str] | None = None) -> int:
             if result.get("error"):
                 print(f"  error: {result.get('error')}")
             print(f"  probe_run_id: {result.get('probe_run_id')}")
-            return 0 if str(result.get("status")) not in {"FAILED", "CANARY_BLOCKED"} else 1
+            failed_statuses = {"FAILED", "CANARY_BLOCKED", "CANARY_UNSUPPORTED"}
+            return 0 if str(result.get("status")) not in failed_statuses else 1
 
         if args.command == "funding-paper-report":
             store.init_db()
@@ -958,6 +959,7 @@ def build_parser() -> argparse.ArgumentParser:
     risex_probe.add_argument("--max-notional-usd", type=float, default=10.0)
     risex_probe.add_argument("--entry-lead-seconds", type=float, default=30.0)
     risex_probe.add_argument("--max-wait-seconds", type=float, default=120.0)
+    risex_probe.add_argument("--symbol", default=None)
     risex_probe.add_argument(
         "--confirmation-timeout-seconds",
         type=float,
@@ -1236,6 +1238,7 @@ def risex_probe_config(args: argparse.Namespace) -> RiseXProbeConfig:
         confirmation_timeout_seconds=args.confirmation_timeout_seconds,
         no_telegram=True,
         confirm_testnet_canary=args.confirm_testnet_canary,
+        symbol=args.symbol,
     ).validated()
 
 

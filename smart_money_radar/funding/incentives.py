@@ -6,6 +6,15 @@ from typing import Any
 
 @dataclass(frozen=True)
 class IncentiveProgramMetadata:
+    status: str = "UNKNOWN"
+    source: str | None = None
+    program_name: str | None = None
+    season: str | None = None
+    multiplier: float | None = None
+    eligibility: str | None = None
+    checked_at: str | None = None
+    confidence: str = "LOW"
+    notes: str | None = None
     incentive_program_status: str = "UNKNOWN"
     incentive_program_name: str | None = None
     season_or_epoch: str | None = None
@@ -14,7 +23,6 @@ class IncentiveProgramMetadata:
     api_volume_multiplier: float | None = None
     known_exclusions: tuple[str, ...] = ()
     last_verified_at: str | None = None
-    confidence: str = "unknown"
     volume_generated_estimate: float | None = None
     estimated_fees: float | None = None
     points_observed: float | None = None

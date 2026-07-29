@@ -25,6 +25,7 @@ from smart_money_radar.funding.adapters.kraken import KrakenFundingClient
 from smart_money_radar.funding.adapters.kucoin import KuCoinFundingClient
 from smart_money_radar.funding.adapters.lighter import LighterFundingClient
 from smart_money_radar.funding.adapters.mexc import MEXCFundingClient
+from smart_money_radar.funding.adapters.nado import NadoFundingClient
 from smart_money_radar.funding.adapters.okx import OKXFundingClient
 from smart_money_radar.funding.adapters.pacifica import PacificaFundingClient
 from smart_money_radar.funding.adapters.paradex import ParadexFundingClient
@@ -64,6 +65,7 @@ __all__ = [
     "KuCoinFundingClient",
     "LighterFundingClient",
     "MEXCFundingClient",
+    "NadoFundingClient",
     "OKXFundingClient",
     "PacificaFundingClient",
     "ParadexFundingClient",

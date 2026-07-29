@@ -7,7 +7,9 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -26,6 +28,12 @@ class BybitFundingClient:
 
     def __init__(self, http: FundingHttpClient | None = None) -> None:
         self.http = http or FundingHttpClient()
+        self.base_url = BYBIT_API_URL
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
         self.non_crypto_assets: set[str] = set()
 
     def catalog_and_markets(
@@ -116,7 +124,11 @@ class BybitFundingClient:
                 }
             )
         self.non_crypto_assets = non_crypto_assets
-        return instruments, markets, []
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            [],
+        )
 
     def _instrument_pages(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []

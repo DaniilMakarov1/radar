@@ -66,6 +66,74 @@ class EventWindowPlannerConfig:
 
 
 @dataclass(frozen=True)
+class CostEstimate:
+    component: str
+    value: Decimal
+    currency_unit: str
+    source: str | None
+    source_type: str
+    observed_at: str | None
+    expires_at: str | None
+    confidence: str
+    verified: bool
+    target_notional_usd: Decimal
+    assumptions: tuple[str, ...]
+    blocker_if_missing: str | None
+    status: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "component": self.component,
+            "value": str(self.value),
+            "currency_unit": self.currency_unit,
+            "source": self.source,
+            "source_type": self.source_type,
+            "observed_at": self.observed_at,
+            "expires_at": self.expires_at,
+            "confidence": self.confidence,
+            "verified": self.verified,
+            "target_notional_usd": str(self.target_notional_usd),
+            "assumptions": list(self.assumptions),
+            "blocker_if_missing": self.blocker_if_missing,
+            "status": self.status,
+        }
+
+
+def _cost_estimate_from_dict(row: dict[str, Any]) -> CostEstimate:
+    return CostEstimate(
+        component=str(row.get("component") or ""),
+        value=_decimal(row.get("value")),
+        currency_unit=str(row.get("currency_unit") or "USD"),
+        source=(
+            str(row.get("source"))
+            if row.get("source") not in (None, "")
+            else None
+        ),
+        source_type=str(row.get("source_type") or "unknown"),
+        observed_at=(
+            str(row.get("observed_at"))
+            if row.get("observed_at") not in (None, "")
+            else None
+        ),
+        expires_at=(
+            str(row.get("expires_at"))
+            if row.get("expires_at") not in (None, "")
+            else None
+        ),
+        confidence=str(row.get("confidence") or "low"),
+        verified=bool(row.get("verified")),
+        target_notional_usd=_decimal(row.get("target_notional_usd")),
+        assumptions=tuple(str(item) for item in row.get("assumptions") or ()),
+        blocker_if_missing=(
+            str(row.get("blocker_if_missing"))
+            if row.get("blocker_if_missing") not in (None, "")
+            else None
+        ),
+        status=str(row.get("status") or "UNKNOWN"),
+    )
+
+
+@dataclass(frozen=True)
 class FundingSettlementEvent:
     event_id: str
     venue: str
@@ -132,6 +200,7 @@ class FundingRoutePlan:
     evidence_version: str
     planner: dict[str, Any]
     modeled_costs: dict[str, float]
+    cost_estimates: list[CostEstimate]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +240,7 @@ class FundingRoutePlan:
             "expires_at": self.expires_at,
             "evidence_version": self.evidence_version,
             "modeled_costs": self.modeled_costs,
+            "cost_estimates": [estimate.as_dict() for estimate in self.cost_estimates],
             "planner": self.planner,
         }
 
@@ -217,14 +287,19 @@ def _event_sort_key(event: FundingSettlementEvent) -> tuple[datetime, str, str]:
     return scheduled.astimezone(UTC), event.venue, event.event_id
 
 
-def _market_notional(mark_price: float | None, target_notional: float) -> float:
+def _non_negative_decimal(value: Any) -> Decimal:
+    parsed = _decimal(value)
+    return parsed if parsed > 0 else Decimal("0")
+
+
+def _market_notional(mark_price: Decimal | None, target_notional: Any) -> Decimal:
     if mark_price is None or mark_price <= 0:
-        return max(0.0, float(target_notional))
-    return max(0.0, float(target_notional))
+        return _non_negative_decimal(target_notional)
+    return _non_negative_decimal(target_notional)
 
 
-def funding_receiver_side(rate_per_next_settlement: float | None) -> str:
-    rate = float(rate_per_next_settlement or 0.0)
+def funding_receiver_side(rate_per_next_settlement: Any) -> str:
+    rate = _decimal(rate_per_next_settlement)
     if rate > 0:
         return "short"
     if rate < 0:
@@ -232,7 +307,7 @@ def funding_receiver_side(rate_per_next_settlement: float | None) -> str:
     return "none"
 
 
-def funding_payer_side(rate_per_next_settlement: float | None) -> str:
+def funding_payer_side(rate_per_next_settlement: Any) -> str:
     receiver = funding_receiver_side(rate_per_next_settlement)
     if receiver == "long":
         return "short"
@@ -244,21 +319,22 @@ def funding_payer_side(rate_per_next_settlement: float | None) -> str:
 def position_funding_cashflow_usd(
     *,
     side: str,
-    notional: float,
-    rate_per_next_settlement: float | None,
-) -> float:
-    rate = float(rate_per_next_settlement or 0.0)
+    notional: Any,
+    rate_per_next_settlement: Any,
+) -> Decimal:
+    rate = _decimal(rate_per_next_settlement)
+    notional_decimal = _non_negative_decimal(notional)
     if str(side).lower() == "long":
-        return -float(notional) * rate
-    return float(notional) * rate
+        return -notional_decimal * rate
+    return notional_decimal * rate
 
 
-def _conservative_cashflow(value: float, config: EventWindowPlannerConfig) -> float:
+def _conservative_cashflow(value: Decimal, config: EventWindowPlannerConfig) -> Decimal:
     if value > 0:
-        return value * float(config.conservative_positive_cashflow_fraction)
+        return value * _decimal(config.conservative_positive_cashflow_fraction)
     if value < 0:
-        return value * float(config.conservative_negative_cashflow_multiplier)
-    return 0.0
+        return value * _decimal(config.conservative_negative_cashflow_multiplier)
+    return Decimal("0")
 
 
 def funding_event_from_market(
@@ -288,10 +364,10 @@ def funding_event_from_market(
     )
     earliest = scheduled - timedelta(seconds=jitter_before + uncertainty)
     latest = scheduled + timedelta(seconds=jitter_after + uncertainty)
-    mark = _optional_float(market.get("mark_price"))
+    mark = _optional_decimal(market.get("mark_price"))
     notional = _market_notional(mark, target_notional)
-    raw_rate = _optional_float(market.get("funding_rate"))
-    normalized_rate = _optional_float(market.get("normalized_next_funding_rate"))
+    raw_rate = _optional_decimal(market.get("funding_rate"))
+    normalized_rate = _optional_decimal(market.get("normalized_next_funding_rate"))
     rate = normalized_rate if normalized_rate is not None else raw_rate
     expected = position_funding_cashflow_usd(
         side=side,
@@ -319,15 +395,15 @@ def funding_event_from_market(
         latest_possible_assessment_at=latest.astimezone(UTC).isoformat(),
         settlement_interval_seconds=resolved_contract.settlement_interval_seconds,
         displayed_rate_period_seconds=resolved_contract.displayed_rate_period_seconds,
-        raw_api_rate=raw_rate,
+        raw_api_rate=float(raw_rate) if raw_rate is not None else None,
         raw_rate_unit=market.get("raw_funding_rate_unit") or market.get("funding_rate_unit"),
         raw_rate_scale=str(market.get("raw_funding_rate_scale") or "fraction"),
-        normalized_rate=normalized_rate,
-        rate_per_next_settlement=rate,
+        normalized_rate=float(normalized_rate) if normalized_rate is not None else None,
+        rate_per_next_settlement=float(rate) if rate is not None else None,
         receiver_side=funding_receiver_side(rate),
         payer_side=funding_payer_side(rate),
-        expected_cashflow_usd=expected,
-        conservative_cashflow_usd=_conservative_cashflow(expected, planner_config),
+        expected_cashflow_usd=float(expected),
+        conservative_cashflow_usd=float(_conservative_cashflow(expected, planner_config)),
         rate_status=str(market.get("rate_status") or "predicted"),
         source_event_at=market.get("source_event_at"),
         response_received_at=market.get("response_received_at"),
@@ -452,11 +528,43 @@ def classify_event_for_hold_window(
     return "ambiguous"
 
 
-def _fee_rate(market: dict[str, Any]) -> float | None:
-    value = _optional_float(market.get("taker_fee_rate"))
+def _fee_rate(market: dict[str, Any]) -> Decimal | None:
+    value = _optional_decimal(market.get("taker_fee_rate"))
     if value is None:
-        value = _optional_float(market.get("fee_rate"))
-    return float(value) if value is not None else None
+        value = _optional_decimal(market.get("fee_rate"))
+    return value
+
+
+def _cost_estimate(
+    *,
+    component: str,
+    value: Decimal,
+    source: str | None,
+    source_type: str,
+    target_notional_usd: Decimal,
+    status: str,
+    observed_at: Any = None,
+    expires_at: Any = None,
+    confidence: str = "medium",
+    verified: bool = False,
+    assumptions: tuple[str, ...] = (),
+    blocker_if_missing: str | None = None,
+) -> CostEstimate:
+    return CostEstimate(
+        component=component,
+        value=value,
+        currency_unit="USD",
+        source=source,
+        source_type=source_type,
+        observed_at=str(observed_at) if observed_at not in (None, "") else None,
+        expires_at=str(expires_at) if expires_at not in (None, "") else None,
+        confidence=confidence,
+        verified=bool(verified),
+        target_notional_usd=target_notional_usd,
+        assumptions=assumptions,
+        blocker_if_missing=blocker_if_missing,
+        status=status,
+    )
 
 
 def _planned_costs(
@@ -465,38 +573,181 @@ def _planned_costs(
     short_market: dict[str, Any],
     target_notional: float,
     config: EventWindowPlannerConfig,
-) -> tuple[dict[str, float], list[str]]:
-    reference = max(0.0, float(target_notional))
+) -> tuple[dict[str, float], list[str], list[CostEstimate], Decimal]:
+    reference_decimal = _non_negative_decimal(target_notional)
     blockers: list[str] = []
     long_fee = _fee_rate(long_market)
     short_fee = _fee_rate(short_market)
     if long_fee is None:
         blockers.append("long_fee_unknown")
-        long_fee = 0.0
+        long_fee = Decimal("0")
     if short_fee is None:
         blockers.append("short_fee_unknown")
-        short_fee = 0.0
-    entry_fees = reference * (long_fee + short_fee)
+        short_fee = Decimal("0")
+    entry_fees = reference_decimal * (long_fee + short_fee)
     exit_fees = entry_fees
-    entry_slippage = reference * max(0.0, float(config.entry_slippage_bps)) / 10_000.0
-    exit_slippage = reference * max(0.0, float(config.exit_slippage_bps)) / 10_000.0
-    basis_reserve = reference * max(0.0, float(config.basis_movement_reserve_bps)) / 10_000.0
-    execution_failure = reference * max(0.0, float(config.execution_failure_reserve_bps)) / 10_000.0
-    partial_fill = reference * max(0.0, float(config.partial_fill_reserve_bps)) / 10_000.0
-    timing = reference * max(0.0, float(config.timing_uncertainty_reserve_bps)) / 10_000.0
-    operational = reference * max(0.0, float(config.operational_reserve_bps)) / 10_000.0
+    entry_slippage = reference_decimal * _non_negative_decimal(config.entry_slippage_bps) / Decimal("10000")
+    exit_slippage = reference_decimal * _non_negative_decimal(config.exit_slippage_bps) / Decimal("10000")
+    basis_reserve = reference_decimal * _non_negative_decimal(config.basis_movement_reserve_bps) / Decimal("10000")
+    stablecoin_reserve = _non_negative_decimal(config.stablecoin_reserve_usd)
+    execution_failure = reference_decimal * _non_negative_decimal(config.execution_failure_reserve_bps) / Decimal("10000")
+    partial_fill = reference_decimal * _non_negative_decimal(config.partial_fill_reserve_bps) / Decimal("10000")
+    timing = reference_decimal * _non_negative_decimal(config.timing_uncertainty_reserve_bps) / Decimal("10000")
+    operational = reference_decimal * _non_negative_decimal(config.operational_reserve_bps) / Decimal("10000")
+    estimates = [
+        _cost_estimate(
+            component="entry_fee_leg_a",
+            value=reference_decimal * long_fee,
+            source=long_market.get("fee_source"),
+            source_type="venue_market_fee",
+            observed_at=long_market.get("response_received_at"),
+            target_notional_usd=reference_decimal,
+            status="UNKNOWN" if "long_fee_unknown" in blockers else "VERIFIED",
+            verified="long_fee_unknown" not in blockers,
+            blocker_if_missing="long_fee_unknown",
+        ),
+        _cost_estimate(
+            component="entry_fee_leg_b",
+            value=reference_decimal * short_fee,
+            source=short_market.get("fee_source"),
+            source_type="venue_market_fee",
+            observed_at=short_market.get("response_received_at"),
+            target_notional_usd=reference_decimal,
+            status="UNKNOWN" if "short_fee_unknown" in blockers else "VERIFIED",
+            verified="short_fee_unknown" not in blockers,
+            blocker_if_missing="short_fee_unknown",
+        ),
+        _cost_estimate(
+            component="exit_fee_leg_a",
+            value=reference_decimal * long_fee,
+            source=long_market.get("fee_source"),
+            source_type="venue_market_fee",
+            observed_at=long_market.get("response_received_at"),
+            target_notional_usd=reference_decimal,
+            status="UNKNOWN" if "long_fee_unknown" in blockers else "VERIFIED",
+            verified="long_fee_unknown" not in blockers,
+            blocker_if_missing="long_fee_unknown",
+        ),
+        _cost_estimate(
+            component="exit_fee_leg_b",
+            value=reference_decimal * short_fee,
+            source=short_market.get("fee_source"),
+            source_type="venue_market_fee",
+            observed_at=short_market.get("response_received_at"),
+            target_notional_usd=reference_decimal,
+            status="UNKNOWN" if "short_fee_unknown" in blockers else "VERIFIED",
+            verified="short_fee_unknown" not in blockers,
+            blocker_if_missing="short_fee_unknown",
+        ),
+        _cost_estimate(
+            component="entry_slippage_leg_a",
+            value=entry_slippage / Decimal("2"),
+            source="planner_config.entry_slippage_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+            assumptions=("split equally across legs",),
+        ),
+        _cost_estimate(
+            component="entry_slippage_leg_b",
+            value=entry_slippage / Decimal("2"),
+            source="planner_config.entry_slippage_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+            assumptions=("split equally across legs",),
+        ),
+        _cost_estimate(
+            component="exit_slippage_leg_a",
+            value=exit_slippage / Decimal("2"),
+            source="planner_config.exit_slippage_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+            assumptions=("split equally across legs",),
+        ),
+        _cost_estimate(
+            component="exit_slippage_leg_b",
+            value=exit_slippage / Decimal("2"),
+            source="planner_config.exit_slippage_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+            assumptions=("split equally across legs",),
+        ),
+        _cost_estimate(
+            component="basis_movement_reserve",
+            value=basis_reserve,
+            source="planner_config.basis_movement_reserve_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+        ),
+        _cost_estimate(
+            component="stablecoin_reserve",
+            value=stablecoin_reserve,
+            source="stablecoin_route_evaluation",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+        ),
+        _cost_estimate(
+            component="execution_failure_reserve",
+            value=execution_failure,
+            source="planner_config.execution_failure_reserve_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+        ),
+        _cost_estimate(
+            component="partial_fill_reserve",
+            value=partial_fill,
+            source="planner_config.partial_fill_reserve_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+        ),
+        _cost_estimate(
+            component="timing_uncertainty_reserve",
+            value=timing,
+            source="planner_config.timing_uncertainty_reserve_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+        ),
+        _cost_estimate(
+            component="operational_reserve",
+            value=operational,
+            source="planner_config.operational_reserve_bps",
+            source_type="conservative_config",
+            target_notional_usd=reference_decimal,
+            status="CONSERVATIVE_CONFIGURED",
+        ),
+    ]
+    total_cost = (
+        entry_fees
+        + exit_fees
+        + entry_slippage
+        + exit_slippage
+        + basis_reserve
+        + stablecoin_reserve
+        + execution_failure
+        + partial_fill
+        + timing
+        + operational
+    )
     return {
-        "entry_fees_usd": entry_fees,
-        "exit_fees_usd": exit_fees,
-        "entry_slippage_usd": entry_slippage,
-        "exit_slippage_usd": exit_slippage,
-        "basis_movement_reserve_usd": basis_reserve,
-        "stablecoin_reserve_usd": max(0.0, float(config.stablecoin_reserve_usd)),
-        "execution_failure_reserve_usd": execution_failure,
-        "partial_fill_reserve_usd": partial_fill,
-        "timing_uncertainty_reserve_usd": timing,
-        "operational_reserve_usd": operational,
-    }, blockers
+        "entry_fees_usd": float(entry_fees),
+        "exit_fees_usd": float(exit_fees),
+        "entry_slippage_usd": float(entry_slippage),
+        "exit_slippage_usd": float(exit_slippage),
+        "basis_movement_reserve_usd": float(basis_reserve),
+        "stablecoin_reserve_usd": float(stablecoin_reserve),
+        "execution_failure_reserve_usd": float(execution_failure),
+        "partial_fill_reserve_usd": float(partial_fill),
+        "timing_uncertainty_reserve_usd": float(timing),
+        "operational_reserve_usd": float(operational),
+    }, blockers, estimates, total_cost
 
 
 def _build_hold_plan(
@@ -533,7 +784,7 @@ def _build_hold_plan(
         else:
             ambiguous.append(event)
     included_sorted = sorted(included, key=_event_sort_key)
-    costs, cost_blockers = _planned_costs(
+    costs, cost_blockers, cost_estimates, total_cost = _planned_costs(
         long_market=long_market,
         short_market=short_market,
         target_notional=target_notional,
@@ -547,11 +798,9 @@ def _build_hold_plan(
         (_decimal(event.conservative_cashflow_usd) for event in included),
         Decimal("0"),
     )
-    total_cost = sum((_decimal(value) for value in costs.values()), Decimal("0"))
     expected_net = expected_cashflow - total_cost
     conservative_net = conservative_cashflow - total_cost
-    reference = max(0.0, float(target_notional))
-    reference_decimal = _decimal(reference)
+    reference_decimal = _non_negative_decimal(target_notional)
     blockers: list[str] = []
     hold_seconds = (planned_exit_at - planned_entry_at).total_seconds()
     if hold_seconds > float(config.max_strategy_hold_seconds):
@@ -605,6 +854,7 @@ def _build_hold_plan(
         "expected_funding_cashflow_usd": float(expected_cashflow),
         "conservative_funding_cashflow_usd": float(conservative_cashflow),
         "modeled_costs": costs,
+        "cost_estimates": [estimate.as_dict() for estimate in cost_estimates],
         "expected_costs_usd": float(total_cost),
         "conservative_costs_usd": float(total_cost),
         "expected_net_usd": float(expected_net),
@@ -671,6 +921,17 @@ def _eligibility_status(blockers: list[str], *, lifecycle_state: str) -> str:
     return "SHADOW_CANDIDATE"
 
 
+def _venue_capability_blockers(market: dict[str, Any], prefix: str) -> list[str]:
+    blockers: list[str] = []
+    if market.get("data_enabled") is False:
+        blockers.append(f"{prefix}_data_capability_disabled")
+    if market.get("strategy_observation_enabled") is False:
+        blockers.append(f"{prefix}_strategy_observation_capability_disabled")
+    if market.get("shadow_candidate_enabled") is False:
+        blockers.append(f"{prefix}_shadow_candidate_disabled")
+    return blockers
+
+
 class FundingSettlementPlanner:
     """Side-effect-free funding settlement capture planner used by shadow and PaperBot."""
 
@@ -701,9 +962,16 @@ class FundingSettlementPlanner:
         blockers: list[str] = []
         if long_venue == "paradex" or short_venue == "paradex":
             blockers.append("funding_continuous_pro_rata")
+        blockers.extend(_venue_capability_blockers(long_market, "long"))
+        blockers.extend(_venue_capability_blockers(short_market, "short"))
         long_env = str(long_market.get("environment") or "").lower()
         short_env = str(short_market.get("environment") or "").lower()
         if long_env not in {"mainnet", "testnet"} or short_env not in {"mainnet", "testnet"}:
+            blockers.append("environment_unverified")
+        elif (
+            long_market.get("environment_verified") is False
+            or short_market.get("environment_verified") is False
+        ):
             blockers.append("environment_unverified")
         elif long_env != short_env:
             blockers.append("environment_mismatch")
@@ -798,6 +1066,7 @@ class FundingSettlementPlanner:
                 evidence_version="",
                 planner={"plans": [], "config": asdict(config)},
                 modeled_costs={},
+                cost_estimates=[],
             )
 
         first_event = events[0]
@@ -920,6 +1189,10 @@ class FundingSettlementPlanner:
             expires_at=monitor_until,
             evidence_version="|".join(sorted(set(evidence_versions))),
             modeled_costs=dict(selected.get("modeled_costs") or {}),
+            cost_estimates=[
+                _cost_estimate_from_dict(estimate)
+                for estimate in selected.get("cost_estimates", [])
+            ],
             planner={
                 "selected_plan": selected["plan_name"],
                 "plans": plans,

@@ -8,7 +8,9 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.adapters.common import iso_from_nanoseconds
 from smart_money_radar.funding.normalization import (
@@ -39,6 +41,11 @@ class RiseXFundingClient:
         self.http = http or FundingHttpClient(min_delay_seconds=0.08)
         self.base_url = base_url.rstrip("/")
         self.environment = risex_environment(environment, self.base_url)
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment=self.environment,
+        )
         self._markets_by_symbol: dict[str, dict[str, Any]] = {}
         self._markets_by_id: dict[str, dict[str, Any]] = {}
 
@@ -158,7 +165,11 @@ class RiseXFundingClient:
                     },
                 }
             )
-        return instruments, markets, warnings
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            warnings,
+        )
 
     def orderbook(
         self,

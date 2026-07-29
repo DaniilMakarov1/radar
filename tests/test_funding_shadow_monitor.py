@@ -17,6 +17,7 @@ from smart_money_radar.funding.adapter_contracts import (
     funding_adapter_contract_from_market,
     mandatory_shadow_inventory,
 )
+from smart_money_radar.funding.adapters.base import build_endpoint_identity
 from smart_money_radar.funding.incentives import (
     funding_net_excluding_points,
     rank_opportunities_with_points_tiebreaker,
@@ -28,8 +29,10 @@ from smart_money_radar.funding.shadow_monitor import (
     adaptive_broad_sweep_interval_seconds,
 )
 from smart_money_radar.funding.risex_probe import (
+    RiseXProbeConfig,
     classify_risex_funding_semantics_observation,
     redact_secret_payload,
+    run_risex_funding_probe,
 )
 from smart_money_radar.funding.settlement_contracts import (
     FundingAccrualModel,
@@ -46,6 +49,11 @@ from smart_money_radar.funding.stablecoins import (
     evaluate_stablecoin_route,
     stablecoin_basis_bps,
     stablecoin_reserve_bps,
+)
+from smart_money_radar.funding.venue_capabilities import (
+    ExecutionModel,
+    apply_declared_venue_capability_contract,
+    venue_funding_capabilities,
 )
 from smart_money_radar.notifications import (
     TelegramNotifier,
@@ -776,6 +784,13 @@ def test_missing_fee_is_unknown_and_blocks_candidate() -> None:
 
     assert "long_fee_unknown" in opportunity["blockers"]
     assert opportunity["eligibility_status"] == "RESEARCH_ONLY"
+    costs = {
+        row["component"]: row
+        for row in opportunity["cost_estimates"]
+    }
+    assert costs["entry_fee_leg_a"]["status"] == "UNKNOWN"
+    assert costs["entry_fee_leg_a"]["blocker_if_missing"] == "long_fee_unknown"
+    assert costs["entry_slippage_leg_a"]["status"] == "CONSERVATIVE_CONFIGURED"
 
 
 def test_explicit_zero_fee_is_allowed_when_payload_provides_it() -> None:
@@ -806,6 +821,12 @@ def test_explicit_zero_fee_is_allowed_when_payload_provides_it() -> None:
     assert "long_fee_unknown" not in opportunity["blockers"]
     assert "short_fee_unknown" not in opportunity["blockers"]
     assert opportunity["modeled_costs"]["entry_fees_usd"] == pytest.approx(0.0)
+    costs = {
+        row["component"]: row
+        for row in opportunity["cost_estimates"]
+    }
+    assert costs["entry_fee_leg_a"]["status"] == "VERIFIED"
+    assert float(costs["entry_fee_leg_a"]["value"]) == 0.0
 
 
 def test_paradex_is_not_built_as_shadow_route(tmp_path) -> None:
@@ -912,6 +933,127 @@ def test_risex_payload_promotion_remains_research_only(tmp_path) -> None:
     assert "short_position_inclusion_rule_unverified" in multi["blockers"]
 
 
+def test_venue_capability_registry_keeps_research_venues_fail_closed() -> None:
+    risex = venue_funding_capabilities("risex")
+    pacifica = venue_funding_capabilities("pacifica")
+    variational = venue_funding_capabilities("variational")
+    paradex = venue_funding_capabilities("paradex")
+
+    assert risex.data_enabled is True
+    assert risex.strategy_observation_enabled is True
+    assert risex.shadow_candidate_enabled is False
+    assert risex.paper_enabled is False
+    assert risex.live_enabled is False
+    assert risex.mandatory is True
+    assert pacifica.data_enabled is True
+    assert pacifica.strategy_observation_enabled is True
+    assert pacifica.shadow_candidate_enabled is False
+    assert pacifica.paper_enabled is False
+    assert variational.execution_model == ExecutionModel.RFQ
+    assert variational.strategy_observation_enabled is False
+    assert paradex.strategy_observation_enabled is False
+    assert "funding_continuous_pro_rata" in paradex.blockers
+
+
+def test_venue_capability_payload_cannot_promote_risex_to_paper() -> None:
+    row = complete_market(
+        venue="risex",
+        collateral="USDC",
+        environment="testnet",
+    )
+    row.update(
+        {
+            "shadow_candidate_enabled": True,
+            "paper_enabled": True,
+            "live_enabled": True,
+            "execution_model": "CLOB",
+            "settlement_verification_level": "VERIFIED",
+            "venue_capability_blockers": [],
+        }
+    )
+
+    hardened = apply_declared_venue_capability_contract(row)
+
+    assert hardened["shadow_candidate_enabled"] is False
+    assert hardened["paper_enabled"] is False
+    assert hardened["live_enabled"] is False
+    assert hardened["settlement_verification_level"] == "PUBLIC_OBSERVED"
+    assert "mainnet_canary_required" in hardened["venue_capability_blockers"]
+
+
+def test_nado_periodic_unverified_route_is_research_only() -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    nado = apply_declared_venue_capability_contract(
+        complete_market(
+            venue="nado",
+            symbol="BTC-PERP_USDT0",
+            collateral="USDT0",
+            funding_rate=0.024 / 24,
+            settlement=(now + timedelta(seconds=30)).isoformat(),
+            observed_at=now.isoformat(),
+            environment="mainnet",
+        )
+    )
+    hedge = apply_declared_venue_capability_contract(
+        complete_market(
+            venue="binance",
+            collateral="USDT0",
+            funding_rate=-0.0001,
+            settlement=(now + timedelta(hours=4)).isoformat(),
+            observed_at=now.isoformat(),
+            environment="mainnet",
+        )
+    )
+
+    opportunity = build_settlement_capture_opportunity(
+        long_market=nado,
+        short_market=hedge,
+        now=now,
+        target_notional=1_000,
+    )
+
+    assert opportunity["eligibility_status"] == "RESEARCH_ONLY"
+    assert "long_shadow_candidate_disabled" in opportunity["blockers"]
+    assert nado["paper_enabled"] is False
+    assert nado["live_enabled"] is False
+
+
+def test_variational_strategy_route_is_capability_blocked() -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    variational = apply_declared_venue_capability_contract(
+        complete_market(
+            venue="variational",
+            collateral="USDC",
+            funding_rate=0.001,
+            settlement=(now + timedelta(seconds=30)).isoformat(),
+            observed_at=now.isoformat(),
+            environment="mainnet",
+        )
+    )
+    hedge = apply_declared_venue_capability_contract(
+        complete_market(
+            venue="binance",
+            collateral="USDC",
+            funding_rate=-0.0001,
+            settlement=(now + timedelta(hours=4)).isoformat(),
+            observed_at=now.isoformat(),
+            environment="mainnet",
+        )
+    )
+
+    opportunity = build_settlement_capture_opportunity(
+        long_market=variational,
+        short_market=hedge,
+        now=now,
+        target_notional=1_000,
+    )
+
+    assert opportunity["eligibility_status"] == "CAPABILITY_BLOCKED"
+    assert "long_strategy_observation_capability_disabled" in opportunity["blockers"]
+    assert variational["execution_model"] == "RFQ"
+    assert variational["paper_enabled"] is False
+
+
 def test_risex_is_in_primary_inventory_and_missing_step_is_research_only() -> None:
     market = complete_market(venue="risex", collateral="USDC", quantity_step=None)
     contract = funding_adapter_contract_from_market(market)
@@ -954,6 +1096,28 @@ def test_risex_testnet_cannot_match_mainnet() -> None:
 
     assert opportunity["status"] in {"CAPABILITY_BLOCKED", "RESEARCH_ONLY"}
     assert "environment_mismatch" in opportunity["blockers"]
+
+
+def test_unverified_endpoint_identity_blocks_candidate() -> None:
+    first = complete_market(venue="binance", environment="mainnet")
+    second = complete_market(
+        venue="bybit",
+        environment="mainnet",
+        funding_rate=-0.002,
+    )
+    first["environment_verified"] = False
+    second["environment_verified"] = True
+
+    opportunity = build_settlement_capture_opportunity(
+        long_market=first,
+        short_market=second,
+        now=datetime(2026, 7, 28, 12, 1, tzinfo=UTC),
+        target_notional=1_000,
+        max_response_age_seconds=300,
+    )
+
+    assert opportunity["eligibility_status"] in {"CAPABILITY_BLOCKED", "RESEARCH_ONLY"}
+    assert "environment_unverified" in opportunity["blockers"]
 
 
 def test_cross_usdc_usdt_route_is_allowed_with_reserve() -> None:
@@ -1091,6 +1255,43 @@ def test_points_never_change_trading_net_and_only_tie_break_positive_routes() ->
     assert ranked[2] is negative_with_points
 
 
+def test_unknown_points_metadata_is_typed_low_confidence(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=30)
+    monitor = FundingShadowMonitor(
+        SQLiteStore(tmp_path / "radar.sqlite"),
+        [],
+        config=FundingShadowConfig(telegram_enabled=False),
+        clock=FakeClock(now),
+    )
+    opportunity = monitor._shadow_opportunity_for_pair(
+        "BTC",
+        complete_market(
+            venue="binance",
+            funding_rate=-0.006,
+            settlement=settlement.isoformat(),
+            observed_at=now.isoformat(),
+        ),
+        complete_market(
+            venue="bybit",
+            funding_rate=0.006,
+            settlement=settlement.isoformat(),
+            observed_at=now.isoformat(),
+        ),
+        now,
+    )
+
+    metadata = opportunity["points_metadata"]
+    assert metadata["status"] == "UNKNOWN"
+    assert metadata["source"] is None
+    assert metadata["program_name"] is None
+    assert metadata["season"] is None
+    assert metadata["multiplier"] is None
+    assert metadata["eligibility"] is None
+    assert metadata["confidence"] == "LOW"
+    assert metadata["incentive_program_status"] == "UNKNOWN"
+
+
 def test_hanging_broad_sweep_venue_returns_partial_results(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
@@ -1144,6 +1345,64 @@ def test_pending_venue_request_prevents_overlapping_second_request(tmp_path) -> 
 
     assert second["overlapping_call_prevention_count"] >= 1
     assert slow.sweep_calls == 1
+
+
+def test_broad_sweep_not_repeated_on_each_focused_tick(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=30)
+    binance = _ShadowClient("binance", funding_rate=-0.006, settlement=settlement)
+    bybit = _ShadowClient("bybit", funding_rate=0.006, settlement=settlement)
+    okx = _ShadowClient("okx", asset="ETH", funding_rate=0.003, settlement=settlement)
+    monitor = FundingShadowMonitor(
+        SQLiteStore(tmp_path / "radar.sqlite"),
+        [binance, bybit, okx],
+        config=FundingShadowConfig(
+            telegram_enabled=False,
+            broad_near_interval_seconds=10.0,
+            focused_refresh_cadence_seconds=1.0,
+        ).validated(),
+        clock=FakeClock(now),
+    )
+
+    result = monitor.run(duration_seconds=3.2)
+
+    assert result["broad_sweep_count"] == 1
+    assert result["focused_refresh_count"] >= 2
+    assert result["request_counts_by_venue"]["okx"] == 1
+    assert result["request_counts_by_venue"]["binance"] > 1
+    assert result["request_counts_by_endpoint_class"]["funding_sweep"] >= 5
+
+
+def test_worker_latency_uses_completion_timestamp(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    monitor = FundingShadowMonitor(
+        store,
+        [_ShadowClient("binance", funding_rate=0.003, settlement=settlement, delay_seconds=0.02)],
+        config=FundingShadowConfig(
+            telegram_enabled=False,
+            venue_deadline_seconds=1.0,
+        ).validated(),
+        clock=FakeClock(now),
+    )
+
+    monitor.run_once()
+
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT request_started_at, response_received_at, parsing_completed_at,
+                   total_latency_ms, endpoint_class
+              FROM funding_shadow_venue_health
+             WHERE venue = 'binance'
+            """
+        ).fetchone()
+    assert row[0] is not None
+    assert row[1] is not None
+    assert row[2] is not None
+    assert row[3] >= 10.0
+    assert row[4] == "funding_sweep"
 
 
 def test_adaptive_cadence_boundaries() -> None:
@@ -1242,6 +1501,56 @@ def test_dex_profile_records_mandatory_risex_health_on_fetch_failure(tmp_path) -
             """
         ).fetchone()
     assert row == ("MANDATORY_UNAVAILABLE", "mainnet")
+
+
+def test_shadow_monitor_does_not_use_monitor_environment_as_client_identity(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    monitor = FundingShadowMonitor(
+        store,
+        [_FailingShadowClient("risex", environment="")],
+        config=FundingShadowConfig(environment="mainnet", telegram_enabled=False),
+        clock=FakeClock(now),
+    )
+
+    monitor.run_once()
+
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT status, environment
+              FROM funding_shadow_venue_health
+             WHERE venue = 'risex'
+            """
+        ).fetchone()
+    assert row == ("MANDATORY_UNAVAILABLE", "unknown")
+
+
+def test_shadow_monitor_endpoint_identity_overrides_payload_environment(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    client = _ShadowClient(
+        "binance",
+        environment="testnet",
+        settlement=now + timedelta(seconds=30),
+    )
+    client.endpoint_identity = build_endpoint_identity(
+        venue="binance",
+        base_url="https://fapi.binance.com",
+        requested_environment="mainnet",
+    )
+    monitor = FundingShadowMonitor(
+        SQLiteStore(tmp_path / "radar.sqlite"),
+        [client],
+        config=FundingShadowConfig(environment="testnet", telegram_enabled=False),
+        clock=FakeClock(now),
+    )
+
+    markets, health_rows, warnings = monitor.broad_funding_sweep(now.isoformat())
+
+    assert warnings == []
+    assert markets[0]["environment"] == "mainnet"
+    assert markets[0]["environment_verified"] is True
+    assert health_rows[0]["environment"] == "mainnet"
 
 
 def test_strict_required_venue_validation_returns_nonzero(tmp_path, monkeypatch) -> None:
@@ -1426,6 +1735,114 @@ def test_sent_alert_is_not_repeated_after_restart(tmp_path) -> None:
     assert len(individual_alerts) == 1
 
 
+def test_retryable_shadow_alert_retries_only_after_next_retry(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    opportunity = {
+        "opportunity_key": "alert-opp",
+        "environment": "mainnet",
+        "profile": "dex_shadow",
+        "canonical_asset": "BTC",
+        "status": "SHADOW_CANDIDATE",
+        "long_venue": "binance",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "bybit",
+        "short_symbol": "BTCUSDT",
+        "settlement_at": "2026-07-28T12:01:00+00:00",
+        "settlement_skew_seconds": 0.0,
+        "seconds_until_settlement": 60.0,
+        "preliminary_gross_funding": 10.0,
+        "funding_net_excluding_points": 9.0,
+        "observed_at": "2026-07-28T12:00:00+00:00",
+    }
+    store.upsert_funding_shadow_opportunity(opportunity)
+    row = {
+        "alert_key": "retry-alert",
+        "opportunity_key": "alert-opp",
+        "environment": "mainnet",
+        "status": "SHADOW_CANDIDATE",
+        "message": "SHADOW FUNDING WINDOW",
+        "telegram_status": "queued",
+        "payload": {},
+    }
+    started = datetime(2026, 7, 28, 12, tzinfo=UTC)
+
+    first = store.claim_funding_shadow_alert(row, now=started)
+    store.update_funding_shadow_alert_status(
+        "retry-alert",
+        "failed",
+        "https://api.telegram.org/bot123:ABC/sendMessage api_key=SECRET",
+        retry_delay_seconds=60.0,
+        now=started,
+    )
+    blocked = store.claim_funding_shadow_alert(
+        row,
+        now=started + timedelta(seconds=30),
+    )
+    retried = store.claim_funding_shadow_alert(
+        row,
+        now=started + timedelta(seconds=61),
+    )
+
+    with sqlite3.connect(store.db_path) as conn:
+        state, attempts, error = conn.execute(
+            """
+            SELECT state, attempt_count, last_error_redacted
+              FROM funding_shadow_alerts
+             WHERE alert_key = 'retry-alert'
+            """
+        ).fetchone()
+    assert first is not None
+    assert blocked is None
+    assert retried == first
+    assert state == "CLAIMED"
+    assert attempts == 2
+    assert "123:ABC" not in error
+    assert "SECRET" not in error
+
+
+def test_active_claimed_shadow_alert_prevents_duplicate_claim(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    opportunity = {
+        "opportunity_key": "concurrent-opp",
+        "environment": "mainnet",
+        "profile": "dex_shadow",
+        "canonical_asset": "BTC",
+        "status": "SHADOW_CANDIDATE",
+        "long_venue": "binance",
+        "long_symbol": "BTCUSDT",
+        "short_venue": "bybit",
+        "short_symbol": "BTCUSDT",
+        "settlement_at": "2026-07-28T12:01:00+00:00",
+        "settlement_skew_seconds": 0.0,
+        "seconds_until_settlement": 60.0,
+        "preliminary_gross_funding": 10.0,
+        "funding_net_excluding_points": 9.0,
+        "observed_at": "2026-07-28T12:00:00+00:00",
+    }
+    store.upsert_funding_shadow_opportunity(opportunity)
+    row = {
+        "alert_key": "concurrent-alert",
+        "opportunity_key": "concurrent-opp",
+        "environment": "mainnet",
+        "status": "SHADOW_CANDIDATE",
+        "message": "SHADOW FUNDING WINDOW",
+        "telegram_status": "queued",
+        "payload": {},
+    }
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+
+    first = store.claim_funding_shadow_alert(row, now=now)
+    second = store.claim_funding_shadow_alert(row, now=now)
+
+    with sqlite3.connect(store.db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM funding_shadow_alerts").fetchone()[0]
+    assert first is not None
+    assert second is None
+    assert count == 1
+
+
 def test_fake_paper_delta_causes_safety_violation(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     store = SQLiteStore(tmp_path / "radar.sqlite")
@@ -1495,11 +1912,66 @@ def test_risex_probe_default_public_places_no_orders(tmp_path, monkeypatch) -> N
         orders_enabled = conn.execute(
             "SELECT orders_enabled FROM funding_semantics_probe_runs"
         ).fetchone()[0]
+        payload_json = conn.execute(
+            "SELECT payload_json FROM funding_semantics_probe_runs"
+        ).fetchone()[0]
         observations = conn.execute(
             "SELECT COUNT(*) FROM funding_semantics_probe_observations"
         ).fetchone()[0]
     assert orders_enabled == 0
     assert observations == 1
+    payload = json.loads(payload_json)
+    assert payload["market_snapshot_count"] == 1
+    assert payload["boundary_event_attempt_count"] == 0
+    assert payload["boundary_event_observed_count"] == 0
+    assert payload["public_settlement_confirmed_count"] == 0
+
+
+def test_risex_public_probe_confirms_boundary_only_from_history(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FakeRiseXClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.venue = "risex"
+            self.scheduled = datetime.now(UTC) + timedelta(seconds=0.05)
+
+        def catalog_and_markets(self, observed_at: str):
+            market = complete_market(
+                venue="risex",
+                collateral="USDC",
+                environment="testnet",
+                settlement=self.scheduled.isoformat(),
+                observed_at=observed_at,
+            )
+            return [market], [market], []
+
+        def funding_history(
+            self,
+            _symbol: str,
+            *,
+            start_time_ms: int,
+            interval_hours: float,
+            observed_at: str,
+        ) -> list[dict[str, Any]]:
+            del start_time_ms, interval_hours, observed_at
+            return [{"funding_at": self.scheduled.isoformat(), "funding_rate": 0.001}]
+
+    monkeypatch.setattr("smart_money_radar.funding.risex_probe.RiseXFundingClient", FakeRiseXClient)
+
+    result = run_risex_funding_probe(
+        RiseXProbeConfig(
+            db_path=tmp_path / "probe.sqlite",
+            mode="public",
+            max_wait_seconds=1.0,
+        )
+    )
+
+    assert result["status"] == "PUBLIC_BOUNDARY_OBSERVED"
+    assert result["market_snapshot_count"] >= 2
+    assert result["boundary_event_attempt_count"] == 1
+    assert result["boundary_event_observed_count"] == 1
+    assert result["public_settlement_confirmed_count"] == 1
 
 
 def test_testnet_canary_requires_explicit_flag(tmp_path) -> None:
@@ -1515,6 +1987,40 @@ def test_testnet_canary_requires_explicit_flag(tmp_path) -> None:
     )
 
     assert code == 1
+
+
+def test_testnet_canary_returns_honest_unsupported_without_placeholder(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RISEX_TESTNET_API_KEY", "test-api-key")
+    monkeypatch.setenv("RISEX_TESTNET_API_SECRET", "test-api-secret")
+
+    code = main(
+        [
+            "--db",
+            str(tmp_path / "probe.sqlite"),
+            "funding-risex-probe",
+            "--mode",
+            "testnet-canary",
+            "--confirm-testnet-canary",
+            "--no-telegram",
+        ]
+    )
+
+    assert code == 1
+    with sqlite3.connect(tmp_path / "probe.sqlite") as conn:
+        status, error, payload_json = conn.execute(
+            """
+            SELECT status, error, payload_json
+              FROM funding_semantics_probe_runs
+            """
+        ).fetchone()
+    payload = json.loads(payload_json)
+    assert status == "CANARY_UNSUPPORTED"
+    assert error == "risex_eip712_session_key_order_and_ledger_flow_not_implemented"
+    assert payload["reason"] == error
+    assert "private_testnet_order_client_not_implemented" not in json.dumps(payload)
 
 
 def test_secret_redaction_removes_auth_material() -> None:

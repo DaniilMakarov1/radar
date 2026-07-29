@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import gzip
 import http.client
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from typing import Any
 
 
@@ -41,6 +43,7 @@ class RateLimitedHttpClient:
         body = None
         headers = {
             "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
             "User-Agent": self.user_agent,
         }
         if payload is not None:
@@ -60,7 +63,15 @@ class RateLimitedHttpClient:
                     request,
                     timeout=self.timeout_seconds,
                 ) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    raw_body = response.read()
+                    encoding = str(
+                        response.headers.get("Content-Encoding") or ""
+                    ).lower()
+                    if "gzip" in encoding:
+                        raw_body = gzip.decompress(raw_body)
+                    elif "deflate" in encoding:
+                        raw_body = zlib.decompress(raw_body)
+                    return json.loads(raw_body.decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:

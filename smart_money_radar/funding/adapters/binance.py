@@ -6,7 +6,9 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -24,6 +26,12 @@ class BinanceFundingClient:
 
     def __init__(self, http: FundingHttpClient | None = None) -> None:
         self.http = http or FundingHttpClient()
+        self.base_url = BINANCE_FUTURES_URL
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
 
     def catalog_and_markets(
         self,
@@ -115,7 +123,11 @@ class BinanceFundingClient:
                     "raw": current,
                 }
             )
-        return instruments, markets, warnings
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            warnings,
+        )
 
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
         query = urllib.parse.urlencode(

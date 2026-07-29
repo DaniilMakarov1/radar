@@ -6,14 +6,15 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.adapters.common import (
     next_interval_boundary_iso,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
-    normalize_orderbook,
     parse_timestamp,
 )
 
@@ -39,6 +40,12 @@ class VariationalFundingClient:
     ) -> None:
         self.http = http or FundingHttpClient(min_delay_seconds=0.12)
         self.base_url = base_url.rstrip("/")
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
+        self.environment = self.endpoint_identity.environment
         self._quotes: dict[str, dict[str, Any]] = {}
 
     def catalog_and_markets(
@@ -124,16 +131,21 @@ class VariationalFundingClient:
                     "index_price": mark_price,
                     "open_interest_usd": open_interest_usd,
                     "volume_24h_usd": volume_24h,
-                    "maker_fee_rate": 0.0,
-                    "taker_fee_rate": 0.0,
-                    "fee_source": "venue_public_zero_fee",
+                    "execution_model": "RFQ",
+                    "orderbook_depth_available": False,
+                    "fee_source": "fee_model_missing",
+                    "fee_model_missing": True,
                     "observed_at": observed_at,
                     "raw": raw,
                 }
             )
 
         self._quotes = quotes_cache
-        return instruments, markets, []
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            [],
+        )
 
     def orderbook(
         self,
@@ -141,34 +153,9 @@ class VariationalFundingClient:
         observed_at: str,
         limit: int = 100,
     ) -> dict[str, Any]:
-        quotes = self._quotes.get(symbol)
-        if quotes is None:
-            raise FundingDataError(
-                f"Variational quotes unavailable for {symbol}; "
-                "call catalog_and_markets first"
-            )
-
-        bids: list[list[float]] = []
-        asks: list[list[float]] = []
-
-        for tier_key, notional in VARIATIONAL_QUOTE_NOTIONAL_TIERS:
-            tier = quotes.get(tier_key)
-            if not isinstance(tier, dict):
-                continue
-            bid_px = as_float(tier.get("bid"))
-            ask_px = as_float(tier.get("ask"))
-            if bid_px > 0:
-                bids.append([bid_px, notional / bid_px])
-            if ask_px > 0:
-                asks.append([ask_px, notional / ask_px])
-
-        return normalize_orderbook(
-            self.venue,
-            symbol,
-            bids,
-            asks,
-            observed_at,
-            quotes,
+        del observed_at, limit
+        raise FundingDataError(
+            f"Variational {symbol} is RFQ-only; public CLOB orderbook unavailable"
         )
 
     def funding_history(

@@ -12,7 +12,9 @@ import websocket
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -39,6 +41,11 @@ class OKXFundingClient:
     ) -> None:
         self.http = http or FundingHttpClient(min_delay_seconds=0.11)
         self.base_url = base_url.rstrip("/")
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
         self.use_websocket = http is None if use_websocket is None else use_websocket
         self.websocket_url = websocket_url
         self._contract_multipliers: dict[str, float] = {}
@@ -158,7 +165,11 @@ class OKXFundingClient:
                 f"OKX funding unavailable for {len(funding_failures)} symbols"
                 f" (examples: {examples})."
             )
-        return instruments, markets, warnings
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            warnings,
+        )
 
     def _current_funding_rates(
         self,
