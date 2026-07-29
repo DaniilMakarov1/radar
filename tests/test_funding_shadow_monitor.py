@@ -361,7 +361,8 @@ def test_shadow_monitor_writes_no_paper_state(tmp_path) -> None:
     result = monitor.run_once()
     counts = store.funding_shadow_counts()
 
-    assert result["shadow_candidates"] >= 1
+    assert result["shadow_candidates"] == 0
+    assert result["research_only_routes"] >= 1
     assert counts["opportunities"] >= 1
     assert counts["observations"] >= 2
     assert counts["paper_positions"] == 0
@@ -464,7 +465,7 @@ def test_negative_second_settlement_is_excluded_when_exit_is_guaranteed() -> Non
     second = first + timedelta(seconds=20)
     long_market = complete_market(
         venue="binance",
-        funding_rate=-0.006,
+        funding_rate=-0.014,
         settlement=first.isoformat(),
         observed_at=now.isoformat(),
     )
@@ -493,7 +494,7 @@ def test_unavoidable_negative_second_settlement_is_deducted() -> None:
     second = first + timedelta(seconds=4)
     long_market = complete_market(
         venue="binance",
-        funding_rate=-0.006,
+        funding_rate=-0.014,
         settlement=first.isoformat(),
         observed_at=now.isoformat(),
     )
@@ -512,7 +513,7 @@ def test_unavoidable_negative_second_settlement_is_deducted() -> None:
     )
 
     assert len(opportunity["included_settlement_events"]) == 2
-    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(1.0)
+    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(5.0)
 
 
 def test_three_settlement_events_are_considered_as_timeline() -> None:
@@ -634,6 +635,59 @@ def test_dynamic_intervals_and_displayed_rate_period_are_not_hardcoded() -> None
     assert contract.displayed_rate_period_seconds == pytest.approx(1800.0)
 
 
+def test_market_row_cannot_self_promote_settlement_semantics() -> None:
+    market = complete_market(
+        venue="risex",
+        collateral="USDC",
+        environment="testnet",
+        funding_accrual_model=FundingAccrualModel.POSITION_AT_EVENT_FULL.value,
+        position_inclusion_rule_verified=True,
+        settlement_semantics_status="VERIFIED",
+    )
+    market["verification_level"] = "VERIFIED"
+    market["official_evidence_urls"] = ["https://attacker.invalid/fake"]
+    market["evidence_checked_at"] = "2099-01-01"
+    market["assessment_jitter_before_seconds"] = 0
+    market["assessment_jitter_after_seconds"] = 0
+    market["settlement_confirmation_source"] = "payload_claimed_history"
+    market["realized_payment_source"] = "payload_claimed_ledger"
+
+    contract = settlement_contract_from_market(market)
+
+    assert contract.accrual_model == FundingAccrualModel.UNKNOWN.value
+    assert contract.position_inclusion_rule_verified is False
+    assert contract.verification_level == "PUBLIC_OBSERVED"
+    assert "attacker.invalid" not in ",".join(contract.official_evidence_urls)
+    assert contract.evidence_checked_at != "2099-01-01"
+    assert contract.assessment_jitter_before_seconds is None
+    assert contract.assessment_jitter_after_seconds is None
+    assert contract.settlement_confirmation_source is None
+    assert contract.realized_payment_source is None
+
+
+def test_unknown_adapter_payload_cannot_self_promote_settlement_contract() -> None:
+    market = complete_market(
+        venue="unknownvenue",
+        funding_accrual_model=FundingAccrualModel.POSITION_AT_EVENT_FULL.value,
+        position_inclusion_rule_verified=True,
+        settlement_semantics_status="VERIFIED",
+    )
+    market["official_evidence_urls"] = ["https://attacker.invalid/fake"]
+    market["assessment_jitter_before_seconds"] = 0
+    market["assessment_jitter_after_seconds"] = 0
+    market["settlement_confirmation_source"] = "payload_claimed_history"
+
+    contract = settlement_contract_from_market(market)
+
+    assert contract.accrual_model == FundingAccrualModel.UNKNOWN.value
+    assert contract.position_inclusion_rule_verified is False
+    assert contract.verification_level == "UNVERIFIED"
+    assert contract.official_evidence_urls == ()
+    assert contract.assessment_jitter_before_seconds is None
+    assert contract.assessment_jitter_after_seconds is None
+    assert contract.settlement_confirmation_source is None
+
+
 def test_displayed_8h_rate_is_not_used_as_next_settlement_cashflow() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     settlement = now + timedelta(seconds=30)
@@ -695,6 +749,65 @@ def test_positive_gross_negative_conservative_net_is_not_candidate() -> None:
     assert "conservative_net_not_positive" in opportunity["blockers"]
 
 
+def test_missing_fee_is_unknown_and_blocks_candidate() -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=30)
+    long_market = complete_market(
+        venue="binance",
+        funding_rate=-0.010,
+        settlement=settlement.isoformat(),
+        observed_at=now.isoformat(),
+    )
+    short_market = complete_market(
+        venue="bybit",
+        funding_rate=0.010,
+        settlement=settlement.isoformat(),
+        observed_at=now.isoformat(),
+    )
+    long_market.pop("taker_fee_rate", None)
+    long_market.pop("fee_rate", None)
+
+    opportunity = build_settlement_capture_opportunity(
+        long_market=long_market,
+        short_market=short_market,
+        now=now,
+        target_notional=500.0,
+    )
+
+    assert "long_fee_unknown" in opportunity["blockers"]
+    assert opportunity["eligibility_status"] == "RESEARCH_ONLY"
+
+
+def test_explicit_zero_fee_is_allowed_when_payload_provides_it() -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=30)
+    long_market = complete_market(
+        venue="binance",
+        funding_rate=-0.010,
+        settlement=settlement.isoformat(),
+        observed_at=now.isoformat(),
+    )
+    short_market = complete_market(
+        venue="bybit",
+        funding_rate=0.010,
+        settlement=settlement.isoformat(),
+        observed_at=now.isoformat(),
+    )
+    long_market["taker_fee_rate"] = 0.0
+    short_market["taker_fee_rate"] = 0.0
+
+    opportunity = build_settlement_capture_opportunity(
+        long_market=long_market,
+        short_market=short_market,
+        now=now,
+        target_notional=500.0,
+    )
+
+    assert "long_fee_unknown" not in opportunity["blockers"]
+    assert "short_fee_unknown" not in opportunity["blockers"]
+    assert opportunity["modeled_costs"]["entry_fees_usd"] == pytest.approx(0.0)
+
+
 def test_paradex_is_not_built_as_shadow_route(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     settlement = now + timedelta(seconds=30)
@@ -750,7 +863,7 @@ def test_risex_unverified_opportunity_is_research_only(tmp_path) -> None:
     assert "short_position_inclusion_rule_unverified" in opportunity["blockers"]
 
 
-def test_verified_risex_builder_can_create_one_and_multi_settlement_candidates(tmp_path) -> None:
+def test_risex_payload_promotion_remains_research_only(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     first = now + timedelta(seconds=30)
     second = first + timedelta(seconds=20)
@@ -791,10 +904,12 @@ def test_verified_risex_builder_can_create_one_and_multi_settlement_candidates(t
     one = monitor._shadow_opportunity_for_pair("BTC", hedge, risex, now)
     multi = monitor._shadow_opportunity_for_pair("BTC", near, risex, now)
 
-    assert one["status"] == "SHADOW_CANDIDATE"
-    assert one["opportunity_shape"] == "ONE_SETTLEMENT"
-    assert multi["status"] == "SHADOW_CANDIDATE"
-    assert multi["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
+    assert one["status"] == "RESEARCH_ONLY"
+    assert "short_funding_accrual_model_unknown" in one["blockers"]
+    assert "short_position_inclusion_rule_unverified" in one["blockers"]
+    assert multi["status"] == "RESEARCH_ONLY"
+    assert "short_funding_accrual_model_unknown" in multi["blockers"]
+    assert "short_position_inclusion_rule_unverified" in multi["blockers"]
 
 
 def test_risex_is_in_primary_inventory_and_missing_step_is_research_only() -> None:
@@ -876,6 +991,8 @@ def test_public_stablecoin_provider_uses_two_sources_and_caches() -> None:
     second = provider.prices("USDC", "2026-07-28T12:00:00+00:00")
 
     assert {row.source for row in first} == {"coingecko", "coinbase"}
+    assert all(row.source_event_at == "" for row in first)
+    assert all(row.response_received_at != "2026-07-28T12:00:00+00:00" for row in first)
     assert second == first
     assert len(calls) == 2
 
@@ -906,6 +1023,37 @@ def test_same_stable_route_does_not_receive_cross_reserve_twice() -> None:
 
     assert not result["cross_stable"]
     assert result["stablecoin_reserve_bps"] == 0.0
+    assert result["funding_net_after_stablecoin_reserve"] == pytest.approx(12.0)
+
+
+@pytest.mark.parametrize("asset", ["USDe", "DAI", "USDT0", "UNKNOWN"])
+def test_untrusted_same_asset_stable_route_is_blocked(asset: str) -> None:
+    result = evaluate_stablecoin_route(
+        long_collateral=asset,
+        short_collateral=asset,
+        provider=None,
+        observed_at="2026-07-28T12:00:00+00:00",
+        reference_notional=1_000.0,
+        funding_net_before_stablecoin_reserve=12.0,
+    )
+
+    assert result["status"] == "RESEARCH_ONLY"
+    assert result["compatible"] is False
+    assert "same_asset_collateral_not_trusted" in result["blockers"]
+
+
+@pytest.mark.parametrize("asset", ["USD", "USDT", "USDC"])
+def test_trusted_same_asset_stable_route_is_allowed(asset: str) -> None:
+    result = evaluate_stablecoin_route(
+        long_collateral=asset,
+        short_collateral=asset,
+        provider=None,
+        observed_at="2026-07-28T12:00:00+00:00",
+        reference_notional=1_000.0,
+        funding_net_before_stablecoin_reserve=12.0,
+    )
+
+    assert result["status"] == "PASS"
     assert result["funding_net_after_stablecoin_reserve"] == pytest.approx(12.0)
 
 
@@ -966,7 +1114,8 @@ def test_hanging_broad_sweep_venue_returns_partial_results(tmp_path) -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.5
-    assert result["shadow_candidates"] >= 1
+    assert result["shadow_candidates"] == 0
+    assert result["research_only_routes"] >= 1
     assert any("timed out" in warning for warning in result["warnings"])
 
 

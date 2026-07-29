@@ -16,7 +16,6 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
     hold_economics,
     initial_entry_economics,
     parse_time,
-    settlement_alignment_passed,
     summarize_funding_observations,
     validate_focused_observation,
 )
@@ -309,6 +308,27 @@ class SynchronizedFundingRuntimeV2:
                 ),
                 settlement_confirmation_timeout_seconds=float(
                     getattr(config, "settlement_confirmation_timeout_seconds", 5.0)
+                ),
+                entry_slippage_bps=float(
+                    getattr(config, "entry_slippage_bps", 1.0)
+                ),
+                exit_slippage_bps=float(
+                    getattr(config, "exit_slippage_bps", 1.0)
+                ),
+                basis_movement_reserve_bps=float(
+                    getattr(config, "basis_movement_reserve_bps", 10.0)
+                ),
+                execution_failure_reserve_bps=float(
+                    getattr(config, "execution_failure_reserve_bps", 1.0)
+                ),
+                partial_fill_reserve_bps=float(
+                    getattr(config, "partial_fill_reserve_bps", 1.0)
+                ),
+                timing_uncertainty_reserve_bps=float(
+                    getattr(config, "timing_uncertainty_reserve_bps", 1.0)
+                ),
+                operational_reserve_bps=float(
+                    getattr(config, "operational_reserve_bps", 1.0)
                 ),
             )
         )

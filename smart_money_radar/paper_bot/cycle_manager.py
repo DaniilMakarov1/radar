@@ -8,7 +8,6 @@ from typing import Any
 from smart_money_radar.funding.strategy_synchronized_funding import (
     entry_underwriting,
     parse_time,
-    settlement_alignment_passed,
     settlement_skew_seconds,
     validate_focused_observation,
 )
@@ -163,8 +162,6 @@ def next_cycle_schedule_decision(
     if short_time is not None and short_time <= now:
         reasons.append("short_next_settlement_not_future")
     skew = settlement_skew_seconds(long_time, short_time)
-    if not settlement_alignment_passed(long_time, short_time, tolerance_seconds=tolerance_seconds):
-        reasons.append("next_settlement_schedule_mismatch")
     next_cycle_at = max(time for time in (long_time, short_time) if time is not None) if long_time and short_time else None
     seconds_to_next = (next_cycle_at - now).total_seconds() if next_cycle_at is not None else None
     if seconds_to_next is not None and seconds_to_next < float(min_wait_seconds):
@@ -231,8 +228,6 @@ def arm_decision(
             reasons.append(f"long_lead_{long_lead:.1f}s_outside_entry_window")
         if not (entry_min_lead_seconds <= short_lead <= entry_max_lead_seconds):
             reasons.append(f"short_lead_{short_lead:.1f}s_outside_entry_window")
-        if not settlement_alignment_passed(long_settlement, short_settlement):
-            reasons.append("settlement_alignment_mismatch")
     underwriting = entry_underwriting(observations, now=now)
     if not underwriting["eligible"]:
         reasons.extend(underwriting["reasons"])

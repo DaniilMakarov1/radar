@@ -55,14 +55,14 @@ class EventWindowPlannerConfig:
     conservative_positive_cashflow_fraction: float = 0.90
     conservative_negative_cashflow_multiplier: float = 1.0
     configured_min_net_bps: float = 0.0
-    entry_slippage_bps: float = 0.0
-    exit_slippage_bps: float = 0.0
-    basis_movement_reserve_bps: float = 0.0
+    entry_slippage_bps: float = 1.0
+    exit_slippage_bps: float = 1.0
+    basis_movement_reserve_bps: float = 10.0
     stablecoin_reserve_usd: float = 0.0
-    execution_failure_reserve_bps: float = 0.0
-    partial_fill_reserve_bps: float = 0.0
-    timing_uncertainty_reserve_bps: float = 0.0
-    operational_reserve_bps: float = 0.0
+    execution_failure_reserve_bps: float = 1.0
+    partial_fill_reserve_bps: float = 1.0
+    timing_uncertainty_reserve_bps: float = 1.0
+    operational_reserve_bps: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -452,11 +452,11 @@ def classify_event_for_hold_window(
     return "ambiguous"
 
 
-def _fee_rate(market: dict[str, Any]) -> float:
+def _fee_rate(market: dict[str, Any]) -> float | None:
     value = _optional_float(market.get("taker_fee_rate"))
     if value is None:
         value = _optional_float(market.get("fee_rate"))
-    return float(value or 0.0)
+    return float(value) if value is not None else None
 
 
 def _planned_costs(
@@ -465,9 +465,18 @@ def _planned_costs(
     short_market: dict[str, Any],
     target_notional: float,
     config: EventWindowPlannerConfig,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], list[str]]:
     reference = max(0.0, float(target_notional))
-    entry_fees = reference * (_fee_rate(long_market) + _fee_rate(short_market))
+    blockers: list[str] = []
+    long_fee = _fee_rate(long_market)
+    short_fee = _fee_rate(short_market)
+    if long_fee is None:
+        blockers.append("long_fee_unknown")
+        long_fee = 0.0
+    if short_fee is None:
+        blockers.append("short_fee_unknown")
+        short_fee = 0.0
+    entry_fees = reference * (long_fee + short_fee)
     exit_fees = entry_fees
     entry_slippage = reference * max(0.0, float(config.entry_slippage_bps)) / 10_000.0
     exit_slippage = reference * max(0.0, float(config.exit_slippage_bps)) / 10_000.0
@@ -487,7 +496,7 @@ def _planned_costs(
         "partial_fill_reserve_usd": partial_fill,
         "timing_uncertainty_reserve_usd": timing,
         "operational_reserve_usd": operational,
-    }
+    }, blockers
 
 
 def _build_hold_plan(
@@ -524,7 +533,7 @@ def _build_hold_plan(
         else:
             ambiguous.append(event)
     included_sorted = sorted(included, key=_event_sort_key)
-    costs = _planned_costs(
+    costs, cost_blockers = _planned_costs(
         long_market=long_market,
         short_market=short_market,
         target_notional=target_notional,
@@ -549,6 +558,7 @@ def _build_hold_plan(
         blockers.append("max_strategy_hold_seconds_exceeded")
     if ambiguous:
         blockers.append("settlement_timing_ambiguous")
+    blockers.extend(cost_blockers)
     if conservative_net <= 0:
         blockers.append("conservative_net_not_positive")
     min_net_bps = max(0.0, float(config.configured_min_net_bps))

@@ -2353,8 +2353,8 @@ def test_hold_proceeds_while_prior_reconciliation_pending(tmp_path) -> None:
     assert hold["hold"], f"Expected hold but got reasons: {hold['reasons']}"
 
 
-def test_equal_timestamps_eligible_same_interval_different_timestamps_closes() -> None:
-    """Equal next timestamps eligible; same interval but different timestamps => entry rejects."""
+def test_different_timestamps_are_not_alignment_blockers() -> None:
+    """Different timestamps are diagnostics; timing windows still gate legacy entry."""
     from smart_money_radar.paper_bot.position import route_entry_decision
     from smart_money_radar.funding.trader import PaperBotConfig
     config = PaperBotConfig().validated()
@@ -2392,7 +2392,7 @@ def test_equal_timestamps_eligible_same_interval_different_timestamps_closes() -
     result_equal = route_entry_decision(route_equal, accounts, now, config)
     assert "settlement_alignment_mismatch" not in result_equal["reasons"]
 
-    # Same interval but different timestamps: entry rejects with alignment mismatch
+    # Same interval but different timestamps: alignment is not the rejection reason.
     route_diff = {
         **route_equal,
         "legs": [
@@ -2407,7 +2407,8 @@ def test_equal_timestamps_eligible_same_interval_different_timestamps_closes() -
         ],
     }
     result_diff = route_entry_decision(route_diff, accounts, now, config)
-    assert "settlement_alignment_mismatch" in result_diff["reasons"]
+    assert "settlement_alignment_mismatch" not in result_diff["reasons"]
+    assert "short_settlement_outside_final_entry_window" in result_diff["reasons"]
 
 
 def test_different_nominal_intervals_equal_next_timestamp_passes() -> None:

@@ -447,135 +447,63 @@ def settlement_contract_from_market(market: dict[str, Any]) -> FundingSettlement
         displayed_seconds = displayed_hours * 3600.0 if displayed_hours is not None else None
     if displayed_seconds is None:
         displayed_seconds = template.displayed_rate_period_seconds or interval_seconds
-    accrual_model = str(
-        market.get("funding_accrual_model")
-        or market.get("accrual_model")
-        or template.accrual_model
-        or FundingAccrualModel.UNKNOWN.value
-    ).strip().upper()
-    if accrual_model not in {item.value for item in FundingAccrualModel}:
-        accrual_model = FundingAccrualModel.UNKNOWN.value
-    verification_level = str(
-        market.get("settlement_semantics_status")
-        or market.get("verification_level")
-        or template.verification_level
+    accrual_model = template.accrual_model or FundingAccrualModel.UNKNOWN.value
+    verification_level = (
+        template.verification_level
         or FundingSemanticsVerificationLevel.UNVERIFIED.value
-    ).strip().upper()
-    if verification_level not in {item.value for item in FundingSemanticsVerificationLevel}:
-        verification_level = FundingSemanticsVerificationLevel.UNVERIFIED.value
-    urls = market.get("official_evidence_urls")
-    if isinstance(urls, str):
-        official_urls = tuple(url.strip() for url in urls.split(",") if url.strip())
-    elif isinstance(urls, (list, tuple)):
-        official_urls = tuple(str(url) for url in urls if str(url).strip())
-    else:
-        official_urls = template.official_evidence_urls
+    )
+    official_urls = template.official_evidence_urls
+    position_inclusion_rule = template.position_inclusion_rule
+    position_inclusion_rule_verified = template.position_inclusion_rule_verified
+    assessment_jitter_before_seconds = template.assessment_jitter_before_seconds
+    assessment_jitter_after_seconds = template.assessment_jitter_after_seconds
+    settlement_confirmation_source = template.settlement_confirmation_source
+    realized_payment_source = template.realized_payment_source
+    base_url = template.base_url
     if environment is not None and not exact_registry_match and environment != template.supported_environment:
         accrual_model = FundingAccrualModel.UNKNOWN.value
         verification_level = FundingSemanticsVerificationLevel.UNVERIFIED.value
-        forced_position_verified = False
-        forced_jitter_before = None
-        forced_jitter_after = None
-        forced_confirmation_source = None
-        forced_realized_source = None
-        forced_rate_derivation = None
+        official_urls = ()
+        position_inclusion_rule = None
+        position_inclusion_rule_verified = False
+        assessment_jitter_before_seconds = None
+        assessment_jitter_after_seconds = None
+        settlement_confirmation_source = None
+        realized_payment_source = None
+        base_url = None
+        rate_derivation_fallback = None
     else:
-        forced_position_verified = None
-        forced_jitter_before = "template"
-        forced_jitter_after = "template"
-        forced_confirmation_source = "template"
-        forced_realized_source = "template"
-        forced_rate_derivation = "template"
+        rate_derivation_fallback = template.rate_per_settlement_derivation
     return replace(
         template,
         venue=venue or template.venue,
         supported_environment=environment or template.supported_environment,
-        base_url=(
-            str(market.get("base_url"))
-            if market.get("base_url") not in (None, "")
-            else template.base_url
-        ),
+        base_url=base_url,
         accrual_model=accrual_model,
-        position_inclusion_rule=(
-            str(market.get("position_inclusion_rule"))
-            if market.get("position_inclusion_rule") not in (None, "")
-            else template.position_inclusion_rule
-        ),
-        position_inclusion_rule_verified=_bool_from_market(
-            market.get("position_inclusion_rule_verified"),
-            template.position_inclusion_rule_verified
-            if forced_position_verified is None
-            else forced_position_verified,
-        ),
+        position_inclusion_rule=position_inclusion_rule,
+        position_inclusion_rule_verified=position_inclusion_rule_verified,
         settlement_interval_seconds=interval_seconds,
-        settlement_interval_dynamic=bool(
-            market.get(
-                "settlement_interval_dynamic",
-                template.settlement_interval_dynamic,
-            )
-        ),
+        settlement_interval_dynamic=template.settlement_interval_dynamic,
         displayed_rate_period_seconds=displayed_seconds,
         next_settlement_source=(
             str(market.get("next_settlement_source"))
             if market.get("next_settlement_source") not in (None, "")
             else template.next_settlement_source
         ),
-        rate_per_settlement_derivation=(
-            str(market.get("rate_per_settlement_derivation"))
-            if market.get("rate_per_settlement_derivation") not in (None, "")
-            else (
-                template.rate_per_settlement_derivation
-                if forced_rate_derivation == "template"
-                else forced_rate_derivation
-            )
-        ),
+        rate_per_settlement_derivation=rate_derivation_fallback,
         funding_notional_price_source=(
             str(market.get("funding_notional_price_source"))
             if market.get("funding_notional_price_source") not in (None, "")
             else template.funding_notional_price_source
         ),
-        assessment_jitter_before_seconds=_optional_non_negative_float(
-            market.get("assessment_jitter_before_seconds")
-        )
-        if market.get("assessment_jitter_before_seconds") is not None
-        else (
-            template.assessment_jitter_before_seconds
-            if forced_jitter_before == "template"
-            else forced_jitter_before
-        ),
-        assessment_jitter_after_seconds=_optional_non_negative_float(
-            market.get("assessment_jitter_after_seconds")
-        )
-        if market.get("assessment_jitter_after_seconds") is not None
-        else (
-            template.assessment_jitter_after_seconds
-            if forced_jitter_after == "template"
-            else forced_jitter_after
-        ),
-        settlement_confirmation_source=(
-            str(market.get("settlement_confirmation_source"))
-            if market.get("settlement_confirmation_source") not in (None, "")
-            else (
-                template.settlement_confirmation_source
-                if forced_confirmation_source == "template"
-                else forced_confirmation_source
-            )
-        ),
-        realized_payment_source=(
-            str(market.get("realized_payment_source"))
-            if market.get("realized_payment_source") not in (None, "")
-            else (
-                template.realized_payment_source
-                if forced_realized_source == "template"
-                else forced_realized_source
-            )
-        ),
+        assessment_jitter_before_seconds=assessment_jitter_before_seconds,
+        assessment_jitter_after_seconds=assessment_jitter_after_seconds,
+        settlement_confirmation_source=settlement_confirmation_source,
+        realized_payment_source=realized_payment_source,
         official_evidence_urls=official_urls,
-        evidence_checked_at=str(
-            market.get("evidence_checked_at") or template.evidence_checked_at
-        ),
+        evidence_checked_at=template.evidence_checked_at,
         verification_level=verification_level,
-        notes=str(market.get("semantics_notes") or template.notes or ""),
+        notes=str(template.notes or ""),
     )
 
 

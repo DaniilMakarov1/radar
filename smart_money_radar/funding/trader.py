@@ -74,7 +74,6 @@ from smart_money_radar.funding.shadow_monitor import (
 from smart_money_radar.funding.strategy_synchronized_funding import (
     build_settlement_capture_opportunity,
     gross_funding_pnl,
-    settlement_alignment_passed,
     settlement_skew_seconds,
 )
 from smart_money_radar.funding.venue_capabilities import (
@@ -1823,7 +1822,6 @@ class PaperBot:
                             for reason in list(monitor.get("reasons") or [])
                             if reason
                             not in {
-                                "settlement_alignment_mismatch",
                                 "long_settlement_outside_arm_window",
                                 "short_settlement_outside_arm_window",
                             }

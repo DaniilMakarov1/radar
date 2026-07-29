@@ -13,6 +13,8 @@ from smart_money_radar.funding.adapter_contracts import (
     collateral_family,
 )
 
+TRUSTED_SAME_ASSET_COLLATERAL = {"USD", "USDT", "USDC"}
+
 
 @dataclass(frozen=True)
 class StablecoinPrice:
@@ -83,7 +85,7 @@ class PublicStablecoinPriceProvider:
             query = urllib.parse.urlencode(
                 {"ids": coingecko_id, "vs_currencies": "usd"}
             )
-            payload = self._safe_fetch(
+            payload, response_received_at = self._safe_fetch(
                 f"https://api.coingecko.com/api/v3/simple/price?{query}"
             )
             try:
@@ -96,11 +98,12 @@ class PublicStablecoinPriceProvider:
                         asset,
                         price,
                         "coingecko",
-                        observed_at,
-                        observed_at,
+                        "",
+                        response_received_at,
+                        "current_snapshot_response_time",
                     )
                 )
-        coinbase_payload = self._safe_fetch(
+        coinbase_payload, coinbase_response_received_at = self._safe_fetch(
             f"https://api.coinbase.com/v2/exchange-rates?currency={asset}"
         )
         try:
@@ -113,17 +116,19 @@ class PublicStablecoinPriceProvider:
                     asset,
                     coinbase_price,
                     "coinbase",
-                    observed_at,
-                    observed_at,
+                    "",
+                    coinbase_response_received_at,
+                    "current_snapshot_response_time",
                 )
             )
         return rows
 
-    def _safe_fetch(self, url: str) -> Any:
+    def _safe_fetch(self, url: str) -> tuple[Any, str]:
         try:
-            return self.fetch_json(url, self.timeout_seconds)
+            payload = self.fetch_json(url, self.timeout_seconds)
+            return payload, datetime.now(UTC).isoformat()
         except Exception:
-            return {}
+            return {}, datetime.now(UTC).isoformat()
 
     @staticmethod
     def _fetch_json(url: str, timeout_seconds: float) -> Any:
@@ -233,6 +238,22 @@ def evaluate_stablecoin_route(
     long_asset = str(long_collateral or "").upper()
     short_asset = str(short_collateral or "").upper()
     if long_asset == short_asset:
+        if (
+            long_asset not in TRUSTED_SAME_ASSET_COLLATERAL
+            or collateral_family(long_asset) != USD_MAJOR_STABLE
+        ):
+            return {
+                "compatible": False,
+                "numeraire": None,
+                "stablecoin_pair": f"{long_asset}/{short_asset}",
+                "cross_stable": False,
+                "status": "RESEARCH_ONLY",
+                "blockers": ["same_asset_collateral_not_trusted"],
+                "funding_net_before_stablecoin_reserve": (
+                    funding_net_before_stablecoin_reserve
+                ),
+                "funding_net_after_stablecoin_reserve": None,
+            }
         return {
             "compatible": True,
             "numeraire": "USD",

@@ -92,13 +92,6 @@ def route_entry_decision(
                 reasons.append(f"{side}_settlement_inside_final_deadline")
             elif lead > config.entry_max_lead_seconds:
                 reasons.append(f"{side}_settlement_outside_final_entry_window")
-        if "long" in settlements and "short" in settlements:
-            skew = settlement_skew_seconds(settlements["long"], settlements["short"])
-            if (
-                skew is None
-                or skew > float(config.settlement_alignment_tolerance_seconds)
-            ):
-                reasons.append("settlement_alignment_mismatch")
         if long_leg and short_leg:
             for leg in (long_leg, short_leg):
                 venue = str(leg.get("venue") or "")
@@ -186,18 +179,6 @@ def route_monitor_decision(
             reasons.append(f"{side}_settlement_already_passed")
         elif lead > config.arm_window_seconds:
             reasons.append(f"{side}_settlement_outside_arm_window")
-    long_leg = leg_by_side(legs, "long")
-    short_leg = leg_by_side(legs, "short")
-    if long_leg and short_leg:
-        skew = settlement_skew_seconds(
-            long_leg.get("next_funding_at"),
-            short_leg.get("next_funding_at"),
-        )
-        if (
-            skew is None
-            or skew > float(config.settlement_alignment_tolerance_seconds)
-        ):
-            reasons.append("settlement_alignment_mismatch")
     selected_strategy = selected_route_strategy(route, config.strategy_set)
     if selected_strategy is None:
         reasons.append("no_allowed_strategy_candidate")
