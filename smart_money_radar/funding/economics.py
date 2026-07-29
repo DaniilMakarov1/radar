@@ -2531,6 +2531,8 @@ def route_leg(
         "index_price": market.get("index_price"),
         "best_bid": book.get("best_bid"),
         "best_ask": book.get("best_ask"),
+        "bids": book.get("bids") or [],
+        "asks": book.get("asks") or [],
         "vwap": open_fill["vwap"],
         "open_vwap": open_fill["vwap"],
         "close_vwap": close_fill["vwap"],

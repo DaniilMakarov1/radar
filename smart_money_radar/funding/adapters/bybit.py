@@ -10,6 +10,7 @@ from smart_money_radar.funding.adapters.base import (
     apply_endpoint_identity,
     as_float,
     build_endpoint_identity,
+    endpoint_identity_fields,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -86,6 +87,7 @@ class BybitFundingClient:
             funding_rate = as_float(ticker.get("fundingRate"))
             mark_price = as_float(ticker.get("markPrice"))
             index_price = as_float(ticker.get("indexPrice"))
+            rules = bybit_market_rules(raw)
             if mark_price <= 0 or index_price <= 0:
                 continue
             instruments.append(
@@ -97,7 +99,11 @@ class BybitFundingClient:
                     "quote_asset": "USDT",
                     "collateral_asset": "USDT",
                     "contract_type": "linear_perpetual",
+                    "contract_kind": "linear_perpetual",
                     "contract_multiplier": 1.0,
+                    "quantity_step": rules.get("quantity_step"),
+                    "min_quantity": rules.get("min_quantity"),
+                    "min_notional_usd": rules.get("min_notional_usd"),
                     "status": "active",
                     "source_url": f"https://www.bybit.com/trade/usdt/{symbol}",
                     "observed_at": observed_at,
@@ -118,6 +124,9 @@ class BybitFundingClient:
                     "index_price": index_price,
                     "open_interest_usd": as_float(ticker.get("openInterestValue")) or None,
                     "volume_24h_usd": as_float(ticker.get("turnover24h")) or None,
+                    "quantity_step": rules.get("quantity_step"),
+                    "min_quantity": rules.get("min_quantity"),
+                    "min_notional_usd": rules.get("min_notional_usd"),
                     "taker_fee_rate": 0.00055,
                     "observed_at": observed_at,
                     "raw": {"instrument": raw, "ticker": ticker},
@@ -200,6 +209,7 @@ class BybitFundingClient:
             raise FundingDataError(f"Bybit reference prices unavailable for {symbol}")
         return {
             "venue": self.venue,
+            **endpoint_identity_fields(self.endpoint_identity),
             "symbol": symbol,
             "canonical_asset": canonical_asset,
             "funding_rate": funding_rate,
@@ -221,6 +231,9 @@ class BybitFundingClient:
                 "canonical_unit_multiplier",
                 1.0,
             ),
+            "quantity_step": previous.get("quantity_step"),
+            "min_quantity": previous.get("min_quantity"),
+            "min_notional_usd": previous.get("min_notional_usd"),
         }
 
     def funding_history(
@@ -305,3 +318,18 @@ def bybit_result_list(payload: Any, label: str) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise FundingDataError(f"Invalid Bybit {label} rows")
     return rows
+
+
+def bybit_market_rules(raw: dict[str, Any]) -> dict[str, float | None]:
+    lot = raw.get("lotSizeFilter") if isinstance(raw, dict) else None
+    lot = lot if isinstance(lot, dict) else {}
+    return {
+        "quantity_step": positive_float(lot.get("qtyStep")),
+        "min_quantity": positive_float(lot.get("minOrderQty")),
+        "min_notional_usd": positive_float(lot.get("minNotionalValue")),
+    }
+
+
+def positive_float(value: Any) -> float | None:
+    parsed = as_float(value)
+    return parsed if parsed > 0 else None

@@ -15,6 +15,7 @@ from smart_money_radar.funding.adapters.base import (
     apply_endpoint_identity,
     as_float,
     build_endpoint_identity,
+    endpoint_identity_fields,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -116,6 +117,7 @@ class OKXFundingClient:
             last_price = as_float(ticker.get("last"))
             if mark_price <= 0 or index_price <= 0 or last_price <= 0:
                 continue
+            rules = okx_market_rules(raw, mark_price)
             self._contract_multipliers[symbol] = multiplier
             instruments.append(
                 {
@@ -126,7 +128,11 @@ class OKXFundingClient:
                     "quote_asset": "USDT",
                     "collateral_asset": "USDT",
                     "contract_type": "linear_perpetual",
+                    "contract_kind": "linear_perpetual",
                     "contract_multiplier": multiplier,
+                    "quantity_step": rules.get("quantity_step"),
+                    "min_quantity": rules.get("min_quantity"),
+                    "min_notional_usd": rules.get("min_notional_usd"),
                     "status": "active",
                     "source_url": f"https://www.okx.com/trade-swap/{symbol.lower()}",
                     "observed_at": observed_at,
@@ -147,6 +153,9 @@ class OKXFundingClient:
                     "index_price": index_price,
                     "open_interest_usd": None,
                     "volume_24h_usd": as_float(ticker.get("volCcy24h")) * last_price or None,
+                    "quantity_step": rules.get("quantity_step"),
+                    "min_quantity": rules.get("min_quantity"),
+                    "min_notional_usd": rules.get("min_notional_usd"),
                     "taker_fee_rate": 0.0005,
                     "observed_at": observed_at,
                     "raw": {
@@ -238,6 +247,89 @@ class OKXFundingClient:
             observed_at,
             raw,
         )
+
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = previous_market or {}
+        family = str(previous.get("inst_family") or previous.get("underlying") or "")
+        if not family and symbol.endswith("-SWAP"):
+            family = symbol.removesuffix("-SWAP")
+        funding = okx_first_row(
+            self.http.get_json(
+                f"{self.base_url}/api/v5/public/funding-rate?"
+                f"{urllib.parse.urlencode({'instId': symbol})}"
+            ),
+            f"funding rate for {symbol}",
+        )
+        mark = okx_first_row(
+            self.http.get_json(
+                f"{self.base_url}/api/v5/public/mark-price?"
+                f"{urllib.parse.urlencode({'instType': 'SWAP', 'instId': symbol})}"
+            ),
+            f"mark price for {symbol}",
+        )
+        index = okx_first_row(
+            self.http.get_json(
+                f"{self.base_url}/api/v5/market/index-tickers?"
+                f"{urllib.parse.urlencode({'instId': family})}"
+            ),
+            f"index price for {family}",
+        )
+        ticker = okx_first_row(
+            self.http.get_json(
+                f"{self.base_url}/api/v5/market/ticker?"
+                f"{urllib.parse.urlencode({'instId': symbol})}"
+            ),
+            f"ticker for {symbol}",
+        )
+        funding_time = integer_or_none(funding.get("fundingTime"))
+        previous_time = integer_or_none(funding.get("prevFundingTime"))
+        interval_hours = interval_between(
+            previous_time,
+            funding_time,
+            as_float(previous.get("funding_interval_hours"), 8.0),
+        )
+        funding_rate = as_float(funding.get("fundingRate"))
+        mark_price = as_float(mark.get("markPx"))
+        index_price = as_float(index.get("idxPx"))
+        last_price = as_float(ticker.get("last"), mark_price)
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"OKX reference prices unavailable for {symbol}")
+        contract_multiplier = previous.get("contract_multiplier") or self._contract_multipliers.get(symbol)
+        if contract_multiplier:
+            self._contract_multipliers[symbol] = float(contract_multiplier)
+        return {
+            "venue": self.venue,
+            **endpoint_identity_fields(self.endpoint_identity),
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_current_estimate",
+            "next_funding_at": iso_from_milliseconds(funding_time),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "volume_24h_usd": as_float(ticker.get("volCcy24h")) * last_price or None,
+            "taker_fee_rate": 0.0005,
+            "observed_at": observed_at,
+            "raw": {
+                "funding": funding,
+                "mark": mark,
+                "index": index,
+                "ticker": ticker,
+            },
+            "contract_multiplier": contract_multiplier,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "quantity_step": previous.get("quantity_step"),
+            "min_quantity": previous.get("min_quantity"),
+            "min_notional_usd": previous.get("min_notional_usd"),
+        }
 
     def funding_history(
         self,
@@ -416,6 +508,22 @@ def okx_contract_multiplier(raw: dict[str, Any], base_asset: str) -> float:
     if contract_value <= 0 or contract_multiplier <= 0:
         return 0.0
     return contract_value * contract_multiplier
+
+
+def okx_market_rules(raw: dict[str, Any], mark_price: float) -> dict[str, float | None]:
+    quantity_step = positive_float(raw.get("lotSz"))
+    min_quantity = positive_float(raw.get("minSz"))
+    min_notional = min_quantity * mark_price if min_quantity is not None and mark_price > 0 else None
+    return {
+        "quantity_step": quantity_step,
+        "min_quantity": min_quantity,
+        "min_notional_usd": min_notional,
+    }
+
+
+def positive_float(value: Any) -> float | None:
+    parsed = as_float(value)
+    return parsed if parsed > 0 else None
 
 
 def contract_levels_to_base(levels: Any, multiplier: float) -> list[list[float]]:

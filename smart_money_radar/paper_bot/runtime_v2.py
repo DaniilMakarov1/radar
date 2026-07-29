@@ -1838,13 +1838,8 @@ class SynchronizedFundingRuntimeV2:
         self._ensure_discovered_or_armed(route, capture_id, settlement_at, lead, now)
         if route_plan is None:
             return {"opened": False, "reason": "route_plan_missing"}
-        if str(route_plan.get("lifecycle_state") or "") == "ENTRY_PENDING":
-            return {
-                "opened": False,
-                "reason": "entry_pending",
-                "route_plan": route_plan,
-            }
-        if str(route_plan.get("lifecycle_state") or "") == "ENTRY_WINDOW_MISSED":
+        lifecycle_state = str(route_plan.get("lifecycle_state") or "")
+        if lifecycle_state == "ENTRY_WINDOW_MISSED":
             self.store.update_funding_capture_position_state(
                 capture_id,
                 "ENTRY_WINDOW_MISSED",
@@ -1894,6 +1889,13 @@ class SynchronizedFundingRuntimeV2:
             )
         self._store_observation(route, capture_id, settlement_at, observation, phase="entry")
         observations = self._valid_observations(route, now, phase="entry", cycle_id=f"{capture_id}:1")
+        if lifecycle_state == "ENTRY_PENDING":
+            return {
+                "opened": False,
+                "reason": "entry_pending",
+                "route_plan": route_plan,
+                "valid_observation_count": len(observations),
+            }
         underwriting = entry_underwriting(
             observations,
             now=now,

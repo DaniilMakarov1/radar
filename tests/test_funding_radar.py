@@ -204,6 +204,304 @@ class FundingRadarTest(unittest.TestCase):
                         "official_public_rest",
                     )
 
+    def _lightweight_bot_for_clients(
+        self,
+        tmp_path: Path,
+        now: datetime,
+        clients: list[Any],
+        *,
+        foreground_budget_seconds: float = 0.5,
+    ):
+        from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+        from smart_money_radar.paper_bot.clock import FakeClock
+
+        store = SQLiteStore(tmp_path / "radar.sqlite")
+        store.init_db()
+        config = PaperBotConfig(
+            telegram_enabled=False,
+            arm_window_seconds=120,
+            lightweight_foreground_budget_seconds=foreground_budget_seconds,
+            lightweight_route_horizon_seconds=600,
+            export_dir=tmp_path / "exports",
+        ).validated()
+        bot = PaperBot(store, config, clock=FakeClock(now, monotonic_start=100.0))
+        bot.build_venue_clients = lambda: clients  # type: ignore[method-assign]
+        return bot
+
+    def test_lightweight_discovery_normalizes_real_public_adapter_contracts(self) -> None:
+        from smart_money_radar.funding.synchronized_market_contract import (
+            FEE_EVIDENCE_VERSION,
+            NORMALIZATION_EVIDENCE_VERSION,
+        )
+
+        now = datetime(2026, 7, 14, 15, 58, 30, tzinfo=UTC)
+        clients = [
+            BinanceFundingClient(http=FakeBinanceHttp()),
+            BybitFundingClient(http=FakeBybitHttp()),
+            OKXFundingClient(http=FakeOKXHttp(), use_websocket=False),
+        ]
+        with TemporaryDirectory() as directory:
+            bot = self._lightweight_bot_for_clients(Path(directory), now, clients)
+            try:
+                markets, warnings = bot._fetch_lightweight_market_snapshots(
+                    clients,
+                    now.isoformat(),
+                )
+            finally:
+                bot.shutdown_foreground_executors()
+
+        self.assertEqual(warnings, [])
+        btc_by_venue = {
+            str(market["venue"]): market
+            for market in markets
+            if market.get("canonical_asset") == "BTC"
+        }
+        self.assertEqual(set(btc_by_venue), {"binance", "bybit", "okx"})
+        expected_rules = {
+            "binance": "perp_position_at_funding_time",
+            "bybit": "perp_position_at_funding_timestamp",
+            "okx": "swap_position_at_funding_time",
+        }
+        for venue, market in btc_by_venue.items():
+            with self.subTest(venue=venue):
+                self.assertEqual(market["funding_rate_semantics"], "next_settlement")
+                self.assertEqual(
+                    market["funding_rate_unit"],
+                    "fraction_of_notional_per_settlement",
+                )
+                self.assertEqual(market["funding_sign_convention"], "positive_long_pays")
+                self.assertIsNotNone(market.get("normalized_next_funding_rate"))
+                self.assertEqual(
+                    market["normalization_evidence"]["evidence_version"],
+                    NORMALIZATION_EVIDENCE_VERSION,
+                )
+                self.assertEqual(
+                    market["fee_evidence"]["evidence_version"],
+                    FEE_EVIDENCE_VERSION,
+                )
+                self.assertTrue(market["position_inclusion_rule_verified"])
+                self.assertEqual(market["position_inclusion_rule"], expected_rules[venue])
+                self.assertGreater(float(market["quantity_step"]), 0.0)
+                self.assertGreater(float(market["min_notional_usd"]), 0.0)
+
+    def test_lightweight_discovery_watch_uses_only_positive_verified_direction(self) -> None:
+        class HighBinanceHttp(FakeBinanceHttp):
+            def get_json(self, url: str) -> Any:
+                payload = copy.deepcopy(super().get_json(url))
+                if url.endswith("/premiumIndex"):
+                    payload[0]["lastFundingRate"] = "0.006"
+                if "/premiumIndex?" in url:
+                    payload["lastFundingRate"] = "0.006"
+                return payload
+
+        class LowBybitHttp(FakeBybitHttp):
+            def get_json(self, url: str) -> Any:
+                payload = copy.deepcopy(super().get_json(url))
+                if "/tickers" in url:
+                    payload["result"]["list"][0]["fundingRate"] = "-0.006"
+                return payload
+
+        now = datetime(2026, 7, 14, 15, 58, 30, tzinfo=UTC)
+        clients = [
+            BinanceFundingClient(http=HighBinanceHttp()),
+            BybitFundingClient(http=LowBybitHttp()),
+        ]
+        with TemporaryDirectory() as directory:
+            bot = self._lightweight_bot_for_clients(Path(directory), now, clients)
+            try:
+                markets, _warnings = bot._fetch_lightweight_market_snapshots(
+                    clients,
+                    now.isoformat(),
+                )
+                routes, summary = bot._build_lightweight_watch_routes(
+                    markets,
+                    {client.venue: client for client in clients},
+                    now,
+                )
+            finally:
+                bot.shutdown_foreground_executors()
+
+        self.assertEqual(summary["watch_routes_added"], 1, summary)
+        self.assertEqual(len(routes), 1)
+        route = routes[0]
+        self.assertEqual(route["status"], "watch")
+        self.assertNotEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["long_venue"], "bybit")
+        self.assertEqual(route["short_venue"], "binance")
+        self.assertNotIn(
+            ("binance", "bybit"),
+            {(row["long_venue"], row["short_venue"]) for row in routes},
+        )
+        self.assertEqual(
+            route["evidence"]["selected_strategy"]["selection_model"],
+            "lightweight_discovery_v1",
+        )
+        self.assertIn("funnel", summary)
+        self.assertEqual(summary["funnel"]["capability_eligible"]["count"], 2)
+
+    def test_lightweight_discovery_missing_required_contract_fields_fail_closed(self) -> None:
+        class HighBinanceHttp(FakeBinanceHttp):
+            def get_json(self, url: str) -> Any:
+                payload = copy.deepcopy(super().get_json(url))
+                if url.endswith("/premiumIndex"):
+                    payload[0]["lastFundingRate"] = "0.006"
+                if "/premiumIndex?" in url:
+                    payload["lastFundingRate"] = "0.006"
+                return payload
+
+        class LowBybitHttp(FakeBybitHttp):
+            def get_json(self, url: str) -> Any:
+                payload = copy.deepcopy(super().get_json(url))
+                if "/tickers" in url:
+                    payload["result"]["list"][0]["fundingRate"] = "-0.006"
+                return payload
+
+        class DummyOrderbookClient:
+            venue = "paradex"
+
+            def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
+                return {}
+
+        now = datetime(2026, 7, 14, 15, 58, 30, tzinfo=UTC)
+        clients = [
+            BinanceFundingClient(http=HighBinanceHttp()),
+            BybitFundingClient(http=LowBybitHttp()),
+        ]
+        with TemporaryDirectory() as directory:
+            bot = self._lightweight_bot_for_clients(Path(directory), now, clients)
+            try:
+                base_markets, _warnings = bot._fetch_lightweight_market_snapshots(
+                    clients,
+                    now.isoformat(),
+                )
+                client_map = {client.venue: client for client in clients}
+
+                cases = [
+                    (
+                        "fee_evidence",
+                        lambda rows: rows["bybit"].pop("fee_evidence", None),
+                        "long_taker_fee_missing",
+                        client_map,
+                    ),
+                    (
+                        "normalized_next_rate",
+                        lambda rows: rows["bybit"].pop("normalized_next_funding_rate", None),
+                        "normalized_next_funding_rate_missing",
+                        client_map,
+                    ),
+                    (
+                        "quantity_step",
+                        lambda rows: rows["bybit"].pop("quantity_step", None),
+                        "long_quantity_step_missing",
+                        client_map,
+                    ),
+                    (
+                        "min_notional",
+                        lambda rows: (
+                            rows["bybit"].pop("min_notional_usd", None),
+                            rows["bybit"].pop("min_notional", None),
+                        ),
+                        "long_min_notional_missing",
+                        client_map,
+                    ),
+                    (
+                        "continuous_settlement",
+                        lambda rows: rows["bybit"].update({"venue": "paradex"}),
+                        "long_funding_continuous_pro_rata",
+                        {**client_map, "paradex": DummyOrderbookClient()},
+                    ),
+                ]
+                for label, mutate, expected_reason, clients_for_case in cases:
+                    with self.subTest(label=label):
+                        rows_by_venue = {
+                            str(market["venue"]): market
+                            for market in copy.deepcopy(base_markets)
+                            if market.get("canonical_asset") == "BTC"
+                        }
+                        self.assertTrue({"binance", "bybit"} <= set(rows_by_venue))
+                        mutate(rows_by_venue)
+                        markets = [
+                            rows_by_venue["binance"],
+                            rows_by_venue.get("paradex") or rows_by_venue["bybit"],
+                        ]
+                        routes, summary = bot._build_lightweight_watch_routes(
+                            markets,
+                            clients_for_case,
+                            now,
+                        )
+                        self.assertEqual(routes, [])
+                        self.assertEqual(summary["watch_routes_added"], 0)
+                        self.assertIn(expected_reason, summary["rejection_reasons"], summary)
+            finally:
+                bot.shutdown_foreground_executors()
+
+    def test_generic_raw_funding_rate_is_not_promoted_to_synchronized_next_rate(self) -> None:
+        class RawFundingClient:
+            venue = "binance"
+
+            def catalog_and_markets(self, observed_at: str):
+                settlement = datetime(2026, 7, 14, 16, 0, tzinfo=UTC).isoformat()
+                instrument = {
+                    "venue": self.venue,
+                    "environment": "mainnet",
+                    "symbol": "BTCUSDT",
+                    "canonical_asset": "BTC",
+                    "base_asset": "BTC",
+                    "quote_asset": "USDT",
+                    "collateral_asset": "USDT",
+                    "contract_type": "linear_perpetual",
+                    "contract_kind": "linear_perpetual",
+                    "contract_multiplier": 1.0,
+                    "quantity_step": 0.001,
+                    "min_quantity": 0.001,
+                    "min_notional_usd": 5.0,
+                    "status": "active",
+                    "observed_at": observed_at,
+                }
+                market = {
+                    "venue": self.venue,
+                    "environment": "mainnet",
+                    "symbol": "BTCUSDT",
+                    "canonical_asset": "BTC",
+                    "funding_rate": -0.02,
+                    "funding_interval_hours": 8.0,
+                    "hourly_funding_rate": -0.0025,
+                    "funding_rate_kind": "generic_raw_funding_rate",
+                    "next_funding_at": settlement,
+                    "mark_price": 100.0,
+                    "index_price": 100.0,
+                    "quantity_step": 0.001,
+                    "min_quantity": 0.001,
+                    "min_notional_usd": 5.0,
+                    "observed_at": observed_at,
+                }
+                return [instrument], [market], []
+
+            def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
+                return {}
+
+        now = datetime(2026, 7, 14, 15, 58, 30, tzinfo=UTC)
+        client = RawFundingClient()
+        with TemporaryDirectory() as directory:
+            bot = self._lightweight_bot_for_clients(Path(directory), now, [client])
+            try:
+                markets, _warnings = bot._fetch_lightweight_market_snapshots(
+                    [client],
+                    now.isoformat(),
+                )
+                routes, summary = bot._build_lightweight_watch_routes(
+                    markets,
+                    {client.venue: client},
+                    now,
+                )
+            finally:
+                bot.shutdown_foreground_executors()
+
+        self.assertEqual(len(markets), 1)
+        self.assertNotIn("normalized_next_funding_rate", markets[0])
+        self.assertEqual(routes, [])
+        self.assertIn("normalized_next_funding_rate_missing", summary["rejection_reasons"])
+
     def test_risex_points_profile_is_available_after_adapter_registration(self) -> None:
         self.assertIn("risex_points", funding_bot_profile_names())
 
@@ -5069,6 +5367,11 @@ class FakeBinanceHttp:
                     "baseAsset": "BTC",
                     "quoteAsset": "USDT",
                     "marginAsset": "USDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                    ],
                 }]
             }
         if url.endswith("/premiumIndex"):
@@ -5079,6 +5382,19 @@ class FakeBinanceHttp:
                 "markPrice": "100",
                 "indexPrice": "100",
             }]
+        if "/premiumIndex?" in url:
+            return {
+                "symbol": "BTCUSDT",
+                "lastFundingRate": "0.0008",
+                "nextFundingTime": "1784044800000",
+                "markPrice": "100",
+                "indexPrice": "100",
+            }
+        if "/depth?" in url:
+            return {
+                "bids": [["99.9", "100"]],
+                "asks": [["100.1", "100"]],
+            }
         if url.endswith("/fundingInfo"):
             return [{
                 "symbol": "BTCUSDT",
@@ -5128,6 +5444,11 @@ class FakeBybitHttp:
                     "settleCoin": "USDT",
                     "fundingInterval": 480,
                     "isPreListing": False,
+                    "lotSizeFilter": {
+                        "qtyStep": "0.001",
+                        "minOrderQty": "0.001",
+                        "minNotionalValue": "5",
+                    },
                 },
                 {
                     "symbol": "MRVLUSDT",
@@ -6421,6 +6742,8 @@ class FakeOKXHttp:
                     "settleCcy": "USDT",
                     "contTdSwTime": "1573557408000",
                     "instCategory": "1",
+                    "lotSz": "0.01",
+                    "minSz": "0.01",
                 },
                 {
                     "instId": "MRVL-USDT-SWAP",
@@ -6445,6 +6768,14 @@ class FakeOKXHttp:
                 {
                     "instId": "MRVL-USDT-SWAP",
                     "last": "185",
+                    "volCcy24h": "1000",
+                }]
+            )
+        if "/market/ticker" in url:
+            return okx_payload(
+                [{
+                    "instId": "BTC-USDT-SWAP",
+                    "last": "100",
                     "volCcy24h": "1000",
                 }]
             )

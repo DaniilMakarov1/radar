@@ -9,6 +9,7 @@ from smart_money_radar.funding.adapters.base import (
     apply_endpoint_identity,
     as_float,
     build_endpoint_identity,
+    endpoint_identity_fields,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -87,6 +88,7 @@ class BinanceFundingClient:
             funding_rate = as_float(current.get("lastFundingRate"))
             mark_price = as_float(current.get("markPrice"))
             index_price = as_float(current.get("indexPrice"))
+            rules = binance_market_rules(raw)
             instruments.append(
                 {
                     "venue": self.venue,
@@ -96,7 +98,11 @@ class BinanceFundingClient:
                     "quote_asset": "USDT",
                     "collateral_asset": "USDT",
                     "contract_type": "linear_perpetual",
+                    "contract_kind": "linear_perpetual",
                     "contract_multiplier": 1.0,
+                    "quantity_step": rules.get("quantity_step"),
+                    "min_quantity": rules.get("min_quantity"),
+                    "min_notional_usd": rules.get("min_notional_usd"),
                     "status": "active",
                     "source_url": f"https://www.binance.com/en/futures/{symbol}",
                     "observed_at": observed_at,
@@ -119,6 +125,9 @@ class BinanceFundingClient:
                     "index_price": index_price,
                     "open_interest_usd": None,
                     "volume_24h_usd": None,
+                    "quantity_step": rules.get("quantity_step"),
+                    "min_quantity": rules.get("min_quantity"),
+                    "min_notional_usd": rules.get("min_notional_usd"),
                     "observed_at": observed_at,
                     "raw": current,
                 }
@@ -128,6 +137,42 @@ class BinanceFundingClient:
             apply_endpoint_identity(markets, self.endpoint_identity),
             warnings,
         )
+
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"symbol": symbol})
+        current = self.http.get_json(f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex?{query}")
+        if not isinstance(current, dict):
+            raise FundingDataError(f"Invalid Binance premiumIndex for {symbol}")
+        previous = previous_market or {}
+        interval_hours = max(1.0, as_float(previous.get("funding_interval_hours"), 8.0))
+        funding_rate = as_float(current.get("lastFundingRate"))
+        mark_price = as_float(current.get("markPrice"))
+        index_price = as_float(current.get("indexPrice"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Binance reference prices unavailable for {symbol}")
+        return {
+            "venue": self.venue,
+            **endpoint_identity_fields(self.endpoint_identity),
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": iso_from_milliseconds(current.get("nextFundingTime")),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "observed_at": observed_at,
+            "raw": {"premium_index": current},
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+        }
 
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
         query = urllib.parse.urlencode(
@@ -206,3 +251,24 @@ class BinanceFundingClient:
                 }
             )
         return [row for row in rows if row["funding_at"]]
+
+
+def binance_market_rules(raw: dict[str, Any]) -> dict[str, float | None]:
+    filters = raw.get("filters") if isinstance(raw, dict) else None
+    rows = [row for row in filters if isinstance(row, dict)] if isinstance(filters, list) else []
+    by_type = {str(row.get("filterType") or ""): row for row in rows}
+    lot = by_type.get("MARKET_LOT_SIZE") or by_type.get("LOT_SIZE") or {}
+    min_notional = by_type.get("MIN_NOTIONAL") or {}
+    return {
+        "quantity_step": positive_float(lot.get("stepSize")),
+        "min_quantity": positive_float(lot.get("minQty")),
+        "min_notional_usd": positive_float(
+            min_notional.get("notional")
+            or min_notional.get("minNotional")
+        ),
+    }
+
+
+def positive_float(value: Any) -> float | None:
+    parsed = as_float(value)
+    return parsed if parsed > 0 else None

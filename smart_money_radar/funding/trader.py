@@ -77,6 +77,9 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
     gross_funding_pnl,
     settlement_skew_seconds,
 )
+from smart_money_radar.funding.synchronized_market_contract import (
+    normalize_synchronized_capture_market,
+)
 from smart_money_radar.funding.venue_capabilities import (
     apply_declared_venue_capability_contract,
     capability_from_market,
@@ -991,7 +994,10 @@ class PaperBot:
             "universe_route_count": summary["routes_structurally_matched"],
             "execution_shortlist_count": 0,
             "route_count": len(watch_routes),
+            "funnel": summary.get("funnel") or {},
             "screen_reasons": summary.get("rejection_reasons") or {},
+            "rejection_details": summary.get("rejection_details") or {},
+            "blocker_examples": summary.get("blocker_examples") or [],
             "blocker_summary": [],
             "warnings": warnings,
             "venue_health": dict(self._last_lightweight_venue_health),
@@ -1624,6 +1630,12 @@ class PaperBot:
             long_market, long_client = fresh_markets["long"]
             short_market, short_client = fresh_markets["short"]
             markets = [long_market, short_market]
+            counts["instrument_count"] = self.store.upsert_funding_instruments(
+                [
+                    instrument_row_from_market(market, observed_at)
+                    for market in markets
+                ]
+            )
             counts["market_snapshot_count"] = self.store.insert_funding_market_snapshots(
                 scan_id,
                 markets,
@@ -1705,7 +1717,11 @@ class PaperBot:
         client = funding_client_for_venue(venue, fast=True)
         if client is None:
             raise FundingDataError(f"No funding client for {venue}")
-        previous = self.store.latest_funding_market_with_instrument(venue, symbol) or dict(leg)
+        stored_previous = self.store.latest_funding_market_with_instrument(venue, symbol) or {}
+        previous = dict(leg)
+        for key, value in stored_previous.items():
+            if value not in (None, ""):
+                previous[key] = value
         snapshot_method = getattr(client, "market_snapshot", None)
         request_started_at = self.clock.now().isoformat()
         if callable(snapshot_method):
@@ -1776,8 +1792,13 @@ class PaperBot:
         market.setdefault("request_started_at", request_started_at)
         market.setdefault("response_received_at", response_received_at)
         market.setdefault("normalized_at", response_received_at)
+        if market.get("source_event_at") in (None, ""):
+            market["source_event_at"] = market.get("observed_at") or response_received_at
         market = apply_declared_venue_capability_contract(market)
-        market.setdefault("normalization_evidence", {"source": "adapter_market_snapshot"})
+        market = normalize_synchronized_capture_market(
+            market,
+            observed_at=response_received_at,
+        )
         return market, client
 
     def fetch_direct_orderbooks(
@@ -2466,9 +2487,32 @@ class PaperBot:
                     if metadata[0] in requested_venues
                 ]
             if pending_futures:
+                now_for_cache = self.clock.now().astimezone(UTC)
+                with self._lightweight_state_lock:
+                    cached_ready_pending = {
+                        metadata[0]
+                        for future, metadata in self._lightweight_pending_futures.items()
+                        if future in pending_futures
+                        and _lightweight_cache_entry_is_usable(
+                            self._lightweight_venue_cache.get(metadata[0]),
+                            now_for_cache,
+                            float(self.config.lightweight_cache_ttl_seconds),
+                        )
+                    }
+                    pending_venues_for_wait = {
+                        metadata[0]
+                        for future, metadata in self._lightweight_pending_futures.items()
+                        if future in pending_futures
+                    }
+                wait_timeout = (
+                    0.0
+                    if pending_venues_for_wait
+                    and pending_venues_for_wait <= cached_ready_pending
+                    else float(self.config.lightweight_foreground_budget_seconds)
+                )
                 wait(
                     pending_futures,
-                    timeout=float(self.config.lightweight_foreground_budget_seconds),
+                    timeout=wait_timeout,
                 )
             completed_venues.update(
                 self._harvest_lightweight_market_requests(warnings)
@@ -2533,6 +2577,10 @@ class PaperBot:
             "pending_venues": sorted(pending_venues),
             "unavailable_venues": sorted(unavailable_venues),
             "stale_venues": sorted(stale_venues),
+            "last_successful_snapshot_age_seconds_by_venue": {
+                venue: round(float(catalog_results[venue].get("cache_age_seconds") or 0.0), 3)
+                for venue in sorted(ready_venues)
+            },
             "foreground_budget_seconds": float(
                 self.config.lightweight_foreground_budget_seconds
             ),
@@ -2592,11 +2640,13 @@ class PaperBot:
             row.setdefault("request_started_at", started_at)
             row.setdefault("response_received_at", received_at)
             row.setdefault("normalized_at", received_at)
+            if row.get("source_event_at") in (None, ""):
+                row["source_event_at"] = row.get("observed_at") or received_at
             row["lightweight_cache_age_seconds"] = cache_age_seconds
             row = apply_declared_venue_capability_contract(row)
-            row.setdefault(
-                "normalization_evidence",
-                {"source": "lightweight_market_snapshot"},
+            row = normalize_synchronized_capture_market(
+                row,
+                observed_at=received_at,
             )
             enriched_markets.append(row)
         return enriched_markets, warnings
@@ -2676,13 +2726,35 @@ class PaperBot:
         now: datetime,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rejection_reasons: dict[str, int] = {}
+        rejection_details: dict[str, dict[str, Any]] = {}
+        blocker_examples: list[dict[str, Any]] = []
         nearest_settlement_seconds: float | None = None
 
-        def reject(reason: str) -> None:
+        def reject(
+            reason: str,
+            *,
+            stage: str,
+            denominator: int,
+            example: dict[str, Any] | None = None,
+        ) -> None:
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+            detail = rejection_details.setdefault(
+                reason,
+                {
+                    "count": 0,
+                    "stage": stage,
+                    "denominator": denominator,
+                },
+            )
+            detail["count"] = int(detail.get("count") or 0) + 1
+            detail["denominator"] = max(int(detail.get("denominator") or 0), denominator)
+            if example is not None and len(blocker_examples) < 8:
+                blocker_examples.append(example)
 
         eligible_by_asset: dict[str, list[dict[str, Any]]] = {}
         markets_checked = 0
+        within_horizon_markets = 0
+        normalized_next_rate_markets = 0
         research_only_routes = 0
         for market in markets:
             markets_checked += 1
@@ -2690,7 +2762,11 @@ class PaperBot:
             market["venue"] = venue
             settlement = parse_iso(market.get("next_funding_at"))
             if settlement is None:
-                reject("next_funding_at_missing")
+                reject(
+                    "next_funding_at_missing",
+                    stage="markets_received",
+                    denominator=len(markets),
+                )
                 continue
             seconds_to_settlement = (settlement - now).total_seconds()
             if seconds_to_settlement >= 0:
@@ -2704,28 +2780,61 @@ class PaperBot:
                 or seconds_to_settlement
                 > self.config.lightweight_route_horizon_seconds
             ):
-                reject("outside_lightweight_route_horizon")
+                reject(
+                    "outside_lightweight_route_horizon",
+                    stage="within_horizon",
+                    denominator=markets_checked,
+                )
                 continue
+            within_horizon_markets += 1
             asset = str(market.get("canonical_asset") or "").upper()
             if not asset:
-                reject("canonical_asset_missing")
+                reject(
+                    "canonical_asset_missing",
+                    stage="within_horizon",
+                    denominator=within_horizon_markets,
+                )
                 continue
             if optional_float(market.get("mark_price")) is None:
-                reject("mark_price_missing")
+                reject(
+                    "mark_price_missing",
+                    stage="within_horizon",
+                    denominator=within_horizon_markets,
+                )
                 continue
             if optional_float(market.get("index_price")) is None:
-                reject("index_price_missing")
+                reject(
+                    "index_price_missing",
+                    stage="within_horizon",
+                    denominator=within_horizon_markets,
+                )
                 continue
             if optional_float(market.get("normalized_next_funding_rate")) is None:
-                reject("normalized_next_funding_rate_missing")
+                reject(
+                    "normalized_next_funding_rate_missing",
+                    stage="normalized_next_rate_markets",
+                    denominator=within_horizon_markets,
+                )
                 continue
+            normalized_next_rate_markets += 1
             if venue not in clients_by_venue:
-                reject("venue_client_missing")
+                reject(
+                    "venue_client_missing",
+                    stage="normalized_next_rate_markets",
+                    denominator=normalized_next_rate_markets,
+                )
                 continue
             eligible_by_asset.setdefault(asset, []).append(market)
 
         routes_by_key: dict[str, dict[str, Any]] = {}
+        multi_venue_asset_count = sum(
+            1
+            for rows in eligible_by_asset.values()
+            if len({str(row.get("venue") or "") for row in rows}) >= 2
+        )
         structurally_matched = 0
+        capability_eligible_pairs = 0
+        planner_positive_pairs = 0
         for asset, rows in eligible_by_asset.items():
             if len({str(row.get("venue") or "") for row in rows}) < 2:
                 continue
@@ -2736,6 +2845,11 @@ class PaperBot:
                     if not long_venue or not short_venue or long_venue == short_venue:
                         continue
                     structurally_matched += 1
+                    pair_example = {
+                        "asset": asset,
+                        "long_venue": long_venue,
+                        "short_venue": short_venue,
+                    }
                     skew = settlement_skew_seconds(
                         long_market.get("next_funding_at"),
                         short_market.get("next_funding_at"),
@@ -2748,8 +2862,17 @@ class PaperBot:
                     if not capability["paper_eligible"]:
                         research_only_routes += 1
                         for reason in capability["all_reasons"]:
-                            reject(reason)
+                            reject(
+                                reason,
+                                stage="capability_eligible",
+                                denominator=structurally_matched,
+                                example={
+                                    **pair_example,
+                                    "blockers": capability["all_reasons"][:6],
+                                },
+                            )
                         continue
+                    capability_eligible_pairs += 1
                     plan = build_settlement_capture_opportunity(
                         long_market=long_market,
                         short_market=short_market,
@@ -2766,19 +2889,41 @@ class PaperBot:
                     if plan_blockers:
                         research_only_routes += 1
                         for reason in plan_blockers:
-                            reject(str(reason))
+                            reject(
+                                str(reason),
+                                stage="planner_positive",
+                                denominator=capability_eligible_pairs,
+                                example={
+                                    **pair_example,
+                                    "blockers": [str(item) for item in plan_blockers[:6]],
+                                },
+                            )
                         continue
                     long_mark = float(optional_float(long_market.get("mark_price")) or 0.0)
                     short_mark = float(optional_float(short_market.get("mark_price")) or 0.0)
                     if long_mark <= 0 or short_mark <= 0:
-                        reject("mark_price_missing")
+                        reject(
+                            "mark_price_missing",
+                            stage="planner_positive",
+                            denominator=capability_eligible_pairs,
+                            example={**pair_example, "blockers": ["mark_price_missing"]},
+                        )
                         continue
                     target_notional = float(self.config.target_notional_per_leg)
                     quantity = min(target_notional / long_mark, target_notional / short_mark)
                     gross = float(plan.get("conservative_funding_cashflow_usd") or 0.0)
                     if gross <= 0:
-                        reject("preliminary_gross_funding_not_positive")
+                        reject(
+                            "preliminary_gross_funding_not_positive",
+                            stage="planner_positive",
+                            denominator=capability_eligible_pairs,
+                            example={
+                                **pair_example,
+                                "blockers": ["preliminary_gross_funding_not_positive"],
+                            },
+                        )
                         continue
+                    planner_positive_pairs += 1
                     route = self._lightweight_watch_route(
                         asset,
                         long_market,
@@ -2822,6 +2967,51 @@ class PaperBot:
                 stage_counts[stage] += 1
         return routes, {
             "markets_checked": markets_checked,
+            "funnel": {
+                "markets_received": {
+                    "count": len(markets),
+                    "denominator": len(markets),
+                    "unit": "market",
+                },
+                "within_horizon": {
+                    "count": within_horizon_markets,
+                    "denominator": markets_checked,
+                    "unit": "market",
+                },
+                "normalized_next_rate_markets": {
+                    "count": normalized_next_rate_markets,
+                    "denominator": within_horizon_markets,
+                    "unit": "market",
+                },
+                "multi_venue_assets": {
+                    "count": multi_venue_asset_count,
+                    "denominator": len(eligible_by_asset),
+                    "unit": "asset",
+                },
+                "directed_pairs": {
+                    "count": structurally_matched,
+                    "denominator": max(0, normalized_next_rate_markets),
+                    "unit": "directed_pair",
+                },
+                "capability_eligible": {
+                    "count": capability_eligible_pairs,
+                    "denominator": structurally_matched,
+                    "unit": "directed_pair",
+                },
+                "planner_positive": {
+                    "count": planner_positive_pairs,
+                    "denominator": capability_eligible_pairs,
+                    "unit": "directed_pair",
+                },
+                "watch": {
+                    "count": len(routes),
+                    "denominator": planner_positive_pairs,
+                    "unit": "route",
+                },
+                "focused": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "qualified": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "opened": {"count": 0, "denominator": len(routes), "unit": "route"},
+            },
             "routes_structurally_matched": structurally_matched,
             "routes_detected": len(routes),
             "watch_routes_added": len(routes),
@@ -2833,6 +3023,8 @@ class PaperBot:
             "research_only_routes": research_only_routes,
             "nearest_settlement_seconds": nearest_settlement_seconds,
             "rejection_reasons": dict(sorted(rejection_reasons.items())),
+            "rejection_details": dict(sorted(rejection_details.items())),
+            "blocker_examples": blocker_examples,
         }
 
     def _lightweight_capability_check(
@@ -3038,14 +3230,48 @@ class PaperBot:
             "fee_rate": fee_rate,
             "taker_fee_rate": fee_rate,
             "maker_fee_rate": market.get("maker_fee_rate"),
+            "fee_source": market.get("fee_source"),
+            "fee_evidence": market.get("fee_evidence"),
+            "fee_observed_at": market.get("fee_observed_at"),
+            "fee_reviewed_at": market.get("fee_reviewed_at"),
             "quantity_step": market.get("quantity_step"),
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
             "min_notional_usd": min_notional,
             "position_inclusion_rule": market.get("position_inclusion_rule"),
+            "position_inclusion_rule_verified": market.get(
+                "position_inclusion_rule_verified"
+            ),
+            "settlement_contract_evidence": market.get(
+                "settlement_contract_evidence"
+            ),
+            "settlement_contract_blockers": market.get(
+                "settlement_contract_blockers"
+            ),
+            "settlement_accrual_model": market.get("settlement_accrual_model"),
             "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
             "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
             "timing_policy_source": market.get("timing_policy_source"),
+            "environment_verified": market.get("environment_verified"),
+            "endpoint_base_url": market.get("endpoint_base_url"),
+            "endpoint_identity_provenance": market.get("endpoint_identity_provenance"),
+            "endpoint_client_version": market.get("endpoint_client_version"),
+            "endpoint_verified_at": market.get("endpoint_verified_at"),
+            "api_product_type": market.get("api_product_type"),
+            "market_type": market.get("market_type"),
+            "product_type": market.get("product_type"),
+            "data_enabled": market.get("data_enabled"),
+            "strategy_observation_enabled": market.get(
+                "strategy_observation_enabled"
+            ),
+            "shadow_candidate_enabled": market.get("shadow_candidate_enabled"),
+            "paper_enabled": market.get("paper_enabled"),
+            "live_enabled": market.get("live_enabled"),
+            "execution_model": market.get("execution_model"),
+            "settlement_verification_level": market.get(
+                "settlement_verification_level"
+            ),
+            "venue_capability_blockers": market.get("venue_capability_blockers"),
             "stablecoin_route_evaluation": market.get("stablecoin_route_evaluation"),
             "stablecoin_risk": market.get("stablecoin_risk"),
         }
@@ -3258,6 +3484,11 @@ class PaperBot:
         ):
             if market.get(field) in (None, "") and previous.get(field) not in (None, ""):
                 market[field] = previous[field]
+        market = apply_declared_venue_capability_contract(market)
+        market = normalize_synchronized_capture_market(
+            market,
+            observed_at=market_response_at,
+        )
         book = client.orderbook(symbol, observed_at, 100)
         book = normalize_orderbook_canonical_units(
             book,
@@ -4097,6 +4328,20 @@ def venues_from_routes(routes: list[dict[str, Any]]) -> list[str]:
                 venues.add(str(value))
     return sorted(venues)
 
+
+def _lightweight_cache_entry_is_usable(
+    entry: dict[str, Any] | None,
+    now: datetime,
+    ttl_seconds: float,
+) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    response_received_at = parse_iso(entry.get("response_received_at"))
+    if response_received_at is None:
+        return False
+    age = (now.astimezone(UTC) - response_received_at.astimezone(UTC)).total_seconds()
+    return 0.0 <= age <= float(ttl_seconds)
+
 def route_is_older_than(
     incoming: dict[str, Any],
     existing: dict[str, Any],
@@ -4231,6 +4476,31 @@ def count_urgent_routes(
     return sum(
         1 for route in routes if route_monitor_decision(route, now, config)["urgent"]
     )
+
+def instrument_row_from_market(
+    market: dict[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    asset = str(market.get("canonical_asset") or market.get("base_asset") or "").upper()
+    quote = str(market.get("quote_asset") or "USDT").upper()
+    return {
+        "venue": str(market["venue"]),
+        "symbol": str(market["symbol"]),
+        "canonical_asset": asset,
+        "base_asset": str(market.get("base_asset") or asset),
+        "quote_asset": quote,
+        "collateral_asset": str(market.get("collateral_asset") or quote),
+        "contract_type": str(
+            market.get("contract_type")
+            or market.get("contract_kind")
+            or "linear_perpetual"
+        ),
+        "contract_multiplier": market.get("contract_multiplier", 1.0),
+        "status": str(market.get("status") or "active"),
+        "source_url": market.get("source_url"),
+        "observed_at": str(market.get("observed_at") or observed_at),
+        "raw": market.get("raw") or {},
+    }
 
 def route_summary(route: dict[str, Any]) -> dict[str, Any]:
     evidence = route.get("evidence") or {}

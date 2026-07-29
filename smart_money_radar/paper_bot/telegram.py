@@ -110,6 +110,9 @@ def status_report_message(
         filter_lines = compact_filter_lines(result)
         if filter_lines:
             lines.extend(filter_lines)
+    funnel_lines = compact_funnel_lines(result)
+    if funnel_lines:
+        lines.extend(["", "<b>Discovery funnel</b>", *funnel_lines])
     if candidates:
         lines.extend(["", "<b>Qualified candidates</b>"])
         lines.extend(
@@ -162,13 +165,62 @@ def compact_filter_lines(result: dict[str, Any]) -> list[str]:
         for row in screen_reasons:
             reason = screen_reason_label(row.get("execution_screen_reason"))
             count = int(row.get("route_count") or 0)
-            lines.append(f"• {tg(reason)}: <b>{count:,}</b>")
+            detail = (result.get("rejection_details") or {}).get(
+                str(row.get("execution_screen_reason") or "")
+            ) or {}
+            stage = detail.get("stage")
+            denominator = int(detail.get("denominator") or 0)
+            suffix = f" / {denominator:,} @ {tg(stage)}" if stage and denominator else ""
+            lines.append(f"• {tg(reason)}: <b>{count:,}</b>{suffix}")
     if blocker_summary:
         lines.append("<b>Full-model blockers</b>")
         for row in blocker_summary:
             reason = blocker_label(row.get("risk_flag"))
             count = int(row.get("route_count") or 0)
             lines.append(f"• {tg(reason)}: <b>{count:,}</b>")
+    return lines
+
+
+def compact_funnel_lines(result: dict[str, Any]) -> list[str]:
+    funnel = result.get("funnel")
+    if not isinstance(funnel, dict) or not funnel:
+        return []
+    ordered = [
+        "markets_received",
+        "within_horizon",
+        "normalized_next_rate_markets",
+        "multi_venue_assets",
+        "directed_pairs",
+        "capability_eligible",
+        "planner_positive",
+        "watch",
+        "focused",
+        "qualified",
+        "opened",
+    ]
+    lines: list[str] = []
+    for key in ordered:
+        row = funnel.get(key)
+        if not isinstance(row, dict):
+            continue
+        count = int(row.get("count") or 0)
+        denominator = int(row.get("denominator") or 0)
+        label = key.replace("_", " ")
+        if denominator:
+            lines.append(f"• {tg(label)}: <b>{count:,}</b> / {denominator:,}")
+        else:
+            lines.append(f"• {tg(label)}: <b>{count:,}</b>")
+    examples = list(result.get("blocker_examples") or [])[:3]
+    if examples:
+        lines.append("<b>Examples</b>")
+        for example in examples:
+            blockers = ", ".join(str(item) for item in (example.get("blockers") or [])[:3])
+            lines.append(
+                "• "
+                f"{tg(example.get('asset'))}: "
+                f"{tg(example.get('long_venue'))}->{tg(example.get('short_venue'))} "
+                f"{tg(blockers)}"
+            )
     return lines
 
 

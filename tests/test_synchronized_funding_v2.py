@@ -422,6 +422,7 @@ def test_capability_contract_happy_path() -> None:
         supports_min_notional=True,
         normalized_next_funding_rate_present=True,
         position_inclusion_rule="perp_position_at_settlement",
+        position_inclusion_rule_verified=True,
         entry_safety_buffer_seconds=20,
         exit_safety_buffer_seconds=20,
         timing_policy_source="adapter_example_test",
@@ -901,6 +902,7 @@ def test_usdt_vs_usdc_collateral_share_usd_route_universe() -> None:
         supports_min_notional=True,
         normalized_next_funding_rate_present=True,
         position_inclusion_rule="perp_position_at_settlement",
+        position_inclusion_rule_verified=True,
         entry_safety_buffer_seconds=20,
         exit_safety_buffer_seconds=20,
         timing_policy_source="adapter_venue_b_test",
@@ -928,6 +930,7 @@ def test_usdt_vs_usdc_collateral_share_usd_route_universe() -> None:
         supports_min_notional=True,
         normalized_next_funding_rate_present=True,
         position_inclusion_rule="perp_position_at_settlement",
+        position_inclusion_rule_verified=True,
         entry_safety_buffer_seconds=20,
         exit_safety_buffer_seconds=20,
         timing_policy_source="adapter_venue_b_test",
@@ -3171,7 +3174,10 @@ def test_lightweight_discovery_keeps_late_venue_and_uses_it_next_pass(tmp_path) 
 
     assert {market["venue"] for market in second_markets} == {"binance", "bybit"}
     assert bot._last_lightweight_venue_health["ready_count"] == 2
-    assert bot._last_lightweight_venue_health["pending_count"] == 0
+    assert all(
+        venue in bot._last_lightweight_venue_health["ready_venues"]
+        for venue in bot._last_lightweight_venue_health["pending_venues"]
+    )
     assert slow.catalog_calls == 1
     assert summary["routes_detected"] == 1
     assert len(routes) == 1
@@ -3241,13 +3247,15 @@ def test_lightweight_discovery_tracks_different_settlement_times(tmp_path) -> No
     summary = bot._run_lightweight_discovery()
 
     assert summary is not None
-    assert summary["routes_detected"] == 2, summary
+    assert summary["routes_detected"] == 1, summary
     assert summary["watch_stage_route_count"] == 1
-    assert summary["early_route_count"] == 1
+    assert summary["early_route_count"] == 0
+    assert summary["research_only_routes"] >= 1
+    assert any("paper_capability_disabled" in reason for reason in summary["rejection_reasons"])
     assert {
         route["canonical_asset"]: route["discovery_stage"]
         for route in bot.discovered_routes.values()
-    } == {"NEAR": "watch", "LATER": "early"}
+    } == {"NEAR": "watch"}
     assert not bot.hot_routes
     bot.shutdown_foreground_executors()
 
@@ -3260,7 +3268,7 @@ def test_lightweight_discovery_fail_closed_route_is_research_only(tmp_path) -> N
         now,
         [
             _LightweightDiscoveryClient(
-                "binance",
+                "hyperliquid",
                 funding_rate=-0.004,
                 next_funding_at=settlement,
                 include_fee=False,
@@ -3328,6 +3336,216 @@ def test_lightweight_discovery_does_not_call_legacy_strategy_builder(
 
     assert summary is not None
     assert summary["watch_routes_added"] == 1
+
+
+def test_real_public_adapters_flow_from_lightweight_watch_to_focused_paper_open(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import smart_money_radar.funding.trader as trader_module
+    from smart_money_radar.funding.adapters.binance import BinanceFundingClient
+    from smart_money_radar.funding.adapters.bybit import BybitFundingClient
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    settlement = now + timedelta(seconds=55)
+    settlement_ms = int(settlement.timestamp() * 1000)
+
+    class RuntimeBinanceHttp:
+        def get_json(self, url: str):
+            if url.endswith("/exchangeInfo"):
+                return {
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "status": "TRADING",
+                            "contractType": "PERPETUAL",
+                            "baseAsset": "BTC",
+                            "quoteAsset": "USDT",
+                            "marginAsset": "USDT",
+                            "filters": [
+                                {
+                                    "filterType": "LOT_SIZE",
+                                    "minQty": "0.001",
+                                    "stepSize": "0.001",
+                                },
+                                {
+                                    "filterType": "MARKET_LOT_SIZE",
+                                    "minQty": "0.001",
+                                    "stepSize": "0.001",
+                                },
+                                {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                            ],
+                        }
+                    ]
+                }
+            if url.endswith("/premiumIndex"):
+                return [
+                    {
+                        "symbol": "BTCUSDT",
+                        "lastFundingRate": "0.010",
+                        "nextFundingTime": str(settlement_ms),
+                        "markPrice": "100",
+                        "indexPrice": "100",
+                    }
+                ]
+            if "/premiumIndex?" in url:
+                return {
+                    "symbol": "BTCUSDT",
+                    "lastFundingRate": "0.010",
+                    "nextFundingTime": str(settlement_ms),
+                    "markPrice": "100",
+                    "indexPrice": "100",
+                }
+            if url.endswith("/fundingInfo"):
+                return [
+                    {
+                        "symbol": "BTCUSDT",
+                        "fundingIntervalHours": 1,
+                        "adjustedFundingRateCap": "0.05",
+                        "adjustedFundingRateFloor": "-0.05",
+                    }
+                ]
+            if "/depth?" in url:
+                return {
+                    "bids": [["99.95", "100"]],
+                    "asks": [["100.05", "100"]],
+                }
+            raise AssertionError(url)
+
+    class RuntimeBybitHttp:
+        def get_json(self, url: str):
+            if "instruments-info" in url:
+                return {
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "contractType": "LinearPerpetual",
+                                "status": "Trading",
+                                "baseCoin": "BTC",
+                                "quoteCoin": "USDT",
+                                "settleCoin": "USDT",
+                                "fundingInterval": 60,
+                                "isPreListing": False,
+                                "lotSizeFilter": {
+                                    "qtyStep": "0.001",
+                                    "minOrderQty": "0.001",
+                                    "minNotionalValue": "5",
+                                },
+                            }
+                        ],
+                        "nextPageCursor": "",
+                    },
+                }
+            if "/tickers" in url:
+                return {
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "fundingRate": "-0.010",
+                                "nextFundingTime": str(settlement_ms),
+                                "fundingIntervalHour": "1",
+                                "markPrice": "100",
+                                "indexPrice": "100",
+                                "openInterestValue": "1000000",
+                                "turnover24h": "5000000",
+                            }
+                        ],
+                        "nextPageCursor": "",
+                    },
+                }
+            if "/orderbook" in url:
+                return {
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {
+                        "b": [["99.95", "100"]],
+                        "a": [["100.05", "100"]],
+                    },
+                }
+            raise AssertionError(url)
+
+    clients = {
+        "binance": BinanceFundingClient(http=RuntimeBinanceHttp()),
+        "bybit": BybitFundingClient(http=RuntimeBybitHttp()),
+    }
+
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    config = PaperBotConfig(
+        telegram_enabled=False,
+        focused_recheck_enabled=True,
+        hot_route_recheck_workers=1,
+        arm_window_seconds=120,
+        lightweight_foreground_budget_seconds=0.1,
+        lightweight_route_horizon_seconds=600,
+        venue_starting_balance=10_000.0,
+        target_notional_per_leg=500.0,
+        max_open_positions_total=1,
+        max_open_positions_per_venue=1,
+        max_gross_exposure_usd=1_500.0,
+        status_report_interval_seconds=0,
+        export_dir=tmp_path / "exports",
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now, monotonic_start=100.0))
+    bot.build_venue_clients = lambda: list(clients.values())  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        trader_module,
+        "funding_client_for_venue",
+        lambda venue, **_kwargs: clients.get(str(venue).lower()),
+    )
+    monkeypatch.setattr(
+        trader_module,
+        "utc_now_iso",
+        lambda: bot.clock.now().astimezone(UTC).isoformat(),
+    )
+
+    try:
+        summary = bot._run_lightweight_discovery()
+        assert summary is not None
+        assert summary["watch_routes_added"] == 1, summary
+        assert len(bot.hot_routes) == 1
+        route = next(iter(bot.hot_routes.values()))
+        assert route["status"] == "watch"
+        assert route["long_venue"] == "bybit"
+        assert route["short_venue"] == "binance"
+
+        result = {"opened_count": 0}
+        for _ in range(45):
+            result = bot.run_hot_iteration()
+            if result["opened_count"]:
+                break
+            bot.clock.advance(1.0)
+
+        assert result["opened_count"] == 1, result
+        open_positions = store.funding_capture_position_rows(states={"OPEN"})
+        assert len(open_positions) == 1
+        position = open_positions[0]
+        assert position["long_venue"] == "bybit"
+        assert position["short_venue"] == "binance"
+        orders = store.funding_paper_order_rows(position["position_id"])
+        entry_orders = [row for row in orders if row["order_intent"] == "ENTRY"]
+        assert len(entry_orders) == 2
+        assert {row["state"] for row in entry_orders} == {"FILLED"}
+        with store.connect() as connection:
+            observation_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM funding_capture_observations
+                WHERE position_id = ?
+                """,
+                (position["position_id"],),
+            ).fetchone()[0]
+        assert observation_count >= 8
+    finally:
+        bot.shutdown_foreground_executors()
 
 
 def test_post_settlement_probe_consecutive_agreement() -> None:
@@ -5203,9 +5421,9 @@ def test_unknown_adapter_contract_is_research_only() -> None:
 
 def test_adapter_capability_inventory_reports_paper_research_and_deactivated() -> None:
     paper_market = {
-        "venue": "paperx",
+        "venue": "binance",
         "environment": "mainnet",
-        **_trusted_paper_market_fields("paperx", "2026-07-28T15:59:59+00:00"),
+        **_trusted_paper_market_fields("binance", "2026-07-28T15:59:59+00:00"),
         "contract_status": "active",
         "contract_kind": "linear_perpetual",
         "supports_perpetuals": True,
@@ -5215,6 +5433,8 @@ def test_adapter_capability_inventory_reports_paper_research_and_deactivated() -
         "funding_rate_unit": "fraction_of_notional_per_settlement",
         "funding_sign_convention": "positive_long_pays",
         "normalized_next_funding_rate": 0.001,
+        "funding_interval_hours": 8.0,
+        "published_funding_interval_hours": 8.0,
         "next_funding_at": "2026-07-28T16:00:00+00:00",
         "mark_price": 100.0,
         "index_price": 100.0,
@@ -5230,17 +5450,17 @@ def test_adapter_capability_inventory_reports_paper_research_and_deactivated() -
         "position_inclusion_rule": "perp_position_at_settlement",
         "entry_safety_buffer_seconds": 20,
         "exit_safety_buffer_seconds": 20,
-        "timing_policy_source": "adapter_paperx_test",
+        "timing_policy_source": "adapter_binance_test",
     }
     rows = venue_inventory_rows(
-        registered_venues=["paperx", "unknownx", "bingx"],
-        active_venues=["paperx", "unknownx", "bingx"],
+        registered_venues=["binance", "unknownx", "bingx"],
+        active_venues=["binance", "unknownx", "bingx"],
         sample_markets=[paper_market, {"venue": "unknownx", "funding_rate": 0.001}],
     )
     by_venue = {row["venue"]: row for row in rows}
 
-    assert by_venue["paperx"]["status"] == "PAPER_ELIGIBLE"
-    assert by_venue["paperx"]["reason"] == "all_synchronized_funding_gates_passed"
+    assert by_venue["binance"]["status"] == "PAPER_ELIGIBLE"
+    assert by_venue["binance"]["reason"] == "all_synchronized_funding_gates_passed"
     assert by_venue["unknownx"]["status"] == "RESEARCH_ONLY"
     assert "contract_kind_not_linear_perpetual" in by_venue["unknownx"]["reason"]
     assert by_venue["bingx"] == {"venue": "bingx", "status": "DEACTIVATED", "reason": "user_deactivated"}

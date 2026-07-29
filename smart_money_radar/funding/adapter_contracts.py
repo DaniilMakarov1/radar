@@ -253,10 +253,6 @@ def adapter_contract_reasons(
         reasons.append("mark_price_missing")
     if _optional_float(market.get("index_price")) is None:
         reasons.append("index_price_missing")
-    if _optional_float(market.get("volume_24h_usd")) is None:
-        reasons.append("volume_24h_usd_missing")
-    if _optional_float(market.get("open_interest_usd")) is None:
-        reasons.append("open_interest_usd_missing")
     if contract.market_rules.taker_fee is None:
         reasons.append("taker_fee_missing")
     if contract.market_rules.quantity_step is None:

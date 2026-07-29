@@ -6,6 +6,10 @@ from typing import Any
 
 from smart_money_radar.funding.adapter_contracts import USD_MAJOR_STABLE, collateral_family
 from smart_money_radar.funding.fees import fee_evidence_status
+from smart_money_radar.funding.settlement_contracts import (
+    settlement_contract_blockers,
+    settlement_contract_from_market,
+)
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 
 PAPER_COLLATERAL_ASSETS = {"USDT", "USDC", "USD"}
@@ -100,12 +104,13 @@ _APPROVED_SETTLEMENT_CAPTURE_VENUES = {
     "bybit",
     "okx",
     "hyperliquid",
-    "extended",
-    "edgex",
-    "ethereal",
-    "grvt",
     "lighter",
     "dydx",
+}
+_PAPER_ENABLED_SETTLEMENT_CAPTURE_VENUES = {
+    "binance",
+    "bybit",
+    "okx",
 }
 
 
@@ -115,16 +120,64 @@ _VENUE_FUNDING_CAPABILITIES: dict[str, VenueFundingCapabilities] = {
         data_enabled=True,
         strategy_observation_enabled=True,
         shadow_candidate_enabled=True,
-        paper_enabled=True,
+        paper_enabled=venue in _PAPER_ENABLED_SETTLEMENT_CAPTURE_VENUES,
         live_enabled=False,
         execution_model=ExecutionModel.CLOB,
-        settlement_verification_level="VERIFIED",
-        blockers=("live_disabled",),
+        settlement_verification_level="PUBLIC_OBSERVED",
+        blockers=(
+            ("live_disabled",)
+            if venue in _PAPER_ENABLED_SETTLEMENT_CAPTURE_VENUES
+            else ("paper_execution_contract_incomplete", "live_disabled")
+        ),
     )
     for venue in _APPROVED_SETTLEMENT_CAPTURE_VENUES
 }
 _VENUE_FUNDING_CAPABILITIES.update(
     {
+        "extended": VenueFundingCapabilities(
+            venue="extended",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="UNVERIFIED",
+            blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
+        ),
+        "edgex": VenueFundingCapabilities(
+            venue="edgex",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="UNVERIFIED",
+            blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
+        ),
+        "ethereal": VenueFundingCapabilities(
+            venue="ethereal",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="UNVERIFIED",
+            blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
+        ),
+        "grvt": VenueFundingCapabilities(
+            venue="grvt",
+            data_enabled=True,
+            strategy_observation_enabled=True,
+            shadow_candidate_enabled=False,
+            paper_enabled=False,
+            live_enabled=False,
+            execution_model=ExecutionModel.CLOB,
+            settlement_verification_level="UNVERIFIED",
+            blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
+        ),
         "risex": VenueFundingCapabilities(
             venue="risex",
             data_enabled=True,
@@ -251,6 +304,8 @@ class VenueCapability:
     supports_server_time: bool = False
     normalized_next_funding_rate_present: bool = False
     position_inclusion_rule: str | None = None
+    position_inclusion_rule_verified: bool = False
+    settlement_contract_blockers: tuple[str, ...] = ()
     entry_safety_buffer_seconds: float | None = None
     exit_safety_buffer_seconds: float | None = None
     timing_policy_source: str | None = None
@@ -274,6 +329,13 @@ def apply_declared_venue_capability_contract(market: dict[str, Any]) -> dict[str
 
 def capability_from_market(market: dict[str, Any]) -> VenueCapability:
     venue = str(market.get("venue") or "").lower()
+    settlement_contract = settlement_contract_from_market(market)
+    settlement_blockers = tuple(
+        settlement_contract_blockers(
+            settlement_contract,
+            next_settlement_at=market.get("next_funding_at"),
+        )
+    )
     funding_kind = str(market.get("funding_rate_kind") or "")
     collateral = normalized_asset(market.get("collateral_asset"))
     quote = normalized_asset(market.get("quote_asset"))
@@ -331,11 +393,11 @@ def capability_from_market(market: dict[str, Any]) -> VenueCapability:
         normalized_next_funding_rate_present=market.get(
             "normalized_next_funding_rate"
         ) is not None,
-        position_inclusion_rule=(
-            str(market.get("position_inclusion_rule"))
-            if market.get("position_inclusion_rule") not in (None, "")
-            else None
+        position_inclusion_rule=settlement_contract.position_inclusion_rule,
+        position_inclusion_rule_verified=(
+            settlement_contract.position_inclusion_rule_verified
         ),
+        settlement_contract_blockers=settlement_blockers,
         entry_safety_buffer_seconds=(
             float(market["entry_safety_buffer_seconds"])
             if positive(market.get("entry_safety_buffer_seconds"))
@@ -387,8 +449,12 @@ def synchronized_capability_rejection(capability: VenueCapability) -> list[str]:
         reasons.append("funding_sign_convention_not_positive_long_pays")
     if not capability.normalized_next_funding_rate_present:
         reasons.append("normalized_next_funding_rate_missing")
-    if capability.position_inclusion_rule != "perp_position_at_settlement":
+    if capability.settlement_contract_blockers:
+        reasons.extend(capability.settlement_contract_blockers)
+    elif not capability.position_inclusion_rule:
         reasons.append("position_inclusion_rule_missing")
+    elif not capability.position_inclusion_rule_verified:
+        reasons.append("position_inclusion_rule_unverified")
     if capability.entry_safety_buffer_seconds is None:
         reasons.append("entry_safety_buffer_seconds_missing")
     if capability.exit_safety_buffer_seconds is None:
@@ -401,8 +467,6 @@ def synchronized_capability_rejection(capability: VenueCapability) -> list[str]:
         "supports_index_price": capability.supports_index_price,
         "supports_orderbook_timestamp": capability.supports_orderbook_timestamp,
         "supports_orderbook_depth": capability.supports_orderbook_depth,
-        "supports_24h_quote_volume": capability.supports_24h_quote_volume,
-        "supports_open_interest": capability.supports_open_interest,
         "supports_taker_fee": capability.supports_taker_fee,
         "supports_quantity_step": capability.supports_quantity_step,
         "supports_min_notional": capability.supports_min_notional,
