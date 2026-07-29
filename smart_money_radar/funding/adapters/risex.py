@@ -366,9 +366,15 @@ def risex_interval_hours(value: Any) -> float:
 
 def risex_environment(value: str | None, base_url: str) -> str:
     configured = str(value or os.environ.get("RISEX_ENVIRONMENT") or "").strip().lower()
+    base = str(base_url or "").lower()
+    base_is_testnet = "testnet" in base
     if configured in {"mainnet", "testnet"}:
+        if configured == "mainnet" and base_is_testnet:
+            raise FundingDataError("RiseX mainnet cannot use a testnet base_url")
+        if configured == "testnet" and base and not base_is_testnet:
+            raise FundingDataError("RiseX testnet requires an explicit testnet base_url")
         return configured
-    return "testnet" if "testnet" in str(base_url).lower() else "mainnet"
+    return "testnet" if base_is_testnet else "mainnet"
 
 
 def risex_quantity_step(row: dict[str, Any]) -> float | None:

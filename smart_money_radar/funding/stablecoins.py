@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import json
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from smart_money_radar.funding.adapter_contracts import (
     USD_MAJOR_STABLE,
@@ -44,6 +47,95 @@ class StaticStablecoinPriceProvider:
 
     def prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
         return list(self.prices_by_asset.get(str(asset).upper(), []))
+
+
+class PublicStablecoinPriceProvider:
+    """Fetch USDC/USDT prices from two independent public sources."""
+
+    COINGECKO_IDS = {
+        "USDC": "usd-coin",
+        "USDT": "tether",
+    }
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 2.0,
+        fetch_json: Callable[[str, float], Any] | None = None,
+    ) -> None:
+        self.timeout_seconds = max(0.25, float(timeout_seconds))
+        self.fetch_json = fetch_json or self._fetch_json
+        self._cache: dict[tuple[str, str], list[StablecoinPrice]] = {}
+
+    def prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
+        symbol = str(asset or "").upper()
+        if symbol not in {"USDC", "USDT"}:
+            return []
+        key = (symbol, observed_at)
+        if key not in self._cache:
+            self._cache[key] = self._fetch_prices(symbol, observed_at)
+        return list(self._cache[key])
+
+    def _fetch_prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
+        rows: list[StablecoinPrice] = []
+        coingecko_id = self.COINGECKO_IDS.get(asset)
+        if coingecko_id:
+            query = urllib.parse.urlencode(
+                {"ids": coingecko_id, "vs_currencies": "usd"}
+            )
+            payload = self._safe_fetch(
+                f"https://api.coingecko.com/api/v3/simple/price?{query}"
+            )
+            try:
+                price = float(payload[coingecko_id]["usd"])
+            except (TypeError, ValueError, KeyError):
+                price = 0.0
+            if price > 0:
+                rows.append(
+                    StablecoinPrice(
+                        asset,
+                        price,
+                        "coingecko",
+                        observed_at,
+                        observed_at,
+                    )
+                )
+        coinbase_payload = self._safe_fetch(
+            f"https://api.coinbase.com/v2/exchange-rates?currency={asset}"
+        )
+        try:
+            coinbase_price = float(coinbase_payload["data"]["rates"]["USD"])
+        except (TypeError, ValueError, KeyError):
+            coinbase_price = 0.0
+        if coinbase_price > 0:
+            rows.append(
+                StablecoinPrice(
+                    asset,
+                    coinbase_price,
+                    "coinbase",
+                    observed_at,
+                    observed_at,
+                )
+            )
+        return rows
+
+    def _safe_fetch(self, url: str) -> Any:
+        try:
+            return self.fetch_json(url, self.timeout_seconds)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _fetch_json(url: str, timeout_seconds: float) -> Any:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "smart-money-radar/0.1",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
 
 
 def _parse_time(value: Any) -> datetime | None:

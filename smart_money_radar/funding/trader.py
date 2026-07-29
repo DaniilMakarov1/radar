@@ -1710,6 +1710,8 @@ class PaperBot:
                 if last_light <= 0
                 else max(0.0, last_light + lightweight_interval - now_monotonic)
             )
+            if 0.0 < lightweight_interval - lightweight_due_in <= 0.05:
+                lightweight_due_in = lightweight_interval
             deadlines.append(lightweight_due_in)
             full_due_in = (
                 0.0
@@ -1721,6 +1723,12 @@ class PaperBot:
                     - now_monotonic,
                 )
             )
+            if (
+                0.0
+                < float(self.config.scan_interval_seconds) - full_due_in
+                <= 0.05
+            ):
+                full_due_in = float(self.config.scan_interval_seconds)
             deadlines.append(full_due_in)
         if result.get("background_full_scan_running") or self.background_full_scan_running():
             deadlines.append(float(self.config.hot_interval_seconds))
@@ -3633,10 +3641,17 @@ def funding_clients_for_route(
 def funding_client_for_venue(
     venue: str,
     *,
+    environment: str = "auto",
     fast: bool = False,
     timeout_seconds: float | None = None,
 ) -> FundingVenueClient | None:
-    if venue.lower() in DEACTIVATED_FUNDING_VENUES:
+    venue_key = str(venue).lower()
+    environment_key = str(environment or "mainnet").strip().lower()
+    if environment_key == "auto":
+        environment_key = "testnet" if venue_key == "risex" else "mainnet"
+    if environment_key not in {"mainnet", "testnet"}:
+        return None
+    if venue_key in DEACTIVATED_FUNDING_VENUES:
         return None
     factories: dict[str, type[FundingVenueClient]] = {
         "aevo": AevoFundingClient,
@@ -3672,19 +3687,28 @@ def funding_client_for_venue(
         "vertex_base": VertexFundingClient,
         "woox": WOOXFundingClient,
     }
-    factory = factories.get(str(venue))
+    factory = factories.get(venue_key)
     if factory is None:
         return None
+    if venue_key != "risex" and environment_key != "mainnet":
+        return None
+    if venue_key == "risex" and environment_key == "mainnet":
+        return None
     if not fast:
+        if venue_key == "risex":
+            return factory(environment=environment_key)
         return factory()
     try:
-        return factory(
-            http=FundingHttpClient(
+        kwargs: dict[str, Any] = {
+            "http": FundingHttpClient(
                 timeout_seconds=float(timeout_seconds or 3),
                 max_retries=0,
                 min_delay_seconds=0.0,
             )
-        )
+        }
+        if venue_key == "risex":
+            kwargs["environment"] = environment_key
+        return factory(**kwargs)
     except TypeError:
         return factory()
 

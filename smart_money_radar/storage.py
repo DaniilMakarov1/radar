@@ -8301,6 +8301,7 @@ class SQLiteStore:
                     payload_json = excluded.payload_json,
                     last_observed_at = excluded.last_observed_at,
                     updated_at = excluded.updated_at
+                WHERE excluded.last_observed_at >= funding_shadow_opportunities.last_observed_at
                 """,
                 (
                     key,
@@ -8388,6 +8389,106 @@ class SQLiteStore:
             )
         return int(cursor.lastrowid) if cursor.lastrowid else None
 
+    def update_funding_shadow_alert_status(
+        self,
+        alert_key: str,
+        telegram_status: str,
+        telegram_error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE funding_shadow_alerts
+                   SET telegram_status = ?, telegram_error = ?
+                 WHERE alert_key = ?
+                """,
+                (telegram_status, telegram_error, alert_key),
+            )
+
+    def upsert_funding_shadow_settlement_event(
+        self,
+        opportunity_key: str,
+        event: dict[str, Any],
+        *,
+        classification: str,
+    ) -> int:
+        now = utc_now_iso()
+        event_id = str(event["event_id"])
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO funding_shadow_settlement_events (
+                    opportunity_key, event_id, classification, venue,
+                    environment, symbol, canonical_underlying, leg_id,
+                    scheduled_at, earliest_possible_assessment_at,
+                    latest_possible_assessment_at, settlement_interval_seconds,
+                    displayed_rate_period_seconds, raw_api_rate, normalized_rate,
+                    rate_per_next_settlement, receiver_side,
+                    expected_cashflow_usd, conservative_cashflow_usd,
+                    rate_status, source_event_at, response_received_at,
+                    confirmation_source, settlement_semantics_status,
+                    evidence_version, payload_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(opportunity_key, event_id, classification) DO UPDATE SET
+                    venue = excluded.venue,
+                    environment = excluded.environment,
+                    symbol = excluded.symbol,
+                    canonical_underlying = excluded.canonical_underlying,
+                    leg_id = excluded.leg_id,
+                    scheduled_at = excluded.scheduled_at,
+                    earliest_possible_assessment_at = excluded.earliest_possible_assessment_at,
+                    latest_possible_assessment_at = excluded.latest_possible_assessment_at,
+                    settlement_interval_seconds = excluded.settlement_interval_seconds,
+                    displayed_rate_period_seconds = excluded.displayed_rate_period_seconds,
+                    raw_api_rate = excluded.raw_api_rate,
+                    normalized_rate = excluded.normalized_rate,
+                    rate_per_next_settlement = excluded.rate_per_next_settlement,
+                    receiver_side = excluded.receiver_side,
+                    expected_cashflow_usd = excluded.expected_cashflow_usd,
+                    conservative_cashflow_usd = excluded.conservative_cashflow_usd,
+                    rate_status = excluded.rate_status,
+                    source_event_at = excluded.source_event_at,
+                    response_received_at = excluded.response_received_at,
+                    confirmation_source = excluded.confirmation_source,
+                    settlement_semantics_status = excluded.settlement_semantics_status,
+                    evidence_version = excluded.evidence_version,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    opportunity_key,
+                    event_id,
+                    classification,
+                    event.get("venue"),
+                    event.get("environment"),
+                    event.get("symbol"),
+                    event.get("canonical_underlying"),
+                    event.get("leg_id"),
+                    event.get("scheduled_at"),
+                    event.get("earliest_possible_assessment_at"),
+                    event.get("latest_possible_assessment_at"),
+                    event.get("settlement_interval_seconds"),
+                    event.get("displayed_rate_period_seconds"),
+                    event.get("raw_api_rate"),
+                    event.get("normalized_rate"),
+                    event.get("rate_per_next_settlement"),
+                    event.get("receiver_side"),
+                    event.get("expected_cashflow_usd"),
+                    event.get("conservative_cashflow_usd"),
+                    event.get("rate_status"),
+                    event.get("source_event_at"),
+                    event.get("response_received_at"),
+                    event.get("confirmation_source"),
+                    event.get("settlement_semantics_status"),
+                    event.get("evidence_version"),
+                    json.dumps(event, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+        return int(cursor.lastrowid or 0)
+
     def upsert_funding_shadow_venue_health(self, row: dict[str, Any]) -> None:
         now = utc_now_iso()
         with self.connect() as connection:
@@ -8404,6 +8505,7 @@ class SQLiteStore:
                     last_error = excluded.last_error,
                     observed_at = excluded.observed_at,
                     updated_at = excluded.updated_at
+                WHERE excluded.observed_at >= funding_shadow_venue_health.observed_at
                 """,
                 (
                     row["venue"],
@@ -8416,12 +8518,89 @@ class SQLiteStore:
                 ),
             )
 
+    def funding_shadow_paper_safety_snapshot(self) -> dict[str, float]:
+        tables = {
+            "funding_paper_positions": "funding_paper_positions",
+            "funding_capture_positions": "funding_capture_positions",
+            "funding_paper_orders": "funding_paper_orders",
+            "funding_paper_accounts": "funding_paper_accounts",
+            "paper_event_ledger": "paper_event_ledger",
+        }
+        with self.connect() as connection:
+            snapshot = {
+                name: float(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
+                for name, table in tables.items()
+            }
+            balances = connection.execute(
+                """
+                SELECT COALESCE(SUM(cash_balance), 0),
+                       COALESCE(SUM(reserved_margin), 0)
+                  FROM funding_paper_accounts
+                """
+            ).fetchone()
+            snapshot["funding_paper_accounts_cash_balance"] = float(balances[0] or 0.0)
+            snapshot["funding_paper_accounts_reserved_margin"] = float(balances[1] or 0.0)
+            ledger = connection.execute(
+                "SELECT COALESCE(SUM(cash_delta), 0) FROM paper_event_ledger"
+            ).fetchone()
+            snapshot["paper_event_ledger_cash_delta"] = float(ledger[0] or 0.0)
+            return snapshot
+
+    def prune_funding_shadow_runtime_rows(
+        self,
+        *,
+        keep_observations: int = 10_000,
+        keep_events: int = 20_000,
+        keep_alerts: int = 5_000,
+    ) -> dict[str, int]:
+        deleted: dict[str, int] = {}
+        with self.connect() as connection:
+            for key, table, order_column, keep in (
+                (
+                    "observations",
+                    "funding_shadow_observations",
+                    "funding_shadow_observation_id",
+                    keep_observations,
+                ),
+                (
+                    "settlement_events",
+                    "funding_shadow_settlement_events",
+                    "funding_shadow_settlement_event_id",
+                    keep_events,
+                ),
+                (
+                    "alerts",
+                    "funding_shadow_alerts",
+                    "funding_shadow_alert_id",
+                    keep_alerts,
+                ),
+            ):
+                cursor = connection.execute(
+                    f"""
+                    DELETE FROM {table}
+                     WHERE {order_column} NOT IN (
+                        SELECT {order_column}
+                          FROM {table}
+                         ORDER BY {order_column} DESC
+                         LIMIT ?
+                     )
+                    """,
+                    (max(0, int(keep)),),
+                )
+                deleted[key] = int(cursor.rowcount if cursor.rowcount is not None else 0)
+        return deleted
+
     def funding_shadow_counts(self) -> dict[str, int]:
         tables = {
             "opportunities": "funding_shadow_opportunities",
             "observations": "funding_shadow_observations",
+            "settlement_events": "funding_shadow_settlement_events",
             "alerts": "funding_shadow_alerts",
             "venue_health": "funding_shadow_venue_health",
+            "probe_runs": "funding_semantics_probe_runs",
+            "probe_observations": "funding_semantics_probe_observations",
             "paper_positions": "funding_capture_positions",
             "paper_orders": "funding_paper_orders",
             "paper_accounts": "funding_paper_accounts",
@@ -8433,6 +8612,98 @@ class SQLiteStore:
                 )
                 for name, table in tables.items()
             }
+
+    def insert_funding_semantics_probe_run(self, row: dict[str, Any]) -> str:
+        now = utc_now_iso()
+        probe_run_id = str(row["probe_run_id"])
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO funding_semantics_probe_runs (
+                    probe_run_id, venue, environment, mode, db_path,
+                    started_at, completed_at, status, orders_enabled,
+                    base_url, max_notional_usd, entry_lead_seconds,
+                    max_wait_seconds, confirmation_timeout_seconds,
+                    no_telegram, error, payload_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(probe_run_id) DO UPDATE SET
+                    completed_at = excluded.completed_at,
+                    status = excluded.status,
+                    error = excluded.error,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    probe_run_id,
+                    row.get("venue", "risex"),
+                    row.get("environment", "testnet"),
+                    row.get("mode", "public"),
+                    row.get("db_path"),
+                    row.get("started_at", now),
+                    row.get("completed_at"),
+                    row.get("status", "RUNNING"),
+                    1 if row.get("orders_enabled") else 0,
+                    row.get("base_url"),
+                    row.get("max_notional_usd"),
+                    row.get("entry_lead_seconds"),
+                    row.get("max_wait_seconds"),
+                    row.get("confirmation_timeout_seconds"),
+                    1 if row.get("no_telegram", True) else 0,
+                    row.get("error"),
+                    json.dumps(row.get("payload") or {}, sort_keys=True),
+                    row.get("created_at", now),
+                    now,
+                ),
+            )
+        return probe_run_id
+
+    def insert_funding_semantics_probe_observation(self, row: dict[str, Any]) -> int:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO funding_semantics_probe_observations (
+                    probe_run_id, venue, environment, symbol,
+                    scheduled_settlement_at, actual_assessment_at,
+                    actual_confirmation_at, entry_lead_seconds,
+                    entry_request_at, acknowledgement_at, fill_at,
+                    hold_duration_seconds, size, predicted_rate,
+                    rate_period_seconds, expected_full_payment,
+                    expected_prorata_payment, realized_payment,
+                    balance_delta, classification, confidence, errors,
+                    raw_evidence_metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["probe_run_id"],
+                    row.get("venue", "risex"),
+                    row.get("environment", "testnet"),
+                    row.get("symbol"),
+                    row.get("scheduled_settlement_at"),
+                    row.get("actual_assessment_at"),
+                    row.get("actual_confirmation_at"),
+                    row.get("entry_lead_seconds"),
+                    row.get("entry_request_at"),
+                    row.get("acknowledgement_at"),
+                    row.get("fill_at"),
+                    row.get("hold_duration_seconds"),
+                    row.get("size"),
+                    row.get("predicted_rate"),
+                    row.get("rate_period_seconds"),
+                    row.get("expected_full_payment"),
+                    row.get("expected_prorata_payment"),
+                    row.get("realized_payment"),
+                    row.get("balance_delta"),
+                    row.get("classification"),
+                    row.get("confidence"),
+                    row.get("errors"),
+                    json.dumps(row.get("raw_evidence_metadata") or {}, sort_keys=True),
+                    row.get("created_at", now),
+                ),
+            )
+        return int(cursor.lastrowid)
 
     def funding_paper_pending_reprice_events(
         self,

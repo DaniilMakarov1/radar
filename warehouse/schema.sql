@@ -1621,6 +1621,46 @@ CREATE INDEX IF NOT EXISTS idx_funding_shadow_observations_time
         environment, venue, symbol, observed_at DESC
     );
 
+CREATE TABLE IF NOT EXISTS funding_shadow_settlement_events (
+    funding_shadow_settlement_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_key TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    symbol TEXT,
+    canonical_underlying TEXT,
+    leg_id TEXT,
+    scheduled_at TEXT NOT NULL,
+    earliest_possible_assessment_at TEXT,
+    latest_possible_assessment_at TEXT,
+    settlement_interval_seconds REAL,
+    displayed_rate_period_seconds REAL,
+    raw_api_rate REAL,
+    normalized_rate REAL,
+    rate_per_next_settlement REAL,
+    receiver_side TEXT,
+    expected_cashflow_usd REAL,
+    conservative_cashflow_usd REAL,
+    rate_status TEXT,
+    source_event_at TEXT,
+    response_received_at TEXT,
+    confirmation_source TEXT,
+    settlement_semantics_status TEXT,
+    evidence_version TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (opportunity_key)
+        REFERENCES funding_shadow_opportunities(opportunity_key),
+    UNIQUE (opportunity_key, event_id, classification)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_shadow_settlement_events_time
+    ON funding_shadow_settlement_events (
+        environment, venue, scheduled_at DESC
+    );
+
 CREATE TABLE IF NOT EXISTS funding_shadow_alerts (
     funding_shadow_alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
     alert_key TEXT NOT NULL UNIQUE,
@@ -1652,6 +1692,63 @@ CREATE TABLE IF NOT EXISTS funding_shadow_venue_health (
 
 CREATE INDEX IF NOT EXISTS idx_funding_shadow_venue_health_status
     ON funding_shadow_venue_health (environment, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS funding_semantics_probe_runs (
+    probe_run_id TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    db_path TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL,
+    orders_enabled INTEGER NOT NULL DEFAULT 0,
+    base_url TEXT,
+    max_notional_usd REAL,
+    entry_lead_seconds REAL,
+    max_wait_seconds REAL,
+    confirmation_timeout_seconds REAL,
+    no_telegram INTEGER NOT NULL DEFAULT 1,
+    error TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS funding_semantics_probe_observations (
+    funding_semantics_probe_observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    probe_run_id TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    symbol TEXT,
+    scheduled_settlement_at TEXT,
+    actual_assessment_at TEXT,
+    actual_confirmation_at TEXT,
+    entry_lead_seconds REAL,
+    entry_request_at TEXT,
+    acknowledgement_at TEXT,
+    fill_at TEXT,
+    hold_duration_seconds REAL,
+    size REAL,
+    predicted_rate REAL,
+    rate_period_seconds REAL,
+    expected_full_payment REAL,
+    expected_prorata_payment REAL,
+    realized_payment REAL,
+    balance_delta REAL,
+    classification TEXT,
+    confidence TEXT,
+    errors TEXT,
+    raw_evidence_metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (probe_run_id)
+        REFERENCES funding_semantics_probe_runs(probe_run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_semantics_probe_observations_venue
+    ON funding_semantics_probe_observations (
+        venue, environment, scheduled_settlement_at DESC
+    );
 
 CREATE TABLE IF NOT EXISTS paper_event_ledger (
     ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,

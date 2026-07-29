@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from smart_money_radar.config import DEFAULT_DB_PATH, api_key_status
+from smart_money_radar.config import DEFAULT_DB_PATH, PROJECT_ROOT, api_key_status
 from smart_money_radar.funding.adapters import FundingDataError
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.presentation import (
@@ -31,6 +31,12 @@ from smart_money_radar.funding.service import (
 from smart_money_radar.funding.shadow_monitor import (
     FundingShadowConfig,
     FundingShadowMonitor,
+    UnavailableFundingVenueClient,
+)
+from smart_money_radar.funding.stablecoins import PublicStablecoinPriceProvider
+from smart_money_radar.funding.risex_probe import (
+    RiseXProbeConfig,
+    run_risex_funding_probe,
 )
 from smart_money_radar.funding.trader import (
     PaperBot,
@@ -58,7 +64,13 @@ from smart_money_radar.storage import SQLiteStore
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    db_explicit = any(item == "--db" or item.startswith("--db=") for item in raw_argv)
+    if not db_explicit and args.command == "funding-shadow-monitor":
+        args.db = str(PROJECT_ROOT / "data" / "radar-shadow.sqlite")
+    if not db_explicit and args.command == "funding-risex-probe":
+        args.db = str(PROJECT_ROOT / "data" / "risex-funding-probe-testnet.sqlite")
     store = SQLiteStore(Path(args.db))
 
     try:
@@ -433,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
                 store,
                 clients,
                 config=funding_shadow_config(args),
+                stablecoin_price_provider=PublicStablecoinPriceProvider(
+                    timeout_seconds=2.0,
+                ),
                 notifier=(
                     TelegramNotifier(scope=TelegramScope.SHADOW)
                     if not args.no_telegram
@@ -442,11 +457,35 @@ def main(argv: list[str] | None = None) -> int:
             result = monitor.run(duration_seconds=args.duration_seconds)
             print("Funding shadow monitor")
             print(f"  profile: {args.profile}")
+            print(f"  environment: {args.environment}")
+            print(f"  db: {store.db_path}")
             print(f"  duration_seconds: {args.duration_seconds}")
             print(f"  iterations: {result['iterations']}")
-            print("  paper_positions_opened: 0")
-            print("  paper_orders_created: 0")
+            print(f"  paper_safety_deltas: {result.get('paper_safety_deltas', {})}")
+            print(f"  mandatory_unavailable: {result.get('mandatory_unavailable', 0)}")
+            if result.get("paper_safety_deltas") and any(
+                float(value) != 0.0
+                for value in result.get("paper_safety_deltas", {}).values()
+            ):
+                return 1
+            if args.strict_required_venues and result.get("mandatory_unavailable", 0):
+                return 1
             return 0
+
+        if args.command == "funding-risex-probe":
+            result = run_risex_funding_probe(risex_probe_config(args))
+            print("RiseX funding semantics probe")
+            print(f"  mode: {args.mode}")
+            print(f"  environment: {args.environment}")
+            print(f"  db: {args.db}")
+            print(f"  status: {result.get('status')}")
+            print(f"  orders_enabled: {result.get('orders_enabled')}")
+            if result.get("reason"):
+                print(f"  reason: {result.get('reason')}")
+            if result.get("error"):
+                print(f"  error: {result.get('error')}")
+            print(f"  probe_run_id: {result.get('probe_run_id')}")
+            return 0 if str(result.get("status")) not in {"FAILED", "CANARY_BLOCKED"} else 1
 
         if args.command == "funding-paper-report":
             store.init_db()
@@ -865,7 +904,67 @@ def build_parser() -> argparse.ArgumentParser:
         default=180.0,
         help="Bounded run duration. The command never starts a permanent service.",
     )
+    funding_shadow_monitor.add_argument(
+        "--max-strategy-hold-seconds",
+        type=float,
+        default=180.0,
+    )
+    funding_shadow_monitor.add_argument(
+        "--max-gap-between-settlements-seconds",
+        type=float,
+        default=60.0,
+    )
+    funding_shadow_monitor.add_argument(
+        "--entry-safety-buffer-seconds",
+        type=float,
+        default=30.0,
+    )
+    funding_shadow_monitor.add_argument(
+        "--exit-safety-buffer-seconds",
+        type=float,
+        default=5.0,
+    )
+    funding_shadow_monitor.add_argument(
+        "--settlement-confirmation-timeout-seconds",
+        type=float,
+        default=5.0,
+    )
+    funding_shadow_monitor.add_argument(
+        "--max-clock-uncertainty-ms",
+        type=float,
+        default=500.0,
+    )
+    funding_shadow_monitor.add_argument(
+        "--strict-required-venues",
+        action="store_true",
+    )
     funding_shadow_monitor.add_argument("--no-telegram", action="store_true")
+
+    risex_probe = subparsers.add_parser(
+        "funding-risex-probe",
+        help="Run RiseX funding semantics probe in public or guarded testnet canary mode.",
+    )
+    risex_probe.add_argument("--environment", choices=("testnet",), default="testnet")
+    risex_probe.add_argument(
+        "--mode",
+        choices=("public", "testnet-canary"),
+        default="public",
+    )
+    risex_probe.add_argument(
+        "--db",
+        default=argparse.SUPPRESS,
+        help="SQLite database path for RiseX probe observations.",
+    )
+    risex_probe.add_argument("--max-notional-usd", type=float, default=10.0)
+    risex_probe.add_argument("--entry-lead-seconds", type=float, default=30.0)
+    risex_probe.add_argument("--max-wait-seconds", type=float, default=120.0)
+    risex_probe.add_argument(
+        "--confirmation-timeout-seconds",
+        type=float,
+        default=60.0,
+    )
+    risex_probe.add_argument("--no-telegram", action="store_true", default=True)
+    risex_probe.add_argument("--confirm-testnet-canary", action="store_true")
 
     funding_paper_report = subparsers.add_parser(
         "funding-paper-report",
@@ -1113,24 +1212,54 @@ def funding_shadow_config(args: argparse.Namespace) -> FundingShadowConfig:
         profile=args.profile,
         environment=args.environment,
         target_notional=args.target_notional,
+        max_strategy_hold_seconds=args.max_strategy_hold_seconds,
+        max_gap_between_settlements_seconds=args.max_gap_between_settlements_seconds,
+        entry_safety_buffer_seconds=args.entry_safety_buffer_seconds,
+        exit_safety_buffer_seconds=args.exit_safety_buffer_seconds,
+        settlement_confirmation_timeout_seconds=(
+            args.settlement_confirmation_timeout_seconds
+        ),
+        max_clock_uncertainty_ms=args.max_clock_uncertainty_ms,
+        strict_required_venues=args.strict_required_venues,
         telegram_enabled=not args.no_telegram,
+    ).validated()
+
+
+def risex_probe_config(args: argparse.Namespace) -> RiseXProbeConfig:
+    return RiseXProbeConfig(
+        environment=args.environment,
+        mode=args.mode,
+        db_path=Path(args.db),
+        max_notional_usd=args.max_notional_usd,
+        entry_lead_seconds=args.entry_lead_seconds,
+        max_wait_seconds=args.max_wait_seconds,
+        confirmation_timeout_seconds=args.confirmation_timeout_seconds,
+        no_telegram=True,
+        confirm_testnet_canary=args.confirm_testnet_canary,
     ).validated()
 
 
 def shadow_monitor_clients(args: argparse.Namespace) -> list[Any]:
     if args.profile == "dex_shadow":
-        return [
-            client
-            for client in (
-                funding_client_for_venue(
-                    venue,
-                    fast=True,
-                    timeout_seconds=2.0,
-                )
-                for venue in PRIMARY_SHADOW_VENUES
+        clients: list[Any] = []
+        for venue in PRIMARY_SHADOW_VENUES:
+            client = funding_client_for_venue(
+                venue,
+                environment=args.environment,
+                fast=True,
+                timeout_seconds=2.0,
             )
-            if client is not None
-        ]
+            if client is None:
+                clients.append(
+                    UnavailableFundingVenueClient(
+                        venue,
+                        environment=args.environment,
+                        reason=f"{venue} client unavailable for {args.environment}",
+                    )
+                )
+            else:
+                clients.append(client)
+        return clients
     return active_default_funding_clients()
 
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from queue import Empty, Queue
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from threading import Lock, Thread
 from typing import Any
 
 from smart_money_radar.funding.adapter_contracts import (
@@ -15,13 +16,16 @@ from smart_money_radar.funding.adapter_contracts import (
 )
 from smart_money_radar.funding.adapters import FundingDataError, FundingVenueClient
 from smart_money_radar.funding.normalization import normalize_catalog_canonical_units
+from smart_money_radar.funding.settlement_contracts import (
+    settlement_contract_from_market,
+)
 from smart_money_radar.funding.stablecoins import (
     StablecoinPriceProvider,
     evaluate_stablecoin_route,
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
-    gross_funding_pnl,
-    settlement_skew_seconds,
+    EventWindowPlannerConfig,
+    build_settlement_capture_opportunity,
 )
 from smart_money_radar.paper_bot.clock import SystemClock
 from smart_money_radar.paper_bot.helpers import parse_iso
@@ -48,13 +52,24 @@ class FundingShadowConfig:
     venue_deadline_seconds: float = 2.0
     periodic_summary_seconds: float = 900.0
     unchanged_opportunity_cooldown_seconds: float = 900.0
+    max_strategy_hold_seconds: float = 180.0
+    max_gap_between_settlements_seconds: float = 60.0
+    entry_safety_buffer_seconds: float = 30.0
+    exit_safety_buffer_seconds: float = 5.0
+    settlement_confirmation_timeout_seconds: float = 5.0
+    max_clock_uncertainty_ms: float = 500.0
+    max_response_age_seconds: float = 5.0
+    max_source_age_seconds: float = 60.0
+    configured_min_net_bps: float = 0.0
+    max_individual_alerts_per_run: int = 20
+    strict_required_venues: bool = False
     telegram_enabled: bool = True
     max_workers: int = 12
 
     def validated(self) -> "FundingShadowConfig":
-        environment = str(self.environment or "mainnet").strip().lower()
+        environment = str(self.environment or "").strip().lower()
         if environment not in {"mainnet", "testnet"}:
-            environment = "mainnet"
+            environment = "unknown"
         return FundingShadowConfig(
             profile=str(self.profile or "dex_shadow"),
             environment=environment,
@@ -66,9 +81,55 @@ class FundingShadowConfig:
                 60.0,
                 float(self.unchanged_opportunity_cooldown_seconds),
             ),
+            max_strategy_hold_seconds=max(1.0, float(self.max_strategy_hold_seconds)),
+            max_gap_between_settlements_seconds=max(
+                0.0,
+                float(self.max_gap_between_settlements_seconds),
+            ),
+            entry_safety_buffer_seconds=max(0.0, float(self.entry_safety_buffer_seconds)),
+            exit_safety_buffer_seconds=max(0.0, float(self.exit_safety_buffer_seconds)),
+            settlement_confirmation_timeout_seconds=max(
+                0.0,
+                float(self.settlement_confirmation_timeout_seconds),
+            ),
+            max_clock_uncertainty_ms=max(0.0, float(self.max_clock_uncertainty_ms)),
+            max_response_age_seconds=max(0.1, float(self.max_response_age_seconds)),
+            max_source_age_seconds=max(0.1, float(self.max_source_age_seconds)),
+            configured_min_net_bps=max(0.0, float(self.configured_min_net_bps)),
+            max_individual_alerts_per_run=max(0, int(self.max_individual_alerts_per_run)),
+            strict_required_venues=bool(self.strict_required_venues),
             telegram_enabled=bool(self.telegram_enabled),
             max_workers=max(1, min(int(self.max_workers), 32)),
         )
+
+    def planner_config(self, *, stablecoin_reserve_usd: float = 0.0) -> EventWindowPlannerConfig:
+        return EventWindowPlannerConfig(
+            max_strategy_hold_seconds=self.max_strategy_hold_seconds,
+            max_gap_between_settlements_seconds=self.max_gap_between_settlements_seconds,
+            entry_safety_buffer_seconds=self.entry_safety_buffer_seconds,
+            exit_safety_buffer_seconds=self.exit_safety_buffer_seconds,
+            settlement_confirmation_timeout_seconds=self.settlement_confirmation_timeout_seconds,
+            max_clock_uncertainty_ms=self.max_clock_uncertainty_ms,
+            configured_min_net_bps=self.configured_min_net_bps,
+            stablecoin_reserve_usd=stablecoin_reserve_usd,
+        )
+
+
+class UnavailableFundingVenueClient:
+    def __init__(self, venue: str, *, environment: str, reason: str) -> None:
+        self.venue = str(venue).lower()
+        self.environment = str(environment or "unknown").lower()
+        self.reason = str(reason)
+
+    def catalog_metadata(self, _observed_at: str) -> list[dict[str, Any]]:
+        return []
+
+    def funding_sweep(
+        self,
+        _observed_at: str,
+        _catalog: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        raise FundingDataError(self.reason)
 
 
 class ShadowAlertDeduper:
@@ -135,6 +196,11 @@ class FundingShadowMonitor:
             self.config.unchanged_opportunity_cooldown_seconds
         )
         self.last_summary_monotonic = 0.0
+        self._inflight_lock = Lock()
+        self._inflight_venues: set[str] = set()
+        self.last_request_counts_by_venue: dict[str, int] = {}
+        self.overlapping_call_prevention_count = 0
+        self.last_focused_refresh_count = 0
 
     def run(self, *, duration_seconds: float = 180.0) -> dict[str, Any]:
         self.store.init_db()
@@ -143,9 +209,11 @@ class FundingShadowMonitor:
         self._notify(
             "<b>SHADOW FUNDING</b>\n\nSHADOW STARTED\nNO POSITION OPENED"
         )
+        last_result: dict[str, Any] = {}
         try:
             while self.clock.monotonic() - started < max(1.0, float(duration_seconds)):
                 result = self.run_once()
+                last_result = result
                 iterations += 1
                 interval = adaptive_broad_sweep_interval_seconds(
                     result.get("nearest_settlement_seconds")
@@ -169,49 +237,115 @@ class FundingShadowMonitor:
             self._notify(
                 "<b>SHADOW FUNDING</b>\n\nSHADOW STOPPED\nNO POSITION OPENED"
             )
-        return {"iterations": iterations, "duration_seconds": duration_seconds}
+        return {
+            "iterations": iterations,
+            "duration_seconds": duration_seconds,
+            **last_result,
+        }
 
     def run_once(self) -> dict[str, Any]:
         self.store.init_db()
+        before_safety = self.store.funding_shadow_paper_safety_snapshot()
         observed = self.clock.now().astimezone(UTC)
         observed_at = observed.isoformat()
         markets, venue_health, warnings = self.broad_funding_sweep(observed_at)
         for health in venue_health:
             self.store.upsert_funding_shadow_venue_health(health)
         opportunities, summary = self.build_shadow_opportunities(markets, observed)
+        focused_markets = self.focused_route_refresh(opportunities, observed_at)
+        if focused_markets:
+            focused_opportunities, focused_summary = self.build_shadow_opportunities(
+                focused_markets,
+                observed,
+            )
+            if focused_opportunities:
+                opportunities = focused_opportunities
+                summary = {**summary, **focused_summary}
+        alert_attempted = 0
+        alert_sent = 0
+        alert_failed = 0
+        alert_disabled = 0
         for opportunity in opportunities:
             self.store.upsert_funding_shadow_opportunity(opportunity)
+            for event in opportunity.get("included_settlement_events") or []:
+                self.store.upsert_funding_shadow_settlement_event(
+                    opportunity["opportunity_key"],
+                    event,
+                    classification="included",
+                )
+            for event in opportunity.get("excluded_settlement_events") or []:
+                self.store.upsert_funding_shadow_settlement_event(
+                    opportunity["opportunity_key"],
+                    event,
+                    classification="excluded",
+                )
+            for event in opportunity.get("ambiguous_settlement_events") or []:
+                self.store.upsert_funding_shadow_settlement_event(
+                    opportunity["opportunity_key"],
+                    event,
+                    classification="ambiguous",
+                )
             for observation in shadow_observations_for_opportunity(opportunity):
                 self.store.insert_funding_shadow_observation(observation)
-            if opportunity.get("status") in {"SHADOW_CANDIDATE", "RESEARCH_ONLY"}:
+            if (
+                opportunity.get("status") == "SHADOW_CANDIDATE"
+                and alert_attempted < self.config.max_individual_alerts_per_run
+            ):
                 should_send, alert_key = self.alert_deduper.should_send(
                     opportunity,
                     now_monotonic=self.clock.monotonic(),
                 )
                 if should_send:
                     message = shadow_opportunity_message(opportunity)
-                    result = self._notify(message)
-                    self.store.insert_funding_shadow_alert(
+                    claim_id = self.store.insert_funding_shadow_alert(
                         {
                             "alert_key": alert_key,
                             "opportunity_key": opportunity["opportunity_key"],
                             "environment": opportunity["environment"],
                             "status": opportunity["status"],
                             "message": message,
-                            "telegram_status": result.get("status"),
-                            "telegram_error": result.get("error"),
+                            "telegram_status": "queued",
+                            "telegram_error": None,
                             "payload": {
                                 "opportunity": opportunity,
                                 "material_bucket": alert_key,
                             },
                         }
                     )
+                    if claim_id is None:
+                        continue
+                    alert_attempted += 1
+                    result = self._notify(message)
+                    self.store.update_funding_shadow_alert_status(
+                        alert_key,
+                        result.get("status") or "unknown",
+                        result.get("error"),
+                    )
+                    if result.get("status") == "sent":
+                        alert_sent += 1
+                    elif result.get("status") == "disabled":
+                        alert_disabled += 1
+                    else:
+                        alert_failed += 1
         if self._summary_due():
             self._notify(shadow_summary_message(summary, opportunities, warnings))
+        self.store.prune_funding_shadow_runtime_rows()
+        after_safety = self.store.funding_shadow_paper_safety_snapshot()
+        safety_deltas = funding_shadow_safety_deltas(before_safety, after_safety)
+        safety_violation = any(value != 0 for value in safety_deltas.values())
         return {
-            "status": "success",
+            "status": "safety_violation" if safety_violation else "success",
             "warnings": warnings,
             "opportunities": len(opportunities),
+            "telegram_individual_attempted": alert_attempted,
+            "telegram_individual_sent": alert_sent,
+            "telegram_individual_failed": alert_failed,
+            "telegram_individual_disabled": alert_disabled,
+            "paper_safety_deltas": safety_deltas,
+            "broad_sweep_count": 1,
+            "focused_refresh_count": self.last_focused_refresh_count,
+            "request_counts_by_venue": dict(sorted(self.last_request_counts_by_venue.items())),
+            "overlapping_call_prevention_count": self.overlapping_call_prevention_count,
             **summary,
         }
 
@@ -226,82 +360,135 @@ class FundingShadowMonitor:
         }
         if not clients:
             return [], [], ["shadow sweep skipped: no venues configured"]
-        worker_count = min(self.config.max_workers, len(clients))
         markets: list[dict[str, Any]] = []
         warnings: list[str] = []
         health_rows: list[dict[str, Any]] = []
         started_monotonic = self.clock.monotonic()
-        executor = ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="funding-shadow-sweep",
-        )
-        try:
-            futures: dict[Future[tuple[list[dict[str, Any]], list[str]]], tuple[str, float]] = {}
-            for venue, client in clients.items():
-                request_started = self.clock.monotonic()
-                futures[
-                    executor.submit(
-                        self._fetch_public_market_snapshot,
-                        venue,
-                        client,
-                        observed_at,
-                    )
-                ] = (venue, request_started)
-            done, pending = wait(
-                futures,
-                timeout=float(self.config.venue_deadline_seconds),
+        self.last_request_counts_by_venue = {}
+        result_queue: Queue[dict[str, Any]] = Queue()
+        threads: dict[str, tuple[Thread, float]] = {}
+        for venue, client in clients.items():
+            if len(threads) >= self.config.max_workers:
+                warnings.append("shadow sweep worker limit reached")
+                break
+            with self._inflight_lock:
+                if venue in self._inflight_venues:
+                    self.overlapping_call_prevention_count += 1
+                    warnings.append(f"{venue} shadow sweep skipped: request already in-flight")
+                    continue
+                self._inflight_venues.add(venue)
+            request_started = self.clock.monotonic()
+            self.last_request_counts_by_venue[venue] = (
+                self.last_request_counts_by_venue.get(venue, 0) + 1
             )
-            for future in pending:
-                venue, request_started = futures[future]
-                future.cancel()
+            thread = Thread(
+                target=self._fetch_public_market_snapshot_worker,
+                args=(result_queue, venue, client, observed_at, request_started),
+                name=f"funding-shadow-sweep-{venue}",
+                daemon=True,
+            )
+            threads[venue] = (thread, request_started)
+            thread.start()
+
+        deadline = time.monotonic() + float(self.config.venue_deadline_seconds)
+        for thread, _request_started in list(threads.values()):
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        completed: set[str] = set()
+        while True:
+            try:
+                item = result_queue.get_nowait()
+            except Empty:
+                break
+            venue = str(item["venue"])
+            completed.add(venue)
+            request_started = float(item["request_started"])
+            latency_ms = (self.clock.monotonic() - request_started) * 1_000.0
+            if item.get("error"):
+                warnings.append(f"{venue} shadow sweep failed: {item['error']}")
+                health_rows.append(
+                    {
+                        "venue": venue,
+                        "environment": client_environment(clients[venue], self.config.environment),
+                        "status": mandatory_health_status(venue, "degraded"),
+                        "latency_ms": latency_ms,
+                        "last_error": str(item["error"]),
+                        "observed_at": observed_at,
+                    }
+                )
+                continue
+            markets.extend(list(item.get("markets") or []))
+            warnings.extend(list(item.get("warnings") or []))
+            health_rows.append(
+                {
+                    "venue": venue,
+                    "environment": client_environment(clients[venue], self.config.environment),
+                    "status": "healthy",
+                    "latency_ms": latency_ms,
+                    "last_error": None,
+                    "observed_at": observed_at,
+                }
+            )
+        for venue, (thread, request_started) in threads.items():
+            if venue in completed:
+                continue
+            if thread.is_alive():
                 latency_ms = (self.clock.monotonic() - request_started) * 1_000.0
                 warnings.append(f"{venue} shadow sweep timed out")
                 health_rows.append(
                     {
                         "venue": venue,
-                        "environment": self.config.environment,
-                        "status": "degraded",
+                        "environment": client_environment(clients[venue], self.config.environment),
+                        "status": mandatory_health_status(venue, "degraded"),
                         "latency_ms": latency_ms,
                         "last_error": "venue_deadline_exceeded",
                         "observed_at": observed_at,
                     }
                 )
-            for future in done:
-                venue, request_started = futures[future]
-                latency_ms = (self.clock.monotonic() - request_started) * 1_000.0
-                try:
-                    venue_markets, venue_warnings = future.result()
-                except Exception as exc:
-                    warnings.append(f"{venue} shadow sweep failed: {exc}")
-                    health_rows.append(
-                        {
-                            "venue": venue,
-                            "environment": self.config.environment,
-                            "status": "degraded",
-                            "latency_ms": latency_ms,
-                            "last_error": str(exc),
-                            "observed_at": observed_at,
-                        }
-                    )
-                    continue
-                markets.extend(venue_markets)
-                warnings.extend(venue_warnings)
-                health_rows.append(
-                    {
-                        "venue": venue,
-                        "environment": self.config.environment,
-                        "status": "healthy",
-                        "latency_ms": latency_ms,
-                        "last_error": None,
-                        "observed_at": observed_at,
-                    }
-                )
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
         elapsed = self.clock.monotonic() - started_monotonic
         if elapsed > float(self.config.venue_deadline_seconds) + 0.25:
             warnings.append("shadow sweep exceeded venue deadline budget")
         return markets, health_rows, warnings
+
+    def _clear_inflight_venue(self, venue: str) -> None:
+        with self._inflight_lock:
+            self._inflight_venues.discard(str(venue).lower())
+
+    def _fetch_public_market_snapshot_worker(
+        self,
+        result_queue: Queue[dict[str, Any]],
+        venue: str,
+        client: FundingVenueClient,
+        observed_at: str,
+        request_started: float,
+    ) -> None:
+        try:
+            markets, warnings = self._fetch_public_market_snapshot(
+                venue,
+                client,
+                observed_at,
+            )
+            result_queue.put(
+                {
+                    "venue": venue,
+                    "request_started": request_started,
+                    "markets": markets,
+                    "warnings": warnings,
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            result_queue.put(
+                {
+                    "venue": venue,
+                    "request_started": request_started,
+                    "markets": [],
+                    "warnings": [],
+                    "error": str(exc),
+                }
+            )
+        finally:
+            self._clear_inflight_venue(venue)
 
     def _fetch_public_market_snapshot(
         self,
@@ -324,6 +511,7 @@ class FundingShadowMonitor:
                 cached_instruments,
                 self.clock.monotonic(),
             )
+        response_received_at = self.clock.now().astimezone(UTC).isoformat()
         instrument_by_key = {
             (str(row.get("venue") or venue).lower(), str(row.get("symbol") or "")): row
             for row in cached_instruments
@@ -335,10 +523,10 @@ class FundingShadowMonitor:
             instrument = instrument_by_key.get(key, {})
             row = {**instrument, **row}
             row["venue"] = str(row.get("venue") or venue).lower()
-            row.setdefault("environment", self.config.environment)
-            row.setdefault("response_received_at", observed_at)
-            row.setdefault("source_event_at", row.get("observed_at") or observed_at)
-            row.setdefault("observed_at", observed_at)
+            if row.get("response_received_at") in (None, ""):
+                row["response_received_at"] = response_received_at
+            if row.get("observed_at") in (None, ""):
+                row["observed_at"] = observed_at
             enriched.append(row)
         return enriched, list(warnings or [])
 
@@ -358,6 +546,67 @@ class FundingShadowMonitor:
             self.catalog_cache[venue] = (instruments, now_monotonic)
             return instruments
         return cached[0] if cached else []
+
+    def focused_route_refresh(
+        self,
+        opportunities: list[dict[str, Any]],
+        observed_at: str,
+    ) -> list[dict[str, Any]]:
+        clients = {
+            str(getattr(client, "venue", "")).lower(): client
+            for client in self.clients
+            if getattr(client, "venue", None)
+        }
+        wanted: dict[str, set[str]] = {}
+        for opportunity in opportunities:
+            try:
+                seconds = float(opportunity.get("seconds_until_settlement"))
+            except (TypeError, ValueError):
+                continue
+            if seconds > 60.0:
+                continue
+            if opportunity.get("status") not in {
+                "WATCH",
+                "SHADOW_CANDIDATE",
+                "RESEARCH_ONLY",
+            }:
+                continue
+            for side in ("long", "short"):
+                venue = str(opportunity.get(f"{side}_venue") or "").lower()
+                symbol = str(opportunity.get(f"{side}_symbol") or "")
+                if venue and symbol:
+                    wanted.setdefault(venue, set()).add(symbol)
+        self.last_focused_refresh_count = 0
+        refreshed: list[dict[str, Any]] = []
+        for venue, symbols in sorted(wanted.items()):
+            client = clients.get(venue)
+            if client is None:
+                continue
+            with self._inflight_lock:
+                if venue in self._inflight_venues:
+                    self.overlapping_call_prevention_count += 1
+                    continue
+                self._inflight_venues.add(venue)
+            try:
+                markets, _warnings = self._fetch_public_market_snapshot(
+                    venue,
+                    client,
+                    observed_at,
+                )
+                self.last_request_counts_by_venue[venue] = (
+                    self.last_request_counts_by_venue.get(venue, 0) + 1
+                )
+                self.last_focused_refresh_count += 1
+                refreshed.extend(
+                    market
+                    for market in markets
+                    if str(market.get("symbol") or "") in symbols
+                )
+            except Exception:
+                continue
+            finally:
+                self._clear_inflight_venue(venue)
+        return refreshed
 
     def build_shadow_opportunities(
         self,
@@ -379,7 +628,10 @@ class FundingShadowMonitor:
             ],
         )
         for market in markets:
-            env = str(market.get("environment") or self.config.environment).lower()
+            env = str(market.get("environment") or "").lower()
+            if env not in {"mainnet", "testnet"}:
+                reject("environment_unverified")
+                continue
             if env != self.config.environment:
                 reject("environment_mismatch")
                 continue
@@ -398,6 +650,11 @@ class FundingShadowMonitor:
                     if long_market is short_market:
                         continue
                     if str(long_market.get("venue")) == str(short_market.get("venue")):
+                        continue
+                    if str(long_market.get("venue")).lower() == "paradex" or str(
+                        short_market.get("venue")
+                    ).lower() == "paradex":
+                        reject("funding_continuous_pro_rata")
                         continue
                     structurally_matched += 1
                     opportunity = self._shadow_opportunity_for_pair(
@@ -421,6 +678,8 @@ class FundingShadowMonitor:
                         "WATCH",
                         "RESEARCH_ONLY",
                         "CAPABILITY_BLOCKED",
+                        "DATA_STALE",
+                        "EXPIRED",
                     }:
                         key = opportunity["opportunity_key"]
                         existing = opportunities_by_key.get(key)
@@ -441,13 +700,35 @@ class FundingShadowMonitor:
             "aligned_routes": sum(
                 1
                 for row in opportunities
-                if "settlement_alignment_mismatch" not in (row.get("blockers") or [])
+                if row.get("opportunity_shape") == "MULTIPLE_SETTLEMENTS"
             ),
             "shadow_candidates": sum(
                 1 for row in opportunities if row["status"] == "SHADOW_CANDIDATE"
             ),
             "research_only_routes": sum(
                 1 for row in opportunities if row["status"] == "RESEARCH_ONLY"
+            ),
+            "one_settlement_routes": sum(
+                1 for row in opportunities if row.get("opportunity_shape") == "ONE_SETTLEMENT"
+            ),
+            "multiple_settlements_routes": sum(
+                1
+                for row in opportunities
+                if row.get("opportunity_shape") == "MULTIPLE_SETTLEMENTS"
+            ),
+            "included_settlement_events": sum(
+                len(row.get("included_settlement_events") or []) for row in opportunities
+            ),
+            "excluded_settlement_events": sum(
+                len(row.get("excluded_settlement_events") or []) for row in opportunities
+            ),
+            "ambiguous_settlement_events": sum(
+                len(row.get("ambiguous_settlement_events") or []) for row in opportunities
+            ),
+            "mandatory_unavailable": sum(
+                1
+                for row in inventory
+                if row.get("venue") == "risex" and row.get("status") == "UNAVAILABLE"
             ),
             "nearest_settlement_seconds": nearest_settlement_seconds,
             "rejection_reasons": dict(sorted(rejection_reasons.items())),
@@ -465,17 +746,11 @@ class FundingShadowMonitor:
         short_venue = str(short_market.get("venue") or "").lower()
         long_contract = funding_adapter_contract_from_market(long_market)
         short_contract = funding_adapter_contract_from_market(short_market)
+        long_settlement_contract = settlement_contract_from_market(long_market)
+        short_settlement_contract = settlement_contract_from_market(short_market)
         blockers: list[str] = []
         if long_contract.environment != short_contract.environment:
             blockers.append("environment_mismatch")
-        skew = settlement_skew_seconds(
-            long_market.get("next_funding_at"),
-            short_market.get("next_funding_at"),
-        )
-        if skew is None:
-            blockers.append("settlement_timestamp_missing")
-        elif skew > 1.0:
-            blockers.append("settlement_alignment_mismatch")
         long_mark = optional_float(long_market.get("mark_price"))
         short_mark = optional_float(short_market.get("mark_price"))
         if long_mark is None or short_mark is None:
@@ -497,21 +772,40 @@ class FundingShadowMonitor:
         if short_contract.status not in {"PAPER_ELIGIBLE", "SHADOW_ELIGIBLE"}:
             blockers.extend(f"short_{reason}" for reason in short_contract.reasons)
 
-        preliminary_gross = 0.0
-        if long_mark and short_mark and long_rate is not None and short_rate is not None:
-            quantity = min(
-                float(self.config.target_notional) / long_mark,
-                float(self.config.target_notional) / short_mark,
-            )
-            preliminary_gross = gross_funding_pnl(
-                quantity=quantity,
-                long_mark=long_mark,
-                short_mark=short_mark,
-                long_funding_rate=long_rate,
-                short_funding_rate=short_rate,
-            )
-            if preliminary_gross <= 0:
-                blockers.append("preliminary_gross_funding_not_positive")
+        preliminary_stablecoin = evaluate_stablecoin_route(
+            long_collateral=str(
+                long_contract.settlement_collateral
+                or long_market.get("collateral_asset")
+                or ""
+            ),
+            short_collateral=str(
+                short_contract.settlement_collateral
+                or short_market.get("collateral_asset")
+                or ""
+            ),
+            provider=self.stablecoin_price_provider,
+            observed_at=observed_at,
+            reference_notional=float(self.config.target_notional),
+            funding_net_before_stablecoin_reserve=0.0,
+        )
+        stablecoin_reserve_usd = float(
+            preliminary_stablecoin.get("stablecoin_reserve_usd") or 0.0
+        )
+        planner = build_settlement_capture_opportunity(
+            long_market=long_market,
+            short_market=short_market,
+            now=now,
+            target_notional=float(self.config.target_notional),
+            planner_config=self.config.planner_config(
+                stablecoin_reserve_usd=stablecoin_reserve_usd
+            ),
+            max_response_age_seconds=self.config.max_response_age_seconds,
+            max_source_age_seconds=self.config.max_source_age_seconds,
+        )
+        preliminary_gross = float(planner.get("expected_funding_cashflow_usd") or 0.0)
+        conservative_gross = float(
+            planner.get("conservative_funding_cashflow_usd") or 0.0
+        )
         stablecoin = evaluate_stablecoin_route(
             long_collateral=str(
                 long_contract.settlement_collateral
@@ -526,16 +820,40 @@ class FundingShadowMonitor:
             provider=self.stablecoin_price_provider,
             observed_at=observed_at,
             reference_notional=float(self.config.target_notional),
-            funding_net_before_stablecoin_reserve=preliminary_gross,
+            funding_net_before_stablecoin_reserve=(
+                float(planner.get("conservative_net_usd") or 0.0)
+                + stablecoin_reserve_usd
+            ),
         )
         if stablecoin.get("status") == "RESEARCH_ONLY":
             blockers.extend(str(reason) for reason in stablecoin.get("blockers") or [])
+        blockers.extend(str(reason) for reason in planner.get("blockers") or [])
+        funding_net_after_stablecoin = float(
+            stablecoin.get(
+                "funding_net_after_stablecoin_reserve",
+                planner.get("conservative_net_usd") or 0.0,
+            )
+            or 0.0
+        )
+        if funding_net_after_stablecoin <= 0:
+            blockers.append("funding_net_after_stablecoin_reserve_not_positive")
         blockers = list(dict.fromkeys(blockers))
-        status = shadow_status_from_blockers(blockers, preliminary_gross)
-        settlement_at = (
-            long_market.get("next_funding_at")
-            if skew is not None and skew <= 1.0
+        status = shadow_status_from_blockers(blockers, funding_net_after_stablecoin)
+        settlement_at = planner.get("expires_at")
+        seconds_until_settlement = (
+            (parse_iso(settlement_at) - now).total_seconds()
+            if parse_iso(settlement_at) is not None
             else None
+        )
+        if (
+            seconds_until_settlement is not None
+            and seconds_until_settlement
+            < -float(self.config.settlement_confirmation_timeout_seconds)
+        ):
+            status = "EXPIRED"
+        skew = settlement_skew_for_display(
+            long_market.get("next_funding_at"),
+            short_market.get("next_funding_at"),
         )
         key = shadow_opportunity_key(
             environment=self.config.environment,
@@ -558,18 +876,29 @@ class FundingShadowMonitor:
             "short_symbol": short_market.get("symbol"),
             "settlement_at": settlement_at,
             "settlement_skew_seconds": skew,
-            "seconds_until_settlement": (
-                (parse_iso(settlement_at) - now).total_seconds()
-                if parse_iso(settlement_at) is not None
-                else None
-            ),
+            "seconds_until_settlement": seconds_until_settlement,
             "long_next_funding_rate": long_rate,
             "short_next_funding_rate": short_rate,
             "preliminary_gross_funding": preliminary_gross,
+            "conservative_funding_cashflow_usd": conservative_gross,
+            "expected_net_usd": planner.get("expected_net_usd"),
+            "conservative_net_usd": planner.get("conservative_net_usd"),
+            "conservative_net_bps": planner.get("conservative_net_bps"),
+            "opportunity_shape": planner.get("opportunity_shape"),
+            "planned_entry_at": planner.get("planned_entry_at"),
+            "planned_exit_at": planner.get("planned_exit_at"),
+            "included_settlement_events": planner.get("included_settlement_events") or [],
+            "excluded_settlement_events": planner.get("excluded_settlement_events") or [],
+            "ambiguous_settlement_events": planner.get("ambiguous_settlement_events") or [],
+            "settlement_contracts": {
+                "long": long_settlement_contract.as_dict(),
+                "short": short_settlement_contract.as_dict(),
+            },
+            "planner": planner.get("planner") or {},
             "stablecoin_risk": stablecoin,
             "funding_net_excluding_points": stablecoin.get(
                 "funding_net_after_stablecoin_reserve",
-                preliminary_gross,
+                funding_net_after_stablecoin,
             ),
             "capability_status": {
                 "long": long_contract.as_dict(),
@@ -609,13 +938,44 @@ def adaptive_broad_sweep_interval_seconds(
         lead = float(nearest_settlement_seconds)
     except (TypeError, ValueError):
         return 30.0
-    if lead < 60.0:
-        return 1.0
     if lead <= 120.0:
         return 5.0
     if lead <= 600.0:
         return 10.0
     return 30.0
+
+
+def client_environment(client: Any, fallback: str) -> str:
+    environment = str(getattr(client, "environment", "") or "").strip().lower()
+    if environment in {"mainnet", "testnet"}:
+        return environment
+    fallback_text = str(fallback or "").strip().lower()
+    return fallback_text if fallback_text in {"mainnet", "testnet"} else "unknown"
+
+
+def mandatory_health_status(venue: str, fallback_status: str) -> str:
+    if str(venue).lower() == "risex" and fallback_status != "healthy":
+        return "MANDATORY_UNAVAILABLE"
+    return fallback_status
+
+
+def settlement_skew_for_display(first: Any, second: Any) -> float | None:
+    first_time = parse_iso(first)
+    second_time = parse_iso(second)
+    if first_time is None or second_time is None:
+        return None
+    return abs((first_time.astimezone(UTC) - second_time.astimezone(UTC)).total_seconds())
+
+
+def funding_shadow_safety_deltas(
+    before: dict[str, float],
+    after: dict[str, float],
+) -> dict[str, float]:
+    keys = sorted({*before, *after})
+    return {
+        key: float(after.get(key, 0.0)) - float(before.get(key, 0.0))
+        for key in keys
+    }
 
 
 def optional_float(value: Any) -> float | None:
@@ -631,18 +991,30 @@ def optional_float(value: Any) -> float | None:
 def shadow_status_from_blockers(blockers: list[str], preliminary_gross: float) -> str:
     if not blockers and preliminary_gross > 0:
         return "SHADOW_CANDIDATE"
+    if any("timestamp" in reason or "stale" in reason for reason in blockers):
+        return "DATA_STALE"
     research_blockers = {
         "insufficient_stablecoin_price_sources",
         "stablecoin_price_provider_unavailable",
         "stablecoin_basis_above_30bps",
         "stablecoin_reserve_above_50bps",
         "stablecoin_family_not_compatible",
-        "preliminary_gross_funding_not_positive",
+        "funding_net_after_stablecoin_reserve_not_positive",
+        "funding_accrual_model_unknown",
+        "funding_continuous_pro_rata",
+        "position_inclusion_rule_unverified",
+        "settlement_timing_uncertainty_unknown",
+        "settlement_confirmation_unavailable",
+        "rate_per_settlement_unknown",
+        "displayed_rate_period_unknown",
+        "settlement_interval_unknown",
     }
-    if any(reason in research_blockers for reason in blockers):
+    if any(
+        reason in research_blockers
+        or any(reason.endswith(f"_{blocker}") for blocker in research_blockers)
+        for reason in blockers
+    ):
         return "RESEARCH_ONLY"
-    if any("timestamp" in reason or "stale" in reason for reason in blockers):
-        return "DATA_STALE"
     if blockers:
         return "CAPABILITY_BLOCKED"
     return "WATCH"
@@ -703,6 +1075,15 @@ def compact_market_shadow_payload(market: dict[str, Any]) -> dict[str, Any]:
         "price_quote_currency",
         "settlement_collateral",
         "collateral_family",
+        "funding_accrual_model",
+        "position_inclusion_rule_verified",
+        "settlement_interval_seconds",
+        "displayed_rate_period_seconds",
+        "settlement_semantics_status",
+        "assessment_jitter_before_seconds",
+        "assessment_jitter_after_seconds",
+        "settlement_confirmation_source",
+        "realized_payment_source",
     )
     return {field: market.get(field) for field in fields if field in market}
 

@@ -77,8 +77,8 @@ class FundingAdapterContract:
 
 
 def normalized_environment(value: Any) -> str:
-    text = str(value or "mainnet").strip().lower()
-    return text if text in {"mainnet", "testnet"} else "mainnet"
+    text = str(value or "").strip().lower()
+    return text if text in {"mainnet", "testnet"} else "unknown"
 
 
 def collateral_family(asset: Any) -> str:
@@ -224,6 +224,7 @@ def adapter_contract_reasons(
 ) -> list[str]:
     reasons: list[str] = []
     required = {
+        "environment": contract.environment,
         "contract_kind": contract.contract_kind,
         "price_quote_currency": contract.price_quote_currency,
         "settlement_collateral": contract.settlement_collateral,
@@ -290,6 +291,7 @@ def adapter_contract_status(
         "funding_rate_unit_missing",
         "funding_sign_convention_missing",
         "timing_policy_source_missing",
+        "environment_missing",
         "contract_kind_not_linear_perpetual",
         "funding_semantics_not_next_settlement",
         "funding_rate_unit_not_fraction_per_settlement",
