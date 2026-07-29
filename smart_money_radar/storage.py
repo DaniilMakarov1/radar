@@ -446,6 +446,94 @@ class SQLiteStore:
             )
         return cycle_id
 
+    def begin_funding_entry_attempt(
+        self,
+        *,
+        position_id: str,
+        route_key: str | None,
+        route_entry_key: str | None,
+        attempt_id: str,
+        settlement_at: datetime,
+        submitted_at: datetime,
+        fault_after: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically mark a v2 entry attempt as submitted.
+
+        This intentionally keeps the config marker, audit record, and position
+        lifecycle state in one SQLite transaction so recovery never sees
+        ARMED + entry_attempt_submitted from a partial begin-entry write.
+        """
+        submitted_iso = submitted_at.astimezone(UTC).replace(microsecond=0).isoformat()
+        settlement_iso = settlement_at.astimezone(UTC).isoformat()
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT config_json
+                FROM funding_capture_positions
+                WHERE position_id = ?
+                """,
+                (position_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"funding capture position not found: {position_id}")
+            config = json.loads(row["config_json"] or "{}")
+            attempts = [dict(item) for item in list(config.get("entry_attempts") or []) if isinstance(item, dict)]
+            existing = next(
+                (item for item in attempts if str(item.get("attempt_id") or "") == str(attempt_id)),
+                None,
+            )
+            if existing is None:
+                attempts.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "opportunity_id": position_id,
+                        "route_entry_key": route_entry_key,
+                        "settlement_at": settlement_iso,
+                        "submitted_at": submitted_at.astimezone(UTC).isoformat(),
+                        "state": "ENTRY_SUBMITTED",
+                    }
+                )
+            else:
+                existing.update(
+                    {
+                        "opportunity_id": position_id,
+                        "route_entry_key": existing.get("route_entry_key") or route_entry_key,
+                        "settlement_at": existing.get("settlement_at") or settlement_iso,
+                        "submitted_at": existing.get("submitted_at") or submitted_at.astimezone(UTC).isoformat(),
+                        "state": "ENTRY_SUBMITTED",
+                    }
+                )
+            config["opportunity_id"] = position_id
+            if route_key:
+                config["route_key"] = route_key
+            config["entry_attempt_id"] = attempt_id
+            config["attempt_id"] = attempt_id
+            config["entry_attempt_submitted"] = True
+            config["entry_attempt_submitted_at"] = submitted_at.astimezone(UTC).isoformat()
+            config["entry_attempt_state"] = "ENTRY_SUBMITTED"
+            config["entry_attempts"] = attempts
+            connection.execute(
+                """
+                UPDATE funding_capture_positions
+                SET config_json = ?,
+                    updated_at = ?
+                WHERE position_id = ?
+                """,
+                (json.dumps(config, sort_keys=True), submitted_iso, position_id),
+            )
+            if fault_after == "config":
+                raise RuntimeError("fault_after_config")
+            connection.execute(
+                """
+                UPDATE funding_capture_positions
+                SET state = 'ENTRY_SUBMITTED',
+                    updated_at = ?
+                WHERE position_id = ?
+                """,
+                (submitted_iso, position_id),
+            )
+        return {"position_id": position_id, "attempt_id": attempt_id, "state": "ENTRY_SUBMITTED"}
+
     def upsert_funding_settlement_reconciliation(self, row: dict[str, Any]) -> str:
         now = utc_now_iso()
         reconciliation_id = str(
@@ -956,10 +1044,16 @@ class SQLiteStore:
         mismatches = 0
         with self.connect() as connection:
             positions = connection.execute(
-                "SELECT position_id, config_json FROM funding_capture_positions"
+                "SELECT position_id, state, closed_at, config_json FROM funding_capture_positions"
             ).fetchall()
             for pos in positions:
                 position_id = str(pos["position_id"])
+                position_state = str(pos["state"] or "")
+                position_closed = pos["closed_at"] is not None
+                try:
+                    position_config = json.loads(pos["config_json"] or "{}")
+                except (TypeError, ValueError):
+                    position_config = {}
                 cycles = connection.execute(
                     """
                     SELECT *
@@ -1021,6 +1115,38 @@ class SQLiteStore:
                             (json.dumps(evidence, sort_keys=True), now_iso, cycle_id),
                         )
                         mismatches += 1
+                        if (
+                            not position_closed
+                            and position_state not in {
+                                "FAILED",
+                                "REJECTED_AFTER_SUBMISSION",
+                                "CLOSED_PENDING_RECONCILIATION",
+                                "CLOSED_REQUIRES_REVIEW",
+                                "RECONCILED",
+                                "UNRECONCILED",
+                            }
+                        ):
+                            diagnostics = list(position_config.get("settlement_plan_mismatches") or [])
+                            diagnostics.append(evidence)
+                            position_config["settlement_plan_mismatches"] = diagnostics[-10:]
+                            position_config["lifecycle_state"] = "SETTLEMENT_PLAN_MISMATCH"
+                            position_config["blocker"] = "settlement_plan_event_mismatch"
+                            position_config["requires_review"] = True
+                            connection.execute(
+                                """
+                                UPDATE funding_capture_positions
+                                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                                    config_json = ?,
+                                    updated_at = ?
+                                WHERE position_id = ?
+                                """,
+                                (
+                                    json.dumps(position_config, sort_keys=True),
+                                    now_iso,
+                                    position_id,
+                                ),
+                            )
+                            position_state = "SETTLEMENT_PLAN_MISMATCH"
                         continue
                     if (
                         obligation_count > 0
@@ -1080,6 +1206,54 @@ class SQLiteStore:
                         (captured_count, now_iso, position_id),
                     )
                     repaired_counts += 1
+                mismatch_cycle = connection.execute(
+                    """
+                    SELECT cycle_id, boundary_evidence_json
+                    FROM funding_capture_cycles
+                    WHERE position_id = ?
+                      AND state = 'SETTLEMENT_PLAN_MISMATCH'
+                    ORDER BY cycle_number
+                    LIMIT 1
+                    """,
+                    (position_id,),
+                ).fetchone()
+                if (
+                    mismatch_cycle is not None
+                    and not position_closed
+                    and position_state not in {
+                        "SETTLEMENT_PLAN_MISMATCH",
+                        "FAILED",
+                        "REJECTED_AFTER_SUBMISSION",
+                        "CLOSED_PENDING_RECONCILIATION",
+                        "CLOSED_REQUIRES_REVIEW",
+                        "RECONCILED",
+                        "UNRECONCILED",
+                    }
+                ):
+                    try:
+                        evidence = json.loads(mismatch_cycle["boundary_evidence_json"] or "{}")
+                    except (TypeError, ValueError):
+                        evidence = {}
+                    evidence.setdefault("cycle_id", mismatch_cycle["cycle_id"])
+                    evidence.setdefault("position_id", position_id)
+                    evidence.setdefault("blocker", "settlement_plan_event_mismatch")
+                    diagnostics = list(position_config.get("settlement_plan_mismatches") or [])
+                    diagnostics.append(evidence)
+                    position_config["settlement_plan_mismatches"] = diagnostics[-10:]
+                    position_config["lifecycle_state"] = "SETTLEMENT_PLAN_MISMATCH"
+                    position_config["blocker"] = "settlement_plan_event_mismatch"
+                    position_config["requires_review"] = True
+                    connection.execute(
+                        """
+                        UPDATE funding_capture_positions
+                        SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                            config_json = ?,
+                            updated_at = ?
+                        WHERE position_id = ?
+                        """,
+                        (json.dumps(position_config, sort_keys=True), now_iso, position_id),
+                    )
+                    mismatches += 1
         return {
             "position_counters_repaired": repaired_counts,
             "cycles_completed_from_obligations": completed_cycles,
@@ -1268,6 +1442,7 @@ class SQLiteStore:
                 "EXIT_SUBMITTED",
                 "PARTIALLY_CLOSED",
                 "EMERGENCY_UNWIND",
+                "SETTLEMENT_PLAN_MISMATCH",
             }
         )
 
@@ -8691,18 +8866,33 @@ class SQLiteStore:
             ledger_rows = connection.execute(
                 "SELECT * FROM paper_event_ledger ORDER BY created_at"
             ).fetchall()
+            reconciliation_rows = connection.execute(
+                """
+                SELECT *
+                FROM funding_settlement_reconciliations
+                WHERE status IN (
+                    'RATE_AND_MARK_RECONCILED',
+                    'RECONCILIATION_EFFECT_MISMATCH'
+                )
+                ORDER BY scheduled_funding_at, venue
+                """
+            ).fetchall()
         cash_by_venue: dict[str, float] = {}
         reserve_by_venue: dict[str, float] = {}
+        decoded_ledger_rows: list[dict[str, Any]] = []
         for row in ledger_rows:
+            item = dict(row)
             venue = str(row["venue"] or "")
-            if not venue:
-                continue
-            cash_by_venue[venue] = cash_by_venue.get(venue, 0.0) + float(row["cash_delta"] or 0.0)
             payload: dict[str, Any]
             try:
                 payload = json.loads(row["payload_json"] or "{}")
             except (TypeError, ValueError):
                 payload = {}
+            item["payload"] = payload
+            decoded_ledger_rows.append(item)
+            if not venue:
+                continue
+            cash_by_venue[venue] = cash_by_venue.get(venue, 0.0) + float(row["cash_delta"] or 0.0)
             event_type = str(row["event_type"] or "")
             if event_type == "collateral_reserve":
                 reserve_by_venue[venue] = reserve_by_venue.get(venue, 0.0) + float(payload.get("amount") or 0.0)
@@ -8743,6 +8933,93 @@ class SQLiteStore:
                     "expected": expected_reserved,
                     "actual": actual_reserved,
                 })
+        ledger_by_key = {
+            str(row.get("event_key") or ""): row
+            for row in decoded_ledger_rows
+            if str(row.get("event_key") or "")
+        }
+        for recon in reconciliation_rows:
+            try:
+                evidence = json.loads(recon["evidence_json"] or "{}")
+            except (TypeError, ValueError):
+                evidence = {}
+            financial_effect = (
+                evidence.get("financial_effect")
+                if isinstance(evidence.get("financial_effect"), dict)
+                else {}
+            )
+            position_id = str(recon["position_id"] or "")
+            venue = str(recon["venue"] or "")
+            cycle_id = str(recon["cycle_id"] or "")
+            scheduled_at = str(recon["scheduled_funding_at"] or "")
+            event_key = str(financial_effect.get("event_key") or "")
+            ledger = ledger_by_key.get(event_key) if event_key else None
+            if ledger is None:
+                suffix = f":{venue}:{scheduled_at}"
+                candidates = [
+                    row
+                    for row in decoded_ledger_rows
+                    if str(row.get("event_type") or "") == "funding"
+                    and str(row.get("position_id") or "") == position_id
+                    and str(row.get("cycle_id") or "") == cycle_id
+                    and str(row.get("venue") or "") == venue
+                    and str(row.get("event_key") or "").endswith(suffix)
+                ]
+                ledger = candidates[0] if len(candidates) == 1 else None
+                if ledger is not None:
+                    event_key = str(ledger.get("event_key") or "")
+            if ledger is None:
+                mismatches.append(
+                    {
+                        "venue": venue,
+                        "kind": "reconciliation_effect_missing",
+                        "position_id": position_id,
+                        "cycle_id": cycle_id,
+                        "scheduled_funding_at": scheduled_at,
+                        "event_key": event_key or None,
+                    }
+                )
+                continue
+            effect_mismatches: list[str] = []
+            expected_pnl = float(recon["funding_pnl"] or 0.0)
+            actual_delta = float(ledger.get("cash_delta") or 0.0)
+            if str(ledger.get("event_type") or "") != "funding":
+                effect_mismatches.append("event_type")
+            if str(ledger.get("position_id") or "") != position_id:
+                effect_mismatches.append("position_id")
+            if str(ledger.get("cycle_id") or "") != cycle_id:
+                effect_mismatches.append("cycle_id")
+            if str(ledger.get("venue") or "") != venue:
+                effect_mismatches.append("venue")
+            if abs(actual_delta - expected_pnl) > 1e-8:
+                effect_mismatches.append("cash_delta")
+            payload = ledger.get("payload") if isinstance(ledger.get("payload"), dict) else {}
+            if str(payload.get("side") or "") != str(recon["side"] or ""):
+                effect_mismatches.append("side")
+            if not str(event_key or ledger.get("event_key") or "").endswith(f":{venue}:{scheduled_at}"):
+                effect_mismatches.append("event_key_scheduled_identity")
+            financial_delta = financial_effect.get("cash_delta")
+            if financial_delta is not None:
+                try:
+                    financial_delta_float = float(financial_delta)
+                except (TypeError, ValueError):
+                    financial_delta_float = math.nan
+                if not math.isfinite(financial_delta_float) or abs(financial_delta_float - expected_pnl) > 1e-8:
+                    effect_mismatches.append("financial_effect_cash_delta")
+            if effect_mismatches:
+                mismatches.append(
+                    {
+                        "venue": venue,
+                        "kind": "reconciliation_effect_mismatch",
+                        "position_id": position_id,
+                        "cycle_id": cycle_id,
+                        "scheduled_funding_at": scheduled_at,
+                        "event_key": event_key or ledger.get("event_key"),
+                        "mismatches": list(dict.fromkeys(effect_mismatches)),
+                        "expected_cash_delta": expected_pnl,
+                        "actual_cash_delta": actual_delta,
+                    }
+                )
         return {
             "ok": not mismatches,
             "mismatches": mismatches,

@@ -7,8 +7,17 @@ dependencies = [
     "websocket-client>=1.8,<2",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<9",
+]
+
 [project.scripts]
 smr = "smart_money_radar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["smart_money_radar*"]
+exclude = ["config*", "queries*", "warehouse*", "scripts*", "tests*"]
 
 [build-system]
 requires = ["setuptools>=68"]

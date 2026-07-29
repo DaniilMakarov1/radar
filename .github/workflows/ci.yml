@@ -15,13 +15,15 @@ jobs:
       PYTHONPATH: "."
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest
+          python -m pip install -e ".[test]"
       - name: Compile check
         run: |
           python -m py_compile \
@@ -29,10 +31,11 @@ jobs:
             smart_money_radar/funding/trader.py \
             smart_money_radar/funding/strategy_synchronized_funding.py \
             smart_money_radar/funding/stablecoins.py \
+            smart_money_radar/funding/shadow_monitor.py \
             smart_money_radar/funding/fees.py \
             smart_money_radar/storage.py
-      - name: Targeted synchronized funding tests
-        run: python -m pytest tests/test_synchronized_funding_v2.py -q
+      - name: Targeted synchronized funding and shadow tests
+        run: python -m pytest tests/test_synchronized_funding_v2.py tests/test_funding_shadow_monitor.py -q
       - name: Reconciliation tests
         run: python -m pytest tests/test_reconciliation_worker.py -q
       - name: Full pytest suite
@@ -42,4 +45,11 @@ jobs:
       - name: Two-cycle paper MVP scenario
         run: python scripts/run_synchronized_funding_two_cycle_paper_mvp.py
       - name: Diff check
-        run: git diff --check
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+            git diff --check "${{ github.event.pull_request.base.sha }}" HEAD
+          else
+            git diff --check HEAD^ HEAD
+          fi

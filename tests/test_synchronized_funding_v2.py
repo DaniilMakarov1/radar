@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 
 from smart_money_radar.funding.profiles import funding_bot_profile
-from smart_money_radar.funding.fees import fee_evidence_status
+from smart_money_radar.funding.fees import (
+    fee_evidence_status,
+    fee_override,
+    fee_rate_value,
+    funding_fee_rate,
+    parsed_fee,
+)
 from smart_money_radar.funding.strategy_synchronized_funding import (
     FundingSettlementPlanner,
     STRATEGY_NAME,
@@ -1952,7 +1958,7 @@ def _boost_next_cycle_funding(route: dict, *, long_rate: float = -0.018, short_r
 
 def test_paperbot_v2_entry_uses_new_runtime_not_legacy_open(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
-    store, _bot, _route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    store, _bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
 
     assert opened == [capture_id]
     assert store.funding_paper_open_positions() == []
@@ -4472,6 +4478,83 @@ def test_entry_submitted_recovery_aborts_without_reserve_or_orders(tmp_path) -> 
     assert store.funding_paper_order_rows(capture_id) == []
 
 
+def test_begin_entry_attempt_rolls_back_config_and_state_on_fault(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2, capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    route = _v2_runtime_route(now)
+    capture_id = capture_position_id_for_route(route)
+    settlement_at = now + timedelta(seconds=30)
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route_plan = runtime._plan_dict_for_route(route, now)
+    runtime._ensure_discovered_or_armed(route, capture_id, settlement_at, 30.0, now)
+    runtime._mark_armed(route, capture_id, settlement_at, now, route_plan, {"passed": True})
+
+    with pytest.raises(RuntimeError, match="fault_after_config"):
+        store.begin_funding_entry_attempt(
+            position_id=capture_id,
+            route_key=route["route_key"],
+            route_entry_key=route_entry_key(route),
+            attempt_id="faulted-attempt",
+            settlement_at=settlement_at,
+            submitted_at=now,
+            fault_after="config",
+        )
+
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "ARMED"
+    assert position["config"].get("entry_attempt_submitted") is not True
+    assert position["config"].get("entry_attempts") in (None, [])
+    assert runtime._opportunity_guard(capture_id)["allowed"] is True
+
+
+def test_legacy_armed_submitted_marker_recovers_aborted_idempotently(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    capture_id, attempt_id, _route = _seed_entry_submitted_attempt(store, now)
+    store.update_funding_capture_position_state(capture_id, "ARMED", now)
+
+    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now + timedelta(seconds=5)))
+    second = bot.synchronized_runtime.recover_stale_entry_submissions(now + timedelta(seconds=6))
+
+    position = store.funding_capture_position_by_id(capture_id)
+    assert bot.last_runtime_recovery["entry_submitted"]["recovered_aborted"] == 1
+    assert second["processed"] == 0
+    assert position["state"] == "FAILED"
+    assert position["config"]["entry_attempt_id"] == attempt_id
+    assert position["config"]["entry_attempt_state"] == "RECOVERED_ABORTED"
+    assert all(
+        not (
+            row["config"].get("entry_attempt_submitted")
+            and row["state"] not in {
+                "ENTRY_SUBMITTED",
+                "OPEN",
+                "FAILED",
+                "REJECTED_AFTER_SUBMISSION",
+                "CLOSED_PENDING_RECONCILIATION",
+                "CLOSED_REQUIRES_REVIEW",
+                "RECONCILED",
+                "UNRECONCILED",
+            }
+        )
+        for row in store.funding_capture_position_rows()
+    )
+
+
 def test_entry_submitted_recovery_releases_reserve_without_orders(tmp_path) -> None:
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
@@ -5187,6 +5270,106 @@ def test_out_of_range_fee_blocks_without_clamp() -> None:
     assert status["blocker"] == "taker_fee_rate_out_of_range"
 
 
+def _clear_fee_override_env(monkeypatch) -> None:
+    for name in (
+        "FUNDING_BINANCE_TAKER_FEE",
+        "FUNDING_BINANCE_MAKER_FEE",
+        "FUNDING_BYBIT_TAKER_FEE",
+        "FUNDING_FEE_OVERRIDES_JSON",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_direct_fee_override_out_of_range_is_invalid_not_clamped(monkeypatch) -> None:
+    _clear_fee_override_env(monkeypatch)
+    monkeypatch.setenv("FUNDING_BINANCE_TAKER_FEE", "0.5")
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert parsed_fee("0.5") is None
+    assert fee_override("binance", "taker") is None
+    assert fee_rate_value(market, "taker") is None
+    assert math.isnan(funding_fee_rate(market, "taker"))
+    assert not status["verified"]
+    assert status["trust_status"] == "INVALID"
+    assert status["blocker"] == "taker_fee_override_invalid"
+    assert status["rate"] != pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("raw", ["NaN", "inf", "-inf"])
+def test_direct_fee_override_non_finite_is_invalid(monkeypatch, raw: str) -> None:
+    _clear_fee_override_env(monkeypatch)
+    monkeypatch.setenv("FUNDING_BINANCE_TAKER_FEE", raw)
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert fee_rate_value(market, "taker") is None
+    assert math.isnan(funding_fee_rate(market, "taker"))
+    assert status["blocker"] == "taker_fee_override_invalid"
+
+
+def test_json_fee_override_out_of_range_is_invalid_not_clamped(monkeypatch) -> None:
+    _clear_fee_override_env(monkeypatch)
+    monkeypatch.setenv("FUNDING_FEE_OVERRIDES_JSON", json.dumps({"binance": {"taker": 0.5}}))
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert fee_override("binance", "taker") is None
+    assert fee_rate_value(market, "taker") is None
+    assert math.isnan(funding_fee_rate(market, "taker"))
+    assert status["blocker"] == "taker_fee_override_invalid"
+    assert status["rate"] != pytest.approx(0.02)
+
+
+def test_malformed_json_fee_override_is_blocker_not_default(monkeypatch) -> None:
+    _clear_fee_override_env(monkeypatch)
+    monkeypatch.setenv("FUNDING_FEE_OVERRIDES_JSON", "{bad")
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert fee_rate_value(market, "taker") is None
+    assert math.isnan(funding_fee_rate(market, "taker"))
+    assert status["blocker"] == "funding_fee_overrides_json_malformed"
+
+
+def test_valid_fee_override_still_requires_versioned_evidence(monkeypatch) -> None:
+    _clear_fee_override_env(monkeypatch)
+    monkeypatch.setenv("FUNDING_BINANCE_TAKER_FEE", "0.0004")
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+    market.pop("fee_evidence")
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert fee_override("binance", "taker") == pytest.approx(0.0004)
+    assert fee_rate_value(market, "taker") == pytest.approx(0.0004)
+    assert funding_fee_rate(market, "taker") == pytest.approx(0.0004)
+    assert status["rate"] == pytest.approx(0.0004)
+    assert not status["verified"]
+    assert status["blocker"] == "taker_fee_evidence_missing"
+
+
+def test_absent_fee_override_uses_verified_market_fee(monkeypatch) -> None:
+    _clear_fee_override_env(monkeypatch)
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    market = _fee_status_market(now)
+
+    status = fee_evidence_status(market, "taker", now=now)
+
+    assert fee_override("binance", "taker") is None
+    assert fee_rate_value(market, "taker") == pytest.approx(0.0005)
+    assert funding_fee_rate(market, "taker") == pytest.approx(0.0005)
+    assert status["verified"]
+
+
 def test_full_explicit_trusted_fee_fixture_passes() -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     status = fee_evidence_status(_fee_status_market(now), "taker", now=now)
@@ -5589,7 +5772,7 @@ def test_zero_obligation_crossed_legacy_cycle_fails_closed(tmp_path, monkeypatch
     from smart_money_radar.paper_bot.clock import FakeClock
 
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
-    store, _bot, _route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    store, _bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     assert opened == [capture_id]
     store.update_funding_capture_cycle_state(
         f"{capture_id}:1",
@@ -5606,6 +5789,14 @@ def test_zero_obligation_crossed_legacy_cycle_fails_closed(tmp_path, monkeypatch
     assert restarted.last_runtime_recovery["boundary"]["zero_obligation_mismatches"] == 1
     assert store.funding_capture_cycles_for_position(capture_id)[0]["state"] == "SETTLEMENT_PLAN_MISMATCH"
     assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
+
+    _install_targeted_refresh_clients(restarted, route["route_key"], route)
+    assert restarted.process_open_positions() == ["closed_requires_review"]
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_REQUIRES_REVIEW"
+    assert store.funding_settlement_reconciliation_rows(capture_id) == []
+    assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
 
 
 def test_active_cycle_event_mismatch_does_not_cross_or_create_obligations(tmp_path, monkeypatch) -> None:
@@ -5632,12 +5823,76 @@ def test_active_cycle_event_mismatch_does_not_cross_or_create_obligations(tmp_pa
 
     outcomes = bot.process_open_positions()
 
-    assert outcomes == ["settlement_plan_mismatch"]
+    assert outcomes == ["settlement_plan_mismatch", "closed_requires_review"]
     assert store.funding_settlement_reconciliation_rows(capture_id) == []
     updated_cycle = store.funding_capture_cycles_for_position(capture_id)[0]
     assert updated_cycle["state"] == "SETTLEMENT_PLAN_MISMATCH"
     assert updated_cycle["boundary_evidence"]["blocker"] == "settlement_plan_event_mismatch"
-    assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["settlements_captured_count"] == 0
+    assert position["state"] == "CLOSED_REQUIRES_REVIEW"
+    assert position["config"]["close_requires_review_reason"] == "settlement_plan_event_mismatch"
+    assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
+    assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
+    assert all(row["position_id"] != capture_id for row in store.funding_capture_open_positions())
+
+
+def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monkeypatch) -> None:
+    from smart_money_radar.funding.trader import CaptureRouteRefreshResult
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    plan = dict(cycle["active_plan"])
+    events = [dict(event) for event in plan["included_settlement_events"]]
+    events[0]["scheduled_at"] = (now + timedelta(seconds=33)).isoformat()
+    plan["included_settlement_events"] = events
+    plan["expected_event_count"] = 2
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE funding_capture_cycles
+            SET active_plan_json = ?
+            WHERE cycle_id = ?
+            """,
+            (json.dumps(plan, sort_keys=True), cycle["cycle_id"]),
+        )
+    bot.clock.advance(31)
+    bad_route = _fresh_route_for_open_position(route, bot.clock.now())
+    for leg in bad_route["legs"]:
+        if leg["side"] == "long":
+            leg["bids"] = []
+        if leg["side"] == "short":
+            leg["asks"] = []
+
+    bot.refresh_open_capture_route = lambda position, now: CaptureRouteRefreshResult(  # type: ignore[method-assign]
+        quality="FRESH",
+        route=bad_route,
+        snapshot_id="bad-close-book",
+        reason=None,
+    )
+    first = bot.process_open_positions()
+
+    assert first == ["settlement_plan_mismatch", "close_failed"]
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
+    assert store.funding_settlement_reconciliation_rows(capture_id) == []
+
+    good_route = _fresh_route_for_open_position(route, bot.clock.now())
+    bot.refresh_open_capture_route = lambda position, now: CaptureRouteRefreshResult(  # type: ignore[method-assign]
+        quality="FRESH",
+        route=good_route,
+        snapshot_id="good-close-book",
+        reason=None,
+    )
+    second = bot.process_open_positions()
+
+    assert second == ["closed_requires_review"]
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_REQUIRES_REVIEW"
+    assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
+    assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
 
 
 def test_restart_between_boundary_and_reconciliation_preserves_obligation(tmp_path, monkeypatch) -> None:

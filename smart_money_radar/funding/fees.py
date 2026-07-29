@@ -80,9 +80,11 @@ def funding_fee_rate(
 ) -> float:
     role = "maker" if liquidity_role == "maker" else "taker"
     venue = str(market.get("venue") or "").lower()
-    override = fee_override(venue, role)
-    if override is not None:
-        return override
+    override_status = fee_override_status(venue, role)
+    if override_status.get("present"):
+        if override_status.get("valid"):
+            return float(override_status["rate"])
+        return math.nan
     field = f"{role}_fee_rate"
     raw = market.get(field)
     defaults = (
@@ -99,8 +101,11 @@ def funding_fee_rate(
 def funding_fee_source(market: dict[str, Any], liquidity_role: str = "taker") -> str:
     role = "maker" if liquidity_role == "maker" else "taker"
     venue = str(market.get("venue") or "").lower()
-    if fee_override(venue, role) is not None:
+    override_status = fee_override_status(venue, role)
+    if override_status.get("present") and override_status.get("valid"):
         return "account_override"
+    if override_status.get("present"):
+        return "invalid_account_override"
     if market.get(f"{role}_fee_rate") is not None:
         return str(market.get("fee_source") or "venue_public_tier")
     return "public_default"
@@ -111,6 +116,10 @@ def fee_rate_value(
     liquidity_role: str = "taker",
 ) -> float | None:
     role = "maker" if liquidity_role == "maker" else "taker"
+    venue = str(market.get("venue") or "").lower()
+    override_status = fee_override_status(venue, role)
+    if override_status.get("present"):
+        return float(override_status["rate"]) if override_status.get("valid") else None
     raw = market.get(f"{role}_fee_rate")
     if raw is None and role == "taker":
         raw = market.get("fee_rate")
@@ -197,6 +206,18 @@ def fee_evidence_status(
         "reviewed_at": None,
         "blocker": None,
     }
+    override_status = fee_override_status(venue, role)
+    if override_status.get("present"):
+        status["override_source"] = override_status.get("source")
+        status["override_raw_value"] = override_status.get("raw_value")
+        if not override_status.get("valid"):
+            status["rate"] = override_status.get("raw_value")
+            status["trust_status"] = "INVALID"
+            status["blocker"] = str(
+                override_status.get("blocker") or f"{role}_fee_override_invalid"
+            )
+            return status
+        status["rate"] = float(override_status["rate"])
     if rate is None:
         status["blocker"] = (
             f"{role}_fee_rate_out_of_range"
@@ -313,29 +334,88 @@ def verified_vip1_fee_profile(venue: str) -> dict[str, Any] | None:
 
 
 def fee_override(venue: str, role: str) -> float | None:
+    status = fee_override_status(venue, role)
+    return float(status["rate"]) if status.get("present") and status.get("valid") else None
+
+
+def fee_override_status(venue: str, role: str) -> dict[str, Any]:
+    role = "maker" if role == "maker" else "taker"
+    venue = str(venue or "").lower()
     direct_name = f"FUNDING_{venue.upper()}_{role.upper()}_FEE"
     direct = os.getenv(direct_name)
     if direct not in {None, ""}:
-        return parsed_fee(direct)
+        parsed = parsed_fee_for_role(direct, role)
+        if parsed is None:
+            return {
+                "present": True,
+                "valid": False,
+                "source": direct_name,
+                "raw_value": direct,
+                "blocker": f"{role}_fee_override_invalid",
+            }
+        return {
+            "present": True,
+            "valid": True,
+            "source": direct_name,
+            "raw_value": direct,
+            "rate": parsed,
+        }
 
     raw = os.getenv("FUNDING_FEE_OVERRIDES_JSON", "").strip()
     if not raw:
-        return None
+        return {"present": False, "valid": False}
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return None
+        return {
+            "present": True,
+            "valid": False,
+            "source": "FUNDING_FEE_OVERRIDES_JSON",
+            "raw_value": raw,
+            "blocker": "funding_fee_overrides_json_malformed",
+        }
     if not isinstance(payload, dict):
-        return None
+        return {
+            "present": True,
+            "valid": False,
+            "source": "FUNDING_FEE_OVERRIDES_JSON",
+            "raw_value": raw,
+            "blocker": "funding_fee_overrides_json_invalid",
+        }
     venue_payload = payload.get(venue)
     if not isinstance(venue_payload, dict):
-        return None
-    return parsed_fee(venue_payload.get(role))
+        return {"present": False, "valid": False}
+    if role not in venue_payload:
+        return {"present": False, "valid": False}
+    parsed = parsed_fee_for_role(venue_payload.get(role), role)
+    if parsed is None:
+        return {
+            "present": True,
+            "valid": False,
+            "source": "FUNDING_FEE_OVERRIDES_JSON",
+            "raw_value": venue_payload.get(role),
+            "blocker": f"{role}_fee_override_invalid",
+        }
+    return {
+        "present": True,
+        "valid": True,
+        "source": "FUNDING_FEE_OVERRIDES_JSON",
+        "raw_value": venue_payload.get(role),
+        "rate": parsed,
+    }
 
 
 def parsed_fee(value: Any) -> float | None:
+    return parsed_fee_for_role(value, "maker")
+
+
+def parsed_fee_for_role(value: Any, role: str) -> float | None:
     try:
         rate = float(value)
     except (TypeError, ValueError):
         return None
-    return max(-0.001, min(rate, 0.02))
+    if not math.isfinite(rate):
+        return None
+    if role == "maker":
+        return rate if -0.001 <= rate <= 0.02 else None
+    return rate if 0.0 <= rate <= 0.02 else None

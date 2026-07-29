@@ -637,6 +637,9 @@ class SynchronizedFundingRuntimeV2:
                     ),
                 )
                 repaired += 1
+            validation = self._validate_reconciliation_financial_effect(row)
+            if validation.get("diagnostic") == "RECONCILIATION_EFFECT_MISMATCH":
+                self._mark_reconciliation_effect_mismatch(row, validation)
         account_report = self.store.paper_account_consistency_report()
         account_repaired = False
         if not account_report.get("ok"):
@@ -678,28 +681,124 @@ class SynchronizedFundingRuntimeV2:
         }
 
     def _reconciliation_financial_effect_ready(self, row: dict[str, Any]) -> bool:
+        validation = self._validate_reconciliation_financial_effect(row)
+        if validation.get("ready"):
+            return True
+        if validation.get("diagnostic") == "RECONCILIATION_EFFECT_MISMATCH":
+            self._mark_reconciliation_effect_mismatch(row, validation)
+        return False
+
+    def _validate_reconciliation_financial_effect(self, row: dict[str, Any]) -> dict[str, Any]:
         if str(row.get("status") or "") != "RATE_AND_MARK_RECONCILED":
-            return False
+            return {"ready": False, "reason": "reconciliation_not_rate_and_mark"}
         evidence = dict(row.get("evidence") or {})
         financial_effect = evidence.get("financial_effect") if isinstance(evidence.get("financial_effect"), dict) else {}
         event_key = str(financial_effect.get("event_key") or "")
         position_id = str(row["position_id"])
+        venue = str(row.get("venue") or "")
+        cycle_id = str(row.get("cycle_id") or "")
+        scheduled_at = str(row.get("scheduled_funding_at") or "")
         if not event_key:
             position = self.store.funding_capture_position_by_id(position_id) or {}
             event_key = funding_event_key(
                 position_id,
-                str(row["venue"]),
-                str(row["scheduled_funding_at"]),
+                venue,
+                scheduled_at,
                 attempt_id=_position_attempt_id(position),
             )
         ledger_rows = self.store.paper_event_ledger_rows(position_id)
-        return any(
-            str(item.get("event_key") or "") == event_key
-            and str(item.get("event_type") or "") == "funding"
-            and str(item.get("venue") or "") == str(row.get("venue") or "")
-            and str(item.get("cycle_id") or "") == str(row.get("cycle_id") or "")
-            for item in ledger_rows
+        ledger = next(
+            (item for item in ledger_rows if str(item.get("event_key") or "") == event_key),
+            None,
         )
+        if ledger is None:
+            return {"ready": False, "reason": "funding_ledger_missing", "event_key": event_key}
+        mismatches: list[str] = []
+        expected_pnl = optional_float(row.get("funding_pnl"))
+        actual_delta = optional_float(ledger.get("cash_delta"))
+        payload = ledger.get("payload") if isinstance(ledger.get("payload"), dict) else {}
+        if str(ledger.get("event_type") or "") != "funding":
+            mismatches.append("event_type")
+        if str(ledger.get("position_id") or "") != position_id:
+            mismatches.append("position_id")
+        if str(ledger.get("cycle_id") or "") != cycle_id:
+            mismatches.append("cycle_id")
+        if str(ledger.get("venue") or "") != venue:
+            mismatches.append("venue")
+        if expected_pnl is None or actual_delta is None or not math.isclose(
+            float(actual_delta),
+            float(expected_pnl),
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            mismatches.append("cash_delta")
+        payload_side = str(payload.get("side") or "")
+        if payload_side and payload_side != str(row.get("side") or ""):
+            mismatches.append("side")
+        expected_suffix = f":{venue}:{scheduled_at}"
+        if not event_key.endswith(expected_suffix):
+            mismatches.append("event_key_scheduled_identity")
+        financial_event_key = str(financial_effect.get("event_key") or "")
+        if financial_event_key and financial_event_key != event_key:
+            mismatches.append("financial_effect_event_key")
+        financial_delta = optional_float(financial_effect.get("cash_delta"))
+        if financial_delta is not None and expected_pnl is not None and not math.isclose(
+            float(financial_delta),
+            float(expected_pnl),
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            mismatches.append("financial_effect_cash_delta")
+        if mismatches:
+            return {
+                "ready": False,
+                "diagnostic": "RECONCILIATION_EFFECT_MISMATCH",
+                "event_key": event_key,
+                "mismatches": list(dict.fromkeys(mismatches)),
+                "expected_cash_delta": expected_pnl,
+                "actual_cash_delta": actual_delta,
+                "position_id": position_id,
+                "cycle_id": cycle_id,
+                "venue": venue,
+            }
+        return {"ready": True, "event_key": event_key}
+
+    def _mark_reconciliation_effect_mismatch(
+        self,
+        row: dict[str, Any],
+        validation: dict[str, Any],
+    ) -> None:
+        position_id = str(row.get("position_id") or "")
+        cycle_id = str(row.get("cycle_id") or "")
+        evidence = dict(row.get("evidence") or {})
+        evidence["financial_effect_mismatch"] = {
+            key: value
+            for key, value in validation.items()
+            if key not in {"ready"}
+        }
+        evidence["requires_review"] = True
+        self._update_reconciliation_row(
+            row,
+            status="RECONCILIATION_EFFECT_MISMATCH",
+            evidence_update=evidence,
+        )
+        if cycle_id:
+            self.store.update_funding_capture_cycle_state(
+                cycle_id,
+                "RECONCILIATION_EFFECT_MISMATCH",
+                reconciliation_status="RECONCILIATION_EFFECT_MISMATCH",
+            )
+        position = self.store.funding_capture_position_by_id(position_id) or {}
+        if str(position.get("state") or "") == "CLOSED_PENDING_RECONCILIATION":
+            config = dict(position.get("config") or {})
+            config["lifecycle_state"] = "CLOSED_REQUIRES_REVIEW"
+            config["requires_review"] = True
+            config["blocker"] = "reconciliation_effect_mismatch"
+            self.store.update_funding_capture_position_state(
+                position_id,
+                "CLOSED_REQUIRES_REVIEW",
+            )
+            self.store.update_funding_capture_position_config(position_id, config)
 
     def process_pending_reconciliations(self, now: datetime) -> dict[str, Any]:
         """Process all PENDING reconciliation rows.
@@ -1846,7 +1945,14 @@ class SynchronizedFundingRuntimeV2:
                 "attempt_id": config.get("entry_attempt_id"),
                 "state": state,
             }
-        if state in {"FAILED", "REJECTED_AFTER_SUBMISSION", "CLOSED_PENDING_RECONCILIATION", "RECONCILED", "UNRECONCILED"}:
+        if state in {
+            "FAILED",
+            "REJECTED_AFTER_SUBMISSION",
+            "CLOSED_PENDING_RECONCILIATION",
+            "CLOSED_REQUIRES_REVIEW",
+            "RECONCILED",
+            "UNRECONCILED",
+        }:
             return {
                 "allowed": False,
                 "reason": "opportunity_terminal",
@@ -1869,25 +1975,14 @@ class SynchronizedFundingRuntimeV2:
         settlement_at: datetime,
         decision_at: datetime,
     ) -> None:
-        position = self.store.funding_capture_position_by_id(capture_id)
-        config = dict((position or {}).get("config") or {})
-        attempts = list(config.get("entry_attempts") or [])
-        attempts.append(
-            {
-                "attempt_id": attempt_id,
-                "opportunity_id": capture_id,
-                "route_entry_key": route_entry_key(route),
-                "settlement_at": settlement_at.astimezone(UTC).isoformat(),
-                "submitted_at": decision_at.astimezone(UTC).isoformat(),
-                "state": "ENTRY_SUBMITTED",
-            }
+        self.store.begin_funding_entry_attempt(
+            position_id=capture_id,
+            route_key=str(route.get("route_key") or ""),
+            route_entry_key=route_entry_key(route),
+            attempt_id=attempt_id,
+            settlement_at=settlement_at,
+            submitted_at=decision_at,
         )
-        config["opportunity_id"] = capture_id
-        config["entry_attempt_id"] = attempt_id
-        config["entry_attempt_submitted"] = True
-        config["entry_attempt_submitted_at"] = decision_at.astimezone(UTC).isoformat()
-        config["entry_attempts"] = attempts
-        self.store.update_funding_capture_position_config(capture_id, config, decision_at)
 
     def _mark_entry_attempt_terminal(
         self,
@@ -1934,7 +2029,38 @@ class SynchronizedFundingRuntimeV2:
         completed_open = 0
         aborted = 0
         unwound = 0
-        for position in self.store.funding_capture_position_rows(states={"ENTRY_SUBMITTED"}):
+        terminal_states = {
+            "FAILED",
+            "REJECTED_AFTER_SUBMISSION",
+            "CLOSED_PENDING_RECONCILIATION",
+            "CLOSED_REQUIRES_REVIEW",
+            "RECONCILED",
+            "UNRECONCILED",
+        }
+        live_states = {
+            "OPEN",
+            "HOLDING_NEXT_CYCLE",
+            "SETTLEMENT_CROSSED",
+            "POST_SETTLEMENT_EVALUATION",
+            "EXIT_SCHEDULED",
+            "EXIT_SUBMITTED",
+            "PARTIALLY_CLOSED",
+            "EMERGENCY_UNWIND",
+            "SETTLEMENT_PLAN_MISMATCH",
+        }
+        candidates: list[dict[str, Any]] = []
+        for position in self.store.funding_capture_position_rows():
+            state = str(position.get("state") or "")
+            config = dict(position.get("config") or {})
+            if state == "ENTRY_SUBMITTED":
+                candidates.append(position)
+                continue
+            if not config.get("entry_attempt_submitted"):
+                continue
+            if state in terminal_states or state in live_states:
+                continue
+            candidates.append(position)
+        for position in candidates:
             position_id = str(position["position_id"])
             config = dict(position.get("config") or {})
             attempt_id = _position_attempt_id(position)
@@ -2801,7 +2927,6 @@ class SynchronizedFundingRuntimeV2:
             settlement_at=settlement_at,
             decision_at=decision_at,
         )
-        self.store.update_funding_capture_position_state(capture_id, "ENTRY_SUBMITTED", decision_at)
         self._reserve_collateral(capture_id, route, attempt_id=attempt_id)
         submitted_at = decision_at + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
@@ -4195,7 +4320,13 @@ class SynchronizedFundingRuntimeV2:
                 )
             )
         self._release_collateral(position_id, route or {"legs": entry_legs}, attempt_id=attempt_id)
-        final_state = "CLOSED_PENDING_RECONCILIATION"
+        mismatch_close = (
+            str(reason) == "settlement_plan_event_mismatch"
+            or str(position.get("state") or "") == "SETTLEMENT_PLAN_MISMATCH"
+            or str(position.get("current_cycle_state") or "") == "SETTLEMENT_PLAN_MISMATCH"
+            or str((position.get("config") or {}).get("blocker") or "") == "settlement_plan_event_mismatch"
+        )
+        final_state = "CLOSED_REQUIRES_REVIEW" if mismatch_close else "CLOSED_PENDING_RECONCILIATION"
         self.store.update_funding_capture_position_state(
             position_id,
             final_state,
@@ -4205,6 +4336,14 @@ class SynchronizedFundingRuntimeV2:
             paper_emergency_unwind_cost=emergency_cost,
             paper_net_pnl_estimated=pnl["paper_net_if_exit_now"],
         )
+        if mismatch_close:
+            latest = self.store.funding_capture_position_by_id(position_id) or position
+            review_config = dict(latest.get("config") or position.get("config") or {})
+            review_config["lifecycle_state"] = "CLOSED_REQUIRES_REVIEW"
+            review_config["close_requires_review_reason"] = "settlement_plan_event_mismatch"
+            review_config["blocker"] = "settlement_plan_event_mismatch"
+            review_config["requires_review"] = True
+            self.store.update_funding_capture_position_config(position_id, review_config, now)
         if attempt_id:
             self._mark_entry_attempt_terminal(
                 capture_id=position_id,

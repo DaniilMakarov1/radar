@@ -2765,6 +2765,8 @@ class PaperBot:
             "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
             "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
             "timing_policy_source": market.get("timing_policy_source"),
+            "stablecoin_route_evaluation": market.get("stablecoin_route_evaluation"),
+            "stablecoin_risk": market.get("stablecoin_risk"),
         }
 
     def refresh_open_capture_route(
@@ -3212,11 +3214,16 @@ class PaperBot:
                         )
                         position = self.store.funding_capture_position_by_id(position_id) or position
                     if last_valid_route:
+                        hard_stale_close_reason = (
+                            "settlement_plan_event_mismatch"
+                            if crossed is not None and crossed.get("state") == "SETTLEMENT_PLAN_MISMATCH"
+                            else "targeted_refresh_hard_stale"
+                        )
                         close_payload = self.synchronized_runtime.close_position(
                             position,
                             last_valid_route,
                             self.clock.now(),
-                            reason="targeted_refresh_hard_stale",
+                            reason=hard_stale_close_reason,
                             emergency=True,
                         )
                         if close_payload.get("decision") == "closed":
@@ -3275,7 +3282,78 @@ class PaperBot:
                         else "settlement_plan_mismatch"
                     )
                     position = self.store.funding_capture_position_by_id(position_id) or position
+                    if crossed.get("state") == "SETTLEMENT_PLAN_MISMATCH":
+                        close_payload = self.synchronized_runtime.close_position(
+                            position,
+                            live_route,
+                            now,
+                            reason="settlement_plan_event_mismatch",
+                        )
+                        if close_payload.get("decision") == "closed":
+                            self.record_event(
+                                "close",
+                                (
+                                    f"V2 SETTLEMENT PLAN MISMATCH CLOSE {position.get('canonical_asset')} "
+                                    f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                                    "Reason: settlement plan event mismatch; no synthetic funding obligations were created."
+                                ),
+                                {"position": position, "cycle": crossed, "close": close_payload},
+                                route_key=route_key,
+                                notify=True,
+                                severity="error",
+                            )
+                            outcomes.append("closed_requires_review")
+                            continue
+                        self.store.update_funding_capture_position_state(
+                            position_id,
+                            "SETTLEMENT_PLAN_MISMATCH",
+                            now,
+                        )
+                        self.record_event(
+                            "close_failed",
+                            (
+                                f"V2 SETTLEMENT PLAN MISMATCH CLOSE FAILED {position.get('canonical_asset')} "
+                                f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                                f"Reason: {close_payload.get('reason')}\n"
+                                "Position remains actionable for retry."
+                            ),
+                            {"position": position, "cycle": crossed, "close": close_payload},
+                            route_key=route_key,
+                            notify=True,
+                            severity="error",
+                        )
+                        outcomes.append("close_failed")
+                        continue
                     state = str(position.get("state") or state)
+            if state == "SETTLEMENT_PLAN_MISMATCH":
+                close_payload = self.synchronized_runtime.close_position(
+                    position,
+                    live_route,
+                    now,
+                    reason="settlement_plan_event_mismatch",
+                )
+                if close_payload.get("decision") == "closed":
+                    self.record_event(
+                        "close",
+                        (
+                            f"V2 SETTLEMENT PLAN MISMATCH RETRY CLOSE {position.get('canonical_asset')} "
+                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
+                            "Reason: settlement plan event mismatch retry."
+                        ),
+                        {"position": position, "close": close_payload},
+                        route_key=route_key,
+                        notify=True,
+                        severity="error",
+                    )
+                    outcomes.append("closed_requires_review")
+                    continue
+                self.store.update_funding_capture_position_state(
+                    position_id,
+                    "SETTLEMENT_PLAN_MISMATCH",
+                    now,
+                )
+                outcomes.append("close_failed")
+                continue
             try:
                 current_pnl = self.synchronized_runtime.record_current_executable_pnl(
                     position,

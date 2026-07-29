@@ -67,16 +67,33 @@ class PublicStablecoinPriceProvider:
     ) -> None:
         self.timeout_seconds = max(0.25, float(timeout_seconds))
         self.fetch_json = fetch_json or self._fetch_json
-        self._cache: dict[tuple[str, str], list[StablecoinPrice]] = {}
+        self._cache: dict[tuple[str, tuple[str, ...]], list[StablecoinPrice]] = {}
 
     def prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
         symbol = str(asset or "").upper()
         if symbol not in {"USDC", "USDT"}:
             return []
-        key = (symbol, observed_at)
-        if key not in self._cache:
+        key = (symbol, ("coinbase", "coingecko"))
+        cached = self._cache.get(key)
+        if cached is None or not self._cache_entry_fresh(cached):
             self._cache[key] = self._fetch_prices(symbol, observed_at)
         return list(self._cache[key])
+
+    @staticmethod
+    def _cache_entry_fresh(rows: list[StablecoinPrice]) -> bool:
+        if len(rows) < 2:
+            return False
+        now = datetime.now(UTC)
+        seen_sources: set[str] = set()
+        for row in rows:
+            event_at = _parse_time(row.source_event_at) or _parse_time(row.response_received_at)
+            if event_at is None or row.usd_price <= 0:
+                return False
+            age = (now - event_at.astimezone(UTC)).total_seconds()
+            if age < -1.0 or age > 5.0:
+                return False
+            seen_sources.add(str(row.source))
+        return len(seen_sources) >= 2
 
     def _fetch_prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
         rows: list[StablecoinPrice] = []

@@ -277,6 +277,79 @@ def test_reconciliation_recovery_finalizes_after_row_ledger_cash_without_cycle_f
     assert store.funding_capture_position_by_id("fc-recon-test")["state"] == "RECONCILED"
 
 
+def test_reconciliation_amount_mismatch_blocks_finalization_even_when_account_matches_ledger(tmp_path):
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    position_id = _seed_closed_pending_position(store, quantity=5.0)
+    cycle_id = f"{position_id}:1"
+    for row in store.funding_settlement_reconciliation_rows(position_id):
+        pnl = -0.5 if row["side"] == "long" else 0.5
+        reconciled = {
+            **row,
+            "status": "RATE_AND_MARK_RECONCILED",
+            "confirmed_funding_rate": 0.001,
+            "settlement_mark_price": 100.0,
+            "funding_pnl": pnl,
+            "rate_status": "CONFIRMED",
+            "mark_status": "CONFIRMED",
+            "evidence": {"payment_reconciliation_state": "PAYMENT_RECONCILED"},
+        }
+        store.apply_reconciled_funding_effect(
+            reconciled,
+            make_ledger_entry(
+                funding_event_key(position_id, row["venue"], SCHEDULED),
+                position_id=position_id,
+                cycle_id=cycle_id,
+                venue=row["venue"],
+                event_type="funding",
+                cash_delta=pnl,
+                payload={"side": row["side"]},
+            ),
+        )
+    event_key = funding_event_key(position_id, "binance", SCHEDULED)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE paper_event_ledger SET cash_delta = ? WHERE event_key = ?",
+            (-0.4, event_key),
+        )
+        connection.execute(
+            """
+            UPDATE funding_paper_accounts
+               SET cash_balance = starting_balance - 0.4,
+                   realized_pnl = -0.4
+             WHERE venue = 'binance'
+            """
+        )
+
+    report = store.paper_account_consistency_report()
+    mismatch = next(
+        row for row in report["mismatches"]
+        if row["kind"] == "reconciliation_effect_mismatch" and row["venue"] == "binance"
+    )
+    assert report["ok"] is False
+    assert "cash_delta" in mismatch["mismatches"]
+    assert mismatch["expected_cash_delta"] == pytest.approx(-0.5)
+    assert mismatch["actual_cash_delta"] == pytest.approx(-0.4)
+    assert not any(
+        row["kind"] == "cash_balance_mismatch" and row["venue"] == "binance"
+        for row in report["mismatches"]
+    )
+
+    runtime = _make_runtime(store, NOW_AT_SETTLEMENT + timedelta(seconds=30))
+    recovery = runtime.recover_runtime_state(NOW_AT_SETTLEMENT + timedelta(seconds=30))
+
+    rows = store.funding_settlement_reconciliation_rows(position_id)
+    binance = next(row for row in rows if row["venue"] == "binance")
+    assert binance["status"] == "RECONCILIATION_EFFECT_MISMATCH"
+    assert "cash_delta" in binance["evidence"]["financial_effect_mismatch"]["mismatches"]
+    assert store.funding_capture_cycles_for_position(position_id)[0]["state"] == "RECONCILIATION_EFFECT_MISMATCH"
+    assert store.funding_capture_position_by_id(position_id)["state"] == "CLOSED_REQUIRES_REVIEW"
+    assert recovery["reconciliation"]["finalized_cycles"] == 0
+    assert recovery["reconciliation"]["finalized_positions"] == 0
+    assert recovery["reconciliation"]["account_consistency"]["ok"] is False
+
+
 def test_reconciliation_timeout_marks_unreconciled(tmp_path):
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()

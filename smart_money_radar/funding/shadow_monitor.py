@@ -231,6 +231,7 @@ class FundingShadowMonitor:
         self.last_focused_refresh_count = 0
         self._last_opportunities: list[dict[str, Any]] = []
         self._last_summary: dict[str, Any] = {}
+        self._stablecoin_route_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
         self.cumulative_broad_sweep_count = 0
         self.cumulative_focused_refresh_count = 0
         self.cumulative_request_counts_by_venue: dict[str, int] = {}
@@ -312,7 +313,11 @@ class FundingShadowMonitor:
         focused_markets = self.focused_route_refresh(self._last_opportunities, observed_at)
         if not focused_markets:
             return self._scheduler_metrics()
-        opportunities, summary = self.build_shadow_opportunities(focused_markets, observed)
+        opportunities, summary = self.build_shadow_opportunities(
+            focused_markets,
+            observed,
+            allow_stablecoin_provider=False,
+        )
         self._last_opportunities = opportunities
         self._last_summary = {**self._last_summary, **summary}
         self.cumulative_route_refresh_count += len(opportunities)
@@ -334,12 +339,17 @@ class FundingShadowMonitor:
         self.cumulative_broad_sweep_count += 1
         for health in venue_health:
             self.store.upsert_funding_shadow_venue_health(health)
-        opportunities, summary = self.build_shadow_opportunities(markets, observed)
+        opportunities, summary = self.build_shadow_opportunities(
+            markets,
+            observed,
+            allow_stablecoin_provider=True,
+        )
         focused_markets = self.focused_route_refresh(opportunities, observed_at)
         if focused_markets:
             focused_opportunities, focused_summary = self.build_shadow_opportunities(
                 focused_markets,
                 observed,
+                allow_stablecoin_provider=False,
             )
             if focused_opportunities:
                 opportunities = focused_opportunities
@@ -843,6 +853,8 @@ class FundingShadowMonitor:
         self,
         markets: list[dict[str, Any]],
         now: datetime,
+        *,
+        allow_stablecoin_provider: bool = True,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rejection_reasons: dict[str, int] = {}
 
@@ -893,6 +905,7 @@ class FundingShadowMonitor:
                         long_market,
                         short_market,
                         now,
+                        allow_stablecoin_provider=allow_stablecoin_provider,
                     )
                     for reason in opportunity.get("blockers") or []:
                         reject(str(reason))
@@ -971,6 +984,8 @@ class FundingShadowMonitor:
         long_market: dict[str, Any],
         short_market: dict[str, Any],
         now: datetime,
+        *,
+        allow_stablecoin_provider: bool = True,
     ) -> dict[str, Any]:
         long_market = apply_declared_venue_capability_contract(long_market)
         short_market = apply_declared_venue_capability_contract(short_market)
@@ -1005,22 +1020,50 @@ class FundingShadowMonitor:
         if short_contract.status not in {"PAPER_ELIGIBLE", "SHADOW_ELIGIBLE"}:
             blockers.extend(f"short_{reason}" for reason in short_contract.reasons)
 
-        preliminary_stablecoin = evaluate_stablecoin_route(
-            long_collateral=str(
-                long_contract.settlement_collateral
-                or long_market.get("collateral_asset")
-                or ""
-            ),
-            short_collateral=str(
-                short_contract.settlement_collateral
-                or short_market.get("collateral_asset")
-                or ""
-            ),
-            provider=self.stablecoin_price_provider,
-            observed_at=observed_at,
-            reference_notional=float(self.config.target_notional),
-            funding_net_before_stablecoin_reserve=0.0,
+        long_collateral = str(
+            long_contract.settlement_collateral
+            or long_market.get("collateral_asset")
+            or ""
         )
+        short_collateral = str(
+            short_contract.settlement_collateral
+            or short_market.get("collateral_asset")
+            or ""
+        )
+        stablecoin_key = (long_collateral.upper(), short_collateral.upper())
+        if allow_stablecoin_provider:
+            preliminary_stablecoin = evaluate_stablecoin_route(
+                long_collateral=long_collateral,
+                short_collateral=short_collateral,
+                provider=self.stablecoin_price_provider,
+                observed_at=observed_at,
+                reference_notional=float(self.config.target_notional),
+                funding_net_before_stablecoin_reserve=0.0,
+            )
+            self._stablecoin_route_snapshots[stablecoin_key] = dict(preliminary_stablecoin)
+        else:
+            cached_stablecoin = self._stablecoin_route_snapshots.get(stablecoin_key)
+            if cached_stablecoin is not None:
+                preliminary_stablecoin = dict(cached_stablecoin)
+            else:
+                preliminary_stablecoin = evaluate_stablecoin_route(
+                    long_collateral=long_collateral,
+                    short_collateral=short_collateral,
+                    provider=None,
+                    observed_at=observed_at,
+                    reference_notional=float(self.config.target_notional),
+                    funding_net_before_stablecoin_reserve=0.0,
+                )
+        long_market = {
+            **long_market,
+            "stablecoin_route_evaluation": preliminary_stablecoin,
+            "stablecoin_risk": preliminary_stablecoin,
+        }
+        short_market = {
+            **short_market,
+            "stablecoin_route_evaluation": preliminary_stablecoin,
+            "stablecoin_risk": preliminary_stablecoin,
+        }
         stablecoin_reserve_usd = float(
             preliminary_stablecoin.get("stablecoin_reserve_usd") or 0.0
         )
@@ -1039,25 +1082,15 @@ class FundingShadowMonitor:
         conservative_gross = float(
             planner.get("conservative_funding_cashflow_usd") or 0.0
         )
-        stablecoin = evaluate_stablecoin_route(
-            long_collateral=str(
-                long_contract.settlement_collateral
-                or long_market.get("collateral_asset")
-                or ""
-            ),
-            short_collateral=str(
-                short_contract.settlement_collateral
-                or short_market.get("collateral_asset")
-                or ""
-            ),
-            provider=self.stablecoin_price_provider,
-            observed_at=observed_at,
-            reference_notional=float(self.config.target_notional),
-            funding_net_before_stablecoin_reserve=(
-                float(planner.get("conservative_net_usd") or 0.0)
-                + stablecoin_reserve_usd
-            ),
+        funding_net_before_stablecoin = (
+            float(planner.get("conservative_net_usd") or 0.0)
+            + stablecoin_reserve_usd
         )
+        stablecoin = {
+            **preliminary_stablecoin,
+            "funding_net_before_stablecoin_reserve": funding_net_before_stablecoin,
+            "funding_net_after_stablecoin_reserve": float(planner.get("conservative_net_usd") or 0.0),
+        }
         if stablecoin.get("status") == "RESEARCH_ONLY":
             blockers.extend(str(reason) for reason in stablecoin.get("blockers") or [])
         blockers.extend(str(reason) for reason in planner.get("blockers") or [])
@@ -1338,6 +1371,8 @@ def compact_market_shadow_payload(market: dict[str, Any]) -> dict[str, Any]:
         "assessment_jitter_after_seconds",
         "settlement_confirmation_source",
         "realized_payment_source",
+        "stablecoin_route_evaluation",
+        "stablecoin_risk",
     )
     return {field: market.get(field) for field in fields if field in market}
 

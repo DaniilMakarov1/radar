@@ -309,6 +309,31 @@ def price_provider(observed_at: str) -> StaticStablecoinPriceProvider:
     )
 
 
+class _CountingStablecoinPriceProvider:
+    def __init__(self, observed_at: str) -> None:
+        self.observed_at = observed_at
+        self.calls: list[tuple[str, str]] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    def prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
+        symbol = str(asset).upper()
+        self.calls.append((symbol, observed_at))
+        if symbol == "USDT":
+            return [
+                StablecoinPrice("USDT", 0.9999, "source_a", self.observed_at, self.observed_at),
+                StablecoinPrice("USDT", 1.0000, "source_b", self.observed_at, self.observed_at),
+            ]
+        if symbol == "USDC":
+            return [
+                StablecoinPrice("USDC", 1.0000, "source_a", self.observed_at, self.observed_at),
+                StablecoinPrice("USDC", 1.0001, "source_b", self.observed_at, self.observed_at),
+            ]
+        return []
+
+
 def test_shadow_scope_uses_funding_vars_when_shadow_absent(monkeypatch) -> None:
     monkeypatch.delenv("FUNDING_SHADOW_TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("FUNDING_SHADOW_TELEGRAM_CHAT_ID", raising=False)
@@ -1171,6 +1196,102 @@ def test_cross_usdc_usdt_route_is_allowed_with_reserve() -> None:
     assert result["funding_net_after_stablecoin_reserve"] < 12.0
 
 
+def test_shadow_monitor_attaches_stablecoin_snapshot_before_planner(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=30)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    monitor = FundingShadowMonitor(
+        store,
+        [
+            _ShadowClient("binance", collateral="USDT", funding_rate=-0.006, settlement=settlement),
+            _ShadowClient("bybit", collateral="USDC", funding_rate=0.006, settlement=settlement),
+        ],
+        config=FundingShadowConfig(telegram_enabled=False).validated(),
+        stablecoin_price_provider=price_provider(now.isoformat()),
+        clock=FakeClock(now),
+    )
+
+    monitor.run_once()
+    opportunity = next(
+        row for row in monitor._last_opportunities if row["long_venue"] == "binance"
+    )
+    stablecoin = opportunity["stablecoin_risk"]
+
+    assert opportunity["status"] == "SHADOW_CANDIDATE"
+    assert stablecoin["status"] == "PASS"
+    assert stablecoin["stablecoin_reserve_usd"] > 0
+    assert stablecoin["funding_net_after_stablecoin_reserve"] == pytest.approx(
+        opportunity["conservative_net_usd"]
+    )
+    assert stablecoin["funding_net_before_stablecoin_reserve"] == pytest.approx(
+        opportunity["conservative_net_usd"] + stablecoin["stablecoin_reserve_usd"]
+    )
+    for blocker in (
+        "stablecoin_snapshot_missing",
+        "stablecoin_snapshot_pair_mismatch",
+        "stablecoin_snapshot_source_missing",
+    ):
+        assert blocker not in opportunity["blockers"]
+    for side in ("long", "short"):
+        snapshot = opportunity[f"{side}_market"]["stablecoin_route_evaluation"]
+        assert snapshot["status"] == "PASS"
+        assert snapshot["stablecoin_pair"] == "USDT/USDC"
+        assert snapshot["source_identity"]["provider"] == "StaticStablecoinPriceProvider"
+        assert snapshot["source_identity"]["sources"] == ["source_a", "source_b"]
+
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT stablecoin_risk_json, payload_json
+              FROM funding_shadow_opportunities
+             WHERE opportunity_key = ?
+            """,
+            (opportunity["opportunity_key"],),
+        ).fetchone()
+    stored_stablecoin = json.loads(row[0])
+    stored_payload = json.loads(row[1])
+    assert stored_stablecoin["status"] == "PASS"
+    assert stored_payload["long_market"]["stablecoin_route_evaluation"]["stablecoin_pair"] == "USDT/USDC"
+    assert stored_payload["short_market"]["stablecoin_route_evaluation"]["stablecoin_pair"] == "USDT/USDC"
+
+
+def test_stablecoin_provider_used_by_broad_not_focused_and_expiry_blocks(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=30)
+    provider = _CountingStablecoinPriceProvider(now.isoformat())
+    clock = FakeClock(now)
+    monitor = FundingShadowMonitor(
+        SQLiteStore(tmp_path / "radar.sqlite"),
+        [
+            _ShadowClient("binance", collateral="USDT", funding_rate=-0.006, settlement=settlement),
+            _ShadowClient("bybit", collateral="USDC", funding_rate=0.006, settlement=settlement),
+        ],
+        config=FundingShadowConfig(telegram_enabled=False).validated(),
+        stablecoin_price_provider=provider,
+        clock=clock,
+    )
+
+    monitor.run_once()
+    broad_calls = provider.call_count
+    assert broad_calls > 0
+    assert monitor._last_opportunities
+
+    for _ in range(3):
+        clock.advance(1.0)
+        monitor.run_focused_once()
+        assert provider.call_count == broad_calls
+        assert any(row["stablecoin_risk"]["status"] == "PASS" for row in monitor._last_opportunities)
+
+    clock.advance(4.0)
+    monitor.run_focused_once()
+    assert provider.call_count == broad_calls
+    assert any(
+        "stablecoin_snapshot_expired" in row["blockers"]
+        or "stablecoin_snapshot_stale" in row["blockers"]
+        for row in monitor._last_opportunities
+    )
+
+
 def test_public_stablecoin_provider_uses_two_sources_and_caches() -> None:
     calls: list[str] = []
 
@@ -1184,13 +1305,23 @@ def test_public_stablecoin_provider_uses_two_sources_and_caches() -> None:
 
     provider = PublicStablecoinPriceProvider(fetch_json=fetch_json)
     first = provider.prices("USDC", "2026-07-28T12:00:00+00:00")
-    second = provider.prices("USDC", "2026-07-28T12:00:00+00:00")
+    second = provider.prices("USDC", "2026-07-28T12:00:03+00:00")
 
     assert {row.source for row in first} == {"coingecko", "coinbase"}
     assert all(row.source_event_at == "" for row in first)
     assert all(row.response_received_at != "2026-07-28T12:00:00+00:00" for row in first)
     assert second == first
     assert len(calls) == 2
+
+    stale = (datetime.now(UTC) - timedelta(seconds=6)).isoformat()
+    provider._cache[("USDC", ("coinbase", "coingecko"))] = [
+        StablecoinPrice("USDC", 1.0001, "coingecko", "", stale),
+        StablecoinPrice("USDC", 1.0000, "coinbase", "", stale),
+    ]
+    third = provider.prices("USDC", "2026-07-28T12:00:04+00:00")
+
+    assert {row.source for row in third} == {"coingecko", "coinbase"}
+    assert len(calls) == 4
 
 
 def test_cross_stable_without_price_data_remains_research_only() -> None:
@@ -1966,7 +2097,7 @@ def test_risex_public_probe_confirms_boundary_only_from_history(
     class FakeRiseXClient:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             self.venue = "risex"
-            self.scheduled = datetime.now(UTC) + timedelta(seconds=0.05)
+            self.scheduled = datetime.now(UTC) + timedelta(seconds=0.25)
 
         def catalog_and_markets(self, observed_at: str):
             market = complete_market(
