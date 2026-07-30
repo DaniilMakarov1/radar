@@ -449,6 +449,14 @@ def status_route_line(
         ]
         if flag
     ))
+    hard_blockers = list(dict.fromkeys(
+        str(blocker)
+        for blocker in [
+            *(evidence.get("hard_blockers") or []),
+            *((evidence.get("capability_check") or {}).get("hard_blockers") or []),
+        ]
+        if blocker
+    ))
     label_map = {
         "estimated_rate_used": "WATCH — ESTIMATED RATE",
         "rate_estimate_not_exact_next": "WATCH — ESTIMATED RATE",
@@ -484,6 +492,13 @@ def status_route_line(
         else ""
     )
     risk_line = ""
+    blocker_line = ""
+    if hard_blockers:
+        top_blockers = ", ".join(tg(flag) for flag in hard_blockers[:3])
+        rest = len(hard_blockers) - 3
+        blocker_line = (
+            f"\nBlockers: {top_blockers}{f' +{rest}' if rest > 0 else ''}"
+        )
     if route_risks:
         top_risks = ", ".join(tg(flag) for flag in route_risks[:3])
         rest = len(route_risks) - 3
@@ -526,6 +541,7 @@ def status_route_line(
         f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"
         f"{f' | Semantics {tg(semantics_status)}' if semantics_status else ''}"
         f"{f' | {tg(execution_status)}' if execution_status else ''}"
+        f"{blocker_line}"
         f"{risk_line}"
     )
 

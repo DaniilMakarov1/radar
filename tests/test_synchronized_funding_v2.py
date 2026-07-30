@@ -3322,6 +3322,54 @@ def test_lightweight_discovery_zero_or_negative_gross_not_watch(tmp_path) -> Non
     assert summary["rejection_reasons"]["raw_expected_funding_not_positive"] == 2
 
 
+def test_lightweight_discovery_keeps_risex_hard_blocked_route_research_only(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    risex = _LightweightDiscoveryClient(
+        "risex",
+        funding_rate=-0.006,
+        next_funding_at=settlement,
+    )
+    binance = _LightweightDiscoveryClient(
+        "binance",
+        funding_rate=0.006,
+        next_funding_at=settlement,
+    )
+    bot = _lightweight_bot(tmp_path, now, [risex, binance])
+    _, risex_markets, _ = risex.catalog_and_markets(now.isoformat())
+    _, binance_markets, _ = binance.catalog_and_markets(now.isoformat())
+    for market in risex_markets:
+        market["environment"] = "testnet"
+        market["paper_enabled"] = False
+
+    routes, summary = bot._build_lightweight_watch_routes(
+        [*risex_markets, *binance_markets],
+        {"risex": risex, "binance": binance},
+        now,
+    )
+
+    assert summary["research_only_routes"] >= 1
+    assert summary["research_only_route_variants"] == 1
+    assert summary["routes_detected"] == 1
+    assert summary["watch_routes_added"] == 0
+    assert len(routes) == 1
+    route = routes[0]
+    assert route["long_venue"] == "risex"
+    assert route["status"] == "research_only"
+    assert route["evidence"]["research_only_diagnostic"] is True
+    assert "environment_mismatch" in route["evidence"]["hard_blockers"]
+    assert route["evidence"]["selected_strategy"]["eligible"] is False
+
+    selection = bot.update_discovered_routes(routes, now=now)
+
+    assert len(selection["focus_eligible_routes"]) == 0
+    assert len(selection["focused_routes"]) == 0
+    assert bot.discovered_routes
+    assert not bot.hot_routes
+
+
 def test_lightweight_discovery_does_not_call_legacy_strategy_builder(
     tmp_path,
     monkeypatch,

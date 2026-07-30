@@ -445,9 +445,18 @@ class FundingRadarTest(unittest.TestCase):
                             now,
                         )
                         if classification == "hard":
-                            self.assertEqual(routes, [])
+                            self.assertEqual(len(routes), 1, summary)
                             self.assertEqual(summary["watch_routes_added"], 0)
+                            self.assertEqual(summary["research_only_route_variants"], 1)
                             self.assertIn(expected_reason, summary["rejection_reasons"], summary)
+                            self.assertEqual(routes[0]["status"], "research_only")
+                            self.assertIn(
+                                expected_reason,
+                                routes[0]["evidence"]["hard_blockers"],
+                            )
+                            self.assertFalse(
+                                routes[0]["evidence"]["selected_strategy"]["eligible"]
+                            )
                         else:
                             self.assertEqual(len(routes), 1, summary)
                             self.assertEqual(summary["watch_routes_added"], 1)

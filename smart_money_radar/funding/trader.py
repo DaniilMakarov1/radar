@@ -197,6 +197,21 @@ FUNDING_HISTORY_MIN_ROWS_PER_MARKET = 24
 FUNDING_PAPER_WATCH_SCAN_RETENTION = 1
 OPEN_CAPTURE_REFRESH_TIMEOUT_SECONDS = 2.0
 OPEN_CAPTURE_DEGRADED_HARD_STALE_SECONDS = 5.0
+LIGHTWEIGHT_RESEARCH_DIAGNOSTIC_VENUES = {
+    "aevo",
+    "apex",
+    "dydx",
+    "edgex",
+    "ethereal",
+    "extended",
+    "grvt",
+    "hyperliquid",
+    "lighter",
+    "nado",
+    "pacifica",
+    "paradex",
+    "risex",
+}
 
 
 class FocusedRecheckTimeout(TimeoutError):
@@ -1013,7 +1028,8 @@ class PaperBot:
                 (
                     "Funding background full scan "
                     f"{result.get('funding_scan_id')}: candidates={len(routes)}, "
-                    f"watch={len(watch_routes)}"
+                    f"watch={int(result.get('watch_count') or 0)}, "
+                    f"research_only={int(result.get('research_only_route_variants') or 0)}"
                 ),
                 result,
                 notify=False,
@@ -1147,11 +1163,12 @@ class PaperBot:
         )
         routes: list[dict[str, Any]] = []
         cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        watch_route_count = int(summary.get("watch_routes_added") or 0)
         return {
             "mode": "background_full_market",
             "funding_scan_id": None,
             "candidate_count": len(routes),
-            "watch_count": 0 if cancelled else len(watch_routes),
+            "watch_count": 0 if cancelled else watch_route_count,
             "opened_count": 0,
             "closed_count": 0,
             "repriced_count": 0,
@@ -1177,7 +1194,7 @@ class PaperBot:
             "markets_checked": summary.get("markets_checked", 0),
             "universe_route_count": summary["routes_structurally_matched"],
             "execution_shortlist_count": 0,
-            "route_count": len(watch_routes),
+            "route_count": 0 if cancelled else len(watch_routes),
             "funnel": summary.get("funnel") or {},
             "screen_reasons": summary.get("rejection_reasons") or {},
             "rejection_details": summary.get("rejection_details") or {},
@@ -1453,14 +1470,17 @@ class PaperBot:
             for route in publishable_routes
             if route.get("route_key")
         }
-        visible_watch_routes_by_key = {
+        watch_routes_by_key = {
             str(route.get("route_key") or f"watch-{index}"): route
             for index, route in enumerate(
                 [*self.discovered_routes.values(), *watch_routes]
             )
             if str(route.get("route_key") or "") not in publishable_route_keys
         }
-        visible_watch_routes = list(visible_watch_routes_by_key.values())
+        all_watch_routes = list(watch_routes_by_key.values())
+        visible_watch_routes = [
+            route for route in all_watch_routes if status_publishable_detected_route(route)
+        ]
         stage_counts = {
             "early": 0,
             "watch": 0,
@@ -1469,7 +1489,7 @@ class PaperBot:
             "qualified": len(publishable_routes),
         }
         report_now = self.clock.now().astimezone(UTC)
-        for route in visible_watch_routes:
+        for route in all_watch_routes:
             stage = route_discovery_stage(route, report_now, self.config)["stage"]
             route["discovery_stage"] = stage
             if stage in stage_counts and stage != "qualified":
@@ -1477,7 +1497,7 @@ class PaperBot:
         result["detected_route_count"] = len(
             {
                 str(route.get("route_key") or id(route))
-                for route in [*publishable_routes, *visible_watch_routes]
+                for route in [*publishable_routes, *all_watch_routes]
             }
         )
         result["early_route_count"] = stage_counts["early"]
@@ -1504,7 +1524,8 @@ class PaperBot:
                     : self.config.status_report_max_routes
                 ]
             ],
-            "internal_watch_count": len(visible_watch_routes),
+            "internal_watch_count": len(all_watch_routes),
+            "hidden_detected_route_count": len(all_watch_routes) - len(visible_watch_routes),
             "discovery_funnel": stage_counts,
             "venue_health": result.get("venue_health") or {},
         }
@@ -2821,7 +2842,11 @@ class PaperBot:
         return {
             "status": "success",
             "detected_route_count": len(self.discovered_routes),
-            "watch_route_count": len(self.discovered_routes),
+            "watch_route_count": sum(
+                1
+                for route in self.discovered_routes.values()
+                if route.get("status") == "watch"
+            ),
             "hot_route_count": len(self.hot_routes),
             "focus_eligible_count": len(focused_selection.get("focus_eligible_routes") or []),
             "focused_selected_count": len(focused_selection.get("focused_routes") or []),
@@ -3307,6 +3332,23 @@ class PaperBot:
                                     "blockers": route_readiness["hard_blockers"][:6],
                                 },
                             )
+                        route = self._lightweight_research_diagnostic_route(
+                            asset,
+                            long_market,
+                            short_market,
+                            route_readiness,
+                            now,
+                            settlement_skew_seconds_value=skew,
+                        )
+                        if route is not None:
+                            route_key = str(route["route_key"])
+                            existing = routes_by_key.get(route_key)
+                            if (
+                                existing is None
+                                or route_variant_rank_sort_key(route)
+                                < route_variant_rank_sort_key(existing)
+                            ):
+                                routes_by_key[route_key] = route
                         continue
                     if route_readiness["risk_flags"]:
                         risk_flagged_pairs += 1
@@ -3398,6 +3440,10 @@ class PaperBot:
             for route in routes
             if route.get("route_family_key") or (route.get("evidence") or {}).get("route_family_key")
         }
+        watch_route_variants = sum(1 for route in routes if route.get("status") == "watch")
+        research_only_route_variants = sum(
+            1 for route in routes if route.get("status") == "research_only"
+        )
         risk_flagged_variants = sum(
             1 for route in routes if route.get("risk_flags") or (route.get("evidence") or {}).get("risk_flags")
         )
@@ -3500,8 +3546,13 @@ class PaperBot:
                     "unit": "directed_pair",
                 },
                 "watch": {
-                    "count": len(routes),
+                    "count": watch_route_variants,
                     "denominator": economically_observable_pairs,
+                    "unit": "route_variant",
+                },
+                "research_only": {
+                    "count": research_only_route_variants,
+                    "denominator": hard_blocked_pairs,
                     "unit": "route_variant",
                 },
                 "unique_route_variants": {
@@ -3558,7 +3609,8 @@ class PaperBot:
             "unique_route_families_soft_flagged": len(risk_flagged_families),
             "routes_structurally_matched": structurally_matched,
             "routes_detected": len(routes),
-            "watch_routes_added": len(routes),
+            "watch_routes_added": watch_route_variants,
+            "research_only_route_variants": research_only_route_variants,
             "early_route_count": stage_counts["early"],
             "watch_stage_route_count": stage_counts["watch"],
             "monitor_route_count": stage_counts["monitor"],
@@ -3595,6 +3647,94 @@ class PaperBot:
             "all_reasons": reasons,
             "lightweight_allowed_missing": sorted(readiness.get("risk_flags") or []),
         }
+
+    def _lightweight_research_diagnostic_route(
+        self,
+        asset: str,
+        long_market: dict[str, Any],
+        short_market: dict[str, Any],
+        route_readiness: dict[str, Any],
+        now: datetime,
+        *,
+        settlement_skew_seconds_value: float | None = None,
+    ) -> dict[str, Any] | None:
+        venues = {
+            str(long_market.get("venue") or "").lower(),
+            str(short_market.get("venue") or "").lower(),
+        }
+        if not venues.intersection(LIGHTWEIGHT_RESEARCH_DIAGNOSTIC_VENUES):
+            return None
+        economics = route_readiness.get("economics") or {}
+        net = optional_float(economics.get("conservative_expected_net_usd"))
+        if net is None:
+            net = optional_float(economics.get("raw_expected_net_usd"))
+        if net is None or net <= 0.0:
+            return None
+        long_mark = float(reference_price(long_market)[0] or 0.0)
+        short_mark = float(reference_price(short_market)[0] or 0.0)
+        if long_mark <= 0.0 or short_mark <= 0.0:
+            return None
+        target_notional = float(self.config.target_notional_per_leg)
+        quantity = min(target_notional / long_mark, target_notional / short_mark)
+        preliminary_gross = optional_float(
+            economics.get("conservative_expected_funding_usd")
+        )
+        if preliminary_gross is None:
+            preliminary_gross = optional_float(economics.get("raw_expected_funding_usd"))
+        if preliminary_gross is None:
+            return None
+        route = self._lightweight_watch_route(
+            asset,
+            long_market,
+            short_market,
+            quantity,
+            float(preliminary_gross),
+            route_readiness,
+            now,
+            route_plan={
+                "status": "research_only",
+                "blockers": list(route_readiness.get("hard_blockers") or []),
+                "reason": "hard_blocked_research_diagnostic",
+            },
+            settlement_skew_seconds_value=settlement_skew_seconds_value,
+        )
+        route["status"] = "research_only"
+        route["rationale"] = [
+            "Lightweight discovery found a research-only DEX/RiseX route.",
+            "Hard blockers prevent focused underwriting and paper execution.",
+        ]
+        route["risk_flags"] = list(
+            dict.fromkeys(
+                [
+                    *(route.get("risk_flags") or []),
+                    "research_only_hard_blocked",
+                ]
+            )
+        )
+        evidence = route.setdefault("evidence", {})
+        evidence["research_only_diagnostic"] = True
+        evidence["paper_mode"] = "RESEARCH"
+        evidence["hard_blockers"] = list(route_readiness.get("hard_blockers") or [])
+        evidence["advisory_reasons"] = list(
+            dict.fromkeys(
+                [
+                    *(evidence.get("advisory_reasons") or []),
+                    "research_only_hard_blocked",
+                ]
+            )
+        )
+        for key in ("selected_strategy", "strategy_classification"):
+            if isinstance(evidence.get(key), dict):
+                evidence[key]["eligible"] = False
+                evidence[key]["reasons"] = list(
+                    dict.fromkeys(
+                        [
+                            *(evidence[key].get("reasons") or []),
+                            *list(route_readiness.get("hard_blockers") or []),
+                        ]
+                    )
+                )
+        return route
 
     def _lightweight_watch_route(
         self,
@@ -5117,6 +5257,28 @@ def count_urgent_routes(
     return sum(
         1 for route in routes if route_monitor_decision(route, now, config)["urgent"]
     )
+
+def status_publishable_detected_route(route: dict[str, Any]) -> bool:
+    """Keep Telegram examples actionable; aggregate counts still include all routes."""
+    evidence = route.get("evidence") or {}
+    selected = evidence.get("selected_strategy") or evidence.get("strategy_classification")
+    selected_values: tuple[Any, ...] = ()
+    if isinstance(selected, dict):
+        selected_values = (
+            selected.get("expected_net_pnl"),
+            selected.get("conservative_expected_net_pnl"),
+        )
+    for value in (
+        *selected_values,
+        evidence.get("current_nowcast_net"),
+        evidence.get("conservative_expected_net"),
+        evidence.get("raw_expected_net"),
+        route.get("expected_net_profit"),
+    ):
+        net = optional_float(value)
+        if net is not None:
+            return net > 0.0
+    return False
 
 def instrument_row_from_market(
     market: dict[str, Any],

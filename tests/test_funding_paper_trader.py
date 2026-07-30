@@ -1656,6 +1656,54 @@ def test_status_report_publishes_detected_route_as_preliminary(tmp_path) -> None
     assert "Focused orderbooks, costs and entry observations: pending" in notifier.messages[0]
 
 
+def test_status_report_hides_negative_detected_routes(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    notifier = FakeNotifier()
+    trader = PaperBot(
+        store,
+        config=PaperBotConfig(status_report_interval_seconds=1_800),
+        notifier=notifier,
+    )
+    now = datetime.now(UTC)
+    watch = strategy_route(
+        now,
+        "funding_only",
+        expected_net=-2.0,
+        funding_component=-1.0,
+        spread_component=0.0,
+    )
+    watch["status"] = "watch"
+    watch["discovery_stage"] = "monitor"
+    watch["risk_flags"] = ["lightweight_only_requires_focused_underwriting"]
+    watch["evidence"]["current_nowcast_net"] = -2.0
+    watch["evidence"]["selected_strategy"]["selection_model"] = (
+        "lightweight_discovery_v1"
+    )
+
+    trader.maybe_record_status_report(
+        {
+            "mode": "hot_routes",
+            "funding_scan_id": None,
+            "candidate_count": 0,
+            "watch_count": 1,
+            "opened_count": 0,
+            "closed_count": 0,
+            "pending_count": 0,
+            "hot_route_count": 1,
+            "urgent_route_count": 0,
+            "detected_route_count": 1,
+        },
+        [],
+        [watch],
+    )
+
+    assert len(notifier.messages) == 1
+    assert "Routes detected: 1" in notifier.messages[0]
+    assert "Top detected routes" not in notifier.messages[0]
+    assert "Preliminary funding before focused costs" not in notifier.messages[0]
+
+
 def test_status_report_bounds_many_verbose_detected_routes_for_telegram(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
