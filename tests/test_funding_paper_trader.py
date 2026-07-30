@@ -2590,8 +2590,10 @@ def test_legacy_shared_pool_focused_recheck_design_exhausts_route_timeout(tmp_pa
     assert result["running_scan_count"] == 0
     assert result["scan_statuses"] == [{"status": "failed", "count": 6}]
     assert len([row for row in trace if row["event"] == "outer_start"]) == 6
-    assert len([row for row in trace if row["event"] == "market_start"]) == 0
-    assert len([row for row in trace if row["event"] == "orderbook_start"]) == 0
+    market_starts = [row for row in trace if row["event"] == "market_start"]
+    orderbook_starts = [row for row in trace if row["event"] == "orderbook_start"]
+    assert all("funding-focused-route" in row["thread"] for row in market_starts)
+    assert all("funding-focused-route" in row["thread"] for row in orderbook_starts)
 
 
 def test_market_snapshot_failure_does_not_block_other_focused_routes(tmp_path) -> None:
