@@ -1815,6 +1815,31 @@ class SynchronizedFundingRuntimeV2:
                 reasons.append("unexpected_live_enabled_in_paper_runtime")
         return list(dict.fromkeys(reasons))
 
+    def _verified_readiness_guard(
+        self,
+        plan: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        planner = (plan or {}).get("planner") or {}
+        readiness = planner.get("route_readiness") or {}
+        blockers: list[str] = []
+        if str(planner.get("evaluation_mode") or "") != EvaluationMode.VERIFIED_PAPER.value:
+            blockers.append("verified_runtime_requires_verified_paper_evaluation")
+        if not bool(readiness.get("verified_paper_ready")):
+            blockers.append("verified_paper_ready_false")
+        blockers.extend(str(reason) for reason in readiness.get("mode_blockers") or [])
+        blockers.extend(str(reason) for reason in readiness.get("verified_paper_blockers") or [])
+        return {
+            "passed": not blockers,
+            "evaluation_mode": planner.get("evaluation_mode"),
+            "verified_paper_ready": bool(readiness.get("verified_paper_ready")),
+            "experimental_simulation_ready": bool(
+                readiness.get("experimental_simulation_ready")
+                or readiness.get("experimental_paper_ready")
+            ),
+            "blockers": list(dict.fromkeys(reason for reason in blockers if reason)),
+            "route_readiness": readiness,
+        }
+
     def consider_route(
         self,
         route: dict[str, Any],
@@ -1857,6 +1882,22 @@ class SynchronizedFundingRuntimeV2:
                 "opened": False,
                 "reason": "entry_window_missed",
                 "route_plan": route_plan,
+            }
+        verified_guard = self._verified_readiness_guard(route_plan)
+        if not verified_guard["passed"]:
+            return {
+                "opened": False,
+                "reason": "route_plan_blocked",
+                "route_plan": route_plan,
+                "blockers": list(
+                    dict.fromkeys(
+                        [
+                            *verified_guard["blockers"],
+                            *plan_blockers,
+                        ]
+                    )
+                ),
+                "verified_readiness": verified_guard,
             }
         if plan_blockers:
             return {

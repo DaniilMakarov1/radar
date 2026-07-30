@@ -53,7 +53,7 @@ from smart_money_radar.funding.adapters import (
     WOOXFundingClient,
 )
 from smart_money_radar.funding.adapters.base import FundingDataError, FundingHttpClient
-from smart_money_radar.funding.economics import evaluate_perp_route, perp_route_key
+from smart_money_radar.funding.economics import evaluate_perp_route
 from smart_money_radar.funding.models import FundingScanConfig
 from smart_money_radar.funding.normalization import (
     normalize_catalog_canonical_units,
@@ -69,6 +69,13 @@ from smart_money_radar.funding.readiness_policy import (
     evaluate_synchronized_route,
     rate_estimate_from_market,
     reference_price,
+)
+from smart_money_radar.funding.route_identity import (
+    FocusedSelectionConfig,
+    best_route_variant,
+    enrich_route_identity,
+    route_variant_rank_sort_key,
+    select_focused_routes,
 )
 from smart_money_radar.funding.retention import apply_funding_retention_plan
 from smart_money_radar.funding.service import (
@@ -151,7 +158,6 @@ from smart_money_radar.paper_bot.risk import (
     dynamic_basis_risk_budget_bps,
     dynamic_basis_stop_decision,
     entry_risk_gates,
-    focused_recheck_capacity_check,
     hard_risk_triggered,
     lightweight_discovery_due,
     risk_poll_interval_seconds,
@@ -257,6 +263,11 @@ class PaperBotConfig:
     monitor_interval_seconds: float = 2.0
     hot_interval_seconds: float = 1.0
     hot_route_recheck_workers: int = 6
+    max_focused_routes: int = 20
+    max_experimental_focused_routes: int = 6
+    max_focused_routes_per_venue: int = 8
+    focused_selection_hysteresis: int = 2
+    focused_selection_min_ttl_seconds: float = 20.0
     lightweight_foreground_budget_seconds: float = 8.0
     lightweight_cache_ttl_seconds: float = 180.0
     lightweight_route_horizon_seconds: float = 3_600.0
@@ -411,6 +422,26 @@ class PaperBotConfig:
                 1,
                 min(int(self.hot_route_recheck_workers), 16),
             ),
+            max_focused_routes=max(
+                1,
+                min(int(self.max_focused_routes), 100),
+            ),
+            max_experimental_focused_routes=max(
+                0,
+                min(int(self.max_experimental_focused_routes), 100),
+            ),
+            max_focused_routes_per_venue=max(
+                0,
+                min(int(self.max_focused_routes_per_venue), 100),
+            ),
+            focused_selection_hysteresis=max(
+                0,
+                min(int(self.focused_selection_hysteresis), 20),
+            ),
+            focused_selection_min_ttl_seconds=max(
+                0.0,
+                min(float(self.focused_selection_min_ttl_seconds), 300.0),
+            ),
             lightweight_foreground_budget_seconds=max(
                 0.05,
                 min(float(self.lightweight_foreground_budget_seconds), 30.0),
@@ -512,6 +543,10 @@ class PaperBot:
         self.skipped_notified_routes: set[str] = set()
         self.hot_routes: dict[str, dict[str, Any]] = {}
         self.discovered_routes: dict[str, dict[str, Any]] = {}
+        self.focus_eligible_routes: dict[str, dict[str, Any]] = {}
+        self.focused_routes: dict[str, dict[str, Any]] = {}
+        self.focused_route_selected_at: dict[str, float] = {}
+        self.last_focused_selection: dict[str, Any] = {}
         self.last_full_scan_monotonic = 0.0
         self.last_status_report_monotonic = 0.0
         self.last_retention_monotonic = 0.0
@@ -705,16 +740,14 @@ class PaperBot:
         if completed is not None:
             background_results.append(completed)
 
-        runtime_recovery = self.synchronized_runtime.recover_runtime_state(
-            self.clock.now()
-        )
-        self.last_runtime_recovery = runtime_recovery
-
-        reconciliation = self._maybe_run_reconciliation()
-
         if self.has_open_exposure():
             self.request_background_full_scan_cancel("open_exposure_priority")
             result = self.run_open_position_iteration()
+            runtime_recovery = self.synchronized_runtime.recover_runtime_state(
+                self.clock.now()
+            )
+            self.last_runtime_recovery = runtime_recovery
+            reconciliation = self._maybe_run_reconciliation()
             result["runtime_recovery"] = runtime_recovery
             if reconciliation is not None:
                 result["reconciliation"] = reconciliation
@@ -723,6 +756,13 @@ class PaperBot:
             if self.background_full_scan_running():
                 result["background_full_scan_running"] = True
             return result
+
+        runtime_recovery = self.synchronized_runtime.recover_runtime_state(
+            self.clock.now()
+        )
+        self.last_runtime_recovery = runtime_recovery
+
+        reconciliation = self._maybe_run_reconciliation()
 
         if self.critical_entry_recheck_active():
             self.request_background_full_scan_cancel("critical_hot_route_priority")
@@ -739,6 +779,9 @@ class PaperBot:
 
         if self.hot_routes:
             result = self.run_hot_iteration()
+            discovery = self._run_lightweight_discovery()
+            if discovery is not None:
+                result["lightweight_discovery"] = discovery
         else:
             result = self.run_background_wait_iteration(
                 background_running=self.background_full_scan_running()
@@ -1388,6 +1431,87 @@ class PaperBot:
             market_snapshot_cache_ttl_seconds=0,
         ).validated()
 
+    def focused_selection_config(self) -> FocusedSelectionConfig:
+        return FocusedSelectionConfig(
+            max_focused_routes=int(self.config.max_focused_routes),
+            max_experimental_focused_routes=int(
+                self.config.max_experimental_focused_routes
+            ),
+            max_focused_routes_per_venue=int(
+                self.config.max_focused_routes_per_venue
+            ),
+            focused_selection_hysteresis=int(
+                self.config.focused_selection_hysteresis
+            ),
+            focused_selection_min_ttl_seconds=float(
+                self.config.focused_selection_min_ttl_seconds
+            ),
+            arm_window_seconds=float(self.config.arm_window_seconds),
+            entry_max_lead_seconds=float(self.config.entry_max_lead_seconds),
+        )
+
+    def open_position_route_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for position in [
+            *self.store.funding_capture_open_positions(),
+            *self.store.funding_paper_open_positions(),
+        ]:
+            config = position.get("config") or {}
+            route_key = config.get("route_key") or position.get("route_key")
+            if route_key:
+                keys.add(str(route_key))
+        return keys
+
+    def submitted_entry_route_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for position in self.store.funding_capture_position_rows():
+            config = dict(position.get("config") or {})
+            if (
+                str(position.get("state") or "") == "ENTRY_SUBMITTED"
+                or bool(config.get("entry_attempt_submitted"))
+            ):
+                route_key = config.get("route_key")
+                if route_key:
+                    keys.add(str(route_key))
+        return keys
+
+    def apply_focused_selection(self, now: datetime) -> dict[str, Any]:
+        selection = select_focused_routes(
+            list(self.discovered_routes.values()),
+            now=now.astimezone(UTC),
+            config=self.focused_selection_config(),
+            previous_selected_at=dict(self.focused_route_selected_at),
+            now_monotonic=float(self.clock.monotonic()),
+            open_position_route_keys=self.open_position_route_keys(),
+            submitted_route_keys=self.submitted_entry_route_keys(),
+            venue_health=dict(self._last_lightweight_venue_health),
+        )
+        self.discovered_routes = {
+            str(route.get("route_key")): route
+            for route in selection["routes"]
+            if route.get("route_key")
+        }
+        self.focus_eligible_routes = {
+            str(route.get("route_key")): route
+            for route in selection["focus_eligible_routes"]
+            if route.get("route_key")
+        }
+        open_keys = self.open_position_route_keys()
+        self.focused_routes = {
+            str(route.get("route_key")): route
+            for route in selection["focused_routes"]
+            if route.get("route_key")
+            and str(route.get("route_key")) not in open_keys
+        }
+        self.hot_routes = dict(self.focused_routes)
+        now_monotonic = float(self.clock.monotonic())
+        self.focused_route_selected_at = {
+            route_key: self.focused_route_selected_at.get(route_key, now_monotonic)
+            for route_key in self.focused_routes
+        }
+        self.last_focused_selection = selection
+        return selection
+
     def update_hot_routes(self, routes: list[dict[str, Any]]) -> None:
         now = datetime.now(UTC)
         current_keys: set[str] = set()
@@ -1413,7 +1537,7 @@ class PaperBot:
         routes: list[dict[str, Any]],
         *,
         now: datetime | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         observed_now = (now or self.clock.now()).astimezone(UTC)
         current_route_keys: set[str] = set()
         for route in routes:
@@ -1427,10 +1551,6 @@ class PaperBot:
             stage = route_discovery_stage(route, observed_now, self.config)["stage"]
             route["discovery_stage"] = stage
             self.discovered_routes[route_key] = route
-            if stage in {"monitor", "urgent", "qualified"}:
-                self.hot_routes[route_key] = route
-            else:
-                self.hot_routes.pop(route_key, None)
         for route_key, route in list(self.discovered_routes.items()):
             if route_key in current_route_keys:
                 continue
@@ -1443,6 +1563,9 @@ class PaperBot:
             ):
                 self.discovered_routes.pop(route_key, None)
                 self.hot_routes.pop(route_key, None)
+                self.focused_routes.pop(route_key, None)
+                self.focus_eligible_routes.pop(route_key, None)
+        return self.apply_focused_selection(observed_now)
 
     def refresh_hot_routes(self) -> list[dict[str, Any]]:
         route_items = list(self.hot_routes.items())
@@ -2374,8 +2497,7 @@ class PaperBot:
     def _run_lightweight_discovery(self) -> dict[str, Any] | None:
         """Lightweight discovery: market snapshots + next funding only, no full orderbooks."""
         if (
-            self.hot_routes
-            or self.store.funding_capture_open_positions()
+            self.store.funding_capture_open_positions()
             or self.store.funding_paper_open_positions()
         ):
             return None
@@ -2387,14 +2509,6 @@ class PaperBot:
         ):
             return None
         self._last_lightweight_discovery_monotonic = now_monotonic
-        capacity = focused_recheck_capacity_check(
-            watch_route_count=len(self.hot_routes),
-        )
-        if not capacity["sufficient"]:
-            return {
-                "status": "skipped",
-                "reason": capacity["reason"],
-            }
         clients = self.build_venue_clients() or active_default_funding_clients()
         clients = [
             client
@@ -2427,12 +2541,40 @@ class PaperBot:
         self._last_lightweight_nearest_settlement_seconds = summary.get(
             "nearest_settlement_seconds"
         )
-        self.update_discovered_routes(routes, now=now)
+        focused_selection = self.update_discovered_routes(routes, now=now)
+        funnel = summary.get("funnel")
+        if isinstance(funnel, dict):
+            funnel["focus_eligible"] = {
+                "count": len(focused_selection.get("focus_eligible_routes") or []),
+                "denominator": len(self.discovered_routes),
+                "unit": "route_variant",
+            }
+            funnel["focused_selected"] = {
+                "count": len(focused_selection.get("focused_routes") or []),
+                "denominator": len(focused_selection.get("focus_eligible_routes") or []),
+                "unit": "route_variant",
+            }
+            funnel["focused_deferred"] = {
+                "count": len(focused_selection.get("deferred_routes") or []),
+                "denominator": len(focused_selection.get("focus_eligible_routes") or []),
+                "unit": "route_variant",
+            }
+            funnel["focused"] = funnel["focused_selected"]
         return {
             "status": "success",
             "detected_route_count": len(self.discovered_routes),
             "watch_route_count": len(self.discovered_routes),
             "hot_route_count": len(self.hot_routes),
+            "focus_eligible_count": len(focused_selection.get("focus_eligible_routes") or []),
+            "focused_selected_count": len(focused_selection.get("focused_routes") or []),
+            "focused_deferred_count": len(focused_selection.get("deferred_routes") or []),
+            "focused_selection": {
+                "selected_route_keys": focused_selection.get("selected_route_keys") or [],
+                "deferred_route_keys": focused_selection.get("deferred_route_keys") or [],
+                "cutoff_rank": focused_selection.get("cutoff_rank"),
+                "cutoff_score": focused_selection.get("cutoff_score"),
+                "config": focused_selection.get("config") or {},
+            },
             "venue_health": dict(self._last_lightweight_venue_health),
             "warnings": warnings,
             **summary,
@@ -2912,7 +3054,10 @@ class PaperBot:
                         risk_flagged_pairs += 1
                     if route_readiness["economically_observable"]:
                         economically_observable_pairs += 1
-                    if route_readiness["experimental_paper_ready"]:
+                    if (
+                        route_readiness.get("experimental_simulation_ready")
+                        or route_readiness.get("experimental_paper_ready")
+                    ):
                         experimental_ready_pairs += 1
                     if route_readiness["verified_paper_ready"]:
                         verified_ready_pairs += 1
@@ -2984,13 +3129,36 @@ class PaperBot:
                     existing = routes_by_key.get(route_key)
                     if (
                         existing is None
-                        or gross > float(
-                            ((existing.get("evidence") or {}).get("current_nowcast_gross") or 0.0)
-                        )
+                        or route_variant_rank_sort_key(route)
+                        < route_variant_rank_sort_key(existing)
                     ):
                         routes_by_key[route_key] = route
 
         routes = list(routes_by_key.values())
+        family_keys = {
+            str(route.get("route_family_key") or (route.get("evidence") or {}).get("route_family_key") or "")
+            for route in routes
+            if route.get("route_family_key") or (route.get("evidence") or {}).get("route_family_key")
+        }
+        risk_flagged_variants = sum(
+            1 for route in routes if route.get("risk_flags") or (route.get("evidence") or {}).get("risk_flags")
+        )
+        risk_flagged_families = {
+            str(route.get("route_family_key") or (route.get("evidence") or {}).get("route_family_key") or "")
+            for route in routes
+            if route.get("risk_flags") or (route.get("evidence") or {}).get("risk_flags")
+        }
+        experimental_ready_variants = sum(
+            1
+            for route in routes
+            if (route.get("evidence") or {}).get("experimental_simulation_ready")
+            or (route.get("evidence") or {}).get("experimental_paper_ready")
+        )
+        verified_ready_variants = sum(
+            1
+            for route in routes
+            if (route.get("evidence") or {}).get("verified_paper_ready")
+        )
         stage_counts = {
             "early": 0,
             "watch": 0,
@@ -3076,30 +3244,60 @@ class PaperBot:
                 "watch": {
                     "count": len(routes),
                     "denominator": economically_observable_pairs,
-                    "unit": "route",
+                    "unit": "route_variant",
                 },
-                "focused": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "unique_route_variants": {
+                    "count": len(routes),
+                    "denominator": economically_observable_pairs,
+                    "unit": "route_variant",
+                },
+                "unique_route_families": {
+                    "count": len(family_keys),
+                    "denominator": len(routes),
+                    "unit": "route_family",
+                },
+                "focused": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
+                "focus_eligible": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
+                "focused_selected": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
+                "focused_deferred": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
+                "experimental_simulation_ready": {
+                    "count": experimental_ready_pairs,
+                    "denominator": economically_observable_pairs,
+                    "unit": "directed_pair",
+                },
+                "experimental_simulation_ready_variants": {
+                    "count": experimental_ready_variants,
+                    "denominator": len(routes),
+                    "unit": "route_variant",
+                },
                 "experimental_paper_ready": {
                     "count": experimental_ready_pairs,
                     "denominator": economically_observable_pairs,
-                    "unit": "route",
+                    "unit": "directed_pair",
+                    "deprecated": True,
                 },
                 "verified_paper_ready": {
                     "count": verified_ready_pairs,
                     "denominator": economically_observable_pairs,
                     "unit": "directed_pair",
                 },
-                "opened_experimental": {"count": 0, "denominator": len(routes), "unit": "route"},
-                "opened_verified": {"count": 0, "denominator": len(routes), "unit": "route"},
-                "reconciled": {"count": 0, "denominator": len(routes), "unit": "route"},
-                "unreconciled": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "verified_paper_ready_variants": {
+                    "count": verified_ready_variants,
+                    "denominator": len(routes),
+                    "unit": "route_variant",
+                },
+                "opened_experimental": {"count": 0, "denominator": len(routes), "unit": "route_variant", "deprecated": True},
+                "opened_verified": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
+                "reconciled": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
+                "unreconciled": {"count": 0, "denominator": len(routes), "unit": "route_variant"},
             },
-            "routes_with_any_risk_flag": risk_flagged_pairs,
+            "routes_with_any_risk_flag": risk_flagged_variants,
             "total_risk_flag_occurrences": sum(
                 len(route.get("risk_flags") or []) for route in routes
             ),
-            "unique_routes_hard_blocked": hard_blocked_pairs,
-            "unique_routes_soft_flagged": risk_flagged_pairs,
+            "directed_pairs_soft_flagged": risk_flagged_pairs,
+            "unique_route_variants_soft_flagged": risk_flagged_variants,
+            "unique_route_families_soft_flagged": len(risk_flagged_families),
             "routes_structurally_matched": structurally_matched,
             "routes_detected": len(routes),
             "watch_routes_added": len(routes),
@@ -3132,6 +3330,9 @@ class PaperBot:
         return {
             **readiness,
             "paper_eligible": bool(readiness.get("verified_paper_ready")),
+            "experimental_simulation_ready": bool(
+                readiness.get("experimental_simulation_ready")
+            ),
             "experimental_paper_ready": bool(readiness.get("experimental_paper_ready")),
             "all_reasons": reasons,
             "lightweight_allowed_missing": sorted(readiness.get("risk_flags") or []),
@@ -3180,8 +3381,14 @@ class PaperBot:
                 ]
             )
         )
+        experimental_simulation_ready = bool(
+            route_readiness.get("experimental_simulation_ready")
+            or route_readiness.get("experimental_paper_ready")
+        )
         paper_mode = route_readiness.get("paper_mode") or (
-            "EXPERIMENTAL" if route_readiness.get("experimental_paper_ready") else "RESEARCH"
+            "EXPERIMENTAL_SIMULATION"
+            if experimental_simulation_ready
+            else "RESEARCH"
         )
         readiness_label = str(route_readiness.get("readiness_level") or "economically_observable")
         selected_strategy = {
@@ -3196,7 +3403,7 @@ class PaperBot:
                 if "estimated_rate_used" in {flag.removeprefix("long_").removeprefix("short_") for flag in risk_flags}
                 else "Lightweight funding watch"
             ),
-            "eligible": bool(route_readiness.get("experimental_paper_ready")),
+            "eligible": experimental_simulation_ready,
             "expected_net_pnl": conservative_expected_net,
             "raw_expected_net_pnl": raw_expected_net,
             "conservative_expected_net_pnl": conservative_expected_net,
@@ -3218,7 +3425,7 @@ class PaperBot:
             ),
         }
         route = {
-            "route_key": perp_route_key(asset, long_venue, short_venue),
+            "route_key": "",
             "route_type": "perp_perp",
             "canonical_asset": asset,
             "venue_scope": "+".join(sorted((long_venue, short_venue))),
@@ -3295,9 +3502,11 @@ class PaperBot:
                 "synchronized_capability_passed": bool(
                     route_readiness.get("verified_paper_ready")
                 ),
+                "experimental_simulation_ready": experimental_simulation_ready,
                 "experimental_paper_ready": bool(
                     route_readiness.get("experimental_paper_ready")
                 ),
+                "experimental_paper_ready_deprecated": True,
                 "verified_paper_ready": bool(route_readiness.get("verified_paper_ready")),
                 "capability_rejections": route_readiness.get("verified_paper_blockers") or [],
                 "capability_check": route_readiness,
@@ -3307,7 +3516,12 @@ class PaperBot:
                 "requested_target_notional": target_notional,
             },
         }
-        return route
+        return enrich_route_identity(
+            route,
+            asset=asset,
+            long_market=long_market,
+            short_market=short_market,
+        )
 
     def _lightweight_route_leg(
         self,
@@ -4668,21 +4882,63 @@ def route_summary(route: dict[str, Any]) -> dict[str, Any]:
         "funding_scan_id": route.get("funding_scan_id"),
         "funding_route_id": route.get("funding_route_id"),
         "route_key": route.get("route_key"),
+        "route_family_key": route.get("route_family_key") or evidence.get("route_family_key"),
+        "route_variant_key": route.get("route_variant_key") or evidence.get("route_variant_key"),
         "canonical_asset": route.get("canonical_asset"),
+        "long_venue": route.get("long_venue"),
+        "long_symbol": route.get("long_symbol"),
+        "short_venue": route.get("short_venue"),
+        "short_symbol": route.get("short_symbol"),
         "long": f"{route.get('long_venue')} {route.get('long_symbol')}",
         "short": f"{route.get('short_venue')} {route.get('short_symbol')}",
         "target_notional": route.get("target_notional"),
         "market_capacity": route.get("market_capacity"),
         "strategy_name": selected.get("strategy_name") or selected.get("strategy_class"),
+        "readiness_level": evidence.get("readiness_level"),
+        "paper_mode": evidence.get("paper_mode"),
+        "verified_paper_ready": bool(evidence.get("verified_paper_ready")),
+        "experimental_simulation_ready": bool(
+            evidence.get("experimental_simulation_ready")
+            or evidence.get("experimental_paper_ready")
+        ),
         "current_nowcast_net": selected.get("expected_net_pnl")
         if selected.get("expected_net_pnl") is not None
         else evidence.get("current_nowcast_net"),
         "current_nowcast_gross": evidence.get("current_nowcast_gross"),
+        "conservative_expected_net": evidence.get("conservative_expected_net"),
+        "conservative_expected_funding": evidence.get("conservative_expected_funding"),
         "funding_pnl_component": selected.get("funding_pnl_component"),
         "spread_pnl_component": selected.get("spread_pnl_component"),
         "actionable_profit_threshold": evidence.get("actionable_profit_threshold"),
         "execution_cost": evidence.get("execution_cost"),
+        "focused_state": route.get("focused_state") or evidence.get("focused_state"),
+        "focus_rank": route.get("focus_rank") or evidence.get("focus_rank"),
+        "focused_selection": evidence.get("focused_selection") or {},
         "risk_flags": route.get("risk_flags") or [],
+        "evidence": {
+            key: value
+            for key, value in evidence.items()
+            if key
+            in {
+                "readiness_level",
+                "paper_mode",
+                "funding_cashflow_status",
+                "execution_status",
+                "settlement_semantics_status",
+                "rate_confidence",
+                "execution_confidence",
+                "settlement_confidence",
+                "risk_flags",
+                "capability_rejections",
+                "focused_state",
+                "focus_rank",
+                "focused_selection",
+                "selected_strategy",
+                "strategy_classification",
+                "current_nowcast_net",
+                "current_nowcast_gross",
+            }
+        },
     }
 
 def serializable_config(config: PaperBotConfig) -> dict[str, Any]:

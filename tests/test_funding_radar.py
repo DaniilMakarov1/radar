@@ -456,7 +456,10 @@ class FundingRadarTest(unittest.TestCase):
                             self.assertEqual(routes[0]["status"], "watch")
                             self.assertEqual(
                                 routes[0]["evidence"]["paper_mode"],
-                                "EXPERIMENTAL",
+                                "EXPERIMENTAL_SIMULATION",
+                            )
+                            self.assertTrue(
+                                routes[0]["evidence"]["experimental_simulation_ready"]
                             )
                             self.assertFalse(routes[0]["evidence"]["verified_paper_ready"])
             finally:

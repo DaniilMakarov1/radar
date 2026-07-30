@@ -28,6 +28,8 @@ jobs:
         run: |
           python -m py_compile \
             smart_money_radar/paper_bot/runtime_v2.py \
+            smart_money_radar/funding/route_identity.py \
+            smart_money_radar/funding/readiness_policy.py \
             smart_money_radar/funding/trader.py \
             smart_money_radar/funding/strategy_synchronized_funding.py \
             smart_money_radar/funding/stablecoins.py \

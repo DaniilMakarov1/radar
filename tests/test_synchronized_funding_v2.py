@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from smart_money_radar.funding.profiles import funding_bot_profile
+from smart_money_radar.funding.readiness_policy import EvaluationMode
 from smart_money_radar.funding.fees import (
     fee_evidence_status,
     fee_override,
@@ -2053,7 +2054,9 @@ def test_paperbot_v2_actually_calls_shared_planner(tmp_path) -> None:
 
     class SpyPlanner:
         def __init__(self) -> None:
-            self.delegate = FundingSettlementPlanner()
+            self.delegate = FundingSettlementPlanner(
+                evaluation_mode=EvaluationMode.VERIFIED_PAPER
+            )
             self.calls: list[dict] = []
 
         def plan(self, **kwargs):
@@ -3206,11 +3209,12 @@ def test_lightweight_discovery_records_early_route_without_hot_loop(tmp_path) ->
     assert summary is not None
     assert summary["routes_detected"] == 1
     assert summary["early_route_count"] == 1
-    assert summary["hot_route_count"] == 0
+    assert summary["focused_selected_count"] <= bot.config.max_focused_routes
     assert len(bot.discovered_routes) == 1
-    assert not bot.hot_routes
+    assert len(bot.hot_routes) <= bot.config.max_focused_routes
     route = next(iter(bot.discovered_routes.values()))
     assert route["discovery_stage"] == "early"
+    assert route["focused_state"] in {"selected", "deferred", "not_yet_eligible"}
     bot.shutdown_foreground_executors()
 
 
@@ -3256,7 +3260,11 @@ def test_lightweight_discovery_tracks_different_settlement_times(tmp_path) -> No
         route["canonical_asset"]: route["discovery_stage"]
         for route in bot.discovered_routes.values()
     } == {"NEAR": "watch", "LATER": "early"}
-    assert not bot.hot_routes
+    assert len(bot.hot_routes) <= bot.config.max_focused_routes
+    assert {
+        route["canonical_asset"]: route["focused_state"]
+        for route in bot.discovered_routes.values()
+    }.keys() == {"NEAR", "LATER"}
     bot.shutdown_foreground_executors()
 
 
@@ -5818,6 +5826,131 @@ def test_missing_endpoint_identity_blocks_armed(tmp_path) -> None:
     assert result["reason"] == "route_plan_blocked"
     assert any("endpoint" in blocker or "environment" in blocker for blocker in result["blockers"])
     assert store.funding_capture_position_by_id(capture_id)["state"] == "DISCOVERED"
+
+
+def test_verified_runtime_rejects_experimental_simulation_ready_route(tmp_path) -> None:
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now)
+    route["evidence"]["paper_mode"] = "EXPERIMENTAL_SIMULATION"
+    route["evidence"]["experimental_simulation_ready"] = True
+    route["evidence"]["verified_paper_ready"] = False
+    route["evidence"]["readiness_policy"] = {
+        "experimental_simulation_ready": True,
+        "verified_paper_ready": False,
+    }
+    for key in ("fee_source", "fee_evidence", "fee_observed_at", "fee_reviewed_at"):
+        route["legs"][0].pop(key, None)
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    capture_id = capture_position_id_for_route(route)
+    assert result["opened"] is False
+    assert result["reason"] == "route_plan_blocked"
+    assert "verified_paper_ready_false" in result["blockers"]
+    assert result["verified_readiness"]["evaluation_mode"] == "VERIFIED_PAPER"
+    assert result["verified_readiness"]["experimental_simulation_ready"] is True
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "DISCOVERED"
+
+
+def test_verified_runtime_rejects_experimental_paper_mode(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now)
+    route["evidence"]["paper_mode"] = "EXPERIMENTAL_SIMULATION"
+    for leg in route["legs"]:
+        leg.pop("quantity_step", None)
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is False
+    assert result["reason"] == "route_plan_blocked"
+    assert "verified_paper_ready_false" in result["blockers"]
+    assert any("quantity_step" in blocker for blocker in result["blockers"])
+    assert result["verified_readiness"]["evaluation_mode"] == "VERIFIED_PAPER"
+
+
+def test_verified_runtime_rejects_stale_fake_verified_discovery_json(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now)
+    route["evidence"]["verified_paper_ready"] = True
+    route["evidence"]["synchronized_capability_passed"] = True
+    route["evidence"]["readiness_policy"] = {
+        "verified_paper_ready": True,
+        "verified_paper_blockers": [],
+    }
+    for key in ("fee_source", "fee_evidence", "fee_observed_at", "fee_reviewed_at"):
+        route["legs"][1].pop(key, None)
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is False
+    assert result["reason"] == "route_plan_blocked"
+    assert "verified_paper_ready_false" in result["blockers"]
+    assert result["verified_readiness"]["verified_paper_ready"] is False
+    assert any("fee" in blocker for blocker in result["blockers"])
+
+
+def test_verified_runtime_binance_okx_route_still_opens(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "okx"], 10_000.0)
+    bot = PaperBot(
+        store,
+        PaperBotConfig(
+            telegram_enabled=False,
+            focused_recheck_enabled=False,
+            venue_starting_balance=10_000.0,
+            target_notional_per_leg=500.0,
+        ).validated(),
+        clock=FakeClock(now),
+    )
+    route = _v2_runtime_route(now, route_key="BTC:binance:okx")
+    route["short_venue"] = "okx"
+    route["short_symbol"] = "BTC-USDT-SWAP"
+    short_leg = route["legs"][1]
+    short_leg.update(
+        {
+            "venue": "okx",
+            "symbol": "BTC-USDT-SWAP",
+            **_trusted_paper_market_fields("okx", short_leg["response_received_at"]),
+            "fee_rate": 0.0005,
+            "taker_fee_rate": 0.0005,
+            "collateral_asset": "USDT",
+            "quote_asset": "USDT",
+        }
+    )
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    capture_id = capture_position_id_for_route(route)
+    assert result["opened"] is True
+    assert result["position_id"] == capture_id
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "OPEN"
 
 
 def test_cross_stable_requires_fresh_snapshot_and_can_open_with_peg_guard(tmp_path, monkeypatch) -> None:

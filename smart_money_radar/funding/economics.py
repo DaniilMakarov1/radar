@@ -809,8 +809,11 @@ def evaluate_perp_route(
             "readiness_level": capability_check.get("readiness_level"),
             "paper_mode": capability_check.get("paper_mode")
             or (
-                "EXPERIMENTAL"
-                if capability_check.get("experimental_paper_ready")
+                "EXPERIMENTAL_SIMULATION"
+                if (
+                    capability_check.get("experimental_simulation_ready")
+                    or capability_check.get("experimental_paper_ready")
+                )
                 else "RESEARCH"
             ),
             "funding_cashflow_status": capability_check.get("funding_cashflow_status"),
@@ -843,9 +846,15 @@ def evaluate_perp_route(
             "synchronized_capability_passed": bool(
                 capability_check.get("verified_paper_ready")
             ),
-            "experimental_paper_ready": bool(
-                capability_check.get("experimental_paper_ready")
+            "experimental_simulation_ready": bool(
+                capability_check.get("experimental_simulation_ready")
+                or capability_check.get("experimental_paper_ready")
             ),
+            "experimental_paper_ready": bool(
+                capability_check.get("experimental_simulation_ready")
+                or capability_check.get("experimental_paper_ready")
+            ),
+            "experimental_paper_ready_deprecated": True,
             "verified_paper_ready": bool(
                 capability_check.get("verified_paper_ready")
             ),

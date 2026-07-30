@@ -33,6 +33,7 @@ from smart_money_radar.paper_bot.helpers import format_seconds
 from smart_money_radar.paper_bot.position import settlement_rate_or_entry
 from smart_money_radar.paper_bot.telegram import (
     funding_rate_lines,
+    status_route_line,
     status_report_message,
 )
 from smart_money_radar.paper_bot.risk import common_price_move_telemetry
@@ -46,6 +47,19 @@ def test_risky_venues_are_disabled_for_focused_rechecks() -> None:
 
 def test_format_seconds_shows_overdue_settlement() -> None:
     assert format_seconds(-75) == "просрочено 1m 15s"
+
+
+def test_telegram_uses_simulation_ready_not_experimental_paper() -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    route = paper_route(now, long_lead=90, short_lead=90)
+    route["evidence"]["paper_mode"] = "EXPERIMENTAL_SIMULATION"
+    route["evidence"]["experimental_simulation_ready"] = True
+    route["evidence"]["readiness_level"] = "experimental_simulation_ready"
+
+    line = status_route_line(route, 1)
+
+    assert "SIMULATION READY" in line
+    assert "EXPERIMENTAL PAPER" not in line
 
 
 def paper_route(

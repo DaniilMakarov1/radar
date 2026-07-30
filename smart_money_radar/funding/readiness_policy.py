@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -22,6 +23,7 @@ from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 
 class EvaluationMode(str, Enum):
     DISCOVERY = "DISCOVERY"
+    EXPERIMENTAL_SIMULATION = "EXPERIMENTAL_SIMULATION"
     EXPERIMENTAL_PAPER = "EXPERIMENTAL_PAPER"
     VERIFIED_PAPER = "VERIFIED_PAPER"
 
@@ -30,6 +32,7 @@ class ReadinessLevel(str, Enum):
     STRUCTURALLY_BLOCKED = "structurally_blocked"
     STRUCTURALLY_ELIGIBLE = "structurally_eligible"
     ECONOMICALLY_OBSERVABLE = "economically_observable"
+    EXPERIMENTAL_SIMULATION_READY = "experimental_simulation_ready"
     EXPERIMENTAL_PAPER_READY = "experimental_paper_ready"
     VERIFIED_PAPER_READY = "verified_paper_ready"
     SETTLEMENT_VALIDATION_READY = "settlement_validation_ready"
@@ -163,6 +166,35 @@ def optional_float(value: Any) -> float | None:
 def positive_float(value: Any) -> float | None:
     parsed = optional_float(value)
     return parsed if parsed is not None and parsed > 0 else None
+
+
+def _parse_snapshot_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _snapshot_reference_time(*markets: dict[str, Any]) -> datetime | None:
+    timestamps: list[datetime] = []
+    for market in markets:
+        for field in (
+            "orderbook_response_received_at",
+            "response_received_at",
+            "source_event_at",
+            "observed_at",
+            "fee_observed_at",
+            "fee_reviewed_at",
+        ):
+            parsed = _parse_snapshot_time(market.get(field))
+            if parsed is not None:
+                timestamps.append(parsed)
+    return max(timestamps) if timestamps else None
 
 
 def normalized_rate_kind(value: Any) -> RateEstimateKind:
@@ -407,26 +439,27 @@ def modeled_fee_rate(
     numeric_rate = fee_rate_value(market, "taker")
     default_rate = DEFAULT_TAKER_FEE_RATES.get(venue)
     fee_status = fee_evidence_status(market, "taker", now=now)
-    verified = bool(fee_status.get("verified"))
-    candidates = [
-        value
-        for value in (
-            numeric_rate,
-            default_rate,
-            risk_policy.global_conservative_taker_fee_rate,
-        )
-        if value is not None and math.isfinite(float(value))
-    ]
-    base = max(candidates) if candidates else risk_policy.global_conservative_taker_fee_rate
+    verified = bool(fee_status.get("verified")) and numeric_rate is not None
     flags: list[str] = []
     assumptions: list[str] = []
-    if numeric_rate is None:
-        flags.extend(["account_fee_unknown", "fee_fallback_used"])
-        assumptions.append("taker fee missing; conservative global/venue fallback applied")
-    if not verified:
+    if verified:
+        base = float(numeric_rate or 0.0)
+    else:
+        candidates = [
+            value
+            for value in (
+                numeric_rate,
+                default_rate,
+                risk_policy.global_conservative_taker_fee_rate,
+            )
+            if value is not None and math.isfinite(float(value))
+        ]
+        base = max(candidates) if candidates else risk_policy.global_conservative_taker_fee_rate
+        if numeric_rate is None:
+            flags.extend(["account_fee_unknown", "fee_fallback_used"])
+            assumptions.append("taker fee missing; conservative global/venue fallback applied")
         flags.extend(["fee_unverified", "fee_fallback_used"])
         assumptions.append("taker fee evidence is not verified for paper-grade accounting")
-        base = max(base, risk_policy.global_conservative_taker_fee_rate)
         base += risk_policy.fee_uncertainty_reserve_bps / 10_000.0
     return {
         "fee_rate": max(0.0, float(base)),
@@ -507,6 +540,7 @@ def _market_soft_flags(
     contract: FundingSettlementContract,
     *,
     has_orderbook_client: bool,
+    now: datetime | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     flags: list[str] = []
     assumptions: list[str] = []
@@ -538,7 +572,7 @@ def _market_soft_flags(
     if not market.get("timing_policy_source"):
         flags.append("timing_policy_source_missing")
         missing.append("timing_policy_source")
-    fee = modeled_fee_rate(market)
+    fee = modeled_fee_rate(market, now=now)
     flags.extend(fee["risk_flags"])
     assumptions.extend(fee["assumptions"])
     if not fee["verified"]:
@@ -623,6 +657,7 @@ def evaluate_synchronized_route(
     )
     long = attach_rate_estimate(long_market, policy=risk_policy)
     short = attach_rate_estimate(short_market, policy=risk_policy)
+    reference_now = _snapshot_reference_time(long, short)
     long_contract = settlement_contract_from_market(long)
     short_contract = settlement_contract_from_market(short)
     clients = clients_by_venue or {}
@@ -661,11 +696,13 @@ def evaluate_synchronized_route(
         long,
         long_contract,
         has_orderbook_client=long_venue in clients,
+        now=reference_now,
     )
     short_flags, short_assumptions, short_missing = _market_soft_flags(
         short,
         short_contract,
         has_orderbook_client=short_venue in clients,
+        now=reference_now,
     )
     risk_flags.extend(f"long_{flag}" for flag in long_flags)
     risk_flags.extend(f"short_{flag}" for flag in short_flags)
@@ -714,6 +751,7 @@ def evaluate_synchronized_route(
         long_execution_level=execution_evidence_level(long, has_orderbook_client=long_venue in clients),
         short_execution_level=execution_evidence_level(short, has_orderbook_client=short_venue in clients),
         collateral_reserve_bps=collateral_reserve_bps,
+        now=reference_now,
     )
     if economics.get("sizing_status") == "provisional":
         risk_flags.append("sizing_provisional")
@@ -749,6 +787,7 @@ def evaluate_synchronized_route(
         execution_levels=execution_levels,
         settlement_confidence=settlement_confidence,
         accounting_confidence=accounting_confidence,
+        now=reference_now,
     )
     hard = list(dict.fromkeys(str(reason) for reason in hard if reason))
     risk_flags = list(dict.fromkeys(str(flag) for flag in risk_flags if flag))
@@ -756,13 +795,13 @@ def evaluate_synchronized_route(
     missing = list(dict.fromkeys(str(item) for item in missing if item))
 
     economically_observable = not hard and economics.get("raw_expected_funding_usd") is not None
-    experimental_ready = (
+    experimental_simulation_ready = (
         economically_observable
         and float(economics.get("conservative_expected_net_usd") or 0.0) > 0.0
         and "funding_continuous_pro_rata" not in hard
         and "venue_quarantined_variational" not in hard
     )
-    verified_ready = experimental_ready and not verified_blockers
+    verified_ready = experimental_simulation_ready and not verified_blockers
     settlement_validation_ready = verified_ready and accounting_confidence >= 0.75
     if hard:
         readiness = ReadinessLevel.STRUCTURALLY_BLOCKED
@@ -770,8 +809,8 @@ def evaluate_synchronized_route(
         readiness = ReadinessLevel.SETTLEMENT_VALIDATION_READY
     elif verified_ready:
         readiness = ReadinessLevel.VERIFIED_PAPER_READY
-    elif experimental_ready:
-        readiness = ReadinessLevel.EXPERIMENTAL_PAPER_READY
+    elif experimental_simulation_ready:
+        readiness = ReadinessLevel.EXPERIMENTAL_SIMULATION_READY
     elif economically_observable:
         readiness = ReadinessLevel.ECONOMICALLY_OBSERVABLE
     else:
@@ -805,10 +844,18 @@ def evaluate_synchronized_route(
         "mode_blockers": mode_blockers,
         "structurally_eligible": not hard,
         "economically_observable": economically_observable,
-        "experimental_paper_ready": experimental_ready,
+        "experimental_simulation_ready": experimental_simulation_ready,
+        "experimental_paper_ready": experimental_simulation_ready,
+        "experimental_paper_ready_deprecated": True,
         "verified_paper_ready": verified_ready,
         "settlement_validation_ready": settlement_validation_ready,
-        "paper_mode": "VERIFIED" if verified_ready else "EXPERIMENTAL" if experimental_ready else None,
+        "paper_mode": (
+            "VERIFIED_PAPER"
+            if verified_ready
+            else "EXPERIMENTAL_SIMULATION"
+            if experimental_simulation_ready
+            else None
+        ),
         "funding_cashflow_status": "CONFIRMED_ONLY" if verified_ready else "ESTIMATED_ONLY",
         "execution_status": economics.get("execution_status"),
         "settlement_semantics_status": (
@@ -836,6 +883,7 @@ def _route_economics(
     long_execution_level: ExecutionEvidenceLevel,
     short_execution_level: ExecutionEvidenceLevel,
     collateral_reserve_bps: float,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     if (
         long_reference_price is None
@@ -855,8 +903,12 @@ def _route_economics(
     quantity = min(target / long_reference_price, target / short_reference_price)
     long_notional = quantity * long_reference_price
     short_notional = quantity * short_reference_price
-    long_fee = modeled_fee_rate(long_market, policy=policy)
-    short_fee = modeled_fee_rate(short_market, policy=policy)
+    long_fee = modeled_fee_rate(long_market, policy=policy, now=now)
+    short_fee = modeled_fee_rate(short_market, policy=policy, now=now)
+    fee_uncertainty_reserve_bps = max(
+        float(long_fee.get("uncertainty_reserve_bps") or 0.0),
+        float(short_fee.get("uncertainty_reserve_bps") or 0.0),
+    )
     raw_fee_rate = (
         (long_fee.get("source_rate") if long_fee.get("source_rate") is not None else long_fee["fee_rate"])
         + (short_fee.get("source_rate") if short_fee.get("source_rate") is not None else short_fee["fee_rate"])
@@ -932,7 +984,7 @@ def _route_economics(
             "slippage_reserve_usd": slippage_reserve,
             "timing_uncertainty_reserve_usd": timing_reserve,
             "collateral_reserve_usd": collateral_reserve,
-            "fee_uncertainty_reserve_bps": policy.fee_uncertainty_reserve_bps,
+            "fee_uncertainty_reserve_bps": fee_uncertainty_reserve_bps,
         },
     }
 
@@ -949,6 +1001,7 @@ def _verified_blockers(
     execution_levels: list[ExecutionEvidenceLevel],
     settlement_confidence: float,
     accounting_confidence: float,
+    now: datetime | None = None,
 ) -> list[str]:
     blockers: list[str] = []
     if float(economics.get("conservative_expected_net_usd") or 0.0) <= 0.0:
@@ -993,7 +1046,7 @@ def _verified_blockers(
             blockers.append(f"{side}_quantity_step_missing")
         if positive_float(market.get("min_notional_usd")) is None and positive_float(market.get("min_notional")) is None:
             blockers.append(f"{side}_min_notional_missing")
-        if not bool(modeled_fee_rate(market)["verified"]):
+        if not bool(modeled_fee_rate(market, now=now)["verified"]):
             blockers.append(f"{side}_fee_evidence_unverified")
     for flag in risk_flags:
         if flag.endswith("collateral_other_dollar_stable") or flag.endswith("collateral_usdt0_risk"):

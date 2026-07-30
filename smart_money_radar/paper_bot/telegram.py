@@ -199,17 +199,21 @@ def compact_funnel_lines(result: dict[str, Any]) -> list[str]:
         "risk_flagged_pairs",
         "economically_observable",
         "watch",
-        "focused",
-        "experimental_paper_ready",
+        "focus_eligible",
+        "focused_selected",
+        "focused_deferred",
+        "experimental_simulation_ready",
         "verified_paper_ready",
-        "opened_experimental",
         "opened_verified",
         "reconciled",
         "unreconciled",
         "routes_with_any_risk_flag",
         "total_risk_flag_occurrences",
-        "unique_routes_hard_blocked",
-        "unique_routes_soft_flagged",
+        "directed_pairs_soft_flagged",
+        "unique_route_variants",
+        "unique_route_families",
+        "unique_route_variants_soft_flagged",
+        "unique_route_families_soft_flagged",
     ]
     lines: list[str] = []
     for key in ordered:
@@ -356,9 +360,9 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
         "collateral_usdt0_risk": "COLLATERAL RISK",
     }
     badges: list[str] = []
-    if paper_mode == "EXPERIMENTAL":
-        badges.append("EXPERIMENTAL PAPER")
-    elif paper_mode == "VERIFIED":
+    if paper_mode in {"EXPERIMENTAL_SIMULATION", "EXPERIMENTAL"}:
+        badges.append("SIMULATION READY")
+    elif paper_mode in {"VERIFIED_PAPER", "VERIFIED"}:
         badges.append("VERIFIED PAPER")
     if funding_status in {"ESTIMATED_ONLY", "UNRECONCILED", "PENDING"}:
         badges.append("UNRECONCILED" if funding_status != "ESTIMATED_ONLY" else "ESTIMATED RATE")

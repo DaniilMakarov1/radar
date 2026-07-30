@@ -852,7 +852,7 @@ def test_missing_fee_uses_conservative_fallback_without_blocking_discovery() -> 
     assert costs["entry_slippage_leg_a"]["status"] == "CONSERVATIVE_CONFIGURED"
 
 
-def test_explicit_zero_fee_still_uses_configured_conservative_floor() -> None:
+def test_verified_explicit_zero_fee_is_not_raised_to_conservative_floor() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     settlement = now + timedelta(seconds=30)
     long_market = complete_market(
@@ -879,13 +879,13 @@ def test_explicit_zero_fee_still_uses_configured_conservative_floor() -> None:
 
     assert "long_fee_unknown" not in opportunity["blockers"]
     assert "short_fee_unknown" not in opportunity["blockers"]
-    assert opportunity["modeled_costs"]["entry_fees_usd"] > 0.0
+    assert opportunity["modeled_costs"]["entry_fees_usd"] == 0.0
     costs = {
         row["component"]: row
         for row in opportunity["cost_estimates"]
     }
     assert costs["entry_fee_leg_a"]["status"] == "CONFIGURED_TRUSTED"
-    assert float(costs["entry_fee_leg_a"]["value"]) > 0.0
+    assert float(costs["entry_fee_leg_a"]["value"]) == 0.0
 
 
 def test_paradex_is_not_built_as_shadow_route(tmp_path) -> None:

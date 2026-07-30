@@ -34,13 +34,45 @@ def route_entry_key(route: dict[str, Any]) -> str:
     legs = route.get("legs") or []
     long_leg = leg_by_side(legs, "long") or {}
     short_leg = leg_by_side(legs, "short") or {}
+    def leg_identity(leg: dict[str, Any], side: str) -> list[str]:
+        venue = leg.get("venue") or route.get(f"{side}_venue") or ""
+        symbol = leg.get("symbol") or route.get(f"{side}_symbol") or ""
+        quote = leg.get("quote_asset") or leg.get("settlement_asset") or ""
+        collateral = leg.get("collateral_asset") or quote
+        product_identity = (
+            leg.get("product_id")
+            or leg.get("instrument_id")
+            or leg.get("market_id")
+            or leg.get("api_symbol")
+            or symbol
+        )
+        product_type = (
+            leg.get("api_product_type")
+            or leg.get("product_type")
+            or leg.get("market_type")
+            or leg.get("contract_kind")
+            or leg.get("contract_type")
+            or ""
+        )
+        return [
+            str(venue).lower(),
+            str(leg.get("environment") or "mainnet").lower(),
+            str(symbol),
+            str(product_identity),
+            str(quote).upper(),
+            str(collateral).upper(),
+            str(leg.get("contract_type") or leg.get("contract_kind") or "").lower(),
+            str(product_type).lower(),
+            str(leg.get("contract_multiplier") or "1"),
+            str(leg.get("canonical_unit_multiplier") or "1"),
+            str(leg.get("next_funding_at") or ""),
+        ]
+
     return ":".join(
         [
             str(route.get("canonical_asset") or ""),
-            str(long_leg.get("venue") or route.get("long_venue") or ""),
-            str(short_leg.get("venue") or route.get("short_venue") or ""),
-            str(long_leg.get("next_funding_at") or ""),
-            str(short_leg.get("next_funding_at") or ""),
+            *leg_identity(long_leg, "long"),
+            *leg_identity(short_leg, "short"),
         ]
     )
 

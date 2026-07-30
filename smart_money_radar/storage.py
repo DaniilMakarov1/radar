@@ -8128,6 +8128,10 @@ class SQLiteStore:
                               )
                               OR json_extract(
                                   evidence_json,
+                                  '$.experimental_simulation_ready'
+                              )
+                              OR json_extract(
+                                  evidence_json,
                                   '$.experimental_paper_ready'
                               )
                           )
@@ -8545,6 +8549,7 @@ class SQLiteStore:
                 and settlement_capture
                 and (
                     bool(evidence.get("synchronized_capability_passed"))
+                    or bool(evidence.get("experimental_simulation_ready"))
                     or bool(evidence.get("experimental_paper_ready"))
                 )
                 and selected_expected_net >= minimum_visible_profit
