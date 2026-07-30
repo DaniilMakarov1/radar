@@ -1656,6 +1656,106 @@ def test_status_report_publishes_detected_route_as_preliminary(tmp_path) -> None
     assert "Focused orderbooks, costs and entry observations: pending" in notifier.messages[0]
 
 
+def test_status_report_bounds_many_verbose_detected_routes_for_telegram(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    notifier = FakeNotifier()
+    trader = PaperBot(
+        store,
+        config=PaperBotConfig(
+            status_report_interval_seconds=1_800,
+            status_report_max_routes=5,
+        ),
+        notifier=notifier,
+    )
+    now = datetime.now(UTC)
+    routes = []
+    for index in range(20):
+        route = strategy_route(
+            now,
+            "funding_only",
+            expected_net=3.0,
+            funding_component=3.0,
+            spread_component=0.0,
+        )
+        route["route_key"] = f"verbose-watch-{index}"
+        route["canonical_asset"] = f"ASSET{index}"
+        route["status"] = "watch"
+        route["discovery_stage"] = "early"
+        route["risk_flags"] = [
+            "lightweight_only_requires_focused_underwriting",
+            "long_rate_estimate_not_exact_next",
+            "long_exact_next_rate_unavailable",
+            "long_volume_24h_missing",
+            "short_open_interest_missing",
+        ]
+        route["evidence"]["selected_strategy"]["selection_model"] = (
+            "lightweight_discovery_v1"
+        )
+        route["evidence"]["capability_check"] = {
+            "economics": {
+                "modeled_fee_rates": {
+                    "long": {
+                        "evidence_status": {
+                            "fee_evidence_kind": "REVIEWED_STATIC_SCHEDULE",
+                            "source_identifier": (
+                                "https://example.com/very/long/fee/source/path/"
+                                "with/query?symbol=BTCUSDT&venue=binance"
+                            ),
+                            "fee_schedule_reviewed_at": now.isoformat(),
+                            "age_seconds": 172800,
+                            "expires_at": (now + timedelta(days=28)).isoformat(),
+                            "verified": True,
+                            "fallback_required": False,
+                            "uncertainty_reserve_required": False,
+                        }
+                    },
+                    "short": {
+                        "evidence_status": {
+                            "fee_evidence_kind": "UNVERIFIED_MARKET_FIELD",
+                            "source_identifier": "unknown",
+                            "verified": False,
+                            "fallback_required": True,
+                            "uncertainty_reserve_required": True,
+                        }
+                    },
+                }
+            }
+        }
+        routes.append(route)
+
+    trader.maybe_record_status_report(
+        {
+            "mode": "hot_routes",
+            "funding_scan_id": None,
+            "candidate_count": 0,
+            "watch_count": len(routes),
+            "opened_count": 0,
+            "closed_count": 0,
+            "pending_count": 0,
+            "hot_route_count": 0,
+            "urgent_route_count": 0,
+            "detected_route_count": len(routes),
+            "venue_health": {
+                "requested_count": 24,
+                "ready_count": 24,
+                "pending_count": 0,
+                "unavailable_count": 0,
+            },
+        },
+        [],
+        routes,
+    )
+
+    assert len(notifier.messages) == 1
+    message = notifier.messages[0]
+    assert len(message) <= 4096
+    assert "Top detected routes" in message
+    assert "...and" in message
+    assert "more detected routes" in message
+    assert "Fees:" not in message
+
+
 def test_status_report_does_not_publish_negative_live_pnl_candidate(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()

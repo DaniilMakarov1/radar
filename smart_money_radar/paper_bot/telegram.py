@@ -26,6 +26,9 @@ from smart_money_radar.paper_bot.position import (
     status_publishable_candidate,
 )
 
+TELEGRAM_SEND_MESSAGE_LIMIT_CHARS = 4096
+TELEGRAM_STATUS_MESSAGE_SOFT_LIMIT_CHARS = 3900
+
 
 def status_report_message(
     result: dict[str, Any],
@@ -115,25 +118,56 @@ def status_report_message(
         lines.extend(["", "<b>Discovery funnel</b>", *funnel_lines])
     if candidates:
         lines.extend(["", "<b>Qualified candidates</b>"])
-        lines.extend(
-            status_route_line(route, index)
-            for index, route in enumerate(candidates[:max_routes], start=1)
+        append_bounded_status_routes(
+            lines,
+            candidates,
+            max_routes=max_routes,
+            omitted_label="more",
         )
-        hidden = len(candidates) - max_routes
-        if hidden > 0:
-            lines.append(f"<i>...and {hidden} more</i>")
     else:
         lines.extend(["", "<b>Qualified candidates:</b> нет"])
     if watched:
         lines.extend(["", "<b>Top detected routes</b>"])
-        lines.extend(
-            status_route_line(route, index)
-            for index, route in enumerate(watched[:max_routes], start=1)
+        append_bounded_status_routes(
+            lines,
+            watched,
+            max_routes=max_routes,
+            omitted_label="more detected routes",
         )
-        hidden = len(watched) - max_routes
-        if hidden > 0:
-            lines.append(f"<i>...and {hidden} more detected routes</i>")
     return "\n".join(lines)
+
+
+def append_bounded_status_routes(
+    lines: list[str],
+    routes: list[dict[str, Any]],
+    *,
+    max_routes: int,
+    omitted_label: str,
+) -> None:
+    shown = 0
+    limit = TELEGRAM_STATUS_MESSAGE_SOFT_LIMIT_CHARS
+    for index, route in enumerate(routes[:max_routes], start=1):
+        block = status_route_line(route, index, include_fee_evidence=False)
+        hidden_after_this = len(routes) - index
+        candidate_lines = [block]
+        if hidden_after_this > 0:
+            candidate_lines.append(
+                f"<i>...and {hidden_after_this} {tg(omitted_label)}</i>"
+            )
+        if joined_line_length([*lines, *candidate_lines]) > limit:
+            break
+        lines.append(block)
+        shown = index
+
+    hidden = len(routes) - shown
+    if hidden > 0:
+        hidden_line = f"<i>...and {hidden} {tg(omitted_label)}</i>"
+        if joined_line_length([*lines, hidden_line]) <= TELEGRAM_SEND_MESSAGE_LIMIT_CHARS:
+            lines.append(hidden_line)
+
+
+def joined_line_length(lines: list[str]) -> int:
+    return len("\n".join(lines))
 
 
 def status_scan_label(result: dict[str, Any]) -> str:
@@ -349,7 +383,12 @@ def short_age(value: Any) -> str:
     return f"{age:.0f}s"
 
 
-def status_route_line(route: dict[str, Any], index: int) -> str:
+def status_route_line(
+    route: dict[str, Any],
+    index: int,
+    *,
+    include_fee_evidence: bool = True,
+) -> str:
     evidence = route.get("evidence") or {}
     legs = route.get("legs") or []
     long_leg = leg_by_side(legs, "long") or {}
@@ -455,7 +494,7 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
         else ""
     )
     badges_line = f"{tg(' | '.join(badges))}\n" if badges else ""
-    fee_line = fee_evidence_status_line(route)
+    fee_line = fee_evidence_status_line(route) if include_fee_evidence else ""
     if lightweight:
         pnl_line = (
             "Preliminary funding before focused costs: "
