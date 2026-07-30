@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import csv
 import hashlib
@@ -73,6 +74,24 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _process_id_is_running(process_id: Any) -> bool:
+    try:
+        pid = int(process_id)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _funding_wait_bucket(wait_seconds: float) -> str:
@@ -7624,6 +7643,88 @@ class SQLiteStore:
                 [(scan_id, warning, now) for warning in unique],
             )
         return len(unique)
+
+    def recover_orphaned_focused_running_scans(
+        self,
+        *,
+        current_run_id: str,
+        current_process_id: str,
+        older_than_seconds: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+        threshold = max(60, int(older_than_seconds))
+        cutoff = (now_utc - timedelta(seconds=threshold)).isoformat(timespec="seconds")
+        now_iso = now_utc.isoformat(timespec="seconds")
+        recovered_ids: list[int] = []
+        skipped_current_ids: list[int] = []
+        skipped_live_process_ids: list[int] = []
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT funding_scan_id, started_at, config_json
+                FROM funding_scans
+                WHERE status = 'running'
+                  AND started_at < ?
+                  AND json_extract(config_json, '$.focused_route_key') IS NOT NULL
+                ORDER BY funding_scan_id
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                scan_id = int(row["funding_scan_id"])
+                try:
+                    config = json.loads(row["config_json"] or "{}")
+                except json.JSONDecodeError:
+                    config = {}
+                run_id = str(config.get("focused_run_id") or "")
+                process_id = str(config.get("focused_process_id") or "")
+                if run_id and run_id == str(current_run_id):
+                    skipped_current_ids.append(scan_id)
+                    continue
+                if process_id and process_id == str(current_process_id):
+                    skipped_current_ids.append(scan_id)
+                    continue
+                if process_id and _process_id_is_running(process_id):
+                    skipped_live_process_ids.append(scan_id)
+                    continue
+                recovered_ids.append(scan_id)
+            if recovered_ids:
+                placeholders = ",".join("?" for _ in recovered_ids)
+                connection.execute(
+                    f"""
+                    UPDATE funding_scans
+                    SET status = 'failed',
+                        finished_at = COALESCE(finished_at, ?),
+                        error = COALESCE(error, 'orphaned_by_process_restart')
+                    WHERE status = 'running'
+                      AND funding_scan_id IN ({placeholders})
+                    """,
+                    [now_iso, *recovered_ids],
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO funding_scan_warnings (
+                        funding_scan_id, warning, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    [
+                        (
+                            scan_id,
+                            "orphaned_by_process_restart",
+                            now_iso,
+                        )
+                        for scan_id in recovered_ids
+                    ],
+                )
+        return {
+            "status": "ok",
+            "recovered_count": len(recovered_ids),
+            "recovered_scan_ids": recovered_ids,
+            "skipped_current_count": len(skipped_current_ids),
+            "skipped_live_process_count": len(skipped_live_process_ids),
+            "cutoff_started_before": cutoff,
+        }
 
     def upsert_funding_instruments(self, rows: list[dict[str, Any]]) -> int:
         now = utc_now_iso()

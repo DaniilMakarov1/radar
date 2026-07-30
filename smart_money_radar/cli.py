@@ -823,6 +823,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum focused route rechecks to run in parallel during hot monitoring.",
     )
     funding_paper_trader.add_argument(
+        "--focused-io-workers",
+        type=int,
+        default=0,
+        help=(
+            "Focused leg/orderbook I/O workers. 0 chooses two I/O workers per "
+            "hot route worker, capped by PaperBotConfig."
+        ),
+    )
+    funding_paper_trader.add_argument(
+        "--focused-recheck-route-timeout-seconds",
+        type=float,
+        default=8.0,
+        help="Maximum wall-clock seconds for one focused route recheck.",
+    )
+    funding_paper_trader.add_argument(
         "--lightweight-foreground-budget-seconds",
         type=float,
         default=8.0,
@@ -1234,6 +1249,10 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         monitor_interval_seconds=args.monitor_interval_seconds,
         hot_interval_seconds=args.hot_interval_seconds,
         hot_route_recheck_workers=args.hot_route_recheck_workers,
+        focused_io_workers=args.focused_io_workers,
+        focused_recheck_route_timeout_seconds=(
+            args.focused_recheck_route_timeout_seconds
+        ),
         lightweight_foreground_budget_seconds=(
             args.lightweight_foreground_budget_seconds
         ),

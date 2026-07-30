@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,9 +26,11 @@ from smart_money_radar.funding.synchronized_market_contract import (  # noqa: E4
     normalize_synchronized_capture_market,
 )
 from smart_money_radar.funding.trader import funding_client_for_venue  # noqa: E402
+from smart_money_radar.funding.trader import PaperBot, PaperBotConfig  # noqa: E402
 from smart_money_radar.funding.venue_capabilities import (  # noqa: E402
     apply_declared_venue_capability_contract,
 )
+from smart_money_radar.storage import SQLiteStore  # noqa: E402
 
 
 DEFAULT_VENUES = ("binance", "bybit", "okx")
@@ -34,7 +39,95 @@ ROUTE_COMBINATIONS = (
     ("bybit", "binance"),
     ("binance", "okx"),
     ("okx", "binance"),
+    ("bybit", "okx"),
+    ("okx", "bybit"),
 )
+
+
+class PublicFocusedSmokeBot(PaperBot):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.telemetry_lock = threading.Lock()
+        self.route_telemetry: dict[str, dict[str, Any]] = {}
+        self.outer_started = 0
+
+    def _route_key(self, route: dict[str, Any]) -> str:
+        return str(route.get("route_key") or "unknown")
+
+    def _update_route_telemetry(self, route_key: str, **fields: Any) -> None:
+        with self.telemetry_lock:
+            row = self.route_telemetry.setdefault(route_key, {})
+            row.update(fields)
+
+    def focused_recheck_route(self, route: dict[str, Any]) -> dict[str, Any] | None:
+        route_key = self._route_key(route)
+        started = time.perf_counter()
+        with self.telemetry_lock:
+            self.outer_started += 1
+            self.route_telemetry.setdefault(route_key, {})["outer_thread"] = (
+                threading.current_thread().name
+            )
+            self.route_telemetry[route_key]["route_started_at"] = (
+                datetime.now(UTC).isoformat()
+            )
+        try:
+            result = super().focused_recheck_route(route)
+            self._update_route_telemetry(
+                route_key,
+                status="success" if result else "no_route",
+            )
+            return result
+        except Exception as exc:
+            self._update_route_telemetry(
+                route_key,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            self._update_route_telemetry(
+                route_key,
+                route_latency_seconds=time.perf_counter() - started,
+                route_finished_at=datetime.now(UTC).isoformat(),
+            )
+
+    def fresh_market_for_route_leg(
+        self,
+        route: dict[str, Any],
+        side: str,
+        observed_at: str,
+    ):
+        route_key = self._route_key(route)
+        started = time.perf_counter()
+        result = super().fresh_market_for_route_leg(route, side, observed_at)
+        with self.telemetry_lock:
+            row = self.route_telemetry.setdefault(route_key, {})
+            stages = row.setdefault("stages", {})
+            stages[f"{side}_market"] = {
+                "latency_seconds": time.perf_counter() - started,
+                "thread": threading.current_thread().name,
+            }
+        return result
+
+    def fetch_direct_orderbooks(
+        self,
+        markets_and_clients: list[tuple[dict[str, Any], Any]],
+        observed_at: str,
+        **kwargs: Any,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        route_key = str(kwargs.get("route_key") or "unknown")
+        started = time.perf_counter()
+        result = super().fetch_direct_orderbooks(
+            markets_and_clients,
+            observed_at,
+            **kwargs,
+        )
+        self._update_route_telemetry(
+            route_key,
+            orderbook_latency_seconds=time.perf_counter() - started,
+            orderbook_count=len(result),
+        )
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,6 +140,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--asset", default="BTC")
     parser.add_argument("--target-notional", type=float, default=500.0)
     parser.add_argument("--timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--focused-route-count", type=int, default=6)
+    parser.add_argument("--route-workers", type=int, default=6)
+    parser.add_argument("--focused-io-workers", type=int, default=0)
     args = parser.parse_args(argv)
 
     observed_at = datetime.now(UTC).isoformat()
@@ -169,12 +265,25 @@ def main(argv: list[str] | None = None) -> int:
             },
         }
 
+    focused_smoke = _run_focused_concurrency_smoke(
+        markets=markets,
+        asset=str(args.asset).upper(),
+        target_notional=float(args.target_notional),
+        route_count=int(args.focused_route_count),
+        route_workers=int(args.route_workers),
+        focused_io_workers=int(args.focused_io_workers),
+        timeout_seconds=float(args.timeout_seconds),
+    )
+    if focused_smoke["status"] != "PASS":
+        failures.append(f"focused_concurrency: {focused_smoke.get('reason')}")
+
     payload = {
         "status": "FAIL" if failures else "PASS",
         "observed_at": observed_at,
         "asset": str(args.asset).upper(),
         "venues": venue_results,
         "routes": route_results,
+        "focused_concurrency": focused_smoke,
         "failures": failures,
         "notes": {
             "credentials_used": False,
@@ -188,6 +297,214 @@ def main(argv: list[str] | None = None) -> int:
     output.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
     print(json.dumps({"status": payload["status"], "output": str(output)}, sort_keys=True))
     return 0 if payload["status"] == "PASS" else 1
+
+
+def _run_focused_concurrency_smoke(
+    *,
+    markets: dict[str, dict[str, Any]],
+    asset: str,
+    target_notional: float,
+    route_count: int,
+    route_workers: int,
+    focused_io_workers: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    selected_pairs = [
+        pair
+        for pair in ROUTE_COMBINATIONS
+        if pair[0] in markets and pair[1] in markets
+    ][: max(0, route_count)]
+    if len(selected_pairs) < route_count:
+        return {
+            "status": "FAIL",
+            "reason": "insufficient_public_markets_for_focused_routes",
+            "requested_route_count": route_count,
+            "available_route_count": len(selected_pairs),
+        }
+    start = datetime.now(UTC)
+    with tempfile.TemporaryDirectory(prefix="radar-focused-smoke-") as tmp_dir:
+        store = SQLiteStore(Path(tmp_dir) / "focused-smoke.sqlite")
+        store.init_db()
+        bot = PublicFocusedSmokeBot(
+            store,
+            PaperBotConfig(
+                telegram_enabled=False,
+                target_notional_per_leg=target_notional,
+                hot_route_recheck_workers=route_workers,
+                focused_io_workers=focused_io_workers,
+                focused_recheck_route_timeout_seconds=timeout_seconds,
+                export_dir=Path(tmp_dir) / "exports",
+            ),
+        )
+        for index, (long_venue, short_venue) in enumerate(selected_pairs):
+            route = _focused_smoke_route(
+                long_market=markets[long_venue],
+                short_market=markets[short_venue],
+                asset=asset,
+                target_notional=target_notional,
+                index=index,
+            )
+            bot.hot_routes[route["route_key"]] = route
+        started_perf = time.perf_counter()
+        refreshed = bot.refresh_hot_routes()
+        elapsed = time.perf_counter() - started_perf
+        with store.connect() as connection:
+            scan_statuses = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM funding_scans GROUP BY status"
+                )
+            ]
+            running_scan_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM funding_scans WHERE status = 'running'"
+                ).fetchone()[0]
+            )
+            position_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM funding_capture_positions"
+                ).fetchone()[0]
+            )
+            ledger_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM paper_event_ledger"
+                ).fetchone()[0]
+            )
+        bot.shutdown_foreground_executors()
+    terminal_count = sum(
+        int(row["count"])
+        for row in scan_statuses
+        if str(row["status"]) in {"success", "failed"}
+    )
+    status = (
+        "PASS"
+        if running_scan_count == 0
+        and terminal_count == len(selected_pairs)
+        and bot.outer_started == len(selected_pairs)
+        else "FAIL"
+    )
+    return {
+        "status": status,
+        "start_at": start.isoformat(),
+        "end_at": datetime.now(UTC).isoformat(),
+        "elapsed_seconds": elapsed,
+        "route_count": len(selected_pairs),
+        "route_workers": bot.config.hot_route_recheck_workers,
+        "focused_io_workers": bot.config.focused_io_workers,
+        "outer_started": bot.outer_started,
+        "refreshed_count": len(refreshed),
+        "scan_statuses": scan_statuses,
+        "remaining_running_scan_count": running_scan_count,
+        "position_count": position_count,
+        "paper_event_ledger_count": ledger_count,
+        "experimental_execution_count": 0,
+        "real_orders_sent": False,
+        "live_trading_enabled": False,
+        "routes": bot.route_telemetry,
+    }
+
+
+def _focused_smoke_route(
+    *,
+    long_market: dict[str, Any],
+    short_market: dict[str, Any],
+    asset: str,
+    target_notional: float,
+    index: int,
+) -> dict[str, Any]:
+    observed_at = datetime.now(UTC).isoformat()
+    route_key = (
+        f"public-smoke:{asset}:"
+        f"{long_market.get('venue')}:{long_market.get('symbol')}:"
+        f"{short_market.get('venue')}:{short_market.get('symbol')}:{index}"
+    )
+    return {
+        "route_key": route_key,
+        "route_type": "cex_cex",
+        "venue_scope": "cross_venue",
+        "status": "watch",
+        "canonical_asset": asset,
+        "long_venue": long_market.get("venue"),
+        "long_symbol": long_market.get("symbol"),
+        "short_venue": short_market.get("venue"),
+        "short_symbol": short_market.get("symbol"),
+        "target_notional": target_notional,
+        "observed_at": observed_at,
+        "long_next_funding_at": long_market.get("next_funding_at"),
+        "short_next_funding_at": short_market.get("next_funding_at"),
+        "risk_flags": [],
+        "rationale": [],
+        "legs": [
+            _focused_smoke_leg(long_market, "long", target_notional),
+            _focused_smoke_leg(short_market, "short", target_notional),
+        ],
+        "evidence": {
+            "mode": "public_readonly_focused_concurrency_smoke",
+            "paper_mode": "VERIFIED_PAPER",
+            "experimental_simulation_ready": False,
+        },
+    }
+
+
+def _focused_smoke_leg(
+    market: dict[str, Any],
+    side: str,
+    target_notional: float,
+) -> dict[str, Any]:
+    price = float(market.get("mark_price") or market.get("index_price") or 0.0)
+    quantity = target_notional / price if price > 0 else 0.0
+    return {
+        "side": side,
+        "venue": market.get("venue"),
+        "symbol": market.get("symbol"),
+        "canonical_asset": market.get("canonical_asset"),
+        "notional": target_notional,
+        "base_quantity": quantity,
+        "funding_rate": market.get("funding_rate"),
+        "normalized_next_funding_rate": market.get("normalized_next_funding_rate"),
+        "funding_interval_hours": market.get("funding_interval_hours"),
+        "hourly_funding_rate": market.get("hourly_funding_rate"),
+        "funding_rate_kind": market.get("funding_rate_kind"),
+        "funding_rate_semantics": market.get("funding_rate_semantics"),
+        "funding_rate_unit": market.get("funding_rate_unit"),
+        "funding_sign_convention": market.get("funding_sign_convention"),
+        "next_funding_at": market.get("next_funding_at"),
+        "mark_price": market.get("mark_price"),
+        "index_price": market.get("index_price"),
+        "quote_asset": market.get("quote_asset"),
+        "collateral_asset": market.get("collateral_asset"),
+        "contract_type": market.get("contract_type"),
+        "contract_kind": market.get("contract_kind"),
+        "contract_multiplier": market.get("contract_multiplier"),
+        "canonical_unit_multiplier": market.get("canonical_unit_multiplier"),
+        "quantity_step": market.get("quantity_step"),
+        "min_notional": market.get("min_notional"),
+        "min_notional_usd": market.get("min_notional_usd"),
+        "fee_rate": market.get("fee_rate") or market.get("taker_fee_rate"),
+        "taker_fee_rate": market.get("taker_fee_rate") or market.get("fee_rate"),
+        "fee_source": market.get("fee_source"),
+        "fee_evidence": market.get("fee_evidence"),
+        "fee_observed_at": market.get("fee_observed_at"),
+        "fee_reviewed_at": market.get("fee_reviewed_at"),
+        "environment_verified": market.get("environment_verified"),
+        "endpoint_base_url": market.get("endpoint_base_url"),
+        "endpoint_identity_provenance": market.get("endpoint_identity_provenance"),
+        "endpoint_client_version": market.get("endpoint_client_version"),
+        "endpoint_verified_at": market.get("endpoint_verified_at"),
+        "api_product_type": market.get("api_product_type"),
+        "market_type": market.get("market_type"),
+        "product_type": market.get("product_type"),
+        "data_enabled": market.get("data_enabled"),
+        "strategy_observation_enabled": market.get("strategy_observation_enabled"),
+        "paper_enabled": market.get("paper_enabled"),
+        "live_enabled": market.get("live_enabled"),
+        "execution_model": market.get("execution_model"),
+        "settlement_verification_level": market.get("settlement_verification_level"),
+        "position_inclusion_rule": market.get("position_inclusion_rule"),
+        "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
+        "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
+        "timing_policy_source": market.get("timing_policy_source"),
+    }
 
 
 def _select_market(markets: list[dict[str, Any]], asset: str) -> dict[str, Any] | None:

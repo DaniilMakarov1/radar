@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import signal
 import sqlite3
 import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed, wait
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
@@ -197,6 +199,28 @@ OPEN_CAPTURE_REFRESH_TIMEOUT_SECONDS = 2.0
 OPEN_CAPTURE_DEGRADED_HARD_STALE_SECONDS = 5.0
 
 
+class FocusedRecheckTimeout(TimeoutError):
+    def __init__(
+        self,
+        *,
+        route_key: str,
+        stage: str,
+        elapsed_seconds: float,
+        timeout_seconds: float,
+    ) -> None:
+        self.route_key = route_key
+        self.stage = stage
+        self.elapsed_seconds = elapsed_seconds
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            "focused_recheck_timeout "
+            f"route_key={route_key or 'unknown'} "
+            f"stage={stage} "
+            f"elapsed_seconds={elapsed_seconds:.3f} "
+            f"timeout_seconds={timeout_seconds:.3f}"
+        )
+
+
 @dataclass(frozen=True)
 class CaptureRouteRefreshResult:
     quality: str
@@ -263,6 +287,9 @@ class PaperBotConfig:
     monitor_interval_seconds: float = 2.0
     hot_interval_seconds: float = 1.0
     hot_route_recheck_workers: int = 6
+    focused_io_workers: int = 0
+    focused_recheck_route_timeout_seconds: float = 8.0
+    focused_orphan_scan_recovery_seconds: int = 300
     max_focused_routes: int = 20
     max_experimental_focused_routes: int = 6
     max_focused_routes_per_venue: int = 8
@@ -301,6 +328,14 @@ class PaperBotConfig:
             600.0,
             min(float(self.lightweight_route_horizon_seconds), 14_400.0),
         )
+        hot_route_recheck_workers = max(
+            1,
+            min(int(self.hot_route_recheck_workers), 16),
+        )
+        focused_io_workers = int(self.focused_io_workers)
+        if focused_io_workers <= 0:
+            focused_io_workers = hot_route_recheck_workers * 2
+        focused_io_workers = max(2, min(focused_io_workers, 32))
         lightweight_watch_window_seconds = min(
             lightweight_route_horizon_seconds,
             max(
@@ -421,9 +456,15 @@ class PaperBotConfig:
             scan_interval_seconds=max(10, int(self.scan_interval_seconds)),
             monitor_interval_seconds=max(1.0, float(self.monitor_interval_seconds)),
             hot_interval_seconds=max(1.0, float(self.hot_interval_seconds)),
-            hot_route_recheck_workers=max(
-                1,
-                min(int(self.hot_route_recheck_workers), 16),
+            hot_route_recheck_workers=hot_route_recheck_workers,
+            focused_io_workers=focused_io_workers,
+            focused_recheck_route_timeout_seconds=max(
+                0.05,
+                min(float(self.focused_recheck_route_timeout_seconds), 120.0),
+            ),
+            focused_orphan_scan_recovery_seconds=max(
+                60,
+                min(int(self.focused_orphan_scan_recovery_seconds), 3_600),
             ),
             max_focused_routes=max(
                 1,
@@ -579,8 +620,16 @@ class PaperBot:
             observations_by_route=self.v2_observations_by_route,
             settlement_data_provider=resolved_settlement_data_provider,
         )
-        self.focused_executor: ThreadPoolExecutor | None = None
+        self.focused_process_id = str(os.getpid())
+        self.focused_run_id = (
+            f"{utc_now_iso()}:{self.focused_process_id}:{uuid.uuid4().hex[:12]}"
+        )
+        self.focused_route_executor: ThreadPoolExecutor | None = None
+        self.focused_route_executor_workers = 0
+        self.focused_io_executor: ThreadPoolExecutor | None = None
+        self.focused_io_executor_workers = 0
         self.lightweight_executor: ThreadPoolExecutor | None = None
+        self.lightweight_executor_workers = 0
         self.background_full_scan_executor: ThreadPoolExecutor | None = None
         self.background_full_scan_future: Future[dict[str, Any]] | None = None
         self.background_full_scan_started_monotonic = 0.0
@@ -598,9 +647,19 @@ class PaperBot:
         self._lightweight_state_lock = Lock()
         self._last_lightweight_venue_health: dict[str, Any] = {}
         self.last_runtime_recovery: dict[str, Any] | None = None
+        self.last_orphan_scan_recovery: dict[str, Any] | None = None
         self.store.init_db()
+        self.last_orphan_scan_recovery = self.recover_orphaned_focused_scans()
         self.last_runtime_recovery = self.synchronized_runtime.recover_runtime_state(
             self.clock.now()
+        )
+
+    def recover_orphaned_focused_scans(self) -> dict[str, Any]:
+        return self.store.recover_orphaned_focused_running_scans(
+            current_run_id=self.focused_run_id,
+            current_process_id=self.focused_process_id,
+            older_than_seconds=self.config.focused_orphan_scan_recovery_seconds,
+            now=self.clock.now(),
         )
 
     # ------------------------------------------------------------------
@@ -976,27 +1035,80 @@ class PaperBot:
             self._lightweight_pending_futures.clear()
         for future in pending_futures:
             future.cancel()
-        for name in ("focused_executor", "lightweight_executor"):
+        for name in (
+            "focused_route_executor",
+            "focused_io_executor",
+            "lightweight_executor",
+        ):
             executor = getattr(self, name)
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
                 setattr(self, name, None)
+        self.focused_route_executor_workers = 0
+        self.focused_io_executor_workers = 0
+        self.lightweight_executor_workers = 0
 
-    def _ensure_focused_executor(self, *, workers: int | None = None) -> ThreadPoolExecutor:
-        if self.focused_executor is None:
-            self.focused_executor = ThreadPoolExecutor(
-                max_workers=max(2, int(workers or self.config.hot_route_recheck_workers)),
-                thread_name_prefix="funding-focused",
+    def _ensure_executor(
+        self,
+        *,
+        attr_name: str,
+        workers_attr_name: str,
+        workers: int,
+        thread_name_prefix: str,
+    ) -> ThreadPoolExecutor:
+        desired_workers = max(1, int(workers))
+        executor = getattr(self, attr_name)
+        current_workers = int(getattr(self, workers_attr_name) or 0)
+        if executor is not None and current_workers != desired_workers:
+            executor.shutdown(wait=False, cancel_futures=True)
+            setattr(self, attr_name, None)
+            setattr(self, workers_attr_name, 0)
+            executor = None
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=desired_workers,
+                thread_name_prefix=thread_name_prefix,
             )
-        return self.focused_executor
+            setattr(self, attr_name, executor)
+            setattr(self, workers_attr_name, desired_workers)
+        return executor
+
+    def _ensure_focused_route_executor(
+        self,
+        *,
+        workers: int | None = None,
+    ) -> ThreadPoolExecutor:
+        return self._ensure_executor(
+            attr_name="focused_route_executor",
+            workers_attr_name="focused_route_executor_workers",
+            workers=max(1, int(workers or self.config.hot_route_recheck_workers)),
+            thread_name_prefix="funding-focused-route",
+        )
+
+    def _ensure_focused_io_executor(
+        self,
+        *,
+        workers: int | None = None,
+    ) -> ThreadPoolExecutor:
+        desired_workers = max(
+            2,
+            int(self.config.focused_io_workers),
+            int(workers or 0),
+        )
+        return self._ensure_executor(
+            attr_name="focused_io_executor",
+            workers_attr_name="focused_io_executor_workers",
+            workers=desired_workers,
+            thread_name_prefix="funding-focused-io",
+        )
 
     def _ensure_lightweight_executor(self, *, workers: int) -> ThreadPoolExecutor:
-        if self.lightweight_executor is None:
-            self.lightweight_executor = ThreadPoolExecutor(
-                max_workers=max(1, int(workers)),
-                thread_name_prefix="funding-lightweight",
-            )
-        return self.lightweight_executor
+        return self._ensure_executor(
+            attr_name="lightweight_executor",
+            workers_attr_name="lightweight_executor_workers",
+            workers=max(1, int(workers)),
+            thread_name_prefix="funding-lightweight",
+        )
 
     def run_discovery_full_scan(
         self,
@@ -1582,6 +1694,29 @@ class PaperBot:
                 self.focus_eligible_routes.pop(route_key, None)
         return self.apply_focused_selection(observed_now)
 
+    def focused_batch_timeout_seconds(self, route_count: int, workers: int) -> float:
+        per_route = float(self.config.focused_recheck_route_timeout_seconds)
+        active_workers = max(1, int(workers))
+        batches = max(1, (max(1, int(route_count)) + active_workers - 1) // active_workers)
+        return per_route * batches + min(1.0, per_route)
+
+    def focused_timeout_payload(
+        self,
+        route: dict[str, Any],
+        *,
+        stage: str,
+        elapsed_seconds: float,
+    ) -> dict[str, Any]:
+        return {
+            "route": route_summary(route),
+            "route_key": route.get("route_key"),
+            "stage": stage,
+            "elapsed_seconds": elapsed_seconds,
+            "timeout_seconds": self.config.focused_recheck_route_timeout_seconds,
+            "route_workers": self.config.hot_route_recheck_workers,
+            "io_workers": self.config.focused_io_workers,
+        }
+
     def refresh_hot_routes(self) -> list[dict[str, Any]]:
         route_items = list(self.hot_routes.items())
         if not route_items:
@@ -1624,31 +1759,58 @@ class PaperBot:
                 if route_key in refreshed_by_key
             ]
 
-        executor = self._ensure_focused_executor(workers=workers)
+        executor = self._ensure_focused_route_executor(workers=workers)
         futures = {
             executor.submit(self.focused_recheck_route, route): (route_key, route)
             for route_key, route in route_items
         }
-        for future in as_completed(futures):
-            route_key, route = futures[future]
-            try:
-                fresh = future.result()
-            except Exception as exc:
+        started = time.perf_counter()
+        batch_timeout = self.focused_batch_timeout_seconds(len(route_items), workers)
+        try:
+            for future in as_completed(futures, timeout=batch_timeout):
+                route_key, route = futures[future]
+                try:
+                    fresh = future.result()
+                except Exception as exc:
+                    self.record_event(
+                        "focused_recheck_failed",
+                        (
+                            "Paper Bot focused recheck failed\n"
+                            f"{route.get('canonical_asset')}: "
+                            f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
+                            f"Error: {type(exc).__name__}: {exc}"
+                        ),
+                        {"route": route_summary(route), "error": str(exc)},
+                        route_key=route.get("route_key"),
+                        notify=False,
+                        severity="warning",
+                    )
+                    fresh = None
+                handle_result(route_key, route, fresh)
+        except FutureTimeoutError:
+            elapsed = time.perf_counter() - started
+            for future, (route_key, route) in futures.items():
+                if future.done():
+                    continue
+                future.cancel()
+                self.hot_routes.pop(route_key, None)
                 self.record_event(
-                    "focused_recheck_failed",
+                    "focused_recheck_timeout",
                     (
-                        "Paper Bot focused recheck failed\n"
+                        "Paper Bot focused recheck timed out\n"
                         f"{route.get('canonical_asset')}: "
                         f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
-                        f"Error: {type(exc).__name__}: {exc}"
+                        f"Stage: route_batch elapsed={elapsed:.2f}s"
                     ),
-                    {"route": route_summary(route), "error": str(exc)},
+                    self.focused_timeout_payload(
+                        route,
+                        stage="route_batch",
+                        elapsed_seconds=elapsed,
+                    ),
                     route_key=route.get("route_key"),
                     notify=False,
                     severity="warning",
                 )
-                fresh = None
-            handle_result(route_key, route, fresh)
         return [
             refreshed_by_key[route_key]
             for route_key, _route in route_items
@@ -1658,7 +1820,7 @@ class PaperBot:
     def focused_recheck_route(self, route: dict[str, Any]) -> dict[str, Any] | None:
         if not self.config.focused_recheck_enabled:
             return self.store.latest_funding_route_by_key(str(route.get("route_key") or ""))
-        now = datetime.now(UTC)
+        now = self.clock.now()
         if final_recheck_freeze_window_active(route, now, self.config):
             frozen = final_recheck_fallback_route(
                 route,
@@ -1693,10 +1855,28 @@ class PaperBot:
             fresh = self.direct_focused_recheck_route(route)
             if fresh is not None:
                 return fresh
+        except FocusedRecheckTimeout as exc:
+            self.record_event(
+                "focused_recheck_timeout",
+                (
+                    "Paper Bot focused recheck timed out\n"
+                    f"{route.get('canonical_asset')}: "
+                    f"LONG {route.get('long_venue')} / SHORT {route.get('short_venue')}\n"
+                    f"Stage: {exc.stage} elapsed={exc.elapsed_seconds:.2f}s"
+                ),
+                self.focused_timeout_payload(
+                    route,
+                    stage=exc.stage,
+                    elapsed_seconds=exc.elapsed_seconds,
+                ),
+                route_key=route.get("route_key"),
+                notify=False,
+                severity="warning",
+            )
         except Exception as exc:
             fallback = final_recheck_fallback_route(
                 route,
-                datetime.now(UTC),
+                self.clock.now(),
                 self.config,
                 "focused_recheck_failed_inside_freeze_window",
             )
@@ -1750,10 +1930,20 @@ class PaperBot:
                 "scan_mode": "watch",
                 "focused_route_key": route_key,
                 "focused_route_mode": "direct_symbol_recheck_v1",
+                "focused_run_id": self.focused_run_id,
+                "focused_process_id": self.focused_process_id,
+                "focused_recheck_timeout_seconds": (
+                    self.config.focused_recheck_route_timeout_seconds
+                ),
+                "focused_route_executor_workers": (
+                    self.config.hot_route_recheck_workers
+                ),
+                "focused_io_workers": self.config.focused_io_workers,
             }
         )
         observed_at = utc_now_iso()
         started = time.perf_counter()
+        deadline = started + float(self.config.focused_recheck_route_timeout_seconds)
         warnings: list[str] = []
         counts = {
             "instrument_count": 0,
@@ -1765,7 +1955,7 @@ class PaperBot:
             "paper_execution_count": 0,
         }
         try:
-            executor = self._ensure_focused_executor(workers=2)
+            executor = self._ensure_focused_io_executor()
             market_futures = {
                 executor.submit(
                     self.fresh_market_for_route_leg,
@@ -1775,9 +1965,23 @@ class PaperBot:
                 ): side
                 for side in ("long", "short")
             }
+            market_done, market_pending = wait(
+                market_futures,
+                timeout=max(0.0, deadline - time.perf_counter()),
+            )
+            if market_pending:
+                for future in market_pending:
+                    future.cancel()
+                raise FocusedRecheckTimeout(
+                    route_key=route_key,
+                    stage="market",
+                    elapsed_seconds=time.perf_counter() - started,
+                    timeout_seconds=self.config.focused_recheck_route_timeout_seconds,
+                )
             fresh_markets = {
                 side: future.result()
                 for future, side in market_futures.items()
+                if future in market_done
             }
             long_market, long_client = fresh_markets["long"]
             short_market, short_client = fresh_markets["short"]
@@ -1799,6 +2003,9 @@ class PaperBot:
                     (short_market, short_client),
                 ],
                 observed_at,
+                route_key=route_key,
+                route_started_monotonic=started,
+                deadline_monotonic=deadline,
             )
             counts["orderbook_count"] = self.store.insert_funding_orderbooks(
                 scan_id,
@@ -1843,6 +2050,16 @@ class PaperBot:
             self.store.insert_funding_scan_warnings(scan_id, warnings)
             self.store.finish_funding_scan(scan_id, "success", **counts)
             return stored_routes[0] if stored_routes else None
+        except FocusedRecheckTimeout as exc:
+            warnings.append(str(exc))
+            self.store.insert_funding_scan_warnings(scan_id, warnings)
+            self.store.finish_funding_scan(
+                scan_id,
+                "failed",
+                error=str(exc),
+                **counts,
+            )
+            raise
         except Exception as exc:
             warnings.append(f"direct focused recheck failed: {exc}")
             self.store.insert_funding_scan_warnings(scan_id, warnings)
@@ -1961,9 +2178,16 @@ class PaperBot:
         self,
         markets_and_clients: list[tuple[dict[str, Any], FundingVenueClient]],
         observed_at: str,
+        *,
+        route_key: str = "",
+        route_started_monotonic: float | None = None,
+        deadline_monotonic: float | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         books: dict[tuple[str, str], dict[str, Any]] = {}
-        executor = self._ensure_focused_executor(workers=max(2, len(markets_and_clients)))
+        started = route_started_monotonic or time.perf_counter()
+        executor = self._ensure_focused_io_executor(
+            workers=max(2, len(markets_and_clients))
+        )
         futures = {
             executor.submit(
                 client.orderbook,
@@ -1973,7 +2197,22 @@ class PaperBot:
             ): (market, client, self.clock.now().isoformat())
             for market, client in markets_and_clients
         }
-        for future in as_completed(futures):
+        timeout = (
+            None
+            if deadline_monotonic is None
+            else max(0.0, deadline_monotonic - time.perf_counter())
+        )
+        done, pending = wait(futures, timeout=timeout)
+        if pending:
+            for future in pending:
+                future.cancel()
+            raise FocusedRecheckTimeout(
+                route_key=route_key,
+                stage="orderbook",
+                elapsed_seconds=time.perf_counter() - started,
+                timeout_seconds=self.config.focused_recheck_route_timeout_seconds,
+            )
+        for future in done:
             market, _client, request_started_at = futures[future]
             key = (str(market["venue"]), str(market["symbol"]))
             book = normalize_orderbook_canonical_units(
@@ -3708,7 +3947,7 @@ class PaperBot:
             f"{position_id}:"
             f"{hashlib.sha256(observed_at.encode('utf-8')).hexdigest()[:12]}"
         )
-        executor = self._ensure_focused_executor(workers=2)
+        executor = self._ensure_focused_io_executor(workers=2)
         for spec in leg_specs.values():
             self._foreground_venues.add(str(spec["venue"]))
         futures = {

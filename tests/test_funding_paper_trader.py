@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
+import os
 import threading
 import time
 import sqlite3
@@ -2032,6 +2035,680 @@ class CountingRecheckTrader(PaperBot):
         finally:
             with self.recheck_lock:
                 self.active_rechecks -= 1
+
+
+class InstrumentedFocusedRecheckTrader(PaperBot):
+    def __init__(
+        self,
+        *args,
+        fail_market_route_key: str | None = None,
+        fail_orderbook_route_key: str | None = None,
+        slow_market_route_key: str | None = None,
+        slow_orderbook_route_key: str | None = None,
+        slow_delay_seconds: float = 0.25,
+        trace_path: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.fail_market_route_key = fail_market_route_key
+        self.fail_orderbook_route_key = fail_orderbook_route_key
+        self.slow_market_route_key = slow_market_route_key
+        self.slow_orderbook_route_key = slow_orderbook_route_key
+        self.slow_delay_seconds = slow_delay_seconds
+        self.trace: list[dict] = []
+        self.trace_path = trace_path
+        self.trace_lock = threading.Lock()
+        self.active_outer_rechecks = 0
+        self.max_outer_rechecks = 0
+        self.outer_start_barrier = None
+
+    def _append_trace_locked(self, row: dict) -> None:
+        self.trace.append(row)
+        if self.trace_path:
+            with open(self.trace_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def _record_trace(self, event: str, **payload) -> None:
+        row = {
+            "event": event,
+            "thread": threading.current_thread().name,
+            **payload,
+        }
+        with self.trace_lock:
+            self._append_trace_locked(row)
+
+    def focused_recheck_route(self, route: dict) -> dict | None:
+        route_key = str(route.get("route_key") or "")
+        with self.trace_lock:
+            self.active_outer_rechecks += 1
+            self.max_outer_rechecks = max(
+                self.max_outer_rechecks,
+                self.active_outer_rechecks,
+            )
+            self._append_trace_locked(
+                {
+                    "event": "outer_start",
+                    "route_key": route_key,
+                    "thread": threading.current_thread().name,
+                }
+            )
+            barrier = self.outer_start_barrier
+        if barrier is not None:
+            try:
+                barrier.wait(timeout=2.0)
+            except threading.BrokenBarrierError:
+                pass
+        try:
+            return super().focused_recheck_route(route)
+        finally:
+            with self.trace_lock:
+                self.active_outer_rechecks -= 1
+                self._append_trace_locked(
+                    {
+                        "event": "outer_finish",
+                        "route_key": route_key,
+                        "thread": threading.current_thread().name,
+                    }
+                )
+
+    def fresh_market_for_route_leg(
+        self,
+        route: dict,
+        side: str,
+        observed_at: str,
+    ):
+        route_key = str(route.get("route_key") or "")
+        self._record_trace("market_start", route_key=route_key, side=side)
+        if route_key == self.slow_market_route_key:
+            time.sleep(self.slow_delay_seconds)
+        if route_key == self.fail_market_route_key and side == "long":
+            raise RuntimeError("market snapshot failed")
+        leg = next(
+            leg
+            for leg in route["legs"]
+            if str(leg.get("side") or "") == side
+        )
+        market = _focused_probe_market(route, leg, observed_at)
+        return market, _FocusedProbeClient(self, route_key, side, market)
+
+
+class LegacySharedPoolFocusedRecheckTrader(InstrumentedFocusedRecheckTrader):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.outer_start_barrier = threading.Barrier(
+            int(self.config.hot_route_recheck_workers)
+        )
+
+    def _ensure_focused_io_executor(self, *, workers: int | None = None):
+        return self._ensure_focused_route_executor(
+            workers=max(2, int(workers or self.config.hot_route_recheck_workers))
+        )
+
+
+class _FocusedProbeClient:
+    thread_safe = True
+
+    def __init__(
+        self,
+        owner: InstrumentedFocusedRecheckTrader,
+        route_key: str,
+        side: str,
+        market: dict,
+    ) -> None:
+        self.owner = owner
+        self.route_key = route_key
+        self.side = side
+        self.venue = str(market["venue"])
+        self.market = market
+
+    def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict:
+        self.owner._record_trace(
+            "orderbook_start",
+            route_key=self.route_key,
+            side=self.side,
+        )
+        if self.route_key == self.owner.slow_orderbook_route_key:
+            time.sleep(self.owner.slow_delay_seconds)
+        if self.route_key == self.owner.fail_orderbook_route_key and self.side == "long":
+            raise RuntimeError("orderbook failed")
+        price = float(self.market.get("mark_price") or 100.0)
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "observed_at": observed_at,
+            "bids": [[price - 0.02, 100.0]],
+            "asks": [[price + 0.02, 100.0]],
+            "best_bid": price - 0.02,
+            "best_ask": price + 0.02,
+            "mid_price": price,
+            "response_received_at": observed_at,
+            "orderbook_event_time": observed_at,
+        }
+
+
+def _focused_probe_route(now: datetime, index: int) -> dict:
+    route = paper_route(now, 90 + index, 90 + index, live_net=5.0)
+    route["route_key"] = f"focused-route-{index}"
+    route["canonical_asset"] = "BTC"
+    route["long_venue"] = "binance"
+    route["long_symbol"] = "BTCUSDT"
+    route["short_venue"] = "bybit"
+    route["short_symbol"] = "BTCUSDT"
+    route["legs"][0].update(
+        {
+            "venue": "binance",
+            "symbol": "BTCUSDT",
+            "funding_rate": -0.003,
+            "normalized_next_funding_rate": -0.003,
+            "hourly_funding_rate": -0.003,
+            "funding_interval_hours": 1.0,
+            "mark_price": 100.0,
+            "index_price": 100.0,
+        }
+    )
+    route["legs"][1].update(
+        {
+            "venue": "bybit",
+            "symbol": "BTCUSDT",
+            "funding_rate": 0.003,
+            "normalized_next_funding_rate": 0.003,
+            "hourly_funding_rate": 0.003,
+            "funding_interval_hours": 1.0,
+            "mark_price": 100.0,
+            "index_price": 100.0,
+        }
+    )
+    return route
+
+
+def _focused_probe_market(route: dict, leg: dict, observed_at: str) -> dict:
+    venue = str(leg["venue"])
+    return {
+        "venue": venue,
+        "environment": "mainnet",
+        "environment_verified": True,
+        "endpoint_base_url": f"https://api.{venue}.test",
+        "endpoint_identity_provenance": f"test-fixture:{venue}:endpoint:v1",
+        "endpoint_client_version": "test-client-v1",
+        "endpoint_verified_at": observed_at,
+        "api_product_type": "linear_perpetual",
+        "market_type": "linear_perpetual",
+        "product_type": "linear_perpetual",
+        "data_enabled": True,
+        "strategy_observation_enabled": True,
+        "shadow_candidate_enabled": True,
+        "paper_enabled": True,
+        "live_enabled": False,
+        "execution_model": "CLOB",
+        "settlement_verification_level": "test_fixture",
+        "symbol": leg["symbol"],
+        "canonical_asset": route["canonical_asset"],
+        "base_asset": route["canonical_asset"],
+        "quote_asset": "USDT",
+        "collateral_asset": "USDT",
+        "price_quote_currency": "USDT",
+        "settlement_collateral": "USDT",
+        "funding_rate": leg["funding_rate"],
+        "normalized_next_funding_rate": leg["normalized_next_funding_rate"],
+        "funding_interval_hours": leg["funding_interval_hours"],
+        "hourly_funding_rate": leg["hourly_funding_rate"],
+        "funding_rate_kind": "published_next_estimate",
+        "funding_rate_semantics": "next_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
+        "next_funding_at": leg["next_funding_at"],
+        "mark_price": leg["mark_price"],
+        "index_price": leg["index_price"],
+        "open_interest_usd": 10_000_000.0,
+        "volume_24h_usd": 30_000_000.0,
+        "quantity_step": 0.01,
+        "min_quantity": 0.01,
+        "min_notional": 5.0,
+        "min_notional_usd": 5.0,
+        "maker_fee_rate": 0.0001,
+        "taker_fee_rate": 0.0001,
+        "fee_rate": 0.0001,
+        "fee_source": "configured_trusted_fee",
+        "fee_evidence": {
+            "source_kind": "configured_trusted_fee",
+            "source_identifier": f"test-fixture:{venue}:fees:v1",
+            "trust_status": "CONFIGURED_TRUSTED",
+            "venue": venue,
+            "liquidity_role": "taker",
+            "observed_at": observed_at,
+            "reviewed_at": observed_at,
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "test-fee-evidence-v1",
+        },
+        "fee_observed_at": observed_at,
+        "fee_reviewed_at": observed_at,
+        "contract_type": "linear_perpetual",
+        "contract_kind": "linear_perpetual",
+        "contract_multiplier": 1.0,
+        "canonical_unit_multiplier": 1.0,
+        "supports_perpetuals": True,
+        "is_linear_contract": True,
+        "supports_discrete_funding": True,
+        "position_inclusion_rule": "perp_position_at_settlement",
+        "entry_safety_buffer_seconds": 20,
+        "exit_safety_buffer_seconds": 20,
+        "timing_policy_source": f"adapter_{venue}_test",
+        "source_event_at": observed_at,
+        "response_received_at": observed_at,
+        "observed_at": observed_at,
+    }
+
+
+def _focused_probe_child(
+    db_path: str,
+    result_path: str,
+    trace_path: str,
+    *,
+    route_count: int,
+    workers: int,
+    route_timeout_seconds: float,
+    force_legacy_shared_pool: bool = False,
+    fail_market_route_key: str | None = None,
+    fail_orderbook_route_key: str | None = None,
+    slow_market_route_key: str | None = None,
+    slow_orderbook_route_key: str | None = None,
+    slow_delay_seconds: float = 0.25,
+) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(db_path)
+    store.init_db()
+    trader_cls = (
+        LegacySharedPoolFocusedRecheckTrader
+        if force_legacy_shared_pool
+        else InstrumentedFocusedRecheckTrader
+    )
+    config_kwargs = {
+        "telegram_enabled": False,
+        "hot_route_recheck_workers": workers,
+    }
+    if "focused_recheck_route_timeout_seconds" in PaperBotConfig.__dataclass_fields__:
+        config_kwargs["focused_recheck_route_timeout_seconds"] = route_timeout_seconds
+    trader = trader_cls(
+        store,
+        config=PaperBotConfig(**config_kwargs),
+        fail_market_route_key=fail_market_route_key,
+        fail_orderbook_route_key=fail_orderbook_route_key,
+        slow_market_route_key=slow_market_route_key,
+        slow_orderbook_route_key=slow_orderbook_route_key,
+        slow_delay_seconds=slow_delay_seconds,
+        trace_path=trace_path,
+    )
+    for index in range(route_count):
+        route = _focused_probe_route(now, index)
+        trader.hot_routes[route["route_key"]] = route
+    started = time.perf_counter()
+    refreshed = trader.refresh_hot_routes()
+    elapsed = time.perf_counter() - started
+    with store.connect() as connection:
+        statuses = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT status, COUNT(*) AS count FROM funding_scans GROUP BY status"
+            )
+        ]
+        running_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM funding_scans WHERE status = 'running'"
+            ).fetchone()[0]
+        )
+    trader.shutdown_foreground_executors()
+    with open(result_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "elapsed_seconds": elapsed,
+                "refreshed_count": len(refreshed),
+                "max_outer_rechecks": trader.max_outer_rechecks,
+                "trace": trader.trace,
+                "scan_statuses": statuses,
+                "running_scan_count": running_count,
+            },
+            handle,
+            sort_keys=True,
+        )
+
+
+def _run_focused_probe_child(tmp_path, **kwargs) -> dict:
+    db_path = tmp_path / "probe.sqlite"
+    result_path = tmp_path / "probe-result.json"
+    trace_path = tmp_path / "probe-trace.jsonl"
+    process_timeout_seconds = float(kwargs.pop("process_timeout_seconds", 3.0))
+    ctx = multiprocessing.get_context("fork")
+    process = ctx.Process(
+        target=_focused_probe_child,
+        kwargs={
+            "db_path": str(db_path),
+            "result_path": str(result_path),
+            "trace_path": str(trace_path),
+            **kwargs,
+        },
+    )
+    process.start()
+    process.join(process_timeout_seconds)
+    timed_out = process.is_alive()
+    if timed_out:
+        process.terminate()
+        process.join(2.0)
+        if process.is_alive():
+            process.kill()
+            process.join(2.0)
+    payload = {}
+    if result_path.exists():
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    if trace_path.exists():
+        payload["trace"] = [
+            json.loads(line)
+            for line in trace_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    if db_path.exists():
+        for _attempt in range(5):
+            try:
+                with sqlite3.connect(db_path, timeout=2.0) as connection:
+                    connection.row_factory = sqlite3.Row
+                    payload["running_scan_count"] = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM funding_scans WHERE status = 'running'"
+                        ).fetchone()[0]
+                    )
+                    payload["scan_statuses"] = [
+                        dict(row)
+                        for row in connection.execute(
+                            "SELECT status, COUNT(*) AS count FROM funding_scans GROUP BY status"
+                        )
+                    ]
+                break
+            except sqlite3.OperationalError:
+                time.sleep(0.05)
+    payload["timed_out"] = timed_out
+    payload["exitcode"] = process.exitcode
+    return payload
+
+
+def test_focused_hot_recheck_6_routes_6_workers_completes_without_deadlock(tmp_path) -> None:
+    result = _run_focused_probe_child(
+        tmp_path,
+        route_count=6,
+        workers=6,
+        route_timeout_seconds=1.0,
+        process_timeout_seconds=3.0,
+    )
+
+    assert result["timed_out"] is False
+    assert result["running_scan_count"] == 0
+    assert result["max_outer_rechecks"] == 6
+    market_threads = {
+        row["thread"] for row in result["trace"] if row["event"] == "market_start"
+    }
+    orderbook_threads = {
+        row["thread"] for row in result["trace"] if row["event"] == "orderbook_start"
+    }
+    assert len([row for row in result["trace"] if row["event"] == "market_start"]) == 12
+    assert len([row for row in result["trace"] if row["event"] == "orderbook_start"]) == 12
+    assert market_threads
+    assert orderbook_threads
+    assert all("funding-focused-io" in name for name in market_threads)
+    assert all("funding-focused-io" in name for name in orderbook_threads)
+
+
+def test_focused_hot_recheck_20_routes_6_workers_completes_bounded_batches(tmp_path) -> None:
+    result = _run_focused_probe_child(
+        tmp_path,
+        route_count=20,
+        workers=6,
+        route_timeout_seconds=1.0,
+        process_timeout_seconds=8.0,
+    )
+
+    assert result["timed_out"] is False
+    assert result["running_scan_count"] == 0
+    assert result["max_outer_rechecks"] <= 6
+    assert result["scan_statuses"] == [{"status": "success", "count": 20}]
+    assert len([row for row in result["trace"] if row["event"] == "market_start"]) == 40
+    assert len([row for row in result["trace"] if row["event"] == "orderbook_start"]) == 40
+
+
+def test_legacy_shared_pool_focused_recheck_design_exhausts_route_timeout(tmp_path) -> None:
+    result = _run_focused_probe_child(
+        tmp_path,
+        route_count=6,
+        workers=6,
+        route_timeout_seconds=1.0,
+        force_legacy_shared_pool=True,
+        process_timeout_seconds=3.0,
+    )
+
+    trace = result["trace"]
+    assert result["timed_out"] is False
+    assert result["running_scan_count"] == 0
+    assert result["scan_statuses"] == [{"status": "failed", "count": 6}]
+    assert len([row for row in trace if row["event"] == "outer_start"]) == 6
+    assert len([row for row in trace if row["event"] == "market_start"]) == 0
+    assert len([row for row in trace if row["event"] == "orderbook_start"]) == 0
+
+
+def test_market_snapshot_failure_does_not_block_other_focused_routes(tmp_path) -> None:
+    result = _run_focused_probe_child(
+        tmp_path,
+        route_count=6,
+        workers=6,
+        route_timeout_seconds=1.0,
+        fail_market_route_key="focused-route-0",
+        process_timeout_seconds=4.0,
+    )
+
+    assert result["timed_out"] is False
+    assert result["running_scan_count"] == 0
+    assert sorted(result["scan_statuses"], key=lambda row: row["status"]) == [
+        {"status": "failed", "count": 1},
+        {"status": "success", "count": 5},
+    ]
+
+
+def test_orderbook_failure_does_not_block_other_focused_routes(tmp_path) -> None:
+    result = _run_focused_probe_child(
+        tmp_path,
+        route_count=6,
+        workers=6,
+        route_timeout_seconds=1.0,
+        fail_orderbook_route_key="focused-route-0",
+        process_timeout_seconds=4.0,
+    )
+
+    assert result["timed_out"] is False
+    assert result["running_scan_count"] == 0
+    assert sorted(result["scan_statuses"], key=lambda row: row["status"]) == [
+        {"status": "failed", "count": 1},
+        {"status": "success", "count": 5},
+    ]
+
+
+def test_focused_route_timeout_is_terminal_and_does_not_reach_execution(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = InstrumentedFocusedRecheckTrader(
+        store,
+        config=PaperBotConfig(
+            telegram_enabled=False,
+            hot_route_recheck_workers=1,
+            focused_recheck_route_timeout_seconds=0.05,
+            export_dir=tmp_path / "exports-timeout",
+        ),
+        slow_market_route_key="focused-route-0",
+        slow_delay_seconds=0.25,
+    )
+    route = _focused_probe_route(now, 0)
+    trader.hot_routes[route["route_key"]] = route
+    entry_routes_seen: list[dict] = []
+
+    def fake_process_entry_candidates(routes, *args, **kwargs):
+        entry_routes_seen.extend(routes)
+        return []
+
+    trader.process_entry_candidates = fake_process_entry_candidates  # type: ignore[method-assign]
+
+    result = trader.run_hot_iteration()
+    time.sleep(0.3)
+    trader.shutdown_foreground_executors()
+
+    assert result["opened_count"] == 0
+    assert entry_routes_seen == []
+    with store.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM funding_scans WHERE status = 'running'"
+            ).fetchone()[0]
+            == 0
+        )
+        failed = connection.execute(
+            "SELECT error FROM funding_scans WHERE status = 'failed'"
+        ).fetchone()
+    assert failed is not None
+    assert "focused_recheck_timeout" in failed["error"]
+
+
+def test_focused_executor_shutdown_and_next_iteration_continue_after_timeout(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = InstrumentedFocusedRecheckTrader(
+        store,
+        config=PaperBotConfig(
+            telegram_enabled=False,
+            hot_route_recheck_workers=1,
+            focused_recheck_route_timeout_seconds=0.05,
+            export_dir=tmp_path / "exports-retry",
+        ),
+        slow_market_route_key="focused-route-0",
+        slow_delay_seconds=0.25,
+    )
+    first = _focused_probe_route(now, 0)
+    trader.hot_routes[first["route_key"]] = first
+
+    assert trader.refresh_hot_routes() == []
+    shutdown_started = time.perf_counter()
+    trader.shutdown_foreground_executors()
+    assert time.perf_counter() - shutdown_started < 0.5
+
+    trader.slow_market_route_key = None
+    second = _focused_probe_route(now, 1)
+    trader.hot_routes[second["route_key"]] = second
+    refreshed = trader.refresh_hot_routes()
+    trader.shutdown_foreground_executors()
+
+    assert len(refreshed) == 1
+    with store.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM funding_scans WHERE status = 'running'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_orphaned_focused_running_scan_recovery_is_idempotent(tmp_path) -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    old_started = (now - timedelta(minutes=10)).isoformat()
+    fresh_started = (now - timedelta(seconds=10)).isoformat()
+    current_run_id = "current-run"
+    current_pid = str(os.getpid())
+    with store.connect() as connection:
+        orphan_id = connection.execute(
+            """
+            INSERT INTO funding_scans (status, started_at, config_json)
+            VALUES ('running', ?, ?)
+            """,
+            (
+                old_started,
+                json.dumps(
+                    {
+                        "scan_mode": "watch",
+                        "focused_route_key": "orphan-route",
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        ).lastrowid
+        current_id = connection.execute(
+            """
+            INSERT INTO funding_scans (status, started_at, config_json)
+            VALUES ('running', ?, ?)
+            """,
+            (
+                old_started,
+                json.dumps(
+                    {
+                        "scan_mode": "watch",
+                        "focused_route_key": "current-route",
+                        "focused_run_id": current_run_id,
+                        "focused_process_id": current_pid,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        ).lastrowid
+        fresh_id = connection.execute(
+            """
+            INSERT INTO funding_scans (status, started_at, config_json)
+            VALUES ('running', ?, ?)
+            """,
+            (
+                fresh_started,
+                json.dumps(
+                    {
+                        "scan_mode": "watch",
+                        "focused_route_key": "fresh-route",
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        ).lastrowid
+
+    first = store.recover_orphaned_focused_running_scans(
+        current_run_id=current_run_id,
+        current_process_id=current_pid,
+        older_than_seconds=60,
+        now=now,
+    )
+    second = store.recover_orphaned_focused_running_scans(
+        current_run_id=current_run_id,
+        current_process_id=current_pid,
+        older_than_seconds=60,
+        now=now,
+    )
+
+    assert first["recovered_scan_ids"] == [orphan_id]
+    assert first["recovered_count"] == 1
+    assert second["recovered_count"] == 0
+    with store.connect() as connection:
+        statuses = {
+            row["funding_scan_id"]: row["status"]
+            for row in connection.execute(
+                "SELECT funding_scan_id, status FROM funding_scans"
+            )
+        }
+        warning = connection.execute(
+            """
+            SELECT warning
+            FROM funding_scan_warnings
+            WHERE funding_scan_id = ?
+            """,
+            (orphan_id,),
+        ).fetchone()
+    assert statuses[orphan_id] == "failed"
+    assert statuses[current_id] == "running"
+    assert statuses[fresh_id] == "running"
+    assert warning["warning"] == "orphaned_by_process_restart"
 
 
 class SlowBackgroundScanTrader(PaperBot):

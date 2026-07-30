@@ -43,6 +43,8 @@ exec "$PYTHON_BIN" -u -m smart_money_radar.cli funding-paper-trader \
   --monitor-interval-seconds "${FUNDING_PAPER_MONITOR_INTERVAL_SECONDS:-2}" \
   --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-1}" \
   --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
+  --focused-io-workers "${FUNDING_PAPER_FOCUSED_IO_WORKERS:-0}" \
+  --focused-recheck-route-timeout-seconds "${FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-8}" \
   --lightweight-foreground-budget-seconds "${FUNDING_PAPER_LIGHTWEIGHT_FOREGROUND_BUDGET_SECONDS:-8}" \
   --lightweight-cache-ttl-seconds "${FUNDING_PAPER_LIGHTWEIGHT_CACHE_TTL_SECONDS:-180}" \
   --lightweight-route-horizon-seconds "${FUNDING_PAPER_LIGHTWEIGHT_ROUTE_HORIZON_SECONDS:-3600}" \
