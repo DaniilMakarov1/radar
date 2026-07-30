@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 import csv
+import hashlib
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -19,6 +20,10 @@ from smart_money_radar.config import (
     ChainConfig,
 )
 from smart_money_radar.funding.normalization import CANONICAL_ASSET_UNIT_MULTIPLIERS
+from smart_money_radar.funding.route_identity import (
+    ROUTE_IDENTITY_SCHEMA_VERSION,
+    route_identity_summary,
+)
 
 
 FUNDING_UNIT_MULTIPLIERS = CANONICAL_ASSET_UNIT_MULTIPLIERS
@@ -34,6 +39,14 @@ FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = {
     "EMERGENCY_UNWIND",
     "SETTLEMENT_PLAN_MISMATCH",
 }
+
+FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES = FUNDING_CAPTURE_OPEN_EXPOSURE_STATES | {
+    "DISCOVERED",
+    "ARMED",
+    "ENTRY_SUBMITTED",
+}
+
+FUNDING_CAPTURE_IDENTITY_SQLITE_VERSION = 2026073001
 
 
 def funding_unit_multiplier(row: dict[str, Any]) -> float:
@@ -138,8 +151,12 @@ class SQLiteStore:
             connection.execute("PRAGMA synchronous = NORMAL")
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             self._ensure_funding_paper_position_columns(connection)
+            self._ensure_funding_capture_identity_columns(connection)
             self._ensure_funding_capture_cycle_columns(connection)
+            self._ensure_product_identity_alias_table(connection)
             self._ensure_funding_shadow_columns(connection)
+            self._migrate_funding_capture_identity(connection)
+            connection.execute(f"PRAGMA user_version = {FUNDING_CAPTURE_IDENTITY_SQLITE_VERSION}")
             self.upsert_chains(connection, CHAINS)
 
     def _ensure_funding_paper_position_columns(
@@ -174,6 +191,358 @@ class SQLiteStore:
                 connection.execute(
                     f"ALTER TABLE funding_capture_cycles ADD COLUMN {name} {spec}"
                 )
+
+    def _ensure_funding_capture_identity_columns(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(funding_capture_positions)")
+        }
+        specs = {
+            "route_family_key": "TEXT",
+            "route_variant_key": "TEXT",
+            "canonical_opportunity_key": "TEXT",
+            "identity_schema_version": "TEXT",
+            "product_identity_aliases_json": "TEXT NOT NULL DEFAULT '[]'",
+            "legacy_route_key": "TEXT",
+            "legacy_route_entry_key": "TEXT",
+        }
+        for name, spec in specs.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE funding_capture_positions ADD COLUMN {name} {spec}"
+                )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_funding_capture_positions_route_variant
+            ON funding_capture_positions (route_variant_key, state)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_funding_capture_positions_opportunity
+            ON funding_capture_positions (canonical_opportunity_key, state)
+            """
+        )
+
+    def _ensure_product_identity_alias_table(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_identity_aliases (
+                alias_key TEXT PRIMARY KEY,
+                venue TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                alias_kind TEXT NOT NULL,
+                alias_value TEXT NOT NULL,
+                primary_product_identity TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quote_asset TEXT NOT NULL,
+                collateral_asset TEXT NOT NULL,
+                product_type TEXT NOT NULL,
+                canonical_asset TEXT,
+                side TEXT,
+                conflict_state TEXT NOT NULL DEFAULT 'ACTIVE',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (venue, environment, alias_kind, alias_value)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_product_identity_aliases_primary
+            ON product_identity_aliases (
+                venue, environment, primary_product_identity,
+                quote_asset, collateral_asset, product_type
+            )
+            """
+        )
+
+    def _capture_route_for_identity(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        cycles = connection.execute(
+            """
+            SELECT scheduled_funding_at
+            FROM funding_capture_cycles
+            WHERE position_id = ?
+            ORDER BY cycle_number
+            LIMIT 1
+            """,
+            (row["position_id"],),
+        ).fetchall()
+        scheduled = str(cycles[0]["scheduled_funding_at"]) if cycles else None
+        legs = [
+            dict(item)
+            for item in config.get("entry_legs") or []
+            if isinstance(item, dict)
+        ]
+        if not legs:
+            legs = [
+                {
+                    "side": "long",
+                    "venue": row["long_venue"],
+                    "symbol": row["long_symbol"],
+                    "next_funding_at": scheduled,
+                },
+                {
+                    "side": "short",
+                    "venue": row["short_venue"],
+                    "symbol": row["short_symbol"],
+                    "next_funding_at": scheduled,
+                },
+            ]
+        for side in ("long", "short"):
+            leg = next((item for item in legs if str(item.get("side")) == side), None)
+            if leg is None:
+                continue
+            leg.setdefault("venue", row[f"{side}_venue"])
+            leg.setdefault("symbol", row[f"{side}_symbol"])
+            leg.setdefault("canonical_asset", row["canonical_asset"])
+            if scheduled and not leg.get("next_funding_at"):
+                leg["next_funding_at"] = scheduled
+        return {
+            "route_key": config.get("route_key") or row["route_variant_key"] or "",
+            "canonical_asset": row["canonical_asset"],
+            "long_venue": row["long_venue"],
+            "short_venue": row["short_venue"],
+            "long_symbol": row["long_symbol"],
+            "short_symbol": row["short_symbol"],
+            "legs": legs,
+        }
+
+    def _identity_values_for_capture_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        route = self._capture_route_for_identity(connection, row, config)
+        summary = route_identity_summary(route)
+        blockers = list(summary.get("identity_blockers") or [])
+        legacy_route_key = config.get("legacy_route_key") or config.get("route_key")
+        legacy_entry_key = (
+            config.get("legacy_route_entry_key")
+            or config.get("route_entry_key")
+            or config.get("entry_key")
+        )
+        values = {
+            "route_family_key": summary.get("route_family_key") if not blockers else None,
+            "route_variant_key": summary.get("route_variant_key") if not blockers else None,
+            "canonical_opportunity_key": (
+                summary.get("canonical_opportunity_key") if not blockers else None
+            ),
+            "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+            "product_identity_aliases": list(summary.get("product_identity_aliases") or []),
+            "legacy_route_key": legacy_route_key,
+            "legacy_route_entry_key": legacy_entry_key,
+            "identity_blockers": blockers,
+        }
+        return values
+
+    def _alias_key(self, alias: dict[str, Any]) -> str:
+        parts = [
+            str(alias.get("venue") or "").lower(),
+            str(alias.get("environment") or "").lower(),
+            str(alias.get("alias_kind") or "").lower(),
+            str(alias.get("alias_value") or ""),
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+    def _upsert_product_identity_aliases(
+        self,
+        connection: sqlite3.Connection,
+        aliases: list[dict[str, Any]],
+        *,
+        canonical_asset: str | None = None,
+        now_iso: str | None = None,
+    ) -> list[str]:
+        now = now_iso or utc_now_iso()
+        blockers: list[str] = []
+        for alias in aliases:
+            alias_key = self._alias_key(alias)
+            venue = str(alias.get("venue") or "").lower()
+            environment = str(alias.get("environment") or "").lower()
+            alias_kind = str(alias.get("alias_kind") or "").lower()
+            alias_value = str(alias.get("alias_value") or "")
+            primary = str(alias.get("primary_product_identity") or "")
+            symbol = str(alias.get("symbol") or "")
+            quote = str(alias.get("quote_asset") or "").upper()
+            collateral = str(alias.get("collateral_asset") or "").upper()
+            product_type = str(alias.get("product_type") or "").lower()
+            side = str(alias.get("side") or "")
+            if not all([venue, environment, alias_kind, alias_value, primary]):
+                blockers.append("product_identity_alias_incomplete")
+                continue
+            existing = connection.execute(
+                """
+                SELECT *
+                FROM product_identity_aliases
+                WHERE venue = ? AND environment = ? AND alias_kind = ? AND alias_value = ?
+                """,
+                (venue, environment, alias_kind, alias_value),
+            ).fetchone()
+            evidence = dict(alias)
+            evidence["canonical_asset"] = canonical_asset
+            if existing is not None:
+                mismatch_fields = [
+                    name
+                    for name, expected in (
+                        ("primary_product_identity", primary),
+                        ("symbol", symbol),
+                        ("quote_asset", quote),
+                        ("collateral_asset", collateral),
+                        ("product_type", product_type),
+                    )
+                    if str(existing[name] or "") != str(expected or "")
+                ]
+                if mismatch_fields:
+                    blockers.append(
+                        "product_identity_alias_conflict:"
+                        f"{venue}:{environment}:{alias_kind}:{alias_value}"
+                    )
+                    connection.execute(
+                        """
+                        UPDATE product_identity_aliases
+                        SET conflict_state = 'CONFLICT',
+                            evidence_json = ?,
+                            last_seen_at = ?,
+                            updated_at = ?
+                        WHERE alias_key = ?
+                        """,
+                        (json.dumps(evidence, sort_keys=True), now, now, existing["alias_key"]),
+                    )
+                    continue
+                connection.execute(
+                    """
+                    UPDATE product_identity_aliases
+                    SET last_seen_at = ?,
+                        updated_at = ?,
+                        conflict_state = CASE
+                            WHEN conflict_state = 'CONFLICT' THEN conflict_state
+                            ELSE 'ACTIVE'
+                        END
+                    WHERE alias_key = ?
+                    """,
+                    (now, now, existing["alias_key"]),
+                )
+                continue
+            connection.execute(
+                """
+                INSERT INTO product_identity_aliases (
+                    alias_key, venue, environment, alias_kind, alias_value,
+                    primary_product_identity, symbol, quote_asset, collateral_asset,
+                    product_type, canonical_asset, side, conflict_state,
+                    evidence_json, first_seen_at, last_seen_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?)
+                """,
+                (
+                    alias_key,
+                    venue,
+                    environment,
+                    alias_kind,
+                    alias_value,
+                    primary,
+                    symbol,
+                    quote,
+                    collateral,
+                    product_type,
+                    canonical_asset,
+                    side,
+                    json.dumps(evidence, sort_keys=True),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        return blockers
+
+    def record_product_identity_aliases(
+        self,
+        aliases: list[dict[str, Any]],
+        *,
+        canonical_asset: str | None = None,
+    ) -> list[str]:
+        with self.connect() as connection:
+            return self._upsert_product_identity_aliases(
+                connection,
+                aliases,
+                canonical_asset=canonical_asset,
+            )
+
+    def _migrate_funding_capture_identity(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM funding_capture_positions
+            WHERE identity_schema_version IS NULL
+               OR identity_schema_version != ?
+            """,
+            (ROUTE_IDENTITY_SCHEMA_VERSION,),
+        ).fetchall()
+        for row in rows:
+            try:
+                config = json.loads(row["config_json"] or "{}")
+            except json.JSONDecodeError:
+                config = {"identity_migration_blockers": ["config_json_invalid"]}
+            values = self._identity_values_for_capture_row(connection, row, config)
+            blockers = list(values.get("identity_blockers") or [])
+            alias_blockers = self._upsert_product_identity_aliases(
+                connection,
+                values["product_identity_aliases"],
+                canonical_asset=str(row["canonical_asset"] or ""),
+            )
+            blockers = list(dict.fromkeys([*blockers, *alias_blockers]))
+            config.setdefault("legacy_route_key", values.get("legacy_route_key"))
+            config.setdefault("legacy_route_entry_key", values.get("legacy_route_entry_key"))
+            config["identity_schema_version"] = ROUTE_IDENTITY_SCHEMA_VERSION
+            config["route_family_key"] = values.get("route_family_key")
+            config["route_variant_key"] = values.get("route_variant_key")
+            config["canonical_opportunity_key"] = values.get("canonical_opportunity_key")
+            config["product_identity_aliases"] = values["product_identity_aliases"]
+            if blockers:
+                config["identity_migration_blockers"] = blockers
+            else:
+                config.pop("identity_migration_blockers", None)
+            connection.execute(
+                """
+                UPDATE funding_capture_positions
+                SET route_family_key = ?,
+                    route_variant_key = ?,
+                    canonical_opportunity_key = ?,
+                    identity_schema_version = ?,
+                    product_identity_aliases_json = ?,
+                    legacy_route_key = ?,
+                    legacy_route_entry_key = ?,
+                    config_json = ?,
+                    updated_at = ?
+                WHERE position_id = ?
+                """,
+                (
+                    values.get("route_family_key"),
+                    values.get("route_variant_key"),
+                    values.get("canonical_opportunity_key"),
+                    ROUTE_IDENTITY_SCHEMA_VERSION,
+                    json.dumps(values["product_identity_aliases"], sort_keys=True),
+                    values.get("legacy_route_key"),
+                    values.get("legacy_route_entry_key"),
+                    json.dumps(config, sort_keys=True),
+                    utc_now_iso(),
+                    row["position_id"],
+                ),
+            )
 
     def _ensure_funding_shadow_columns(self, connection: sqlite3.Connection) -> None:
         alert_columns = {
@@ -255,8 +624,58 @@ class SQLiteStore:
     def upsert_funding_capture_position(self, row: dict[str, Any]) -> str:
         now = utc_now_iso()
         position_id = str(row["position_id"])
-        config_json = json.dumps(row.get("config", row.get("config_json", {})), sort_keys=True)
+        config_payload = row.get("config", row.get("config_json", {}))
+        if isinstance(config_payload, str):
+            try:
+                config = json.loads(config_payload or "{}")
+            except json.JSONDecodeError:
+                config = {"config_json_invalid": True}
+        else:
+            config = dict(config_payload or {})
+        product_aliases = list(
+            row.get("product_identity_aliases")
+            or config.get("product_identity_aliases")
+            or []
+        )
+        route_family_key = row.get("route_family_key") or config.get("route_family_key")
+        route_variant_key = row.get("route_variant_key") or config.get("route_variant_key")
+        canonical_opportunity_key = (
+            row.get("canonical_opportunity_key")
+            or config.get("canonical_opportunity_key")
+        )
+        identity_schema_version = (
+            row.get("identity_schema_version")
+            or config.get("identity_schema_version")
+            or ROUTE_IDENTITY_SCHEMA_VERSION
+        )
+        legacy_route_key = row.get("legacy_route_key") or config.get("legacy_route_key")
+        legacy_route_entry_key = (
+            row.get("legacy_route_entry_key")
+            or config.get("legacy_route_entry_key")
+        )
+        if route_family_key:
+            config["route_family_key"] = route_family_key
+        if route_variant_key:
+            config["route_variant_key"] = route_variant_key
+        if canonical_opportunity_key:
+            config["canonical_opportunity_key"] = canonical_opportunity_key
+        config["identity_schema_version"] = identity_schema_version
+        if product_aliases:
+            config["product_identity_aliases"] = product_aliases
+        if legacy_route_key:
+            config.setdefault("legacy_route_key", legacy_route_key)
+        if legacy_route_entry_key:
+            config.setdefault("legacy_route_entry_key", legacy_route_entry_key)
+        config_json = json.dumps(config, sort_keys=True)
         with self.connect() as connection:
+            alias_blockers = self._upsert_product_identity_aliases(
+                connection,
+                product_aliases,
+                canonical_asset=str(row.get("canonical_asset") or ""),
+                now_iso=now,
+            )
+            if alias_blockers:
+                raise ValueError(",".join(alias_blockers))
             connection.execute(
                 """
                 INSERT INTO funding_capture_positions (
@@ -282,13 +701,20 @@ class SQLiteStore:
                     paper_emergency_unwind_cost,
                     paper_net_pnl_estimated,
                     paper_net_pnl_reconciled,
+                    route_family_key,
+                    route_variant_key,
+                    canonical_opportunity_key,
+                    identity_schema_version,
+                    product_identity_aliases_json,
+                    legacy_route_key,
+                    legacy_route_entry_key,
                     config_json,
                     config_hash,
                     code_commit,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_id) DO UPDATE SET
                     funding_paper_position_id = excluded.funding_paper_position_id,
                     strategy_name = excluded.strategy_name,
@@ -311,6 +737,13 @@ class SQLiteStore:
                     paper_emergency_unwind_cost = excluded.paper_emergency_unwind_cost,
                     paper_net_pnl_estimated = excluded.paper_net_pnl_estimated,
                     paper_net_pnl_reconciled = excluded.paper_net_pnl_reconciled,
+                    route_family_key = excluded.route_family_key,
+                    route_variant_key = excluded.route_variant_key,
+                    canonical_opportunity_key = excluded.canonical_opportunity_key,
+                    identity_schema_version = excluded.identity_schema_version,
+                    product_identity_aliases_json = excluded.product_identity_aliases_json,
+                    legacy_route_key = excluded.legacy_route_key,
+                    legacy_route_entry_key = excluded.legacy_route_entry_key,
                     config_json = excluded.config_json,
                     config_hash = excluded.config_hash,
                     code_commit = excluded.code_commit,
@@ -339,6 +772,13 @@ class SQLiteStore:
                     float(row.get("paper_emergency_unwind_cost", 0.0)),
                     row.get("paper_net_pnl_estimated"),
                     row.get("paper_net_pnl_reconciled"),
+                    route_family_key,
+                    route_variant_key,
+                    canonical_opportunity_key,
+                    identity_schema_version,
+                    json.dumps(product_aliases, sort_keys=True),
+                    legacy_route_key,
+                    legacy_route_entry_key,
                     config_json,
                     row.get("config_hash"),
                     row.get("code_commit"),
@@ -1456,6 +1896,104 @@ class SQLiteStore:
             if str((row.get("config") or {}).get("route_key") or "") == str(route_key):
                 return row
         return None
+
+    def funding_capture_active_position_by_route_variant_key(
+        self,
+        route_variant_key: str,
+    ) -> dict[str, Any] | None:
+        key = str(route_variant_key or "")
+        if not key:
+            return None
+        for row in self.funding_capture_position_rows(
+            states=set(FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES)
+        ):
+            config = row.get("config") or {}
+            if key in {
+                str(row.get("route_variant_key") or ""),
+                str(config.get("route_variant_key") or ""),
+                str(config.get("route_key") or ""),
+            }:
+                return row
+        return None
+
+    def funding_capture_position_by_canonical_opportunity_key(
+        self,
+        canonical_opportunity_key: str,
+        *,
+        states: set[str] | None = None,
+    ) -> dict[str, Any] | None:
+        key = str(canonical_opportunity_key or "")
+        if not key:
+            return None
+        rows = self.funding_capture_position_rows(states=states)
+        for row in rows:
+            config = row.get("config") or {}
+            if key in {
+                str(row.get("canonical_opportunity_key") or ""),
+                str(config.get("canonical_opportunity_key") or ""),
+                str(config.get("route_entry_key") or ""),
+            }:
+                return row
+        return None
+
+    def funding_capture_active_identity_issues(self) -> dict[str, Any]:
+        active = self.funding_capture_position_rows(
+            states=set(FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES)
+        )
+        missing: list[dict[str, Any]] = []
+        by_opportunity: dict[str, list[str]] = {}
+        by_variant_open: dict[str, list[str]] = {}
+        for row in active:
+            config = row.get("config") or {}
+            blockers = list(config.get("identity_migration_blockers") or [])
+            opportunity = str(
+                row.get("canonical_opportunity_key")
+                or config.get("canonical_opportunity_key")
+                or ""
+            )
+            variant = str(row.get("route_variant_key") or config.get("route_variant_key") or "")
+            if blockers or not opportunity or not variant:
+                missing.append(
+                    {
+                        "position_id": row.get("position_id"),
+                        "state": row.get("state"),
+                        "blockers": blockers or ["canonical_identity_missing"],
+                    }
+                )
+            if opportunity:
+                by_opportunity.setdefault(opportunity, []).append(str(row["position_id"]))
+            if variant and str(row.get("state") or "") in FUNDING_CAPTURE_OPEN_EXPOSURE_STATES:
+                by_variant_open.setdefault(variant, []).append(str(row["position_id"]))
+        duplicate_opportunities = {
+            key: ids for key, ids in by_opportunity.items() if len(set(ids)) > 1
+        }
+        duplicate_open_variants = {
+            key: ids for key, ids in by_variant_open.items() if len(set(ids)) > 1
+        }
+        with self.connect() as connection:
+            alias_conflicts = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT alias_key, venue, environment, alias_kind, alias_value,
+                           primary_product_identity, symbol, quote_asset,
+                           collateral_asset, product_type, conflict_state
+                    FROM product_identity_aliases
+                    WHERE conflict_state != 'ACTIVE'
+                    ORDER BY updated_at DESC
+                    """
+                ).fetchall()
+            ]
+        return {
+            "missing_or_ambiguous": missing,
+            "duplicate_canonical_opportunities": duplicate_opportunities,
+            "duplicate_open_route_variants": duplicate_open_variants,
+            "alias_conflicts": alias_conflicts,
+            "ok": not missing
+            and not duplicate_opportunities
+            and not duplicate_open_variants
+            and not alias_conflicts,
+        }
 
     def update_funding_capture_position_state(
         self,

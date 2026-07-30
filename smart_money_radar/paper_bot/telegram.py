@@ -284,6 +284,71 @@ def leg_display_rate(leg: dict[str, Any]) -> tuple[float | None, float | None]:
     )
 
 
+def fee_evidence_status_line(route: dict[str, Any]) -> str:
+    evidence = route.get("evidence") or {}
+    readiness = evidence.get("capability_check") or {}
+    economics = readiness.get("economics") or {}
+    modeled = economics.get("modeled_fee_rates") or {}
+    parts: list[str] = []
+    for side, label in (("long", "L"), ("short", "S")):
+        fee = modeled.get(side) or {}
+        status = fee.get("evidence_status") or {}
+        if not isinstance(status, dict) or not status:
+            continue
+        stamp = (
+            status.get("account_fee_observed_at")
+            or status.get("fee_source_observed_at")
+            or status.get("fee_schedule_reviewed_at")
+            or status.get("observed_at")
+        )
+        parts.append(
+            " ".join(
+                item
+                for item in (
+                    f"{label}:{status.get('fee_evidence_kind') or 'UNKNOWN'}",
+                    f"src={short_fee_source(status.get('source_identifier'))}",
+                    f"ts={short_timestamp(stamp)}",
+                    f"age={short_age(status.get('age_seconds'))}",
+                    f"exp={short_timestamp(status.get('expires_at'))}",
+                    f"verified={'Y' if status.get('verified') else 'N'}",
+                    f"fallback={'Y' if status.get('fallback_required') else 'N'}",
+                    f"reserve={'Y' if status.get('uncertainty_reserve_required') else 'N'}",
+                )
+                if item
+            )
+        )
+    return f"Fees: {tg(' | '.join(parts))}\n" if parts else ""
+
+
+def short_fee_source(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    if len(text) <= 34:
+        return text
+    return f"{text[:16]}...{text[-15:]}"
+
+
+def short_timestamp(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "none"
+    if text.endswith("+00:00"):
+        text = f"{text[:-6]}Z"
+    return text.replace("T", " ")
+
+
+def short_age(value: Any) -> str:
+    age = optional_float(value)
+    if age is None:
+        return "none"
+    if abs(age) >= 86_400:
+        return f"{age / 86_400:.1f}d"
+    if abs(age) >= 3_600:
+        return f"{age / 3_600:.1f}h"
+    return f"{age:.0f}s"
+
+
 def status_route_line(route: dict[str, Any], index: int) -> str:
     evidence = route.get("evidence") or {}
     legs = route.get("legs") or []
@@ -390,6 +455,7 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
         else ""
     )
     badges_line = f"{tg(' | '.join(badges))}\n" if badges else ""
+    fee_line = fee_evidence_status_line(route)
     if lightweight:
         pnl_line = (
             "Preliminary funding before focused costs: "
@@ -408,6 +474,7 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
         f"Stage: <code>{tg(stage)}</code> | Edge: <code>{tg(edge_name)}</code>\n"
         f"{readiness_line}"
         f"{badges_line}"
+        f"{fee_line}"
         f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
         f"{long_rate_display}/{long_interval}"
         f"{f' ({long_hourly_label})' if long_hourly_label else ''}\n"

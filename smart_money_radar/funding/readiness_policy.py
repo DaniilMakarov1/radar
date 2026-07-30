@@ -129,6 +129,9 @@ class FundingRiskPolicy:
     sign_flip_uncertainty_multiplier: float = 0.75
     global_conservative_taker_fee_rate: float = 0.0010
     fee_uncertainty_reserve_bps: float = 2.0
+    account_fee_evidence_max_age_seconds: float = 24.0 * 60.0 * 60.0
+    public_fee_endpoint_max_age_seconds: float = 7.0 * 24.0 * 60.0 * 60.0
+    reviewed_static_fee_max_age_seconds: float = 30.0 * 24.0 * 60.0 * 60.0
     reference_price_slippage_bps: float = 15.0
     top_of_book_slippage_bps: float = 8.0
     partial_depth_slippage_bps: float = 4.0
@@ -438,7 +441,14 @@ def modeled_fee_rate(
     venue = str(market.get("venue") or "").lower()
     numeric_rate = fee_rate_value(market, "taker")
     default_rate = DEFAULT_TAKER_FEE_RATES.get(venue)
-    fee_status = fee_evidence_status(market, "taker", now=now)
+    fee_status = fee_evidence_status(
+        market,
+        "taker",
+        now=now,
+        account_max_age_seconds=risk_policy.account_fee_evidence_max_age_seconds,
+        public_endpoint_max_age_seconds=risk_policy.public_fee_endpoint_max_age_seconds,
+        reviewed_static_max_age_seconds=risk_policy.reviewed_static_fee_max_age_seconds,
+    )
     verified = bool(fee_status.get("verified")) and numeric_rate is not None
     flags: list[str] = []
     assumptions: list[str] = []

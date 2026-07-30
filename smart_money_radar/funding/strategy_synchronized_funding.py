@@ -74,6 +74,9 @@ class EventWindowPlannerConfig:
     operational_reserve_bps: float = 1.0
     conservative_taker_fee_fallback_rate: float = 0.0010
     fee_uncertainty_reserve_bps: float = 2.0
+    account_fee_evidence_max_age_seconds: float = 24.0 * 60.0 * 60.0
+    public_fee_endpoint_max_age_seconds: float = 7.0 * 24.0 * 60.0 * 60.0
+    reviewed_static_fee_max_age_seconds: float = 30.0 * 24.0 * 60.0 * 60.0
 
 
 @dataclass(frozen=True)
@@ -716,6 +719,9 @@ def _planned_costs(
     risk_policy = FundingRiskPolicy(
         global_conservative_taker_fee_rate=float(config.conservative_taker_fee_fallback_rate),
         fee_uncertainty_reserve_bps=float(config.fee_uncertainty_reserve_bps),
+        account_fee_evidence_max_age_seconds=float(config.account_fee_evidence_max_age_seconds),
+        public_fee_endpoint_max_age_seconds=float(config.public_fee_endpoint_max_age_seconds),
+        reviewed_static_fee_max_age_seconds=float(config.reviewed_static_fee_max_age_seconds),
     )
     long_modeled_fee = modeled_fee_rate(long_market, policy=risk_policy, now=now)
     short_modeled_fee = modeled_fee_rate(short_market, policy=risk_policy, now=now)

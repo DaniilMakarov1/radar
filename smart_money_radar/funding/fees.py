@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from smart_money_radar.funding.models import (
@@ -35,12 +35,31 @@ VERIFIED_VIP1_FEE_PROFILES = {
     },
 }
 
+ACCOUNT_FEE_EVIDENCE_MAX_AGE_SECONDS = 24.0 * 60.0 * 60.0
+PUBLIC_FEE_ENDPOINT_MAX_AGE_SECONDS = 7.0 * 24.0 * 60.0 * 60.0
+REVIEWED_STATIC_FEE_MAX_AGE_SECONDS = 30.0 * 24.0 * 60.0 * 60.0
+
+FEE_EVIDENCE_KIND_ACCOUNT_ENDPOINT = "ACCOUNT_ENDPOINT"
+FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT = "PUBLIC_FEE_ENDPOINT"
+FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE = "REVIEWED_STATIC_SCHEDULE"
+FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD = "UNVERIFIED_MARKET_FIELD"
+FEE_EVIDENCE_KIND_CONSERVATIVE_FALLBACK = "CONSERVATIVE_FALLBACK"
+
+SUPPORTED_FEE_EVIDENCE_KINDS = {
+    FEE_EVIDENCE_KIND_ACCOUNT_ENDPOINT,
+    FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT,
+    FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE,
+    FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD,
+    FEE_EVIDENCE_KIND_CONSERVATIVE_FALLBACK,
+}
+
 TRUSTED_FEE_SOURCE_KINDS = {
     "account_api",
     "account_fee_endpoint",
     "official_account_fee_endpoint",
     "official_public_fee_endpoint",
     "public_fee_endpoint",
+    "reviewed_static_schedule",
     "configured_trusted_fee",
     "trusted_config",
     "versioned_trusted_config",
@@ -87,11 +106,18 @@ def funding_fee_rate(
         return math.nan
     field = f"{role}_fee_rate"
     raw = market.get(field)
+    if raw is None and role == "taker":
+        raw = market.get("fee_rate")
     defaults = (
         DEFAULT_MAKER_FEE_RATES if role == "maker" else DEFAULT_TAKER_FEE_RATES
     )
+    if raw is not None:
+        parsed = parsed_fee_for_role(raw, role)
+        if parsed is None:
+            return math.nan
+        return parsed
     try:
-        value = float(raw) if raw is not None else defaults.get(venue, 0.0006)
+        value = defaults.get(venue, 0.0006)
     except (TypeError, ValueError):
         value = defaults.get(venue, 0.0006)
     # Maker rebates are valid and should remain negative; taker fees cannot be.
@@ -165,6 +191,132 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+def _timestamp_iso(value: datetime | None) -> str | None:
+    return value.astimezone(UTC).isoformat() if value is not None else None
+
+
+def _normalize_evidence_kind(evidence: dict[str, Any], source_kind: str) -> str:
+    raw = str(
+        evidence.get("fee_evidence_kind")
+        or evidence.get("evidence_kind")
+        or evidence.get("kind")
+        or ""
+    ).strip()
+    if raw:
+        normalized = raw.upper()
+        if normalized in SUPPORTED_FEE_EVIDENCE_KINDS:
+            return normalized
+    source = str(source_kind or "").strip().lower()
+    if source in {"account_api", "account_fee_endpoint", "official_account_fee_endpoint"}:
+        return FEE_EVIDENCE_KIND_ACCOUNT_ENDPOINT
+    if source == "public_fee_endpoint":
+        return FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT
+    if source == "official_public_fee_endpoint":
+        if any(
+            evidence.get(key) not in (None, "")
+            for key in (
+                "fee_source_observed_at",
+                "source_observed_at",
+                "endpoint_observed_at",
+            )
+        ):
+            return FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT
+        return FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE
+    if source in {
+        "configured_trusted_fee",
+        "trusted_config",
+        "versioned_trusted_config",
+        "reviewed_static_schedule",
+        "account_override",
+    }:
+        return FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE
+    return FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD
+
+
+def _max_age_for_kind(
+    kind: str,
+    *,
+    max_age_seconds: float | None,
+    account_max_age_seconds: float | None,
+    public_endpoint_max_age_seconds: float | None,
+    reviewed_static_max_age_seconds: float | None,
+) -> float:
+    if kind == FEE_EVIDENCE_KIND_ACCOUNT_ENDPOINT:
+        return float(
+            account_max_age_seconds
+            if account_max_age_seconds is not None
+            else max_age_seconds
+            if max_age_seconds is not None
+            else ACCOUNT_FEE_EVIDENCE_MAX_AGE_SECONDS
+        )
+    if kind == FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT:
+        return float(
+            public_endpoint_max_age_seconds
+            if public_endpoint_max_age_seconds is not None
+            else max_age_seconds
+            if max_age_seconds is not None
+            else PUBLIC_FEE_ENDPOINT_MAX_AGE_SECONDS
+        )
+    return float(
+        reviewed_static_max_age_seconds
+        if reviewed_static_max_age_seconds is not None
+        else max_age_seconds
+        if max_age_seconds is not None
+        else REVIEWED_STATIC_FEE_MAX_AGE_SECONDS
+    )
+
+
+def _fee_evidence_timestamps(
+    market: dict[str, Any],
+    evidence: dict[str, Any],
+    kind: str,
+) -> dict[str, datetime | None]:
+    market_observed_at = _parse_timestamp(
+        evidence.get("market_observed_at")
+        or market.get("market_observed_at")
+        or market.get("observed_at")
+        or market.get("market_response_received_at")
+        or market.get("response_received_at")
+    )
+    fee_source_observed_at = _parse_timestamp(
+        evidence.get("fee_source_observed_at")
+        or evidence.get("source_observed_at")
+        or evidence.get("endpoint_observed_at")
+        or market.get("fee_source_observed_at")
+    )
+    account_fee_observed_at = _parse_timestamp(
+        evidence.get("account_fee_observed_at")
+        or evidence.get("account_observed_at")
+        or market.get("account_fee_observed_at")
+    )
+    fee_schedule_reviewed_at = _parse_timestamp(
+        evidence.get("fee_schedule_reviewed_at")
+        or evidence.get("reviewed_at")
+        or market.get("fee_schedule_reviewed_at")
+        or market.get("fee_reviewed_at")
+    )
+    legacy_observed = _parse_timestamp(evidence.get("observed_at") or market.get("fee_observed_at"))
+    if kind == FEE_EVIDENCE_KIND_ACCOUNT_ENDPOINT:
+        if account_fee_observed_at is None:
+            account_fee_observed_at = legacy_observed or fee_source_observed_at
+        selected = account_fee_observed_at
+    elif kind == FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT:
+        if fee_source_observed_at is None:
+            fee_source_observed_at = legacy_observed
+        selected = fee_source_observed_at
+    elif kind == FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE:
+        selected = fee_schedule_reviewed_at
+    else:
+        selected = legacy_observed
+    return {
+        "market_observed_at": market_observed_at,
+        "fee_source_observed_at": fee_source_observed_at,
+        "account_fee_observed_at": account_fee_observed_at,
+        "fee_schedule_reviewed_at": fee_schedule_reviewed_at,
+        "selected_evidence_at": selected,
+    }
+
+
 def _select_fee_evidence(
     market: dict[str, Any],
     liquidity_role: str,
@@ -187,7 +339,10 @@ def fee_evidence_status(
     liquidity_role: str = "taker",
     *,
     now: datetime | None = None,
-    max_age_seconds: float = 30.0 * 24.0 * 60.0 * 60.0,
+    max_age_seconds: float | None = None,
+    account_max_age_seconds: float | None = None,
+    public_endpoint_max_age_seconds: float | None = None,
+    reviewed_static_max_age_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Return trust status for a fee rate without inventing verification."""
     role = "maker" if liquidity_role == "maker" else "taker"
@@ -202,8 +357,18 @@ def fee_evidence_status(
         "trust_status": "UNKNOWN",
         "source_kind": None,
         "source_identifier": None,
+        "fee_evidence_kind": None,
+        "market_observed_at": None,
+        "fee_source_observed_at": None,
+        "fee_schedule_reviewed_at": None,
+        "account_fee_observed_at": None,
         "observed_at": None,
         "reviewed_at": None,
+        "age_seconds": None,
+        "max_age_seconds": None,
+        "expires_at": None,
+        "fallback_required": True,
+        "uncertainty_reserve_required": True,
         "blocker": None,
     }
     override_status = fee_override_status(venue, role)
@@ -213,12 +378,18 @@ def fee_evidence_status(
         if not override_status.get("valid"):
             status["rate"] = override_status.get("raw_value")
             status["trust_status"] = "INVALID"
+            status["fee_evidence_kind"] = FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD
             status["blocker"] = str(
                 override_status.get("blocker") or f"{role}_fee_override_invalid"
             )
             return status
         status["rate"] = float(override_status["rate"])
     if rate is None:
+        status["fee_evidence_kind"] = (
+            FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD
+            if raw_rate is not None
+            else FEE_EVIDENCE_KIND_CONSERVATIVE_FALLBACK
+        )
         status["blocker"] = (
             f"{role}_fee_rate_out_of_range"
             if raw_rate is not None
@@ -235,18 +406,20 @@ def fee_evidence_status(
         or ""
     ).strip()
     trust_status = str(evidence.get("trust_status") or "").strip().upper()
-    observed = _parse_timestamp(
-        evidence.get("observed_at")
-        or evidence.get("reviewed_at")
-        or market.get("fee_observed_at")
-        or market.get("response_received_at")
-    )
-    reviewed = _parse_timestamp(evidence.get("reviewed_at") or market.get("fee_reviewed_at"))
+    evidence_kind = _normalize_evidence_kind(evidence, source_kind)
+    timestamps = _fee_evidence_timestamps(market, evidence, evidence_kind)
+    observed = timestamps["selected_evidence_at"]
+    reviewed = timestamps["fee_schedule_reviewed_at"]
 
     source = str(market.get("fee_source") or "").strip().lower()
     if not evidence:
         status["trust_status"] = "UNVERIFIED"
         status["source_identifier"] = source or None
+        status["fee_evidence_kind"] = (
+            FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD
+            if rate is not None
+            else FEE_EVIDENCE_KIND_CONSERVATIVE_FALLBACK
+        )
         status["blocker"] = f"{role}_fee_evidence_missing"
         return status
 
@@ -254,12 +427,27 @@ def fee_evidence_status(
         {
             "source_kind": source_kind or None,
             "source_identifier": source_identifier or None,
-            "observed_at": observed.astimezone(UTC).isoformat() if observed else None,
-            "reviewed_at": reviewed.astimezone(UTC).isoformat() if reviewed else None,
+            "fee_evidence_kind": evidence_kind,
+            "market_observed_at": _timestamp_iso(timestamps["market_observed_at"]),
+            "fee_source_observed_at": _timestamp_iso(timestamps["fee_source_observed_at"]),
+            "fee_schedule_reviewed_at": _timestamp_iso(timestamps["fee_schedule_reviewed_at"]),
+            "account_fee_observed_at": _timestamp_iso(timestamps["account_fee_observed_at"]),
+            "observed_at": _timestamp_iso(observed),
+            "reviewed_at": _timestamp_iso(reviewed),
             "trust_status": trust_status or "UNKNOWN",
         }
     )
 
+    if evidence_kind not in SUPPORTED_FEE_EVIDENCE_KINDS:
+        status["blocker"] = f"{role}_fee_evidence_kind_unsupported"
+        return status
+    if evidence_kind in {
+        FEE_EVIDENCE_KIND_UNVERIFIED_MARKET_FIELD,
+        FEE_EVIDENCE_KIND_CONSERVATIVE_FALLBACK,
+    }:
+        status["trust_status"] = trust_status or "UNVERIFIED"
+        status["blocker"] = f"{role}_fee_source_untrusted"
+        return status
     if source_kind not in TRUSTED_FEE_SOURCE_KINDS:
         status["trust_status"] = trust_status or "UNVERIFIED"
         status["blocker"] = f"{role}_fee_source_untrusted"
@@ -275,16 +463,26 @@ def fee_evidence_status(
     if not evidence_version:
         status["blocker"] = f"{role}_fee_evidence_version_missing"
         return status
-    if observed is None and reviewed is None:
+    if observed is None:
         status["blocker"] = f"{role}_fee_timestamp_missing"
         return status
     reference = now.astimezone(UTC) if now else datetime.now(UTC)
-    timestamp = observed or reviewed
-    if timestamp is not None:
-        age = (reference - timestamp.astimezone(UTC)).total_seconds()
-        if age < -60.0 or age > float(max_age_seconds):
-            status["blocker"] = f"{role}_fee_evidence_stale"
-            return status
+    max_age = _max_age_for_kind(
+        evidence_kind,
+        max_age_seconds=max_age_seconds,
+        account_max_age_seconds=account_max_age_seconds,
+        public_endpoint_max_age_seconds=public_endpoint_max_age_seconds,
+        reviewed_static_max_age_seconds=reviewed_static_max_age_seconds,
+    )
+    age = (reference - observed.astimezone(UTC)).total_seconds()
+    expires = observed.astimezone(UTC) + timedelta(seconds=max_age)
+    status["age_seconds"] = age
+    status["max_age_seconds"] = max_age
+    status["expires_at"] = expires.isoformat()
+    if age < -60.0 or age > max_age:
+        status["stale_kind"] = evidence_kind
+        status["blocker"] = f"{role}_fee_evidence_stale"
+        return status
     evidence_venue = str(evidence.get("venue") or "").strip().lower()
     if not evidence_venue or (venue and evidence_venue != venue):
         status["blocker"] = f"{role}_fee_venue_mismatch"
@@ -324,6 +522,8 @@ def fee_evidence_status(
             return status
 
     status["verified"] = True
+    status["fallback_required"] = False
+    status["uncertainty_reserve_required"] = False
     status["blocker"] = None
     return status
 

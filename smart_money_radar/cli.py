@@ -905,6 +905,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Critical telemetry threshold for common price move; not an automatic close.",
     )
     funding_paper_trader.add_argument("--no-spread-monitoring", action="store_true")
+    funding_paper_trader.add_argument(
+        "--account-fee-evidence-max-age-seconds",
+        type=float,
+        default=24.0 * 60.0 * 60.0,
+        help="Maximum age for account fee endpoint evidence.",
+    )
+    funding_paper_trader.add_argument(
+        "--public-fee-endpoint-max-age-seconds",
+        type=float,
+        default=7.0 * 24.0 * 60.0 * 60.0,
+        help="Maximum age for public fee endpoint response evidence.",
+    )
+    funding_paper_trader.add_argument(
+        "--reviewed-static-fee-max-age-seconds",
+        type=float,
+        default=30.0 * 24.0 * 60.0 * 60.0,
+        help="Maximum age for versioned reviewed static fee schedules.",
+    )
 
     funding_shadow_monitor = subparsers.add_parser(
         "funding-shadow-monitor",
@@ -1239,6 +1257,9 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
             float(getattr(args, "common_price_move_critical_pct", 10.0) or 0.0) / 100.0
         ),
         spread_monitoring_enabled=not getattr(args, "no_spread_monitoring", False),
+        account_fee_evidence_max_age_seconds=args.account_fee_evidence_max_age_seconds,
+        public_fee_endpoint_max_age_seconds=args.public_fee_endpoint_max_age_seconds,
+        reviewed_static_fee_max_age_seconds=args.reviewed_static_fee_max_age_seconds,
     ).validated()
 
 

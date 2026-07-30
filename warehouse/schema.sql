@@ -1434,6 +1434,13 @@ CREATE TABLE IF NOT EXISTS funding_capture_positions (
     paper_emergency_unwind_cost REAL NOT NULL DEFAULT 0,
     paper_net_pnl_estimated REAL,
     paper_net_pnl_reconciled REAL,
+    route_family_key TEXT,
+    route_variant_key TEXT,
+    canonical_opportunity_key TEXT,
+    identity_schema_version TEXT,
+    product_identity_aliases_json TEXT NOT NULL DEFAULT '[]',
+    legacy_route_key TEXT,
+    legacy_route_entry_key TEXT,
     config_json TEXT NOT NULL DEFAULT '{}',
     config_hash TEXT,
     code_commit TEXT,
@@ -1445,6 +1452,33 @@ CREATE TABLE IF NOT EXISTS funding_capture_positions (
 
 CREATE INDEX IF NOT EXISTS idx_funding_capture_positions_state
     ON funding_capture_positions (state, opened_at DESC);
+
+CREATE TABLE IF NOT EXISTS product_identity_aliases (
+    alias_key TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    alias_kind TEXT NOT NULL,
+    alias_value TEXT NOT NULL,
+    primary_product_identity TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    quote_asset TEXT NOT NULL,
+    collateral_asset TEXT NOT NULL,
+    product_type TEXT NOT NULL,
+    canonical_asset TEXT,
+    side TEXT,
+    conflict_state TEXT NOT NULL DEFAULT 'ACTIVE',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (venue, environment, alias_kind, alias_value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_identity_aliases_primary
+    ON product_identity_aliases (
+        venue, environment, primary_product_identity,
+        quote_asset, collateral_asset, product_type
+    );
 
 CREATE TABLE IF NOT EXISTS funding_capture_cycles (
     cycle_id TEXT PRIMARY KEY,

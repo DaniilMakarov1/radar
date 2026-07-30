@@ -52,4 +52,7 @@ exec "$PYTHON_BIN" -u -m smart_money_radar.cli funding-paper-trader \
   --strategy-set "${FUNDING_PAPER_STRATEGY_SET:-synchronized_funding_capture}" \
   --common-price-move-alert-pct "${FUNDING_PAPER_COMMON_PRICE_MOVE_ALERT_PCT:-5}" \
   --common-price-move-critical-pct "${FUNDING_PAPER_COMMON_PRICE_MOVE_CRITICAL_PCT:-10}" \
+  --account-fee-evidence-max-age-seconds "${FUNDING_PAPER_ACCOUNT_FEE_EVIDENCE_MAX_AGE_SECONDS:-86400}" \
+  --public-fee-endpoint-max-age-seconds "${FUNDING_PAPER_PUBLIC_FEE_ENDPOINT_MAX_AGE_SECONDS:-604800}" \
+  --reviewed-static-fee-max-age-seconds "${FUNDING_PAPER_REVIEWED_STATIC_FEE_MAX_AGE_SECONDS:-2592000}" \
   "${funding_telegram_arg[@]}"

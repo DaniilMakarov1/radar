@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from smart_money_radar.funding.fees import fee_rate_value
+from smart_money_radar.funding.fees import (
+    FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE,
+    fee_rate_value,
+)
 from smart_money_radar.funding.readiness_policy import (
     DEFAULT_FUNDING_RISK_POLICY,
     attach_rate_estimate,
@@ -22,6 +25,24 @@ from smart_money_radar.funding.settlement_contracts import (
 NORMALIZATION_EVIDENCE_VERSION = "sync-market-normalization-2026-07-29"
 FEE_EVIDENCE_VERSION = "sync-fee-contract-2026-07-29"
 FEE_CONTRACT_REVIEWED_AT = "2026-07-29T00:00:00+00:00"
+_VERSIONED_FEE_SOURCE_KINDS = {
+    "account_api",
+    "account_fee_endpoint",
+    "official_account_fee_endpoint",
+    "public_fee_endpoint",
+    "official_public_fee_endpoint",
+    "configured_trusted_fee",
+    "trusted_config",
+    "versioned_trusted_config",
+    "reviewed_static_schedule",
+}
+_VERSIONED_FEE_TRUST_STATUSES = {
+    "ACCOUNT_VERIFIED",
+    "CONFIGURED_TRUSTED",
+    "OFFICIAL",
+    "REVIEWED",
+    "VERIFIED",
+}
 
 
 @dataclass(frozen=True)
@@ -276,28 +297,65 @@ def _attach_fee_evidence(row: dict[str, Any], observed: str) -> None:
     contract = VERIFIED_TAKER_FEE_CONTRACTS.get(venue)
     if contract is None:
         return
+    row["market_observed_at"] = observed
+    if _has_versioned_taker_fee_evidence(row):
+        return
     if contract.taker_fee_rate is not None:
         row["taker_fee_rate"] = contract.taker_fee_rate
     rate = fee_rate_value(row, "taker")
     if rate is None:
         return
     row["fee_source"] = contract.source_kind
-    row["fee_observed_at"] = observed
+    row["market_observed_at"] = observed
+    row["fee_observed_at"] = FEE_CONTRACT_REVIEWED_AT
     row["fee_reviewed_at"] = FEE_CONTRACT_REVIEWED_AT
+    row["fee_schedule_reviewed_at"] = FEE_CONTRACT_REVIEWED_AT
     row["fee_evidence"] = {
+        "fee_evidence_kind": FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE,
         "source_kind": contract.source_kind,
         "source_identifier": contract.source_identifier,
         "trust_status": contract.trust_status,
         "venue": venue,
         "liquidity_role": "taker",
-        "observed_at": observed,
+        "market_observed_at": observed,
         "reviewed_at": FEE_CONTRACT_REVIEWED_AT,
+        "fee_schedule_reviewed_at": FEE_CONTRACT_REVIEWED_AT,
         "environment": str(row.get("environment") or "mainnet").strip().lower(),
         "market_type": row.get("market_type") or row.get("product_type") or "linear_perpetual",
         "product_type": row.get("product_type") or row.get("market_type") or "linear_perpetual",
         "applicability": "taker",
         "evidence_version": FEE_EVIDENCE_VERSION,
     }
+
+
+def _has_versioned_taker_fee_evidence(row: dict[str, Any]) -> bool:
+    evidence = row.get("fee_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    taker = evidence.get("taker")
+    if isinstance(taker, dict):
+        evidence = taker
+    generic = evidence.get("default") or evidence.get("generic")
+    if isinstance(generic, dict):
+        evidence = generic
+    if not isinstance(evidence, dict):
+        return False
+    source_kind = str(evidence.get("source_kind") or "").strip().lower()
+    trust_status = str(evidence.get("trust_status") or "").strip().upper()
+    source_identifier = str(
+        evidence.get("source_identifier")
+        or evidence.get("source_url")
+        or evidence.get("source")
+        or ""
+    ).strip()
+    liquidity_role = str(evidence.get("liquidity_role") or evidence.get("applicability") or "taker").strip().lower()
+    return (
+        bool(evidence.get("evidence_version") or evidence.get("schema_version"))
+        and source_kind in _VERSIONED_FEE_SOURCE_KINDS
+        and trust_status in _VERSIONED_FEE_TRUST_STATUSES
+        and bool(source_identifier)
+        and liquidity_role in {"taker", "all"}
+    )
 
 
 def _settlement_evidence(contract: FundingSettlementContract) -> dict[str, Any]:

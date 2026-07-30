@@ -287,6 +287,9 @@ class PaperBotConfig:
     spread_monitoring_enabled: bool = True
     conservative_taker_fee_fallback_rate: float = 0.0010
     fee_uncertainty_reserve_bps: float = 2.0
+    account_fee_evidence_max_age_seconds: float = 24.0 * 60.0 * 60.0
+    public_fee_endpoint_max_age_seconds: float = 7.0 * 24.0 * 60.0 * 60.0
+    reviewed_static_fee_max_age_seconds: float = 30.0 * 24.0 * 60.0 * 60.0
 
     def validated(self) -> "PaperBotConfig":
         strategies = list(normalize_strategy_set(self.strategy_set))
@@ -495,6 +498,18 @@ class PaperBotConfig:
             fee_uncertainty_reserve_bps=max(
                 0.0,
                 float(self.fee_uncertainty_reserve_bps),
+            ),
+            account_fee_evidence_max_age_seconds=max(
+                60.0,
+                float(self.account_fee_evidence_max_age_seconds),
+            ),
+            public_fee_endpoint_max_age_seconds=max(
+                60.0,
+                float(self.public_fee_endpoint_max_age_seconds),
+            ),
+            reviewed_static_fee_max_age_seconds=max(
+                60.0,
+                float(self.reviewed_static_fee_max_age_seconds),
             ),
         ).normalized_entry_leads()
 
@@ -1895,8 +1910,12 @@ class PaperBot:
             "normalization_evidence",
             "fee_source",
             "fee_evidence",
+            "market_observed_at",
             "fee_observed_at",
             "fee_reviewed_at",
+            "fee_schedule_reviewed_at",
+            "fee_source_observed_at",
+            "account_fee_observed_at",
             "environment_verified",
             "endpoint_base_url",
             "endpoint_identity_provenance",
@@ -3603,8 +3622,12 @@ class PaperBot:
             "maker_fee_rate": market.get("maker_fee_rate"),
             "fee_source": market.get("fee_source"),
             "fee_evidence": market.get("fee_evidence"),
+            "market_observed_at": market.get("market_observed_at"),
             "fee_observed_at": market.get("fee_observed_at"),
             "fee_reviewed_at": market.get("fee_reviewed_at"),
+            "fee_schedule_reviewed_at": market.get("fee_schedule_reviewed_at"),
+            "fee_source_observed_at": market.get("fee_source_observed_at"),
+            "account_fee_observed_at": market.get("account_fee_observed_at"),
             "quantity_step": market.get("quantity_step"),
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
@@ -3832,8 +3855,12 @@ class PaperBot:
             "normalization_evidence",
             "fee_source",
             "fee_evidence",
+            "market_observed_at",
             "fee_observed_at",
             "fee_reviewed_at",
+            "fee_schedule_reviewed_at",
+            "fee_source_observed_at",
+            "account_fee_observed_at",
             "environment_verified",
             "endpoint_base_url",
             "endpoint_identity_provenance",
@@ -3911,8 +3938,12 @@ class PaperBot:
             "maker_fee_rate": market.get("maker_fee_rate"),
             "fee_source": market.get("fee_source"),
             "fee_evidence": market.get("fee_evidence"),
+            "market_observed_at": market.get("market_observed_at"),
             "fee_observed_at": market.get("fee_observed_at"),
             "fee_reviewed_at": market.get("fee_reviewed_at"),
+            "fee_schedule_reviewed_at": market.get("fee_schedule_reviewed_at"),
+            "fee_source_observed_at": market.get("fee_source_observed_at"),
+            "account_fee_observed_at": market.get("account_fee_observed_at"),
             "quantity_step": market.get("quantity_step"),
             "min_quantity": market.get("min_quantity"),
             "min_notional": min_notional,
@@ -4911,6 +4942,7 @@ def route_summary(route: dict[str, Any]) -> dict[str, Any]:
         "spread_pnl_component": selected.get("spread_pnl_component"),
         "actionable_profit_threshold": evidence.get("actionable_profit_threshold"),
         "execution_cost": evidence.get("execution_cost"),
+        "fee_evidence": route_fee_evidence_diagnostics(route),
         "focused_state": route.get("focused_state") or evidence.get("focused_state"),
         "focus_rank": route.get("focus_rank") or evidence.get("focus_rank"),
         "focused_selection": evidence.get("focused_selection") or {},
@@ -4940,6 +4972,47 @@ def route_summary(route: dict[str, Any]) -> dict[str, Any]:
             }
         },
     }
+
+
+def route_fee_evidence_diagnostics(route: dict[str, Any]) -> dict[str, Any]:
+    evidence = route.get("evidence") or {}
+    readiness = evidence.get("capability_check") or {}
+    economics = readiness.get("economics") or {}
+    modeled_fee_rates = economics.get("modeled_fee_rates") or {}
+    result: dict[str, Any] = {}
+    for side in ("long", "short"):
+        modeled = modeled_fee_rates.get(side) or {}
+        status = modeled.get("evidence_status") or {}
+        if not isinstance(status, dict):
+            status = {}
+        result[side] = {
+            "fee_evidence_kind": status.get("fee_evidence_kind"),
+            "source_kind": status.get("source_kind"),
+            "source_identifier": status.get("source_identifier"),
+            "market_observed_at": status.get("market_observed_at"),
+            "fee_source_observed_at": status.get("fee_source_observed_at"),
+            "fee_schedule_reviewed_at": status.get("fee_schedule_reviewed_at"),
+            "account_fee_observed_at": status.get("account_fee_observed_at"),
+            "observed_at": status.get("observed_at"),
+            "reviewed_at": status.get("reviewed_at"),
+            "age_seconds": status.get("age_seconds"),
+            "expires_at": status.get("expires_at"),
+            "verified": bool(status.get("verified")),
+            "fallback_required": bool(
+                status.get("fallback_required")
+                if status.get("fallback_required") is not None
+                else not modeled.get("verified")
+            ),
+            "uncertainty_reserve_required": bool(
+                status.get("uncertainty_reserve_required")
+                if status.get("uncertainty_reserve_required") is not None
+                else float(modeled.get("uncertainty_reserve_bps") or 0.0) > 0.0
+            ),
+            "uncertainty_reserve_bps": modeled.get("uncertainty_reserve_bps"),
+            "blocker": status.get("blocker"),
+        }
+    return result
+
 
 def serializable_config(config: PaperBotConfig) -> dict[str, Any]:
     payload = asdict(config)

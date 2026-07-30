@@ -4,9 +4,31 @@ import hashlib
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from smart_money_radar.funding.economics import perp_route_key
+
+ROUTE_IDENTITY_SCHEMA_VERSION = "route-identity-v2"
+CRITICAL_ROUTE_IDENTITY_FIELDS = {
+    "canonical_asset",
+    "long_venue",
+    "short_venue",
+    "long_environment",
+    "short_environment",
+    "long_stable_product_identity",
+    "short_stable_product_identity",
+    "long_symbol",
+    "short_symbol",
+    "long_quote_asset",
+    "short_quote_asset",
+    "long_collateral_asset",
+    "short_collateral_asset",
+    "long_contract_type",
+    "short_contract_type",
+    "long_product_type",
+    "short_product_type",
+}
 
 
 def _clean_text(value: Any, *, default: str = "") -> str:
@@ -26,12 +48,15 @@ def _finite_text(value: Any, *, default: str = "") -> str:
     if value in (None, ""):
         return default
     try:
-        parsed = float(value)
-    except (TypeError, ValueError):
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
         return _clean_text(value, default=default)
-    if not math.isfinite(parsed):
+    if not parsed.is_finite():
         return default
-    return f"{parsed:.12g}"
+    normalized = parsed.normalize()
+    if normalized == 0:
+        return "0"
+    return format(normalized, "f").rstrip("0").rstrip(".")
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -46,38 +71,110 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+def canonical_timestamp(value: Any) -> str:
+    parsed = _parse_time(value)
+    if parsed is None:
+        return ""
+    return parsed.astimezone(UTC).isoformat()
+
+
 def _timestamp_score(value: Any) -> float:
     parsed = _parse_time(value)
     return parsed.timestamp() if parsed is not None else float("-inf")
 
 
-def market_variant_identity_fields(market: dict[str, Any]) -> dict[str, str]:
-    """Fields that distinguish economically different listed products."""
-    product_identity = (
-        market.get("product_id")
-        or market.get("instrument_id")
-        or market.get("market_id")
-        or market.get("api_symbol")
-        or market.get("symbol")
-    )
-    product_type = (
+def _canonical_product_type(market: dict[str, Any]) -> str:
+    value = (
         market.get("api_product_type")
         or market.get("product_type")
         or market.get("market_type")
         or market.get("contract_kind")
         or market.get("contract_type")
     )
+    cleaned = _lower(value)
+    aliases = {
+        "perpetual": "linear_perpetual",
+        "linear-perpetual": "linear_perpetual",
+        "linear_perp": "linear_perpetual",
+        "swap": "linear_perpetual",
+        "perp": "linear_perpetual",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def _canonical_contract_type(market: dict[str, Any]) -> str:
+    value = market.get("contract_type") or market.get("contract_kind")
+    cleaned = _lower(value)
+    aliases = {
+        "perpetual": "linear_perpetual",
+        "linear-perpetual": "linear_perpetual",
+        "linear_perp": "linear_perpetual",
+        "swap": "linear_perpetual",
+        "perp": "linear_perpetual",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def _stable_product_identity(market: dict[str, Any]) -> str:
+    symbol = _upper(market.get("symbol"))
+    if symbol:
+        return symbol
+    for key in ("product_id", "instrument_id", "market_id", "api_symbol"):
+        value = _clean_text(market.get(key))
+        if value:
+            return value
+    return ""
+
+
+def product_identity_aliases(market: dict[str, Any]) -> list[dict[str, str]]:
+    venue = _lower(market.get("venue"))
+    environment = _lower(market.get("environment"), default="mainnet")
+    primary = _stable_product_identity(market)
+    symbol = _upper(market.get("symbol"))
+    quote = _upper(market.get("quote_asset") or market.get("settlement_asset"))
+    collateral = _upper(market.get("collateral_asset") or quote)
+    product_type = _canonical_product_type(market)
+    aliases: list[dict[str, str]] = []
+    for alias_kind in ("product_id", "instrument_id", "market_id", "api_symbol"):
+        alias_value = _clean_text(market.get(alias_kind))
+        if not alias_value:
+            continue
+        aliases.append(
+            {
+                "venue": venue,
+                "environment": environment,
+                "alias_kind": alias_kind,
+                "alias_value": alias_value,
+                "primary_product_identity": primary,
+                "symbol": symbol,
+                "quote_asset": quote,
+                "collateral_asset": collateral,
+                "product_type": product_type,
+            }
+        )
+    return aliases
+
+
+def market_variant_identity_fields(
+    market: dict[str, Any],
+    *,
+    direction: str = "",
+) -> dict[str, Any]:
+    """Fields that distinguish economically different listed products."""
     quote = market.get("quote_asset") or market.get("settlement_asset")
     collateral = market.get("collateral_asset") or quote
     return {
         "venue": _lower(market.get("venue")),
+        "direction": _lower(direction or market.get("side")),
         "environment": _lower(market.get("environment"), default="mainnet"),
-        "symbol": _clean_text(market.get("symbol")),
-        "product_identity": _clean_text(product_identity),
+        "symbol": _upper(market.get("symbol")),
+        "stable_product_identity": _stable_product_identity(market),
+        "product_identity": _stable_product_identity(market),
+        "product_aliases": product_identity_aliases(market),
         "quote_asset": _upper(quote),
         "collateral_asset": _upper(collateral),
-        "contract_type": _lower(market.get("contract_type") or market.get("contract_kind")),
-        "product_type": _lower(product_type),
+        "contract_type": _canonical_contract_type(market),
+        "product_type": _canonical_product_type(market),
         "contract_multiplier": _finite_text(market.get("contract_multiplier"), default="1"),
         "canonical_unit_multiplier": _finite_text(
             market.get("canonical_unit_multiplier"),
@@ -97,8 +194,8 @@ def route_variant_identity_fields(
     long_market: dict[str, Any],
     short_market: dict[str, Any],
 ) -> dict[str, Any]:
-    long = market_variant_identity_fields(long_market)
-    short = market_variant_identity_fields(short_market)
+    long = market_variant_identity_fields(long_market, direction="long")
+    short = market_variant_identity_fields(short_market, direction="short")
     family = {
         "canonical_asset": _upper(asset),
         "long_venue": long["venue"],
@@ -129,6 +226,7 @@ def route_variant_key(
     )
     parts = [
         "route_variant",
+        ROUTE_IDENTITY_SCHEMA_VERSION,
         fields["canonical_asset"],
         fields["long_venue"],
         fields["short_venue"],
@@ -137,9 +235,10 @@ def route_variant_key(
         side_fields = fields[side]
         parts.extend(
             [
+                side,
                 side_fields["environment"],
                 side_fields["symbol"],
-                side_fields["product_identity"],
+                side_fields["stable_product_identity"],
                 side_fields["quote_asset"],
                 side_fields["collateral_asset"],
                 side_fields["contract_type"],
@@ -149,6 +248,100 @@ def route_variant_key(
             ]
         )
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def route_product_identity_aliases(route: dict[str, Any]) -> list[dict[str, str]]:
+    identity = route_identity_from_route(route)
+    aliases: list[dict[str, str]] = []
+    for side in ("long", "short"):
+        for row in identity[side].get("product_aliases") or []:
+            aliases.append({"side": side, **dict(row)})
+    return aliases
+
+
+def route_identity_blockers(route: dict[str, Any]) -> list[str]:
+    identity = route_identity_from_route(route)
+    flattened = {
+        "canonical_asset": identity.get("canonical_asset"),
+        "long_venue": identity.get("long_venue"),
+        "short_venue": identity.get("short_venue"),
+        "long_environment": identity["long"].get("environment"),
+        "short_environment": identity["short"].get("environment"),
+        "long_stable_product_identity": identity["long"].get("stable_product_identity"),
+        "short_stable_product_identity": identity["short"].get("stable_product_identity"),
+        "long_symbol": identity["long"].get("symbol"),
+        "short_symbol": identity["short"].get("symbol"),
+        "long_quote_asset": identity["long"].get("quote_asset"),
+        "short_quote_asset": identity["short"].get("quote_asset"),
+        "long_collateral_asset": identity["long"].get("collateral_asset"),
+        "short_collateral_asset": identity["short"].get("collateral_asset"),
+        "long_contract_type": identity["long"].get("contract_type"),
+        "short_contract_type": identity["short"].get("contract_type"),
+        "long_product_type": identity["long"].get("product_type"),
+        "short_product_type": identity["short"].get("product_type"),
+    }
+    blockers = [
+        f"{name}_missing"
+        for name in sorted(CRITICAL_ROUTE_IDENTITY_FIELDS)
+        if not flattened.get(name)
+    ]
+    return blockers
+
+
+def canonical_opportunity_identity_fields(route: dict[str, Any]) -> dict[str, Any]:
+    identity = route_identity_from_route(route)
+    legs = route.get("legs") or []
+    long_leg = next((leg for leg in legs if str(leg.get("side")) == "long"), {})
+    short_leg = next((leg for leg in legs if str(leg.get("side")) == "short"), {})
+    long_event = canonical_timestamp(
+        long_leg.get("next_funding_at")
+        or route.get("long_next_funding_at")
+        or route.get("next_funding_at")
+    )
+    short_event = canonical_timestamp(
+        short_leg.get("next_funding_at")
+        or route.get("short_next_funding_at")
+        or route.get("next_funding_at")
+    )
+    return {
+        "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+        "route_family_key": identity["route_family_key"],
+        "route_variant_key": identity["route_variant_key"],
+        "canonical_asset": identity["canonical_asset"],
+        "long_funding_event_at": long_event,
+        "short_funding_event_at": short_event,
+        "event_discriminator": str(route.get("event_discriminator") or ""),
+        "long": identity["long"],
+        "short": identity["short"],
+    }
+
+
+def canonical_opportunity_key(route: dict[str, Any]) -> str:
+    fields = canonical_opportunity_identity_fields(route)
+    parts = [
+        "canonical_opportunity",
+        ROUTE_IDENTITY_SCHEMA_VERSION,
+        fields["route_variant_key"],
+        str(fields["long_funding_event_at"]),
+        str(fields["short_funding_event_at"]),
+        str(fields.get("event_discriminator") or ""),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def route_identity_summary(route: dict[str, Any]) -> dict[str, Any]:
+    identity = route_identity_from_route(route)
+    opportunity_fields = canonical_opportunity_identity_fields(route)
+    opportunity_key = canonical_opportunity_key(route)
+    return {
+        "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+        "route_family_key": identity["route_family_key"],
+        "route_variant_key": identity["route_variant_key"],
+        "canonical_opportunity_key": opportunity_key,
+        "canonical_opportunity_identity": opportunity_fields,
+        "product_identity_aliases": route_product_identity_aliases(route),
+        "identity_blockers": route_identity_blockers(route),
+    }
 
 
 def route_identity_from_route(route: dict[str, Any]) -> dict[str, Any]:
@@ -176,6 +369,7 @@ def route_identity_from_route(route: dict[str, Any]) -> dict[str, Any]:
         long_market=long_market,
         short_market=short_market,
     )
+    fields["identity_schema_version"] = ROUTE_IDENTITY_SCHEMA_VERSION
     return fields
 
 
@@ -197,14 +391,32 @@ def enrich_route_identity(
         short_market=short_market,
     )
     evidence = dict(route.get("evidence") or {})
+    summary_route = {
+        **route,
+        "canonical_asset": asset,
+        "legs": [
+            {**dict(long_market), "side": "long"},
+            {**dict(short_market), "side": "short"},
+        ],
+    }
+    summary = route_identity_summary(summary_route)
     evidence["route_family_key"] = fields["route_family_key"]
     evidence["route_variant_key"] = variant_key
-    evidence["route_identity"] = {**fields, "route_variant_key": variant_key}
+    evidence["canonical_opportunity_key"] = summary["canonical_opportunity_key"]
+    evidence["route_identity"] = {
+        **fields,
+        "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+        "route_variant_key": variant_key,
+        "product_identity_aliases": summary["product_identity_aliases"],
+    }
     route = {
         **route,
         "route_key": variant_key,
         "route_family_key": fields["route_family_key"],
         "route_variant_key": variant_key,
+        "canonical_opportunity_key": summary["canonical_opportunity_key"],
+        "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+        "product_identity_aliases": summary["product_identity_aliases"],
         "legacy_route_key": fields["route_family_key"],
         "evidence": evidence,
     }

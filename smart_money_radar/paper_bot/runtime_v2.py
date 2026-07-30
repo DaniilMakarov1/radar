@@ -6,6 +6,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from smart_money_radar.funding.fees import fee_evidence_status
+from smart_money_radar.funding.route_identity import (
+    ROUTE_IDENTITY_SCHEMA_VERSION,
+    route_identity_summary,
+)
 from smart_money_radar.funding.readiness_policy import EvaluationMode
 from smart_money_radar.funding.strategy_synchronized_funding import (
     EventWindowPlannerConfig,
@@ -56,7 +60,10 @@ from smart_money_radar.paper_bot.settlement import (
     reconcile_leg,
     realized_public_funding_rate,
 )
-from smart_money_radar.storage import SQLiteStore
+from smart_money_radar.storage import (
+    FUNDING_CAPTURE_OPEN_EXPOSURE_STATES,
+    SQLiteStore,
+)
 
 OBSERVATION_MIN_COUNT = 10
 OBSERVATION_MIN_SPAN_SECONDS = 20.0
@@ -83,6 +90,40 @@ def synchronized_runtime_enabled(config: Any) -> bool:
 def capture_position_id_for_route(route: dict[str, Any]) -> str:
     digest = hashlib.sha256(route_entry_key(route).encode("utf-8")).hexdigest()[:16]
     return f"fc-{digest}"
+
+
+def route_with_canonical_identity(route: dict[str, Any]) -> dict[str, Any]:
+    summary = route_identity_summary(route)
+    evidence = dict(route.get("evidence") or {})
+    legacy_route_key = route.get("legacy_route_key") or route.get("route_key")
+    legacy_route_entry_key = (
+        route.get("legacy_route_entry_key")
+        or evidence.get("legacy_route_entry_key")
+        or route.get("route_entry_key")
+    )
+    evidence.update(
+        {
+            "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+            "route_family_key": summary["route_family_key"],
+            "route_variant_key": summary["route_variant_key"],
+            "canonical_opportunity_key": summary["canonical_opportunity_key"],
+            "product_identity_aliases": summary["product_identity_aliases"],
+            "identity_blockers": summary["identity_blockers"],
+        }
+    )
+    return {
+        **route,
+        "route_key": summary["route_variant_key"],
+        "route_family_key": summary["route_family_key"],
+        "route_variant_key": summary["route_variant_key"],
+        "canonical_opportunity_key": summary["canonical_opportunity_key"],
+        "identity_schema_version": ROUTE_IDENTITY_SCHEMA_VERSION,
+        "product_identity_aliases": summary["product_identity_aliases"],
+        "identity_blockers": summary["identity_blockers"],
+        "legacy_route_key": legacy_route_key,
+        "legacy_route_entry_key": legacy_route_entry_key,
+        "evidence": evidence,
+    }
 
 
 def route_next_settlement(route: dict[str, Any]) -> datetime | None:
@@ -344,6 +385,15 @@ class SynchronizedFundingRuntimeV2:
                 fee_uncertainty_reserve_bps=float(
                     getattr(config, "fee_uncertainty_reserve_bps", 2.0)
                 ),
+                account_fee_evidence_max_age_seconds=float(
+                    getattr(config, "account_fee_evidence_max_age_seconds", 24.0 * 60.0 * 60.0)
+                ),
+                public_fee_endpoint_max_age_seconds=float(
+                    getattr(config, "public_fee_endpoint_max_age_seconds", 7.0 * 24.0 * 60.0 * 60.0)
+                ),
+                reviewed_static_fee_max_age_seconds=float(
+                    getattr(config, "reviewed_static_fee_max_age_seconds", 30.0 * 24.0 * 60.0 * 60.0)
+                ),
             ),
             evaluation_mode=EvaluationMode.VERIFIED_PAPER,
         )
@@ -427,6 +477,10 @@ class SynchronizedFundingRuntimeV2:
             "plan_generation": int(plan_generation),
             "cycle_number": int(cycle_number),
             "route_plan": route_plan or {},
+            "route_family_key": route.get("route_family_key"),
+            "route_variant_key": route.get("route_variant_key"),
+            "canonical_opportunity_key": route.get("canonical_opportunity_key"),
+            "identity_schema_version": route.get("identity_schema_version"),
             "included_settlement_events": events,
             "expected_event_count": len(events),
             "expected_venues": sorted(
@@ -481,6 +535,10 @@ class SynchronizedFundingRuntimeV2:
             "position_id": position.get("position_id"),
             "plan_generation": int(config.get("active_plan_generation") or config.get("plan_generation") or cycle.get("cycle_number") or 0),
             "route_plan": route_plan,
+            "route_family_key": config.get("route_family_key"),
+            "route_variant_key": config.get("route_variant_key"),
+            "canonical_opportunity_key": config.get("canonical_opportunity_key"),
+            "identity_schema_version": config.get("identity_schema_version"),
             "included_settlement_events": events,
             "expected_event_count": len(events),
             "scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
@@ -1846,6 +1904,24 @@ class SynchronizedFundingRuntimeV2:
         accounts: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         now = self.clock.now()
+        route = route_with_canonical_identity(route)
+        identity_blockers = list(route.get("identity_blockers") or [])
+        if identity_blockers:
+            return {
+                "opened": False,
+                "reason": "route_identity_blocked",
+                "blockers": identity_blockers,
+            }
+        alias_blockers = self.store.record_product_identity_aliases(
+            list(route.get("product_identity_aliases") or []),
+            canonical_asset=str(route.get("canonical_asset") or ""),
+        )
+        if alias_blockers:
+            return {
+                "opened": False,
+                "reason": "product_identity_alias_conflict",
+                "blockers": alias_blockers,
+            }
         route_key = str(route.get("route_key") or "")
         if not route_key:
             return {"opened": False, "reason": "route_key_missing"}
@@ -1862,9 +1938,21 @@ class SynchronizedFundingRuntimeV2:
             }
         lead = (settlement_at - now.astimezone(UTC)).total_seconds()
         capture_id = capture_position_id_for_route(route)
-        existing_open = self.store.funding_capture_open_position_by_route_key(route_key)
+        canonical_opportunity_key = str(route.get("canonical_opportunity_key") or "")
+        existing_same_opportunity = (
+            self.store.funding_capture_position_by_canonical_opportunity_key(
+                canonical_opportunity_key
+            )
+            if canonical_opportunity_key
+            else None
+        )
+        if existing_same_opportunity is not None:
+            capture_id = str(existing_same_opportunity["position_id"])
+        existing_open = self.store.funding_capture_active_position_by_route_variant_key(route_key)
         if existing_open is not None:
-            return {"opened": False, "reason": "route_already_open", "position_id": existing_open["position_id"]}
+            existing_state = str(existing_open.get("state") or "")
+            if existing_state in FUNDING_CAPTURE_OPEN_EXPOSURE_STATES:
+                return {"opened": False, "reason": "route_already_open", "position_id": existing_open["position_id"]}
         guard = self._opportunity_guard(capture_id)
         if not guard["allowed"]:
             return {"opened": False, **guard}
@@ -2053,6 +2141,7 @@ class SynchronizedFundingRuntimeV2:
         settlement_at: datetime,
         decision_at: datetime,
     ) -> None:
+        route = route_with_canonical_identity(route)
         self.store.begin_funding_entry_attempt(
             position_id=capture_id,
             route_key=str(route.get("route_key") or ""),
@@ -2346,6 +2435,7 @@ class SynchronizedFundingRuntimeV2:
         lead: float,
         now: datetime,
     ) -> None:
+        route = route_with_canonical_identity(route)
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
@@ -2364,8 +2454,22 @@ class SynchronizedFundingRuntimeV2:
                 "target_notional": float(route.get("target_notional") or self.config.target_notional_per_leg),
                 "state": "DISCOVERED",
                 "opened_at": now.isoformat(),
+                "route_family_key": route.get("route_family_key"),
+                "route_variant_key": route.get("route_variant_key"),
+                "canonical_opportunity_key": route.get("canonical_opportunity_key"),
+                "identity_schema_version": route.get("identity_schema_version"),
+                "product_identity_aliases": route.get("product_identity_aliases") or [],
+                "legacy_route_key": route.get("legacy_route_key"),
+                "legacy_route_entry_key": route.get("legacy_route_entry_key"),
                 "config": {
                     "route_key": route_key,
+                    "route_family_key": route.get("route_family_key"),
+                    "route_variant_key": route.get("route_variant_key"),
+                    "canonical_opportunity_key": route.get("canonical_opportunity_key"),
+                    "identity_schema_version": route.get("identity_schema_version"),
+                    "product_identity_aliases": route.get("product_identity_aliases") or [],
+                    "legacy_route_key": route.get("legacy_route_key"),
+                    "legacy_route_entry_key": route.get("legacy_route_entry_key"),
                     "route_entry_key": route_entry_key(route),
                     "entry_legs": legs,
                     "candidate_state": "DISCOVERED",
@@ -2462,6 +2566,7 @@ class SynchronizedFundingRuntimeV2:
         route_plan: dict[str, Any],
         gate_result: dict[str, Any],
     ) -> None:
+        route = route_with_canonical_identity(route)
         cycle_identity = f"{STRATEGY_VERSION}:{capture_id}:1:{settlement_at.astimezone(UTC).isoformat()}"
         position = self.store.funding_capture_position_by_id(capture_id)
         config = dict((position or {}).get("config") or {})
@@ -2473,6 +2578,15 @@ class SynchronizedFundingRuntimeV2:
                 "plan_generation": 1,
                 "active_plan_generation": 1,
                 "cycle_identity_key": cycle_identity,
+                "route_key": route.get("route_key"),
+                "route_family_key": route.get("route_family_key"),
+                "route_variant_key": route.get("route_variant_key"),
+                "canonical_opportunity_key": route.get("canonical_opportunity_key"),
+                "identity_schema_version": route.get("identity_schema_version"),
+                "product_identity_aliases": route.get("product_identity_aliases") or [],
+                "legacy_route_key": route.get("legacy_route_key"),
+                "legacy_route_entry_key": route.get("legacy_route_entry_key"),
+                "route_entry_key": route_entry_key(route),
                 "funding_route_plan": route_plan,
                 "included_settlement_events": route_plan.get("included_settlement_events") or [],
                 "planned_exit_at": route_plan.get("planned_exit_at"),
@@ -3283,6 +3397,7 @@ class SynchronizedFundingRuntimeV2:
         now: datetime,
         route_plan: dict[str, Any] | None = None,
     ) -> None:
+        route = route_with_canonical_identity(route)
         legs = route.get("legs") or []
         long_leg = dict(leg_by_side(legs, "long") or {})
         short_leg = dict(leg_by_side(legs, "short") or {})
@@ -3308,6 +3423,13 @@ class SynchronizedFundingRuntimeV2:
                 "original_entry_spread": float(execution["short_entry_price"]) - float(execution["long_entry_price"]),
                 "paper_open_fees": float(execution["paper_open_fees"]),
                 "paper_net_pnl_estimated": economics.get("initial_expected_net_pnl"),
+                "route_family_key": route.get("route_family_key"),
+                "route_variant_key": route.get("route_variant_key"),
+                "canonical_opportunity_key": route.get("canonical_opportunity_key"),
+                "identity_schema_version": route.get("identity_schema_version"),
+                "product_identity_aliases": route.get("product_identity_aliases") or [],
+                "legacy_route_key": route.get("legacy_route_key"),
+                "legacy_route_entry_key": route.get("legacy_route_entry_key"),
                 "config": {
                     **existing_config,
                     "opportunity_id": capture_id,
@@ -3318,6 +3440,13 @@ class SynchronizedFundingRuntimeV2:
                     "plan_generation": 1,
                     "active_plan_generation": 1,
                     "route_key": route.get("route_key"),
+                    "route_family_key": route.get("route_family_key"),
+                    "route_variant_key": route.get("route_variant_key"),
+                    "canonical_opportunity_key": route.get("canonical_opportunity_key"),
+                    "identity_schema_version": route.get("identity_schema_version"),
+                    "product_identity_aliases": route.get("product_identity_aliases") or [],
+                    "legacy_route_key": route.get("legacy_route_key"),
+                    "legacy_route_entry_key": route.get("legacy_route_entry_key"),
                     "route_entry_key": route_entry_key(route),
                     "entry_legs": [long_leg, short_leg],
                     "funding_route_plan": route_plan,
