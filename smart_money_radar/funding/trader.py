@@ -1759,16 +1759,17 @@ class PaperBot:
                 refreshed_by_key[route_key] = fresh
             else:
                 self.hot_routes.pop(route_key, None)
-                self.record_event(
-                    "disarmed",
-                    disarmed_message(fresh, decision),
-                    {"route": route_summary(fresh), "decision": decision},
-                    funding_scan_id=fresh.get("funding_scan_id"),
-                    funding_route_id=fresh.get("funding_route_id"),
-                    route_key=fresh.get("route_key"),
-                    notify=False,
-                    severity="warning",
-                )
+                if should_record_disarmed_event(decision):
+                    self.record_event(
+                        "disarmed",
+                        disarmed_message(fresh, decision),
+                        {"route": route_summary(fresh), "decision": decision},
+                        funding_scan_id=fresh.get("funding_scan_id"),
+                        funding_route_id=fresh.get("funding_route_id"),
+                        route_key=fresh.get("route_key"),
+                        notify=False,
+                        severity="warning",
+                    )
 
         workers = min(self.config.hot_route_recheck_workers, len(route_items))
         if workers <= 1:
@@ -5279,6 +5280,12 @@ def status_publishable_detected_route(route: dict[str, Any]) -> bool:
         if net is not None:
             return net > 0.0
     return False
+
+def should_record_disarmed_event(decision: dict[str, Any]) -> bool:
+    live_net = optional_float(decision.get("live_net"))
+    if live_net is not None and live_net <= 0.0:
+        return False
+    return True
 
 def instrument_row_from_market(
     market: dict[str, Any],

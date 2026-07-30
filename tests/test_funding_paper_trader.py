@@ -2044,6 +2044,22 @@ def test_hot_route_rechecks_are_parallelized(tmp_path) -> None:
     assert trader.max_active_rechecks == 2
 
 
+def test_negative_hot_route_disarm_does_not_record_routine_event(tmp_path) -> None:
+    now = datetime.now(UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    trader = CountingRecheckTrader(store, config=PaperBotConfig())
+    route = paper_route(now, 90, 90, live_net=-2.0)
+    trader.hot_routes[route["route_key"]] = route
+
+    refreshed = trader.refresh_hot_routes()
+
+    assert refreshed == []
+    assert not trader.hot_routes
+    events = store.funding_paper_dashboard(refresh_estimates=False)["events"]
+    assert "disarmed" not in {event["event_type"] for event in events}
+
+
 def test_open_position_keeps_focused_loop_without_hot_route(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
