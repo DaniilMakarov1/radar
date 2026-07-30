@@ -10,9 +10,16 @@ from typing import Any
 
 from smart_money_radar.funding.adapter_contracts import USD_MAJOR_STABLE, collateral_family
 from smart_money_radar.funding.fees import fee_evidence_status, fee_rate_value
+from smart_money_radar.funding.readiness_policy import (
+    DEFAULT_FUNDING_RISK_POLICY,
+    EvaluationMode,
+    FundingRiskPolicy,
+    evaluate_synchronized_route,
+    modeled_fee_rate,
+    rate_estimate_from_market,
+)
 from smart_money_radar.funding.settlement_contracts import (
     FundingSettlementContract,
-    settlement_contract_blockers,
     settlement_contract_from_market,
 )
 
@@ -65,6 +72,8 @@ class EventWindowPlannerConfig:
     partial_fill_reserve_bps: float = 1.0
     timing_uncertainty_reserve_bps: float = 1.0
     operational_reserve_bps: float = 1.0
+    conservative_taker_fee_fallback_rate: float = 0.0010
+    fee_uncertainty_reserve_bps: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -370,12 +379,24 @@ def funding_event_from_market(
     notional = _market_notional(mark, target_notional)
     raw_rate = _optional_decimal(market.get("funding_rate"))
     normalized_rate = _optional_decimal(market.get("normalized_next_funding_rate"))
-    rate = normalized_rate if normalized_rate is not None else raw_rate
+    rate_estimate = rate_estimate_from_market(market)
+    estimate_rate = _optional_decimal(rate_estimate.get("rate_estimate_per_settlement"))
+    rate = estimate_rate if estimate_rate is not None else normalized_rate if normalized_rate is not None else raw_rate
     expected = position_funding_cashflow_usd(
         side=side,
         notional=notional,
         rate_per_next_settlement=rate,
     )
+    lower_bound = _optional_decimal(rate_estimate.get("rate_estimate_lower_bound"))
+    upper_bound = _optional_decimal(rate_estimate.get("rate_estimate_upper_bound"))
+    if lower_bound is not None and upper_bound is not None:
+        conservative_expected = (
+            -notional * upper_bound
+            if str(side).lower() == "long"
+            else notional * lower_bound
+        )
+    else:
+        conservative_expected = _conservative_cashflow(expected, planner_config)
     scheduled_iso = scheduled.astimezone(UTC).isoformat()
     return FundingSettlementEvent(
         event_id=_event_id(
@@ -405,8 +426,12 @@ def funding_event_from_market(
         receiver_side=funding_receiver_side(rate),
         payer_side=funding_payer_side(rate),
         expected_cashflow_usd=float(expected),
-        conservative_cashflow_usd=float(_conservative_cashflow(expected, planner_config)),
-        rate_status=str(market.get("rate_status") or "predicted"),
+        conservative_cashflow_usd=float(conservative_expected),
+        rate_status=str(
+            market.get("rate_status")
+            or rate_estimate.get("rate_estimate_kind")
+            or "UNKNOWN"
+        ),
         source_event_at=market.get("source_event_at"),
         response_received_at=market.get("response_received_at"),
         source_sequence=(
@@ -684,32 +709,34 @@ def _planned_costs(
     target_notional: float,
     config: EventWindowPlannerConfig,
     now: datetime,
+    evaluation_mode: EvaluationMode,
 ) -> tuple[dict[str, float], list[str], list[CostEstimate], Decimal]:
     reference_decimal = _non_negative_decimal(target_notional)
     blockers: list[str] = []
-    long_fee = _fee_rate(long_market)
-    short_fee = _fee_rate(short_market)
+    risk_policy = FundingRiskPolicy(
+        global_conservative_taker_fee_rate=float(config.conservative_taker_fee_fallback_rate),
+        fee_uncertainty_reserve_bps=float(config.fee_uncertainty_reserve_bps),
+    )
+    long_modeled_fee = modeled_fee_rate(long_market, policy=risk_policy, now=now)
+    short_modeled_fee = modeled_fee_rate(short_market, policy=risk_policy, now=now)
+    long_fee = _decimal(long_modeled_fee["fee_rate"])
+    short_fee = _decimal(short_modeled_fee["fee_rate"])
     long_fee_status = fee_evidence_status(long_market, "taker", now=now)
     short_fee_status = fee_evidence_status(short_market, "taker", now=now)
-    if long_fee is None:
-        blockers.append("long_fee_unknown")
-        long_fee = Decimal("0")
-    if short_fee is None:
-        blockers.append("short_fee_unknown")
-        short_fee = Decimal("0")
-    if not bool(long_fee_status.get("verified")):
-        blockers.append(str(long_fee_status.get("blocker") or "long_fee_provenance_unverified").replace("taker_", "long_"))
-    if not bool(short_fee_status.get("verified")):
-        blockers.append(str(short_fee_status.get("blocker") or "short_fee_provenance_unverified").replace("taker_", "short_"))
+    if evaluation_mode is EvaluationMode.VERIFIED_PAPER:
+        if not bool(long_fee_status.get("verified")):
+            blockers.append(str(long_fee_status.get("blocker") or "long_fee_provenance_unverified").replace("taker_", "long_"))
+        if not bool(short_fee_status.get("verified")):
+            blockers.append(str(short_fee_status.get("blocker") or "short_fee_provenance_unverified").replace("taker_", "short_"))
     long_fee_blocker = (
-        "long_fee_unknown"
-        if "long_fee_unknown" in blockers
-        else str(long_fee_status.get("blocker") or "long_fee_provenance_unverified")
+        str(long_fee_status.get("blocker") or "long_fee_provenance_unverified")
+        if not bool(long_fee_status.get("verified"))
+        else None
     )
     short_fee_blocker = (
-        "short_fee_unknown"
-        if "short_fee_unknown" in blockers
-        else str(short_fee_status.get("blocker") or "short_fee_provenance_unverified")
+        str(short_fee_status.get("blocker") or "short_fee_provenance_unverified")
+        if not bool(short_fee_status.get("verified"))
+        else None
     )
     entry_fees = reference_decimal * (long_fee + short_fee)
     exit_fees = entry_fees
@@ -740,6 +767,8 @@ def _planned_costs(
             target_notional_usd=reference_decimal,
             status=str(long_fee_status.get("trust_status") or "UNKNOWN"),
             verified=bool(long_fee_status.get("verified")),
+            confidence="high" if bool(long_fee_status.get("verified")) else "low",
+            assumptions=tuple(str(item) for item in long_modeled_fee.get("assumptions") or ()),
             blocker_if_missing=long_fee_blocker,
         ),
         _cost_estimate(
@@ -751,6 +780,8 @@ def _planned_costs(
             target_notional_usd=reference_decimal,
             status=str(short_fee_status.get("trust_status") or "UNKNOWN"),
             verified=bool(short_fee_status.get("verified")),
+            confidence="high" if bool(short_fee_status.get("verified")) else "low",
+            assumptions=tuple(str(item) for item in short_modeled_fee.get("assumptions") or ()),
             blocker_if_missing=short_fee_blocker,
         ),
         _cost_estimate(
@@ -762,6 +793,8 @@ def _planned_costs(
             target_notional_usd=reference_decimal,
             status=str(long_fee_status.get("trust_status") or "UNKNOWN"),
             verified=bool(long_fee_status.get("verified")),
+            confidence="high" if bool(long_fee_status.get("verified")) else "low",
+            assumptions=tuple(str(item) for item in long_modeled_fee.get("assumptions") or ()),
             blocker_if_missing=long_fee_blocker,
         ),
         _cost_estimate(
@@ -773,6 +806,8 @@ def _planned_costs(
             target_notional_usd=reference_decimal,
             status=str(short_fee_status.get("trust_status") or "UNKNOWN"),
             verified=bool(short_fee_status.get("verified")),
+            confidence="high" if bool(short_fee_status.get("verified")) else "low",
+            assumptions=tuple(str(item) for item in short_modeled_fee.get("assumptions") or ()),
             blocker_if_missing=short_fee_blocker,
         ),
         _cost_estimate(
@@ -901,6 +936,7 @@ def _build_hold_plan(
     short_market: dict[str, Any],
     target_notional: float,
     config: EventWindowPlannerConfig,
+    evaluation_mode: EvaluationMode,
 ) -> dict[str, Any]:
     exit_after = parse_time(exit_after_event.scheduled_at) or planned_entry_at
     planned_exit_at = exit_after + timedelta(
@@ -931,6 +967,7 @@ def _build_hold_plan(
         target_notional=target_notional,
         config=config,
         now=now,
+        evaluation_mode=evaluation_mode,
     )
     expected_cashflow = sum(
         (_decimal(event.expected_cashflow_usd) for event in included),
@@ -1072,63 +1109,6 @@ def _eligibility_status(blockers: list[str], *, lifecycle_state: str) -> str:
     return "SHADOW_CANDIDATE"
 
 
-def _venue_capability_blockers(market: dict[str, Any], prefix: str) -> list[str]:
-    blockers: list[str] = []
-    if market.get("data_enabled") is not True:
-        blockers.append(f"{prefix}_data_capability_disabled")
-    if market.get("strategy_observation_enabled") is not True:
-        blockers.append(f"{prefix}_strategy_observation_capability_disabled")
-    if market.get("shadow_candidate_enabled") is False:
-        blockers.append(f"{prefix}_shadow_candidate_disabled")
-    if market.get("paper_enabled") is not True:
-        blockers.append(f"{prefix}_paper_capability_disabled")
-    if market.get("live_enabled") is True:
-        blockers.append(f"{prefix}_live_capability_enabled_in_paper_plan")
-    execution_model = str(market.get("execution_model") or "").upper()
-    if execution_model != "CLOB":
-        blockers.append(f"{prefix}_execution_model_not_clob")
-    market_type = str(
-        market.get("market_type")
-        or market.get("product_type")
-        or market.get("contract_type")
-        or ""
-    ).lower()
-    if not market_type:
-        blockers.append(f"{prefix}_market_type_missing")
-    return blockers
-
-
-def _endpoint_identity_blockers(market: dict[str, Any], prefix: str) -> list[str]:
-    blockers: list[str] = []
-    venue = str(market.get("venue") or "").strip().lower()
-    if not venue or venue == "unknown":
-        blockers.append(f"{prefix}_venue_identity_missing")
-    environment = str(market.get("environment") or "").strip().lower()
-    if environment not in {"mainnet", "testnet"}:
-        blockers.append(f"{prefix}_environment_unknown")
-    if market.get("environment_verified") is not True:
-        blockers.append(f"{prefix}_environment_unverified")
-    endpoint_base_url = str(market.get("endpoint_base_url") or "").strip()
-    if not endpoint_base_url:
-        blockers.append(f"{prefix}_endpoint_base_url_missing")
-    provenance = str(market.get("endpoint_identity_provenance") or "").strip().lower()
-    if provenance in {"", "unknown", "unverified_client_endpoint", "unverified"}:
-        blockers.append(f"{prefix}_endpoint_identity_unverified")
-    api_product = str(
-        market.get("api_product_type")
-        or market.get("product_type")
-        or market.get("market_type")
-        or market.get("contract_type")
-        or ""
-    ).strip().lower()
-    if api_product in {"", "unknown"}:
-        blockers.append(f"{prefix}_product_type_unverified")
-    semantics = str(market.get("funding_rate_semantics") or "").strip().lower()
-    if semantics in {"", "unknown"}:
-        blockers.append(f"{prefix}_funding_semantics_unverified")
-    return blockers
-
-
 class FundingSettlementPlanner:
     """Side-effect-free funding settlement capture planner used by shadow and PaperBot."""
 
@@ -1138,10 +1118,16 @@ class FundingSettlementPlanner:
         *,
         max_response_age_seconds: float = 5.0,
         max_source_age_seconds: float = 60.0,
+        evaluation_mode: EvaluationMode | str = EvaluationMode.DISCOVERY,
     ) -> None:
         self.config = config or EventWindowPlannerConfig()
         self.max_response_age_seconds = max_response_age_seconds
         self.max_source_age_seconds = max_source_age_seconds
+        self.evaluation_mode = (
+            evaluation_mode
+            if isinstance(evaluation_mode, EvaluationMode)
+            else EvaluationMode(str(evaluation_mode).upper())
+        )
 
     def plan(
         self,
@@ -1156,28 +1142,17 @@ class FundingSettlementPlanner:
         short_venue = str(short_market.get("venue") or "").lower()
         long_contract = settlement_contract_from_market(long_market)
         short_contract = settlement_contract_from_market(short_market)
-        blockers: list[str] = []
-        if long_venue == "paradex" or short_venue == "paradex":
-            blockers.append("funding_continuous_pro_rata")
-        blockers.extend(_venue_capability_blockers(long_market, "long"))
-        blockers.extend(_venue_capability_blockers(short_market, "short"))
-        blockers.extend(_endpoint_identity_blockers(long_market, "long"))
-        blockers.extend(_endpoint_identity_blockers(short_market, "short"))
-        long_env = str(long_market.get("environment") or "").lower()
-        short_env = str(short_market.get("environment") or "").lower()
-        if long_env not in {"mainnet", "testnet"} or short_env not in {"mainnet", "testnet"}:
-            blockers.append("environment_unverified")
-        elif (
-            long_market.get("environment_verified") is not True
-            or short_market.get("environment_verified") is not True
-        ):
-            blockers.append("environment_unverified")
-        elif long_env != short_env:
-            blockers.append("environment_mismatch")
-        long_asset = str(long_market.get("canonical_asset") or long_market.get("canonical_underlying") or "").upper()
-        short_asset = str(short_market.get("canonical_asset") or short_market.get("canonical_underlying") or "").upper()
-        if not long_asset or long_asset != short_asset:
-            blockers.append("canonical_underlying_mismatch")
+        route_readiness = evaluate_synchronized_route(
+            long_market=long_market,
+            short_market=short_market,
+            target_notional=target_notional,
+            mode=self.evaluation_mode,
+        )
+        blockers: list[str] = [
+            str(reason)
+            for reason in route_readiness.get("mode_blockers") or []
+            if reason
+        ]
 
         long_events = funding_events_from_market(
             long_market,
@@ -1194,20 +1169,6 @@ class FundingSettlementPlanner:
             target_notional=target_notional,
             config=config,
             contract=short_contract,
-        )
-        blockers.extend(
-            f"long_{reason}"
-            for reason in settlement_contract_blockers(
-                long_contract,
-                next_settlement_at=long_market.get("next_funding_at"),
-            )
-        )
-        blockers.extend(
-            f"short_{reason}"
-            for reason in settlement_contract_blockers(
-                short_contract,
-                next_settlement_at=short_market.get("next_funding_at"),
-            )
         )
         blockers.extend(
             f"long_{reason}"
@@ -1263,7 +1224,12 @@ class FundingSettlementPlanner:
                 lifecycle_state="DISCOVERED",
                 expires_at="",
                 evidence_version="",
-                planner={"plans": [], "config": asdict(config)},
+                planner={
+                    "plans": [],
+                    "config": asdict(config),
+                    "evaluation_mode": self.evaluation_mode.value,
+                    "route_readiness": route_readiness,
+                },
                 modeled_costs={},
                 cost_estimates=[],
             )
@@ -1301,6 +1267,7 @@ class FundingSettlementPlanner:
                     short_market=short_market,
                     target_notional=target_notional,
                     config=config,
+                    evaluation_mode=self.evaluation_mode,
                 )
             )
         if not plans:
@@ -1315,6 +1282,7 @@ class FundingSettlementPlanner:
                     short_market=short_market,
                     target_notional=target_notional,
                     config=config,
+                    evaluation_mode=self.evaluation_mode,
                 )
             )
         feasible = [plan for plan in plans if not plan["blockers"]]
@@ -1398,6 +1366,8 @@ class FundingSettlementPlanner:
                 "selected_plan": selected["plan_name"],
                 "plans": plans,
                 "config": asdict(config),
+                "evaluation_mode": self.evaluation_mode.value,
+                "route_readiness": route_readiness,
             },
         )
 
@@ -1411,11 +1381,13 @@ def build_settlement_capture_opportunity(
     planner_config: EventWindowPlannerConfig | None = None,
     max_response_age_seconds: float = 5.0,
     max_source_age_seconds: float = 60.0,
+    evaluation_mode: EvaluationMode | str = EvaluationMode.DISCOVERY,
 ) -> dict[str, Any]:
     planner = FundingSettlementPlanner(
         planner_config,
         max_response_age_seconds=max_response_age_seconds,
         max_source_age_seconds=max_source_age_seconds,
+        evaluation_mode=evaluation_mode,
     )
     return planner.plan(
         long_market=long_market,

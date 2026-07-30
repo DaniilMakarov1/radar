@@ -6,7 +6,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from smart_money_radar.funding.fees import fee_rate_value
+from smart_money_radar.funding.readiness_policy import (
+    DEFAULT_FUNDING_RISK_POLICY,
+    attach_rate_estimate,
+    optional_float as policy_optional_float,
+)
 from smart_money_radar.funding.settlement_contracts import (
+    FUNDING_SETTLEMENT_CONTRACT_REGISTRY,
     FundingAccrualModel,
     FundingSettlementContract,
     settlement_contract_blockers,
@@ -49,6 +55,36 @@ SYNCHRONIZED_RATE_CONTRACTS: dict[str, SynchronizedRateContract] = {
     "lighter": SynchronizedRateContract(
         allowed_rate_kinds=("published_8h_equivalent_normalized_hourly",),
         source_identifier="funding-rates.rate divided by published 8h period",
+    ),
+    "hyperliquid": SynchronizedRateContract(
+        allowed_rate_kinds=(
+            "published_predicted_next",
+            "published_current_fallback",
+            "published_next_hour_prediction",
+        ),
+        source_identifier="predictedFundings.fundingRate or assetCtx.funding hourly fallback",
+    ),
+    "dydx": SynchronizedRateContract(
+        allowed_rate_kinds=("published_next_hour",),
+        source_identifier="perpetualMarkets.nextFundingRate hourly settlement estimate",
+    ),
+    "pacifica": SynchronizedRateContract(
+        allowed_rate_kinds=(
+            "published_next_hour_estimate",
+            "published_current_hour_estimate",
+        ),
+        source_identifier="info/prices next_funding or current funding hourly estimate",
+    ),
+    "nado": SynchronizedRateContract(
+        allowed_rate_kinds=(
+            "published_latest_24h_x18",
+            "published_predicted_24h_hourly",
+        ),
+        source_identifier="archive contracts funding_rate_x18 24h divided by 24",
+    ),
+    "risex": SynchronizedRateContract(
+        allowed_rate_kinds=("published_current_interval_rate",),
+        source_identifier="markets.current_funding_rate per funding interval",
     ),
 }
 
@@ -107,16 +143,79 @@ def normalize_synchronized_capture_market(
             FundingAccrualModel.PERIODIC_INDEX_STEP.value,
         }
     )
-    row["entry_safety_buffer_seconds"] = contract.assessment_jitter_before_seconds
-    row["exit_safety_buffer_seconds"] = contract.assessment_jitter_after_seconds
-    if contract.next_settlement_source:
-        row["timing_policy_source"] = contract.next_settlement_source
+    _merge_timing_policy(row, contract)
     if contract.funding_notional_price_source:
         row["funding_notional_price_source"] = contract.funding_notional_price_source
     _normalize_contract_identity(row)
     _normalize_next_rate(row, contract, observed)
+    row.update(attach_rate_estimate(row, policy=DEFAULT_FUNDING_RISK_POLICY))
     _attach_fee_evidence(row, observed)
     return row
+
+
+def _merge_timing_policy(row: dict[str, Any], contract: FundingSettlementContract) -> None:
+    adapter_entry = _non_negative_float(row.get("entry_safety_buffer_seconds"))
+    adapter_exit = _non_negative_float(row.get("exit_safety_buffer_seconds"))
+    adapter_source = (
+        str(row.get("timing_policy_source"))
+        if row.get("timing_policy_source") not in (None, "")
+        else None
+    )
+    registry_template = FUNDING_SETTLEMENT_CONTRACT_REGISTRY.get(
+        (str(contract.venue).lower(), str(contract.supported_environment).lower())
+    )
+    registry_entry = (
+        registry_template.assessment_jitter_before_seconds
+        if registry_template is not None
+        else None
+    )
+    registry_exit = (
+        registry_template.assessment_jitter_after_seconds
+        if registry_template is not None
+        else None
+    )
+    if registry_entry is not None:
+        row["entry_safety_buffer_seconds"] = registry_entry
+        entry_source = "settlement_registry"
+    elif adapter_entry is not None:
+        row["entry_safety_buffer_seconds"] = adapter_entry
+        entry_source = adapter_source or "venue_adapter"
+    else:
+        row["entry_safety_buffer_seconds"] = (
+            DEFAULT_FUNDING_RISK_POLICY.default_entry_safety_buffer_seconds
+        )
+        entry_source = "conservative_default"
+    if registry_exit is not None:
+        row["exit_safety_buffer_seconds"] = registry_exit
+        exit_source = "settlement_registry"
+    elif adapter_exit is not None:
+        row["exit_safety_buffer_seconds"] = adapter_exit
+        exit_source = adapter_source or "venue_adapter"
+    else:
+        row["exit_safety_buffer_seconds"] = (
+            DEFAULT_FUNDING_RISK_POLICY.default_exit_safety_buffer_seconds
+        )
+        exit_source = "conservative_default"
+    if (
+        "settlement_registry" in {entry_source, exit_source}
+        and contract.next_settlement_source
+    ):
+        row["timing_policy_source"] = contract.next_settlement_source
+    elif adapter_source:
+        row["timing_policy_source"] = adapter_source
+    elif contract.next_settlement_source:
+        row["timing_policy_source"] = contract.next_settlement_source
+    else:
+        row["timing_policy_source"] = "conservative_default_hourly_schedule"
+    row["timing_policy_provenance"] = {
+        "entry_safety_buffer_seconds": row.get("entry_safety_buffer_seconds"),
+        "entry_source": entry_source,
+        "entry": entry_source,
+        "exit_safety_buffer_seconds": row.get("exit_safety_buffer_seconds"),
+        "exit_source": exit_source,
+        "exit": exit_source,
+        "timing_policy_source": row.get("timing_policy_source"),
+    }
 
 
 def _normalize_contract_identity(row: dict[str, Any]) -> None:
@@ -231,6 +330,11 @@ def _evidence_timestamp(row: dict[str, Any], observed_at: str | None) -> str:
     if observed_at:
         return str(observed_at)
     return datetime.now(UTC).isoformat()
+
+
+def _non_negative_float(value: Any) -> float | None:
+    parsed = policy_optional_float(value)
+    return parsed if parsed is not None and parsed >= 0.0 else None
 
 
 def _optional_float(value: Any) -> float | None:

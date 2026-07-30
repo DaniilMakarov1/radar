@@ -337,9 +337,11 @@ class FundingRadarTest(unittest.TestCase):
             "lightweight_discovery_v1",
         )
         self.assertIn("funnel", summary)
-        self.assertEqual(summary["funnel"]["capability_eligible"]["count"], 2)
+        self.assertEqual(summary["funnel"]["directed_pairs"]["count"], 2)
+        self.assertEqual(summary["funnel"]["hard_blocked_pairs"]["count"], 0)
+        self.assertEqual(summary["funnel"]["watch"]["count"], 1)
 
-    def test_lightweight_discovery_missing_required_contract_fields_fail_closed(self) -> None:
+    def test_lightweight_discovery_soft_contract_fields_stay_visible(self) -> None:
         class HighBinanceHttp(FakeBinanceHttp):
             def get_json(self, url: str) -> Any:
                 payload = copy.deepcopy(super().get_json(url))
@@ -380,19 +382,30 @@ class FundingRadarTest(unittest.TestCase):
                     (
                         "fee_evidence",
                         lambda rows: rows["bybit"].pop("fee_evidence", None),
-                        "long_taker_fee_missing",
+                        "long_fee_fallback_used",
+                        "soft",
                         client_map,
                     ),
                     (
-                        "normalized_next_rate",
-                        lambda rows: rows["bybit"].pop("normalized_next_funding_rate", None),
-                        "normalized_next_funding_rate_missing",
+                        "typed_current_rate_without_exact_next",
+                        lambda rows: (
+                            rows["bybit"].update({"funding_rate_kind": "published_current_interval_rate"}),
+                            rows["bybit"].pop("normalized_next_funding_rate", None),
+                            rows["bybit"].pop("rate_estimate_per_settlement", None),
+                            rows["bybit"].pop("rate_estimate_kind", None),
+                            rows["bybit"].pop("rate_estimate_lower_bound", None),
+                            rows["bybit"].pop("rate_estimate_upper_bound", None),
+                            rows["bybit"].pop("exact_next_rate_available", None),
+                        ),
+                        "long_estimated_rate_used",
+                        "soft",
                         client_map,
                     ),
                     (
                         "quantity_step",
                         lambda rows: rows["bybit"].pop("quantity_step", None),
                         "long_quantity_step_missing",
+                        "soft",
                         client_map,
                     ),
                     (
@@ -402,16 +415,18 @@ class FundingRadarTest(unittest.TestCase):
                             rows["bybit"].pop("min_notional", None),
                         ),
                         "long_min_notional_missing",
+                        "soft",
                         client_map,
                     ),
                     (
                         "continuous_settlement",
                         lambda rows: rows["bybit"].update({"venue": "paradex"}),
                         "long_funding_continuous_pro_rata",
+                        "hard",
                         {**client_map, "paradex": DummyOrderbookClient()},
                     ),
                 ]
-                for label, mutate, expected_reason, clients_for_case in cases:
+                for label, mutate, expected_reason, classification, clients_for_case in cases:
                     with self.subTest(label=label):
                         rows_by_venue = {
                             str(market["venue"]): market
@@ -429,9 +444,21 @@ class FundingRadarTest(unittest.TestCase):
                             clients_for_case,
                             now,
                         )
-                        self.assertEqual(routes, [])
-                        self.assertEqual(summary["watch_routes_added"], 0)
-                        self.assertIn(expected_reason, summary["rejection_reasons"], summary)
+                        if classification == "hard":
+                            self.assertEqual(routes, [])
+                            self.assertEqual(summary["watch_routes_added"], 0)
+                            self.assertIn(expected_reason, summary["rejection_reasons"], summary)
+                        else:
+                            self.assertEqual(len(routes), 1, summary)
+                            self.assertEqual(summary["watch_routes_added"], 1)
+                            route_flags = set(routes[0]["evidence"]["risk_flags"])
+                            self.assertIn(expected_reason, route_flags)
+                            self.assertEqual(routes[0]["status"], "watch")
+                            self.assertEqual(
+                                routes[0]["evidence"]["paper_mode"],
+                                "EXPERIMENTAL",
+                            )
+                            self.assertFalse(routes[0]["evidence"]["verified_paper_ready"])
             finally:
                 bot.shutdown_foreground_executors()
 
@@ -500,7 +527,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(len(markets), 1)
         self.assertNotIn("normalized_next_funding_rate", markets[0])
         self.assertEqual(routes, [])
-        self.assertIn("normalized_next_funding_rate_missing", summary["rejection_reasons"])
+        self.assertIn("rate_estimate_kind_unknown", summary["rejection_reasons"])
+        self.assertIn("usable_funding_rate_estimate_missing", summary["rejection_reasons"])
 
     def test_risex_points_profile_is_available_after_adapter_registration(self) -> None:
         self.assertIn("risex_points", funding_bot_profile_names())
@@ -1540,7 +1568,7 @@ class FundingRadarTest(unittest.TestCase):
             ["1000PEPEUSDT", "PEPEUSDT"],
         )
 
-    def test_dashboard_hides_routes_when_median_and_q25_are_negative(self) -> None:
+    def test_dashboard_keeps_negative_soft_watch_routes_visible(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
         now = datetime.fromisoformat(observed_at)
         route = evaluate_perp_route(
@@ -1564,8 +1592,9 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(route["status"], "watch")
         self.assertGreaterEqual(route["market_capacity"], 500)
         self.assertEqual(dashboard["routes"], [])
-        self.assertEqual(dashboard["watch_routes"], [])
-        self.assertEqual(dashboard["visible_route_count"], 0)
+        self.assertEqual(len(dashboard["watch_routes"]), 1)
+        self.assertEqual(dashboard["watch_routes"][0]["route_key"], route["route_key"])
+        self.assertEqual(dashboard["visible_route_count"], 1)
         self.assertEqual(dashboard["capacity_eligible_route_count"], 1)
         self.assertEqual(dashboard["economics_funnel"]["capacity_eligible"], 1)
         self.assertEqual(
@@ -2031,7 +2060,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(route["status"], "watch")
         self.assertLessEqual(route["evidence"]["current_nowcast_net"], 0)
         self.assertEqual(dashboard["routes"], [])
-        self.assertEqual(dashboard["watch_routes"], [])
+        self.assertEqual(len(dashboard["watch_routes"]), 1)
+        self.assertEqual(dashboard["watch_routes"][0]["route_key"], route["route_key"])
         self.assertEqual(len(dashboard["maker_routes"]), 1)
         self.assertEqual(
             dashboard["maker_routes"][0]["evidence"]["execution_scenarios"][

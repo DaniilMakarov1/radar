@@ -449,7 +449,7 @@ def test_one_settlement_uses_second_venue_as_short_hold_hedge() -> None:
     short_market = complete_market(
         venue="okx",
         collateral="USDT",
-        funding_rate=0.006,
+        funding_rate=0.008,
         settlement=first.isoformat(),
         observed_at=now.isoformat(),
     )
@@ -814,7 +814,7 @@ def test_positive_gross_negative_conservative_net_is_not_candidate() -> None:
     assert "conservative_net_not_positive" in opportunity["blockers"]
 
 
-def test_missing_fee_is_unknown_and_blocks_candidate() -> None:
+def test_missing_fee_uses_conservative_fallback_without_blocking_discovery() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     settlement = now + timedelta(seconds=30)
     long_market = complete_market(
@@ -831,6 +831,8 @@ def test_missing_fee_is_unknown_and_blocks_candidate() -> None:
     )
     long_market.pop("taker_fee_rate", None)
     long_market.pop("fee_rate", None)
+    long_market.pop("fee_evidence", None)
+    long_market.pop("fee_source", None)
 
     opportunity = build_settlement_capture_opportunity(
         long_market=long_market,
@@ -839,18 +841,18 @@ def test_missing_fee_is_unknown_and_blocks_candidate() -> None:
         target_notional=500.0,
     )
 
-    assert "long_fee_unknown" in opportunity["blockers"]
-    assert opportunity["eligibility_status"] == "RESEARCH_ONLY"
+    assert "long_fee_unknown" not in opportunity["blockers"]
     costs = {
         row["component"]: row
         for row in opportunity["cost_estimates"]
     }
     assert costs["entry_fee_leg_a"]["status"] == "UNKNOWN"
-    assert costs["entry_fee_leg_a"]["blocker_if_missing"] == "long_fee_unknown"
+    assert costs["entry_fee_leg_a"]["blocker_if_missing"] == "taker_fee_rate_missing"
+    assert float(costs["entry_fee_leg_a"]["value"]) > 0.0
     assert costs["entry_slippage_leg_a"]["status"] == "CONSERVATIVE_CONFIGURED"
 
 
-def test_explicit_zero_fee_is_allowed_when_payload_provides_it() -> None:
+def test_explicit_zero_fee_still_uses_configured_conservative_floor() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     settlement = now + timedelta(seconds=30)
     long_market = complete_market(
@@ -877,13 +879,13 @@ def test_explicit_zero_fee_is_allowed_when_payload_provides_it() -> None:
 
     assert "long_fee_unknown" not in opportunity["blockers"]
     assert "short_fee_unknown" not in opportunity["blockers"]
-    assert opportunity["modeled_costs"]["entry_fees_usd"] == pytest.approx(0.0)
+    assert opportunity["modeled_costs"]["entry_fees_usd"] > 0.0
     costs = {
         row["component"]: row
         for row in opportunity["cost_estimates"]
     }
     assert costs["entry_fee_leg_a"]["status"] == "CONFIGURED_TRUSTED"
-    assert float(costs["entry_fee_leg_a"]["value"]) == 0.0
+    assert float(costs["entry_fee_leg_a"]["value"]) > 0.0
 
 
 def test_paradex_is_not_built_as_shadow_route(tmp_path) -> None:
@@ -937,8 +939,9 @@ def test_risex_unverified_opportunity_is_research_only(tmp_path) -> None:
     opportunity = monitor._shadow_opportunity_for_pair("BTC", hedge, risex, now)
 
     assert opportunity["status"] == "RESEARCH_ONLY"
-    assert "short_funding_accrual_model_unknown" in opportunity["blockers"]
-    assert "short_position_inclusion_rule_unverified" in opportunity["blockers"]
+    assert "short_position_inclusion_rule_unverified" not in opportunity["blockers"]
+    assert opportunity["planner"]["route_readiness"]["not_verified_alpha"] is True
+    assert "short_position_inclusion_rule_unverified" in opportunity["planner"]["route_readiness"]["risk_flags"]
 
 
 def test_risex_payload_promotion_remains_research_only(tmp_path) -> None:
@@ -983,14 +986,14 @@ def test_risex_payload_promotion_remains_research_only(tmp_path) -> None:
     multi = monitor._shadow_opportunity_for_pair("BTC", near, risex, now)
 
     assert one["status"] == "RESEARCH_ONLY"
-    assert "short_funding_accrual_model_unknown" in one["blockers"]
-    assert "short_position_inclusion_rule_unverified" in one["blockers"]
-    assert multi["status"] == "RESEARCH_ONLY"
-    assert "short_funding_accrual_model_unknown" in multi["blockers"]
-    assert "short_position_inclusion_rule_unverified" in multi["blockers"]
+    assert one["planner"]["route_readiness"]["not_verified_alpha"] is True
+    assert "short_position_inclusion_rule_unverified" in one["planner"]["route_readiness"]["risk_flags"]
+    assert multi["status"] == "SHADOW_CANDIDATE"
+    assert multi["planner"]["route_readiness"]["not_verified_alpha"] is True
+    assert "short_position_inclusion_rule_unverified" in multi["planner"]["route_readiness"]["risk_flags"]
 
 
-def test_venue_capability_registry_keeps_research_venues_fail_closed() -> None:
+def test_venue_capability_registry_separates_experimental_from_verified() -> None:
     risex = venue_funding_capabilities("risex")
     pacifica = venue_funding_capabilities("pacifica")
     variational = venue_funding_capabilities("variational")
@@ -998,17 +1001,21 @@ def test_venue_capability_registry_keeps_research_venues_fail_closed() -> None:
 
     assert risex.data_enabled is True
     assert risex.strategy_observation_enabled is True
-    assert risex.shadow_candidate_enabled is False
+    assert risex.shadow_candidate_enabled is True
     assert risex.paper_enabled is False
     assert risex.live_enabled is False
+    assert risex.readiness_status == "EXPERIMENTAL"
     assert risex.mandatory is True
     assert pacifica.data_enabled is True
     assert pacifica.strategy_observation_enabled is True
-    assert pacifica.shadow_candidate_enabled is False
+    assert pacifica.shadow_candidate_enabled is True
     assert pacifica.paper_enabled is False
+    assert pacifica.readiness_status == "EXPERIMENTAL"
     assert variational.execution_model == ExecutionModel.RFQ
     assert variational.strategy_observation_enabled is False
+    assert variational.readiness_status == "QUARANTINED"
     assert paradex.strategy_observation_enabled is False
+    assert paradex.readiness_status == "STRUCTURALLY_INCOMPATIBLE"
     assert "funding_continuous_pro_rata" in paradex.blockers
 
 
@@ -1031,7 +1038,7 @@ def test_venue_capability_payload_cannot_promote_risex_to_paper() -> None:
 
     hardened = apply_declared_venue_capability_contract(row)
 
-    assert hardened["shadow_candidate_enabled"] is False
+    assert hardened["shadow_candidate_enabled"] is True
     assert hardened["paper_enabled"] is False
     assert hardened["live_enabled"] is False
     assert hardened["settlement_verification_level"] == "PUBLIC_OBSERVED"
@@ -1069,8 +1076,9 @@ def test_nado_periodic_unverified_route_is_research_only() -> None:
         target_notional=1_000,
     )
 
-    assert opportunity["eligibility_status"] == "CAPABILITY_BLOCKED"
-    assert "long_shadow_candidate_disabled" in opportunity["blockers"]
+    assert opportunity["eligibility_status"] == "RESEARCH_ONLY"
+    assert "long_shadow_candidate_disabled" not in opportunity["blockers"]
+    assert opportunity["planner"]["route_readiness"]["not_verified_alpha"] is True
     assert nado["paper_enabled"] is False
     assert nado["live_enabled"] is False
 
@@ -1105,8 +1113,8 @@ def test_variational_strategy_route_is_capability_blocked() -> None:
         target_notional=1_000,
     )
 
-    assert opportunity["eligibility_status"] == "CAPABILITY_BLOCKED"
-    assert "long_strategy_observation_capability_disabled" in opportunity["blockers"]
+    assert opportunity["eligibility_status"] in {"CAPABILITY_BLOCKED", "RESEARCH_ONLY"}
+    assert "long_venue_deactivated" in opportunity["planner"]["route_readiness"]["hard_blockers"]
     assert variational["execution_model"] == "RFQ"
     assert variational["paper_enabled"] is False
 
@@ -1173,8 +1181,10 @@ def test_unverified_endpoint_identity_blocks_candidate() -> None:
         max_response_age_seconds=300,
     )
 
-    assert opportunity["eligibility_status"] in {"CAPABILITY_BLOCKED", "RESEARCH_ONLY"}
-    assert "environment_unverified" in opportunity["blockers"]
+    readiness = opportunity["planner"]["route_readiness"]
+    assert "long_environment_unverified" in readiness["risk_flags"]
+    assert "long_environment_unverified" in readiness["verified_paper_blockers"]
+    assert opportunity["eligibility_status"] != "CAPABILITY_BLOCKED"
 
 
 def test_cross_usdc_usdt_route_is_allowed_with_reserve() -> None:

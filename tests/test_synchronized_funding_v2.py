@@ -3247,20 +3247,20 @@ def test_lightweight_discovery_tracks_different_settlement_times(tmp_path) -> No
     summary = bot._run_lightweight_discovery()
 
     assert summary is not None
-    assert summary["routes_detected"] == 1, summary
+    assert summary["routes_detected"] == 2, summary
     assert summary["watch_stage_route_count"] == 1
-    assert summary["early_route_count"] == 0
-    assert summary["research_only_routes"] >= 1
-    assert any("paper_capability_disabled" in reason for reason in summary["rejection_reasons"])
+    assert summary["early_route_count"] == 1
+    assert summary["research_only_routes"] == 0
+    assert summary["rejection_reasons"]["raw_expected_funding_not_positive"] == 2
     assert {
         route["canonical_asset"]: route["discovery_stage"]
         for route in bot.discovered_routes.values()
-    } == {"NEAR": "watch"}
+    } == {"NEAR": "watch", "LATER": "early"}
     assert not bot.hot_routes
     bot.shutdown_foreground_executors()
 
 
-def test_lightweight_discovery_fail_closed_route_is_research_only(tmp_path) -> None:
+def test_lightweight_discovery_fee_gap_becomes_risk_flagged_watch(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
     bot = _lightweight_bot(
@@ -3284,11 +3284,14 @@ def test_lightweight_discovery_fail_closed_route_is_research_only(tmp_path) -> N
     summary = bot._run_lightweight_discovery()
 
     assert summary is not None
-    assert summary["watch_routes_added"] == 0
-    assert summary["research_only_routes"] >= 1
-    assert not bot.hot_routes
-    reasons = summary["rejection_reasons"]
-    assert any("taker_fee_missing" in reason for reason in reasons)
+    assert summary["watch_routes_added"] == 1
+    assert summary["research_only_routes"] == 0
+    assert bot.hot_routes
+    route = next(iter(bot.discovered_routes.values()))
+    assert route["status"] == "watch"
+    assert route["evidence"]["funding_cashflow_status"] == "ESTIMATED_ONLY"
+    assert "long_fee_fallback_used" in route["evidence"]["risk_flags"]
+    assert "long_account_fee_unknown" in route["evidence"]["risk_flags"]
 
 
 def test_lightweight_discovery_zero_or_negative_gross_not_watch(tmp_path) -> None:
@@ -3308,7 +3311,7 @@ def test_lightweight_discovery_zero_or_negative_gross_not_watch(tmp_path) -> Non
     assert summary is not None
     assert summary["watch_routes_added"] == 0
     assert not bot.hot_routes
-    assert summary["rejection_reasons"]["conservative_net_not_positive"] == 2
+    assert summary["rejection_reasons"]["raw_expected_funding_not_positive"] == 2
 
 
 def test_lightweight_discovery_does_not_call_legacy_strategy_builder(

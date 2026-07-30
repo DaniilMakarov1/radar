@@ -25,12 +25,12 @@ from smart_money_radar.funding.normalization import (
     funding_persistence,
     parse_timestamp,
 )
+from smart_money_radar.funding.readiness_policy import (
+    EvaluationMode,
+    evaluate_synchronized_route,
+)
 from smart_money_radar.funding.strategy_synchronized_funding import (
     synchronized_strategy_candidate,
-)
-from smart_money_radar.funding.venue_capabilities import (
-    capability_from_market,
-    synchronized_route_capability_check,
 )
 
 
@@ -548,6 +548,10 @@ def evaluate_perp_route(
     risk_flags.append("account_margin_unverified")
     long_capability_market = {
         **long_market,
+        "bids": long_book.get("bids") or [],
+        "asks": long_book.get("asks") or [],
+        "best_bid": long_book.get("best_bid"),
+        "best_ask": long_book.get("best_ask"),
         "orderbook_response_received_at": long_book.get("response_received_at")
         or long_book.get("observed_at"),
         "orderbook_event_time": long_book.get("orderbook_event_time")
@@ -556,18 +560,30 @@ def evaluate_perp_route(
     }
     short_capability_market = {
         **short_market,
+        "bids": short_book.get("bids") or [],
+        "asks": short_book.get("asks") or [],
+        "best_bid": short_book.get("best_bid"),
+        "best_ask": short_book.get("best_ask"),
         "orderbook_response_received_at": short_book.get("response_received_at")
         or short_book.get("observed_at"),
         "orderbook_event_time": short_book.get("orderbook_event_time")
         or short_book.get("observed_at"),
         "orderbook_depth_available": valid_orderbook(short_book),
     }
-    capability_check = synchronized_route_capability_check(
-        capability_from_market(long_capability_market),
-        capability_from_market(short_capability_market),
+    capability_check = evaluate_synchronized_route(
+        long_market=long_capability_market,
+        short_market=short_capability_market,
+        target_notional=config.target_notional,
+        mode=EvaluationMode.DISCOVERY,
+        clients_by_venue={
+            str(long_venue).lower(): True,
+            str(short_venue).lower(): True,
+        },
     )
-    if decision_mode == "settlement_capture" and not capability_check["paper_eligible"]:
-        blocking_risk_flags.extend(capability_check["all_reasons"])
+    if decision_mode == "settlement_capture":
+        blocking_risk_flags.extend(capability_check["hard_blockers"])
+        advisory_risk_flags.extend(capability_check["risk_flags"])
+        risk_flags.extend(capability_check["risk_flags"])
 
     if decision_mode == "settlement_capture":
         synchronized_candidate = synchronized_strategy_candidate(
@@ -607,7 +623,7 @@ def evaluate_perp_route(
             },
         }
         selected_strategy = synchronized_candidate
-        status = "watch" if capability_check["paper_eligible"] else "research_only"
+        status = "research_only" if capability_check["hard_blockers"] else "watch"
     else:
         strategy_evaluation = build_strategy_evaluation(
             selected_size,
@@ -790,8 +806,50 @@ def evaluate_perp_route(
             "selected_strategy": selected_strategy,
             "strategy_classification": selected_strategy,
             "pnl_components": strategy_evaluation["pnl_components"],
-            "synchronized_capability_passed": capability_check["paper_eligible"],
-            "capability_rejections": capability_check["all_reasons"],
+            "readiness_level": capability_check.get("readiness_level"),
+            "paper_mode": capability_check.get("paper_mode")
+            or (
+                "EXPERIMENTAL"
+                if capability_check.get("experimental_paper_ready")
+                else "RESEARCH"
+            ),
+            "funding_cashflow_status": capability_check.get("funding_cashflow_status"),
+            "execution_status": capability_check.get("execution_status"),
+            "settlement_semantics_status": capability_check.get("settlement_semantics_status"),
+            "rate_confidence": capability_check.get("rate_confidence"),
+            "execution_confidence": capability_check.get("execution_confidence"),
+            "settlement_confidence": capability_check.get("settlement_confidence"),
+            "accounting_confidence": capability_check.get("accounting_confidence"),
+            "hard_blockers": capability_check.get("hard_blockers", []),
+            "risk_flags": capability_check.get("risk_flags", []),
+            "assumptions": capability_check.get("assumptions", []),
+            "missing_capabilities": capability_check.get("missing_capabilities", []),
+            "not_verified_alpha": capability_check.get("not_verified_alpha"),
+            "raw_expected_funding": (
+                capability_check.get("economics") or {}
+            ).get("raw_expected_funding_usd"),
+            "conservative_expected_funding": (
+                capability_check.get("economics") or {}
+            ).get("conservative_expected_funding_usd"),
+            "raw_expected_net": (
+                capability_check.get("economics") or {}
+            ).get("raw_expected_net_usd"),
+            "conservative_expected_net": (
+                capability_check.get("economics") or {}
+            ).get("conservative_expected_net_usd"),
+            "uncertainty_reserves": (
+                capability_check.get("economics") or {}
+            ).get("uncertainty_reserves", {}),
+            "synchronized_capability_passed": bool(
+                capability_check.get("verified_paper_ready")
+            ),
+            "experimental_paper_ready": bool(
+                capability_check.get("experimental_paper_ready")
+            ),
+            "verified_paper_ready": bool(
+                capability_check.get("verified_paper_ready")
+            ),
+            "capability_rejections": capability_check.get("verified_paper_blockers", []),
             "capability_check": capability_check,
             "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
             "blocking_risk_flags": list(dict.fromkeys(blocking_risk_flags)),
@@ -2488,6 +2546,16 @@ def route_leg(
         "normalized_next_funding_rate": market.get(
             "normalized_next_funding_rate"
         ),
+        "rate_estimate_per_settlement": market.get("rate_estimate_per_settlement"),
+        "rate_estimate_kind": market.get("rate_estimate_kind"),
+        "rate_estimate_lower_bound": market.get("rate_estimate_lower_bound"),
+        "rate_estimate_upper_bound": market.get("rate_estimate_upper_bound"),
+        "rate_estimate_confidence": market.get("rate_estimate_confidence"),
+        "rate_estimate_source": market.get("rate_estimate_source"),
+        "rate_estimate_observed_at": market.get("rate_estimate_observed_at"),
+        "exact_next_rate_available": market.get("exact_next_rate_available"),
+        "rate_estimate_assumptions": market.get("rate_estimate_assumptions"),
+        "rate_estimate_risk_flags": market.get("rate_estimate_risk_flags"),
         "funding_rate_unit": market.get("funding_rate_unit"),
         "funding_sign_convention": market.get("funding_sign_convention"),
         "normalization_evidence": market.get("normalization_evidence"),

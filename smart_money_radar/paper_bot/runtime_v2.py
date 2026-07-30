@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from smart_money_radar.funding.fees import fee_evidence_status
+from smart_money_radar.funding.readiness_policy import EvaluationMode
 from smart_money_radar.funding.strategy_synchronized_funding import (
     EventWindowPlannerConfig,
     FundingRoutePlan,
@@ -337,7 +338,14 @@ class SynchronizedFundingRuntimeV2:
                 operational_reserve_bps=float(
                     getattr(config, "operational_reserve_bps", 1.0)
                 ),
-            )
+                conservative_taker_fee_fallback_rate=float(
+                    getattr(config, "conservative_taker_fee_fallback_rate", 0.0010)
+                ),
+                fee_uncertainty_reserve_bps=float(
+                    getattr(config, "fee_uncertainty_reserve_bps", 2.0)
+                ),
+            ),
+            evaluation_mode=EvaluationMode.VERIFIED_PAPER,
         )
 
     def _cycle_events_for_scheduled_at(

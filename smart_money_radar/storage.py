@@ -8090,6 +8090,16 @@ class SQLiteStore:
                               evidence_json,
                               '$.strategy_classification.expected_net_pnl'
                           ) AS REAL) > 0
+                          OR (
+                              json_extract(evidence_json, '$.readiness_level') IS NOT NULL
+                              AND COALESCE(
+                                  json_array_length(json_extract(
+                                      evidence_json,
+                                      '$.hard_blockers'
+                                  )),
+                                  0
+                              ) = 0
+                          )
                       )
                       AND NOT (
                           COALESCE(json_extract(
@@ -8111,9 +8121,15 @@ class SQLiteStore:
                               ) AS REAL),
                               0
                           ) >= ?
-                          AND json_extract(
-                              evidence_json,
-                              '$.synchronized_capability_passed'
+                          AND (
+                              json_extract(
+                                  evidence_json,
+                                  '$.synchronized_capability_passed'
+                              )
+                              OR json_extract(
+                                  evidence_json,
+                                  '$.experimental_paper_ready'
+                              )
                           )
                       )
                     ORDER BY COALESCE(
@@ -8527,7 +8543,10 @@ class SQLiteStore:
             actionable_synchronized_watch = (
                 row.get("status") == "watch"
                 and settlement_capture
-                and bool(evidence.get("synchronized_capability_passed"))
+                and (
+                    bool(evidence.get("synchronized_capability_passed"))
+                    or bool(evidence.get("experimental_paper_ready"))
+                )
                 and selected_expected_net >= minimum_visible_profit
                 and "live_net_pnl_not_positive" not in flags
             )
@@ -8620,7 +8639,7 @@ class SQLiteStore:
             "venues": venues,
             "warnings": warnings,
             "minimum_visible_capacity": FUNDING_MINIMUM_ACTIONABLE_NOTIONAL,
-            "visible_route_count": len(candidates),
+            "visible_route_count": len(candidates) + len(watch),
             "internal_watch_route_count": len(watch),
             "internal_maker_setup_count": len(maker_setups),
             "capacity_eligible_route_count": capacity_eligible_route_count,

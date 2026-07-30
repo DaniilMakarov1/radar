@@ -187,16 +187,29 @@ def compact_funnel_lines(result: dict[str, Any]) -> list[str]:
         return []
     ordered = [
         "markets_received",
+        "structurally_rejected_markets",
+        "structurally_usable_markets",
+        "exact_next_rate_markets",
+        "estimated_rate_markets",
+        "markets_with_usable_rate_estimates",
         "within_horizon",
-        "normalized_next_rate_markets",
         "multi_venue_assets",
         "directed_pairs",
-        "capability_eligible",
-        "planner_positive",
+        "hard_blocked_pairs",
+        "risk_flagged_pairs",
+        "economically_observable",
         "watch",
         "focused",
-        "qualified",
-        "opened",
+        "experimental_paper_ready",
+        "verified_paper_ready",
+        "opened_experimental",
+        "opened_verified",
+        "reconciled",
+        "unreconciled",
+        "routes_with_any_risk_flag",
+        "total_risk_flag_occurrences",
+        "unique_routes_hard_blocked",
+        "unique_routes_soft_flagged",
     ]
     lines: list[str] = []
     for key in ordered:
@@ -314,10 +327,71 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
         or ((evidence.get("lightweight_discovery") or {}).get("stage"))
         or "qualified"
     )
+    readiness = str(evidence.get("readiness_level") or route.get("readiness_level") or "").replace("_", " ")
+    paper_mode = str(evidence.get("paper_mode") or route.get("paper_mode") or "").upper()
+    funding_status = str(evidence.get("funding_cashflow_status") or "").upper()
+    execution_status = str(evidence.get("execution_status") or "").upper()
+    semantics_status = str(evidence.get("settlement_semantics_status") or "").upper()
+    route_risks = list(dict.fromkeys(
+        str(flag)
+        for flag in [
+            *(route.get("risk_flags") or []),
+            *(evidence.get("risk_flags") or []),
+            *(evidence.get("capability_rejections") or []),
+        ]
+        if flag
+    ))
+    label_map = {
+        "estimated_rate_used": "WATCH — ESTIMATED RATE",
+        "rate_estimate_not_exact_next": "WATCH — ESTIMATED RATE",
+        "exact_next_rate_unavailable": "WATCH — ESTIMATED RATE",
+        "synthetic_fill": "SYNTHETIC FILL",
+        "synthetic_fill_model_required": "SYNTHETIC FILL",
+        "position_inclusion_rule_unverified": "UNVERIFIED INCLUSION",
+        "position_inclusion_rule_missing": "UNVERIFIED INCLUSION",
+        "fee_fallback_used": "FEE FALLBACK",
+        "fee_unverified": "FEE FALLBACK",
+        "collateral_cross_major_stable": "COLLATERAL RISK",
+        "collateral_other_dollar_stable": "COLLATERAL RISK",
+        "collateral_usdt0_risk": "COLLATERAL RISK",
+    }
+    badges: list[str] = []
+    if paper_mode == "EXPERIMENTAL":
+        badges.append("EXPERIMENTAL PAPER")
+    elif paper_mode == "VERIFIED":
+        badges.append("VERIFIED PAPER")
+    if funding_status in {"ESTIMATED_ONLY", "UNRECONCILED", "PENDING"}:
+        badges.append("UNRECONCILED" if funding_status != "ESTIMATED_ONLY" else "ESTIMATED RATE")
+    for flag in route_risks:
+        normalized_flag = flag.removeprefix("long_").removeprefix("short_")
+        label = label_map.get(normalized_flag)
+        if label:
+            badges.append(label)
+    badges = list(dict.fromkeys(badges))[:5]
+    confidence = (
+        f"Rate {float(evidence.get('rate_confidence') or 0.0):.2f} | "
+        f"Exec {float(evidence.get('execution_confidence') or 0.0):.2f} | "
+        f"Settle {float(evidence.get('settlement_confidence') or 0.0):.2f}"
+        if evidence.get("rate_confidence") is not None
+        else ""
+    )
+    risk_line = ""
+    if route_risks:
+        top_risks = ", ".join(tg(flag) for flag in route_risks[:3])
+        rest = len(route_risks) - 3
+        risk_line = f"\nRisks: {top_risks}{f' +{rest}' if rest > 0 else ''}"
+    readiness_line = (
+        f"Readiness: <code>{tg(readiness)}</code> | {tg(confidence)}\n"
+        if readiness
+        else ""
+    )
+    badges_line = f"{tg(' | '.join(badges))}\n" if badges else ""
     if lightweight:
         pnl_line = (
             "Preliminary funding before focused costs: "
-            f"<b>{format_signed_money(funding_component)}</b>\n"
+            "raw / conservative net "
+            f"<b>{format_signed_money(evidence.get('raw_expected_net') or strategy_net)}</b> / "
+            f"<b>{format_signed_money(evidence.get('conservative_expected_net') or strategy_net)}</b>\n"
             "<i>Focused orderbooks, costs and entry observations: pending</i>"
         )
     else:
@@ -328,6 +402,8 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
     return (
         f"\n<b>{index}. {tg(route.get('canonical_asset'))}</b>\n"
         f"Stage: <code>{tg(stage)}</code> | Edge: <code>{tg(edge_name)}</code>\n"
+        f"{readiness_line}"
+        f"{badges_line}"
         f"LONG <code>{tg(route.get('long_venue'))} {tg(route.get('long_symbol'))}</code> "
         f"{long_rate_display}/{long_interval}"
         f"{f' ({long_hourly_label})' if long_hourly_label else ''}\n"
@@ -338,6 +414,9 @@ def status_route_line(route: dict[str, Any], index: int) -> str:
         f"Funding {format_signed_money(funding_component)} | "
         f"Spread {format_signed_money(spread_component)}\n"
         f"Settlement: L {format_seconds(long_lead)} | S {format_seconds(short_lead)}"
+        f"{f' | Semantics {tg(semantics_status)}' if semantics_status else ''}"
+        f"{f' | {tg(execution_status)}' if execution_status else ''}"
+        f"{risk_line}"
     )
 
 

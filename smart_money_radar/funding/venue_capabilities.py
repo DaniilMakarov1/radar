@@ -89,6 +89,7 @@ class VenueFundingCapabilities:
     live_enabled: bool
     execution_model: ExecutionModel
     settlement_verification_level: str
+    readiness_status: str = "OBSERVATION_ONLY"
     blockers: tuple[str, ...] = ()
     evidence_version: str = "funding-capabilities-2026-07-29"
     mandatory: bool = False
@@ -124,6 +125,11 @@ _VENUE_FUNDING_CAPABILITIES: dict[str, VenueFundingCapabilities] = {
         live_enabled=False,
         execution_model=ExecutionModel.CLOB,
         settlement_verification_level="PUBLIC_OBSERVED",
+        readiness_status=(
+            "VERIFIED"
+            if venue in _PAPER_ENABLED_SETTLEMENT_CAPTURE_VENUES
+            else "EXPERIMENTAL"
+        ),
         blockers=(
             ("live_disabled",)
             if venue in _PAPER_ENABLED_SETTLEMENT_CAPTURE_VENUES
@@ -143,6 +149,7 @@ _VENUE_FUNDING_CAPABILITIES.update(
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="UNVERIFIED",
+            readiness_status="OBSERVATION_ONLY",
             blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
         ),
         "edgex": VenueFundingCapabilities(
@@ -154,6 +161,7 @@ _VENUE_FUNDING_CAPABILITIES.update(
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="UNVERIFIED",
+            readiness_status="OBSERVATION_ONLY",
             blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
         ),
         "ethereal": VenueFundingCapabilities(
@@ -165,6 +173,7 @@ _VENUE_FUNDING_CAPABILITIES.update(
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="UNVERIFIED",
+            readiness_status="OBSERVATION_ONLY",
             blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
         ),
         "grvt": VenueFundingCapabilities(
@@ -176,17 +185,19 @@ _VENUE_FUNDING_CAPABILITIES.update(
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="UNVERIFIED",
+            readiness_status="OBSERVATION_ONLY",
             blockers=("funding_accrual_model_unknown", "reviewed_promotion_required"),
         ),
         "risex": VenueFundingCapabilities(
             venue="risex",
             data_enabled=True,
             strategy_observation_enabled=True,
-            shadow_candidate_enabled=False,
+            shadow_candidate_enabled=True,
             paper_enabled=False,
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="PUBLIC_OBSERVED",
+            readiness_status="EXPERIMENTAL",
             blockers=("mainnet_canary_required", "reviewed_promotion_required"),
             mandatory=True,
         ),
@@ -194,22 +205,24 @@ _VENUE_FUNDING_CAPABILITIES.update(
             venue="pacifica",
             data_enabled=True,
             strategy_observation_enabled=True,
-            shadow_candidate_enabled=False,
+            shadow_candidate_enabled=True,
             paper_enabled=False,
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="MAINNET_CANARY_REQUIRED",
+            readiness_status="EXPERIMENTAL",
             blockers=("mainnet_canary_required", "reviewed_promotion_required"),
         ),
         "nado": VenueFundingCapabilities(
             venue="nado",
             data_enabled=True,
             strategy_observation_enabled=True,
-            shadow_candidate_enabled=False,
+            shadow_candidate_enabled=True,
             paper_enabled=False,
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="MAINNET_CANARY_REQUIRED",
+            readiness_status="EXPERIMENTAL",
             blockers=("position_inclusion_rule_unverified", "reviewed_promotion_required"),
         ),
         "variational": VenueFundingCapabilities(
@@ -221,6 +234,7 @@ _VENUE_FUNDING_CAPABILITIES.update(
             live_enabled=False,
             execution_model=ExecutionModel.RFQ,
             settlement_verification_level="UNVERIFIED",
+            readiness_status="QUARANTINED",
             blockers=(
                 "rfq_execution_layer_missing",
                 "funding_mechanics_unverified",
@@ -236,6 +250,7 @@ _VENUE_FUNDING_CAPABILITIES.update(
             live_enabled=False,
             execution_model=ExecutionModel.CLOB,
             settlement_verification_level="CONTINUOUS_PRO_RATA",
+            readiness_status="STRUCTURALLY_INCOMPATIBLE",
             blockers=("funding_continuous_pro_rata",),
         ),
     }
@@ -249,14 +264,15 @@ def venue_funding_capabilities(venue: str) -> VenueFundingCapabilities:
         return configured
     return VenueFundingCapabilities(
         venue=venue_key or "unknown",
-        data_enabled=False,
-        strategy_observation_enabled=False,
-        shadow_candidate_enabled=False,
+        data_enabled=True,
+        strategy_observation_enabled=True,
+        shadow_candidate_enabled=True,
         paper_enabled=False,
         live_enabled=False,
-        execution_model=ExecutionModel.UNKNOWN,
+        execution_model=ExecutionModel.CLOB,
         settlement_verification_level="UNVERIFIED",
-        blockers=("venue_capability_missing",),
+        readiness_status="OBSERVATION_ONLY",
+        blockers=("verified_paper_contract_incomplete", "live_disabled"),
     )
 
 
@@ -271,6 +287,7 @@ def apply_venue_funding_capabilities(market: dict[str, Any]) -> dict[str, Any]:
     row["live_enabled"] = payload["live_enabled"]
     row["execution_model"] = payload["execution_model"]
     row["settlement_verification_level"] = payload["settlement_verification_level"]
+    row["readiness_status"] = payload["readiness_status"]
     row["evidence_version"] = payload["evidence_version"]
     row["venue_capability_blockers"] = list(payload["blockers"])
     row["mandatory_venue"] = payload["mandatory"]

@@ -64,6 +64,12 @@ from smart_money_radar.funding.presentation import (
     filter_deactivated_funding_dashboard_payload,
     filter_deactivated_funding_paper_payload,
 )
+from smart_money_radar.funding.readiness_policy import (
+    EvaluationMode,
+    evaluate_synchronized_route,
+    rate_estimate_from_market,
+    reference_price,
+)
 from smart_money_radar.funding.retention import apply_funding_retention_plan
 from smart_money_radar.funding.service import (
     active_default_funding_clients,
@@ -82,8 +88,6 @@ from smart_money_radar.funding.synchronized_market_contract import (
 )
 from smart_money_radar.funding.venue_capabilities import (
     apply_declared_venue_capability_contract,
-    capability_from_market,
-    synchronized_route_capability_check,
 )
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.notifications import TelegramNotifier
@@ -270,6 +274,8 @@ class PaperBotConfig:
     common_price_move_alert_fraction: float = 0.05
     common_price_move_critical_fraction: float = 0.10
     spread_monitoring_enabled: bool = True
+    conservative_taker_fee_fallback_rate: float = 0.0010
+    fee_uncertainty_reserve_bps: float = 2.0
 
     def validated(self) -> "PaperBotConfig":
         strategies = list(normalize_strategy_set(self.strategy_set))
@@ -451,6 +457,14 @@ class PaperBotConfig:
                 float(self.common_price_move_critical_fraction),
             ),
             spread_monitoring_enabled=bool(self.spread_monitoring_enabled),
+            conservative_taker_fee_fallback_rate=max(
+                0.0,
+                float(self.conservative_taker_fee_fallback_rate),
+            ),
+            fee_uncertainty_reserve_bps=max(
+                0.0,
+                float(self.fee_uncertainty_reserve_bps),
+            ),
         ).normalized_entry_leads()
 
     def normalized_entry_leads(self) -> "PaperBotConfig":
@@ -2754,8 +2768,11 @@ class PaperBot:
         eligible_by_asset: dict[str, list[dict[str, Any]]] = {}
         markets_checked = 0
         within_horizon_markets = 0
-        normalized_next_rate_markets = 0
+        exact_next_rate_markets = 0
+        estimated_rate_markets = 0
+        usable_rate_markets = 0
         research_only_routes = 0
+        structurally_rejected_markets = 0
         for market in markets:
             markets_checked += 1
             venue = str(market.get("venue") or "").lower()
@@ -2789,41 +2806,54 @@ class PaperBot:
             within_horizon_markets += 1
             asset = str(market.get("canonical_asset") or "").upper()
             if not asset:
+                structurally_rejected_markets += 1
                 reject(
                     "canonical_asset_missing",
                     stage="within_horizon",
                     denominator=within_horizon_markets,
                 )
                 continue
-            if optional_float(market.get("mark_price")) is None:
+            ref_price, ref_kind = reference_price(market)
+            if ref_price is None:
+                structurally_rejected_markets += 1
                 reject(
-                    "mark_price_missing",
+                    "reference_price_missing",
                     stage="within_horizon",
                     denominator=within_horizon_markets,
                 )
                 continue
-            if optional_float(market.get("index_price")) is None:
+            rate_estimate = rate_estimate_from_market(market)
+            if rate_estimate.get("rate_estimate_hard_blockers"):
+                structurally_rejected_markets += 1
+                for reason in rate_estimate["rate_estimate_hard_blockers"]:
+                    reject(
+                        str(reason),
+                        stage="markets_with_usable_rate_estimates",
+                        denominator=within_horizon_markets,
+                    )
+                continue
+            if rate_estimate.get("rate_estimate_per_settlement") is None:
+                structurally_rejected_markets += 1
                 reject(
-                    "index_price_missing",
-                    stage="within_horizon",
+                    "usable_funding_rate_estimate_missing",
+                    stage="markets_with_usable_rate_estimates",
                     denominator=within_horizon_markets,
                 )
                 continue
-            if optional_float(market.get("normalized_next_funding_rate")) is None:
-                reject(
-                    "normalized_next_funding_rate_missing",
-                    stage="normalized_next_rate_markets",
-                    denominator=within_horizon_markets,
-                )
-                continue
-            normalized_next_rate_markets += 1
+            market.update(rate_estimate)
+            market["discovery_reference_price"] = ref_price
+            market["discovery_reference_price_kind"] = ref_kind
+            usable_rate_markets += 1
+            if rate_estimate.get("exact_next_rate_available"):
+                exact_next_rate_markets += 1
+            else:
+                estimated_rate_markets += 1
             if venue not in clients_by_venue:
                 reject(
                     "venue_client_missing",
-                    stage="normalized_next_rate_markets",
-                    denominator=normalized_next_rate_markets,
+                    stage="markets_with_usable_rate_estimates",
+                    denominator=usable_rate_markets,
                 )
-                continue
             eligible_by_asset.setdefault(asset, []).append(market)
 
         routes_by_key: dict[str, dict[str, Any]] = {}
@@ -2833,8 +2863,11 @@ class PaperBot:
             if len({str(row.get("venue") or "") for row in rows}) >= 2
         )
         structurally_matched = 0
-        capability_eligible_pairs = 0
-        planner_positive_pairs = 0
+        hard_blocked_pairs = 0
+        risk_flagged_pairs = 0
+        economically_observable_pairs = 0
+        experimental_ready_pairs = 0
+        verified_ready_pairs = 0
         for asset, rows in eligible_by_asset.items():
             if len({str(row.get("venue") or "") for row in rows}) < 2:
                 continue
@@ -2854,25 +2887,35 @@ class PaperBot:
                         long_market.get("next_funding_at"),
                         short_market.get("next_funding_at"),
                     )
-                    capability = self._lightweight_capability_check(
-                        long_market,
-                        short_market,
-                        clients_by_venue,
+                    route_readiness = evaluate_synchronized_route(
+                        long_market=long_market,
+                        short_market=short_market,
+                        target_notional=float(self.config.target_notional_per_leg),
+                        mode=EvaluationMode.DISCOVERY,
+                        clients_by_venue=clients_by_venue,
                     )
-                    if not capability["paper_eligible"]:
+                    if route_readiness["hard_blockers"]:
                         research_only_routes += 1
-                        for reason in capability["all_reasons"]:
+                        hard_blocked_pairs += 1
+                        for reason in route_readiness["hard_blockers"]:
                             reject(
                                 reason,
-                                stage="capability_eligible",
+                                stage="hard_blocked_pairs",
                                 denominator=structurally_matched,
                                 example={
                                     **pair_example,
-                                    "blockers": capability["all_reasons"][:6],
+                                    "blockers": route_readiness["hard_blockers"][:6],
                                 },
                             )
                         continue
-                    capability_eligible_pairs += 1
+                    if route_readiness["risk_flags"]:
+                        risk_flagged_pairs += 1
+                    if route_readiness["economically_observable"]:
+                        economically_observable_pairs += 1
+                    if route_readiness["experimental_paper_ready"]:
+                        experimental_ready_pairs += 1
+                    if route_readiness["verified_paper_ready"]:
+                        verified_ready_pairs += 1
                     plan = build_settlement_capture_opportunity(
                         long_market=long_market,
                         short_market=short_market,
@@ -2886,51 +2929,53 @@ class PaperBot:
                         ),
                     )
                     plan_blockers = list(plan.get("blockers") or [])
-                    if plan_blockers:
-                        research_only_routes += 1
-                        for reason in plan_blockers:
-                            reject(
-                                str(reason),
-                                stage="planner_positive",
-                                denominator=capability_eligible_pairs,
-                                example={
-                                    **pair_example,
-                                    "blockers": [str(item) for item in plan_blockers[:6]],
-                                },
-                            )
-                        continue
-                    long_mark = float(optional_float(long_market.get("mark_price")) or 0.0)
-                    short_mark = float(optional_float(short_market.get("mark_price")) or 0.0)
+                    for reason in plan_blockers:
+                        reject(
+                            str(reason),
+                            stage="planner_soft_or_late_gate",
+                            denominator=structurally_matched,
+                            example={
+                                **pair_example,
+                                "blockers": [str(item) for item in plan_blockers[:6]],
+                            },
+                        )
+                    long_mark = float(reference_price(long_market)[0] or 0.0)
+                    short_mark = float(reference_price(short_market)[0] or 0.0)
                     if long_mark <= 0 or short_mark <= 0:
                         reject(
-                            "mark_price_missing",
-                            stage="planner_positive",
-                            denominator=capability_eligible_pairs,
-                            example={**pair_example, "blockers": ["mark_price_missing"]},
+                            "reference_price_missing",
+                            stage="economically_observable",
+                            denominator=structurally_matched,
+                            example={**pair_example, "blockers": ["reference_price_missing"]},
                         )
                         continue
                     target_notional = float(self.config.target_notional_per_leg)
                     quantity = min(target_notional / long_mark, target_notional / short_mark)
-                    gross = float(plan.get("conservative_funding_cashflow_usd") or 0.0)
-                    if gross <= 0:
+                    economics = route_readiness.get("economics") or {}
+                    raw_gross = float(economics.get("raw_expected_funding_usd") or 0.0)
+                    conservative_gross = float(
+                        economics.get("conservative_expected_funding_usd")
+                        if economics.get("conservative_expected_funding_usd") is not None
+                        else raw_gross
+                    )
+                    if raw_gross <= 0:
                         reject(
-                            "preliminary_gross_funding_not_positive",
-                            stage="planner_positive",
-                            denominator=capability_eligible_pairs,
+                            "raw_expected_funding_not_positive",
+                            stage="economically_observable",
+                            denominator=structurally_matched,
                             example={
                                 **pair_example,
-                                "blockers": ["preliminary_gross_funding_not_positive"],
+                                "blockers": ["raw_expected_funding_not_positive"],
                             },
                         )
                         continue
-                    planner_positive_pairs += 1
                     route = self._lightweight_watch_route(
                         asset,
                         long_market,
                         short_market,
                         quantity,
-                        gross,
-                        capability,
+                        conservative_gross,
+                        route_readiness,
                         now,
                         route_plan=plan,
                         settlement_skew_seconds_value=skew,
@@ -2973,13 +3018,33 @@ class PaperBot:
                     "denominator": len(markets),
                     "unit": "market",
                 },
+                "structurally_rejected_markets": {
+                    "count": structurally_rejected_markets,
+                    "denominator": markets_checked,
+                    "unit": "market",
+                },
+                "structurally_usable_markets": {
+                    "count": within_horizon_markets - structurally_rejected_markets,
+                    "denominator": markets_checked,
+                    "unit": "market",
+                },
                 "within_horizon": {
                     "count": within_horizon_markets,
                     "denominator": markets_checked,
                     "unit": "market",
                 },
-                "normalized_next_rate_markets": {
-                    "count": normalized_next_rate_markets,
+                "exact_next_rate_markets": {
+                    "count": exact_next_rate_markets,
+                    "denominator": within_horizon_markets,
+                    "unit": "market",
+                },
+                "estimated_rate_markets": {
+                    "count": estimated_rate_markets,
+                    "denominator": within_horizon_markets,
+                    "unit": "market",
+                },
+                "markets_with_usable_rate_estimates": {
+                    "count": usable_rate_markets,
                     "denominator": within_horizon_markets,
                     "unit": "market",
                 },
@@ -2990,28 +3055,51 @@ class PaperBot:
                 },
                 "directed_pairs": {
                     "count": structurally_matched,
-                    "denominator": max(0, normalized_next_rate_markets),
+                    "denominator": max(0, usable_rate_markets),
                     "unit": "directed_pair",
                 },
-                "capability_eligible": {
-                    "count": capability_eligible_pairs,
+                "hard_blocked_pairs": {
+                    "count": hard_blocked_pairs,
                     "denominator": structurally_matched,
                     "unit": "directed_pair",
                 },
-                "planner_positive": {
-                    "count": planner_positive_pairs,
-                    "denominator": capability_eligible_pairs,
+                "risk_flagged_pairs": {
+                    "count": risk_flagged_pairs,
+                    "denominator": structurally_matched,
+                    "unit": "directed_pair",
+                },
+                "economically_observable": {
+                    "count": economically_observable_pairs,
+                    "denominator": structurally_matched,
                     "unit": "directed_pair",
                 },
                 "watch": {
                     "count": len(routes),
-                    "denominator": planner_positive_pairs,
+                    "denominator": economically_observable_pairs,
                     "unit": "route",
                 },
                 "focused": {"count": 0, "denominator": len(routes), "unit": "route"},
-                "qualified": {"count": 0, "denominator": len(routes), "unit": "route"},
-                "opened": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "experimental_paper_ready": {
+                    "count": experimental_ready_pairs,
+                    "denominator": economically_observable_pairs,
+                    "unit": "route",
+                },
+                "verified_paper_ready": {
+                    "count": verified_ready_pairs,
+                    "denominator": economically_observable_pairs,
+                    "unit": "directed_pair",
+                },
+                "opened_experimental": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "opened_verified": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "reconciled": {"count": 0, "denominator": len(routes), "unit": "route"},
+                "unreconciled": {"count": 0, "denominator": len(routes), "unit": "route"},
             },
+            "routes_with_any_risk_flag": risk_flagged_pairs,
+            "total_risk_flag_occurrences": sum(
+                len(route.get("risk_flags") or []) for route in routes
+            ),
+            "unique_routes_hard_blocked": hard_blocked_pairs,
+            "unique_routes_soft_flagged": risk_flagged_pairs,
             "routes_structurally_matched": structurally_matched,
             "routes_detected": len(routes),
             "watch_routes_added": len(routes),
@@ -3033,34 +3121,20 @@ class PaperBot:
         short_market: dict[str, Any],
         clients_by_venue: dict[str, FundingVenueClient],
     ) -> dict[str, Any]:
-        check = synchronized_route_capability_check(
-            capability_from_market(long_market),
-            capability_from_market(short_market),
+        readiness = evaluate_synchronized_route(
+            long_market=long_market,
+            short_market=short_market,
+            target_notional=float(self.config.target_notional_per_leg),
+            mode=EvaluationMode.DISCOVERY,
+            clients_by_venue=clients_by_venue,
         )
-        allowed_lightweight_missing = {
-            "long_orderbook_timestamp_missing",
-            "long_orderbook_depth_missing",
-            "short_orderbook_timestamp_missing",
-            "short_orderbook_depth_missing",
-        }
-        reasons = [
-            reason
-            for reason in check["all_reasons"]
-            if reason not in allowed_lightweight_missing
-        ]
-        for side, market in (("long", long_market), ("short", short_market)):
-            venue = str(market.get("venue") or "").lower()
-            client = clients_by_venue.get(venue)
-            if client is None or not callable(getattr(client, "orderbook", None)):
-                reasons.append(f"{side}_orderbook_client_missing")
-            if optional_float(market.get("normalized_next_funding_rate")) is None:
-                reasons.append(f"{side}_normalized_next_funding_rate_missing")
-        reasons = list(dict.fromkeys(reasons))
+        reasons = list(readiness.get("hard_blockers") or [])
         return {
-            **check,
-            "paper_eligible": not reasons,
+            **readiness,
+            "paper_eligible": bool(readiness.get("verified_paper_ready")),
+            "experimental_paper_ready": bool(readiness.get("experimental_paper_ready")),
             "all_reasons": reasons,
-            "lightweight_allowed_missing": sorted(allowed_lightweight_missing),
+            "lightweight_allowed_missing": sorted(readiness.get("risk_flags") or []),
         }
 
     def _lightweight_watch_route(
@@ -3070,7 +3144,7 @@ class PaperBot:
         short_market: dict[str, Any],
         quantity: float,
         preliminary_gross: float,
-        capability: dict[str, Any],
+        route_readiness: dict[str, Any],
         now: datetime,
         *,
         route_plan: dict[str, Any] | None = None,
@@ -3078,9 +3152,38 @@ class PaperBot:
     ) -> dict[str, Any]:
         long_venue = str(long_market["venue"])
         short_venue = str(short_market["venue"])
-        long_mark = float(long_market["mark_price"])
-        short_mark = float(short_market["mark_price"])
+        long_mark = float(reference_price(long_market)[0] or 0.0)
+        short_mark = float(reference_price(short_market)[0] or 0.0)
         target_notional = float(self.config.target_notional_per_leg)
+        economics = route_readiness.get("economics") or {}
+        raw_expected_funding = float(economics.get("raw_expected_funding_usd") or preliminary_gross)
+        conservative_expected_funding = float(
+            economics.get("conservative_expected_funding_usd")
+            if economics.get("conservative_expected_funding_usd") is not None
+            else preliminary_gross
+        )
+        raw_expected_net = float(
+            economics.get("raw_expected_net_usd")
+            if economics.get("raw_expected_net_usd") is not None
+            else raw_expected_funding
+        )
+        conservative_expected_net = float(
+            economics.get("conservative_expected_net_usd")
+            if economics.get("conservative_expected_net_usd") is not None
+            else conservative_expected_funding
+        )
+        risk_flags = list(
+            dict.fromkeys(
+                [
+                    "lightweight_only_requires_focused_underwriting",
+                    *list(route_readiness.get("risk_flags") or []),
+                ]
+            )
+        )
+        paper_mode = route_readiness.get("paper_mode") or (
+            "EXPERIMENTAL" if route_readiness.get("experimental_paper_ready") else "RESEARCH"
+        )
+        readiness_label = str(route_readiness.get("readiness_level") or "economically_observable")
         selected_strategy = {
             "selection_model": "lightweight_discovery_v1",
             "strategy_name": "synchronized_funding_capture",
@@ -3088,20 +3191,27 @@ class PaperBot:
             "strategy_version": "synchronized_funding_capture_v2",
             "primary_edge": "synchronized_funding",
             "edge_type": "funding_led",
-            "edge_label": "Lightweight funding watch",
-            "eligible": True,
-            "expected_net_pnl": preliminary_gross,
-            "gross_edge_pnl": preliminary_gross,
-            "funding_pnl_component": preliminary_gross,
+            "edge_label": (
+                "WATCH - ESTIMATED RATE"
+                if "estimated_rate_used" in {flag.removeprefix("long_").removeprefix("short_") for flag in risk_flags}
+                else "Lightweight funding watch"
+            ),
+            "eligible": bool(route_readiness.get("experimental_paper_ready")),
+            "expected_net_pnl": conservative_expected_net,
+            "raw_expected_net_pnl": raw_expected_net,
+            "conservative_expected_net_pnl": conservative_expected_net,
+            "gross_edge_pnl": conservative_expected_funding,
+            "raw_funding_pnl_component": raw_expected_funding,
+            "funding_pnl_component": conservative_expected_funding,
             "spread_pnl_component": 0.0,
             "signed_spread_pnl_component": 0.0,
             "expected_spread_convergence_pnl": 0.0,
-            "execution_cost": 0.0,
+            "execution_cost": economics.get("conservative_expected_costs_usd", 0.0),
             "basis_stress_loss": 0.0,
             "actionable_profit_threshold": 0.0,
             "coverage_ratio": None,
-            "reasons": [],
-            "warnings": ["lightweight_only_requires_focused_underwriting"],
+            "reasons": list(route_readiness.get("verified_paper_blockers") or []),
+            "warnings": risk_flags[:8],
             "thesis": (
                 "Preliminary synchronized funding watch. This is not an "
                 "entry candidate until focused orderbook observations pass."
@@ -3125,41 +3235,72 @@ class PaperBot:
                 self._lightweight_route_leg("short", short_market, quantity, short_mark),
             ],
             "rationale": [
-                "Lightweight discovery found a positive event-window funding plan.",
+                "Lightweight discovery found a structurally usable funding route.",
                 "No orderbooks were fetched; focused underwriting remains mandatory before entry.",
             ],
-            "risk_flags": ["lightweight_only_requires_focused_underwriting"],
+            "risk_flags": risk_flags,
             "evidence": {
                 "decision_mode": "settlement_capture",
                 "history_is_advisory": True,
+                "readiness_level": readiness_label,
+                "paper_mode": paper_mode,
+                "funding_cashflow_status": route_readiness.get("funding_cashflow_status"),
+                "execution_status": route_readiness.get("execution_status"),
+                "settlement_semantics_status": route_readiness.get(
+                    "settlement_semantics_status"
+                ),
+                "rate_confidence": route_readiness.get("rate_confidence"),
+                "execution_confidence": route_readiness.get("execution_confidence"),
+                "settlement_confidence": route_readiness.get("settlement_confidence"),
+                "accounting_confidence": route_readiness.get("accounting_confidence"),
+                "hard_blockers": route_readiness.get("hard_blockers") or [],
+                "risk_flags": route_readiness.get("risk_flags") or [],
+                "assumptions": route_readiness.get("assumptions") or [],
+                "missing_capabilities": route_readiness.get("missing_capabilities") or [],
+                "not_verified_alpha": route_readiness.get("not_verified_alpha"),
                 "lightweight_discovery": {
                     "observed_at": now.astimezone(UTC).isoformat(),
-                    "preliminary_gross_funding": preliminary_gross,
+                    "preliminary_gross_funding": conservative_expected_funding,
+                    "raw_expected_funding": raw_expected_funding,
+                    "raw_expected_net": raw_expected_net,
+                    "conservative_expected_net": conservative_expected_net,
                     "target_notional": target_notional,
                     "quantity": quantity,
                     "settlement_skew_seconds": settlement_skew_seconds_value,
                 },
                 "funding_route_plan": route_plan,
+                "readiness_policy": route_readiness,
                 "strategy_candidates": [selected_strategy],
                 "selected_strategy": selected_strategy,
                 "strategy_classification": selected_strategy,
                 "pnl_components": {
-                    "funding_pnl_component": preliminary_gross,
+                    "funding_pnl_component": conservative_expected_funding,
+                    "raw_funding_pnl_component": raw_expected_funding,
                     "spread_pnl_component": 0.0,
                     "signed_spread_pnl_component": 0.0,
                     "spread_convergence_component": 0.0,
-                    "execution_cost": 0.0,
-                    "funding_only_net_pnl": preliminary_gross,
-                    "combined_net_pnl": preliminary_gross,
-                    "opportunity_expected_net_pnl": preliminary_gross,
-                    "positive_edge_pnl": preliminary_gross,
-                    "drag_pnl": 0.0,
+                    "execution_cost": economics.get("conservative_expected_costs_usd", 0.0),
+                    "funding_only_net_pnl": conservative_expected_net,
+                    "combined_net_pnl": conservative_expected_net,
+                    "opportunity_expected_net_pnl": conservative_expected_net,
+                    "positive_edge_pnl": conservative_expected_funding,
+                    "drag_pnl": economics.get("conservative_expected_costs_usd", 0.0),
                 },
-                "current_nowcast_gross": preliminary_gross,
-                "current_nowcast_net": preliminary_gross,
-                "synchronized_capability_passed": capability["paper_eligible"],
-                "capability_rejections": capability["all_reasons"],
-                "capability_check": capability,
+                "current_nowcast_gross": conservative_expected_funding,
+                "current_nowcast_net": conservative_expected_net,
+                "raw_expected_funding": raw_expected_funding,
+                "conservative_expected_funding": conservative_expected_funding,
+                "raw_expected_net": raw_expected_net,
+                "conservative_expected_net": conservative_expected_net,
+                "synchronized_capability_passed": bool(
+                    route_readiness.get("verified_paper_ready")
+                ),
+                "experimental_paper_ready": bool(
+                    route_readiness.get("experimental_paper_ready")
+                ),
+                "verified_paper_ready": bool(route_readiness.get("verified_paper_ready")),
+                "capability_rejections": route_readiness.get("verified_paper_blockers") or [],
+                "capability_check": route_readiness,
                 "blocking_reasons": [],
                 "blocking_risk_flags": [],
                 "advisory_reasons": ["lightweight_only_requires_focused_underwriting"],
@@ -3202,6 +3343,18 @@ class PaperBot:
             "funding_interval_hours": market.get("funding_interval_hours"),
             "hourly_funding_rate": market.get("hourly_funding_rate"),
             "funding_rate_kind": market.get("funding_rate_kind"),
+            "rate_estimate_per_settlement": market.get(
+                "rate_estimate_per_settlement"
+            ),
+            "rate_estimate_kind": market.get("rate_estimate_kind"),
+            "rate_estimate_lower_bound": market.get("rate_estimate_lower_bound"),
+            "rate_estimate_upper_bound": market.get("rate_estimate_upper_bound"),
+            "rate_estimate_confidence": market.get("rate_estimate_confidence"),
+            "rate_estimate_source": market.get("rate_estimate_source"),
+            "rate_estimate_observed_at": market.get("rate_estimate_observed_at"),
+            "exact_next_rate_available": market.get("exact_next_rate_available"),
+            "rate_estimate_assumptions": market.get("rate_estimate_assumptions"),
+            "rate_estimate_risk_flags": market.get("rate_estimate_risk_flags"),
             "published_funding_rate": market.get("published_funding_rate", market.get("funding_rate")),
             "published_funding_interval_hours": market.get(
                 "published_funding_interval_hours",
@@ -3218,6 +3371,10 @@ class PaperBot:
             "venue_server_time": market.get("venue_server_time"),
             "source_event_at": market.get("source_event_at"),
             "mark_price": mark_price,
+            "discovery_reference_price": market.get("discovery_reference_price"),
+            "discovery_reference_price_kind": market.get(
+                "discovery_reference_price_kind"
+            ),
             "index_price": market.get("index_price"),
             "quote_asset": market.get("quote_asset"),
             "collateral_asset": market.get("collateral_asset"),
