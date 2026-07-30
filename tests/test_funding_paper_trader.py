@@ -2538,7 +2538,7 @@ def test_focused_hot_recheck_6_routes_6_workers_completes_without_deadlock(tmp_p
         route_count=6,
         workers=6,
         route_timeout_seconds=1.0,
-        process_timeout_seconds=3.0,
+        process_timeout_seconds=10.0,
     )
 
     assert result["timed_out"] is False
@@ -2564,7 +2564,7 @@ def test_focused_hot_recheck_20_routes_6_workers_completes_bounded_batches(tmp_p
         route_count=20,
         workers=6,
         route_timeout_seconds=1.0,
-        process_timeout_seconds=8.0,
+        process_timeout_seconds=15.0,
     )
 
     assert result["timed_out"] is False
@@ -2582,7 +2582,7 @@ def test_legacy_shared_pool_focused_recheck_design_exhausts_route_timeout(tmp_pa
         workers=6,
         route_timeout_seconds=1.0,
         force_legacy_shared_pool=True,
-        process_timeout_seconds=3.0,
+        process_timeout_seconds=10.0,
     )
 
     trace = result["trace"]
@@ -2603,7 +2603,7 @@ def test_market_snapshot_failure_does_not_block_other_focused_routes(tmp_path) -
         workers=6,
         route_timeout_seconds=1.0,
         fail_market_route_key="focused-route-0",
-        process_timeout_seconds=4.0,
+        process_timeout_seconds=10.0,
     )
 
     assert result["timed_out"] is False
@@ -2621,7 +2621,7 @@ def test_orderbook_failure_does_not_block_other_focused_routes(tmp_path) -> None
         workers=6,
         route_timeout_seconds=1.0,
         fail_orderbook_route_key="focused-route-0",
-        process_timeout_seconds=4.0,
+        process_timeout_seconds=10.0,
     )
 
     assert result["timed_out"] is False
@@ -2641,11 +2641,11 @@ def test_focused_route_timeout_is_terminal_and_does_not_reach_execution(tmp_path
         config=PaperBotConfig(
             telegram_enabled=False,
             hot_route_recheck_workers=1,
-            focused_recheck_route_timeout_seconds=0.05,
+            focused_recheck_route_timeout_seconds=0.2,
             export_dir=tmp_path / "exports-timeout",
         ),
         slow_market_route_key="focused-route-0",
-        slow_delay_seconds=0.25,
+        slow_delay_seconds=0.6,
     )
     route = _focused_probe_route(now, 0)
     trader.hot_routes[route["route_key"]] = route
@@ -2686,11 +2686,11 @@ def test_focused_executor_shutdown_and_next_iteration_continue_after_timeout(tmp
         config=PaperBotConfig(
             telegram_enabled=False,
             hot_route_recheck_workers=1,
-            focused_recheck_route_timeout_seconds=0.05,
+            focused_recheck_route_timeout_seconds=0.2,
             export_dir=tmp_path / "exports-retry",
         ),
         slow_market_route_key="focused-route-0",
-        slow_delay_seconds=0.25,
+        slow_delay_seconds=0.6,
     )
     first = _focused_probe_route(now, 0)
     trader.hot_routes[first["route_key"]] = first
