@@ -1693,7 +1693,7 @@ class PaperBot:
             if client is None:
                 blockers.append(f"{side}_focused_client_missing")
                 continue
-            if not callable(getattr(client, "market_snapshot", None)):
+            if not self._focused_market_snapshot_supported(client):
                 blockers.extend(
                     [
                         "focused_symbol_snapshot_not_supported",
@@ -1729,6 +1729,27 @@ class PaperBot:
             copied.pop("focused_selection_blockers", None)
         copied["evidence"] = evidence
         return copied
+
+    @staticmethod
+    def _focused_market_snapshot_supported(client: FundingVenueClient) -> bool:
+        return callable(getattr(client, "market_snapshot", None))
+
+    def _fresh_market_snapshot_for_client(
+        self,
+        client: FundingVenueClient,
+        symbol: str,
+        asset: str,
+        observed_at: str,
+        previous: dict[str, Any],
+    ) -> dict[str, Any]:
+        snapshot_method = getattr(client, "market_snapshot", None)
+        if callable(snapshot_method):
+            market = snapshot_method(symbol, asset, observed_at, previous)
+            if not isinstance(market, dict):
+                raise FundingDataError(f"{client.venue} focused market snapshot invalid")
+            return dict(market)
+
+        raise FundingDataError(f"{client.venue} focused_symbol_snapshot_not_supported")
 
     def update_hot_routes(self, routes: list[dict[str, Any]]) -> None:
         now = datetime.now(UTC)
@@ -2188,12 +2209,14 @@ class PaperBot:
         for key, value in stored_previous.items():
             if value not in (None, ""):
                 previous[key] = value
-        snapshot_method = getattr(client, "market_snapshot", None)
         request_started_at = self.clock.now().isoformat()
-        if callable(snapshot_method):
-            market = snapshot_method(symbol, asset, observed_at, previous)
-        else:
-            raise FundingDataError(f"{venue} focused_symbol_snapshot_not_supported")
+        market = self._fresh_market_snapshot_for_client(
+            client,
+            symbol,
+            asset,
+            observed_at,
+            previous,
+        )
         response_received_at = self.clock.now().isoformat()
         for field in (
             "canonical_asset",
@@ -4309,14 +4332,19 @@ class PaperBot:
             return {"status": "unavailable", "reason": "venue_client_missing"}
         entry_legs = (position.get("config") or {}).get("entry_legs") or []
         previous = leg_by_side(entry_legs, side) or {}
-        snapshot_method = getattr(client, "market_snapshot", None)
         request_started_at = self.clock.now().isoformat()
-        if callable(snapshot_method):
-            market = snapshot_method(symbol, canonical_asset, observed_at, previous)
-        else:
+        try:
+            market = self._fresh_market_snapshot_for_client(
+                client,
+                symbol,
+                canonical_asset,
+                observed_at,
+                previous,
+            )
+        except FundingDataError as exc:
             return {
                 "status": "unavailable",
-                "reason": "focused_symbol_snapshot_not_supported",
+                "reason": str(exc),
             }
         market = dict(market)
         market.setdefault("venue", venue)

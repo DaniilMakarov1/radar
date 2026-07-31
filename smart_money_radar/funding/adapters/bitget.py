@@ -140,6 +140,82 @@ class BitgetFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        product_query = urllib.parse.urlencode(
+            {"productType": BITGET_PRODUCT_TYPE, "symbol": symbol}
+        )
+        contracts = bitget_rows(
+            self.http.get_json(
+                f"{self.base_url}/api/v2/mix/market/contracts?{product_query}"
+            ),
+            f"contract for {symbol}",
+        )
+        contract = contracts[0] if contracts else {}
+        if not contract or not is_supported_bitget_contract(contract):
+            raise FundingDataError(f"Bitget contract not supported for {symbol}")
+        tickers = bitget_rows(
+            self.http.get_json(
+                f"{self.base_url}/api/v2/mix/market/ticker?{product_query}"
+            ),
+            f"ticker for {symbol}",
+        )
+        ticker = tickers[0] if tickers else {}
+        funding_rows = bitget_rows(
+            self.http.get_json(
+                f"{self.base_url}/api/v2/mix/market/current-fund-rate?{product_query}"
+            ),
+            f"funding rate for {symbol}",
+        )
+        funding = funding_rows[0] if funding_rows else {}
+        if not ticker or not funding:
+            raise FundingDataError(f"Bitget focused market data unavailable for {symbol}")
+        previous = previous_market or {}
+        interval_hours = max(
+            1.0,
+            as_float(
+                funding.get("fundingRateInterval"),
+                as_float(contract.get("fundInterval"), previous.get("funding_interval_hours") or 8.0),
+            ),
+        )
+        funding_rate = as_float(funding.get("fundingRate"))
+        mark_price = as_float(
+            ticker.get("markPrice"),
+            as_float(ticker.get("lastPr"), as_float(previous.get("mark_price"))),
+        )
+        index_price = as_float(
+            ticker.get("indexPrice"),
+            as_float(previous.get("index_price"), mark_price),
+        )
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Bitget reference prices unavailable for {symbol}")
+        taker_fee = max(0.0, as_float(contract.get("takerFeeRate"), 0.0006))
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": iso_from_milliseconds(funding.get("nextUpdate")),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(ticker.get("holdingAmount")) * mark_price
+            or None,
+            "volume_24h_usd": as_float(ticker.get("quoteVolume")) or None,
+            "taker_fee_rate": taker_fee,
+            "contract_multiplier": 1.0,
+            "canonical_unit_multiplier": 1.0,
+            "observed_at": observed_at,
+            "raw": {"contract": contract, "ticker": ticker, "funding": funding},
+        }
+
     def funding_history(
         self,
         symbol: str,

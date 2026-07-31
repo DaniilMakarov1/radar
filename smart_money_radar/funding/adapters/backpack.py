@@ -133,6 +133,63 @@ class BackpackFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"symbol": symbol})
+        prices = backpack_rows(
+            self.http.get_json(f"{self.base_url}/api/v1/markPrices?{query}"),
+            f"mark price for {symbol}",
+        )
+        price = next(
+            (
+                row
+                for row in prices
+                if str(row.get("symbol") or "").strip().lower()
+                == str(symbol).strip().lower()
+            ),
+            prices[0] if prices else None,
+        )
+        if not price:
+            raise FundingDataError(f"Backpack mark price unavailable for {symbol}")
+        previous = previous_market or {}
+        interval_hours = max(
+            0.25,
+            as_float(previous.get("funding_interval_hours"), 1.0),
+        )
+        funding_rate = as_float(price.get("fundingRate"))
+        mark_price = as_float(price.get("markPrice"))
+        index_price = as_float(price.get("indexPrice"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Backpack reference prices unavailable for {symbol}")
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": iso_from_milliseconds(
+                price.get("nextFundingTimestamp")
+            ),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": None,
+            "volume_24h_usd": previous.get("volume_24h_usd"),
+            "maker_fee_rate": previous.get("maker_fee_rate", 0.0002),
+            "taker_fee_rate": previous.get("taker_fee_rate", 0.0005),
+            "fee_source": previous.get("fee_source") or "venue_public_tier",
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {"mark": price},
+        }
+
     def funding_history(
         self,
         symbol: str,

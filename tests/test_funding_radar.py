@@ -4032,6 +4032,7 @@ class FundingRadarTest(unittest.TestCase):
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
         book_row = client.orderbook("BTC_USDC_PERP", observed_at)
+        snapshot = client.market_snapshot("BTC_USDC_PERP", "BTC", observed_at, markets[0])
         history = client.funding_history("BTC_USDC_PERP", 1, 1, observed_at)
 
         self.assertEqual(warnings, [])
@@ -4039,6 +4040,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["venue"], "backpack")
         self.assertEqual(markets[0]["funding_interval_hours"], 1)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0001)
         self.assertEqual(markets[0]["taker_fee_rate"], 0.0005)
         self.assertEqual(book_row["best_bid"], 99.9)
         self.assertEqual(len(history), 1)
@@ -4050,6 +4052,7 @@ class FundingRadarTest(unittest.TestCase):
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
         book_row = client.orderbook("BTCUSDT", observed_at)
+        snapshot = client.market_snapshot("BTCUSDT", "BTC", observed_at, markets[0])
         history = client.funding_history("BTCUSDT", 1, 8, observed_at)
 
         self.assertEqual(warnings, [])
@@ -4057,6 +4060,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["venue"], "aster")
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001 / 8)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0001 / 8)
         self.assertAlmostEqual(markets[0]["funding_rate_cap"], 0.003)
         self.assertAlmostEqual(markets[0]["funding_rate_floor"], -0.003)
         self.assertEqual(markets[0]["taker_fee_rate"], 0.0004)
@@ -4152,6 +4156,7 @@ class FundingRadarTest(unittest.TestCase):
         client = KuCoinFundingClient(http=FakeKuCoinHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("XBTUSDTM", "BTC", observed_at, markets[0])
         book_row = client.orderbook("XBTUSDTM", observed_at)
         history = client.funding_history("XBTUSDTM", 1, 8, observed_at)
 
@@ -4161,6 +4166,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["venue"], "kucoin")
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001 / 8)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0001 / 8)
         self.assertEqual(markets[0]["taker_fee_rate"], 0.0006)
         self.assertAlmostEqual(book_row["bids"][0][1], 0.002)
         self.assertEqual(len(history), 1)
@@ -4809,6 +4815,7 @@ class FundingRadarTest(unittest.TestCase):
         client = BitgetFundingClient(http=FakeBitgetHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTCUSDT", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTCUSDT", observed_at)
         history = client.funding_history("BTCUSDT", 1, 8, observed_at)
 
@@ -4818,6 +4825,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertEqual(markets[0]["taker_fee_rate"], 0.0006)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001 / 8)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0001 / 8)
         self.assertEqual(book_row["bids"][0], [99.9, 2.0])
         self.assertEqual(len(history), 1)
 
@@ -4826,6 +4834,7 @@ class FundingRadarTest(unittest.TestCase):
         client = GateFundingClient(http=FakeGateHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC_USDT", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC_USDT", observed_at)
         history = client.funding_history(
             "BTC_USDT",
@@ -4840,6 +4849,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["taker_fee_rate"], 0.00075)
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001 / 8)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0001 / 8)
         self.assertEqual(book_row["bids"][0], [99.9, 1.0])
         self.assertAlmostEqual(book_row["bid_depth_usd"], 99.9)
         self.assertEqual(len(history), 1)
@@ -5559,7 +5569,7 @@ class FakeBitgetHttp:
                     "takerFeeRate": "0.0006",
                 }]
             )
-        if "/tickers?" in url:
+        if "/tickers?" in url or "/ticker?" in url:
             return bitget_payload(
                 [{
                     "symbol": "BTCUSDT",
@@ -5671,9 +5681,26 @@ class FakeAsterHttp:
                 "lastFundingRate": "0.0001",
                 "nextFundingTime": 1_784_044_800_000,
             }]
+        if "/premiumIndex?" in url:
+            return {
+                "symbol": "BTCUSDT",
+                "markPrice": "100",
+                "indexPrice": "100",
+                "lastFundingRate": "0.0001",
+                "nextFundingTime": 1_784_044_800_000,
+            }
         if url.endswith("/ticker/24hr"):
             return [{"symbol": "BTCUSDT", "quoteVolume": "123456"}]
+        if "/ticker/24hr?" in url:
+            return {"symbol": "BTCUSDT", "quoteVolume": "123456"}
         if url.endswith("/fundingInfo"):
+            return [{
+                "symbol": "BTCUSDT",
+                "fundingIntervalHours": 8,
+                "fundingFeeCap": 0.003,
+                "fundingFeeFloor": -0.003,
+            }]
+        if "/fundingInfo?" in url:
             return [{
                 "symbol": "BTCUSDT",
                 "fundingIntervalHours": 8,
@@ -5742,6 +5769,27 @@ class FakeLighterHttp:
 
 class FakeKuCoinHttp:
     def get_json(self, url: str) -> Any:
+        if url.endswith("/contracts/XBTUSDTM"):
+            return kucoin_payload({
+                "symbol": "XBTUSDTM",
+                "displayBaseCurrency": "XBT",
+                "quoteCurrency": "USDT",
+                "settleCurrency": "USDT",
+                "status": "Open",
+                "expireDate": None,
+                "marketType": "CRYPTO",
+                "isInverse": False,
+                "multiplier": 0.001,
+                "markPrice": 100,
+                "indexPrice": 100,
+                "fundingFeeRate": 0.0001,
+                "currentFundingRateGranularity": 28_800_000,
+                "nextFundingRateDateTime": 1_784_044_800_000,
+                "makerFeeRate": 0.0002,
+                "takerFeeRate": 0.0006,
+                "openInterest": 1000,
+                "turnoverOf24h": 100000,
+            })
         if url.endswith("/contracts/active"):
             return kucoin_payload([{
                 "symbol": "XBTUSDTM",
@@ -6619,6 +6667,22 @@ class FakeGrvtHttp:
 
 class FakeGateHttp:
     def get_json(self, url: str) -> Any:
+        if url.endswith("/contracts/BTC_USDT"):
+            return {
+                "name": "BTC_USDT",
+                "status": "trading",
+                "in_delisting": False,
+                "is_pre_market": False,
+                "contract_type": "",
+                "quanto_multiplier": "0.01",
+                "mark_price": "100",
+                "index_price": "100",
+                "funding_interval": 28800,
+                "funding_rate_indicative": "0.0001",
+                "funding_next_apply": 1784044800,
+                "position_size": 1000,
+                "taker_fee_rate": "0.00075",
+            }
         if url.endswith("/contracts"):
             return [
                 {
@@ -6647,7 +6711,7 @@ class FakeGateHttp:
                     "index_price": "200",
                 },
             ]
-        if url.endswith("/tickers"):
+        if url.endswith("/tickers") or "/tickers?" in url:
             return [{"contract": "BTC_USDT", "volume_24h_quote": "5000000"}]
         if "/order_book?" in url:
             return {

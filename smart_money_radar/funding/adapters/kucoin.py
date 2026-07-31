@@ -141,6 +141,68 @@ class KuCoinFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw = kucoin_object(
+            self.http.get_json(
+                f"{self.base_url}/api/v1/contracts/"
+                f"{urllib.parse.quote(symbol, safe='')}"
+            ),
+            f"contract for {symbol}",
+        )
+        if not is_supported_kucoin_contract(raw):
+            raise FundingDataError(f"KuCoin contract not supported for {symbol}")
+        multiplier = as_float(raw.get("multiplier"))
+        mark_price = as_float(raw.get("markPrice"))
+        index_price = as_float(raw.get("indexPrice"))
+        if multiplier <= 0:
+            raise FundingDataError(f"KuCoin contract multiplier unavailable for {symbol}")
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"KuCoin reference prices unavailable for {symbol}")
+        self._multipliers[symbol] = multiplier
+        interval_hours = max(
+            0.25,
+            as_float(
+                raw.get("currentFundingRateGranularity"),
+                as_float(raw.get("fundingRateGranularity"), 28_800_000.0),
+            )
+            / 3_600_000.0,
+        )
+        funding_rate = as_float(raw.get("fundingFeeRate"))
+        maker_fee = max(0.0, as_float(raw.get("makerFeeRate"), 0.0002))
+        taker_fee = max(0.0, as_float(raw.get("takerFeeRate"), 0.0006))
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_current_estimate",
+            "next_funding_at": iso_from_milliseconds(
+                raw.get("nextFundingRateDateTime")
+            ),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(raw.get("openInterest"))
+            * multiplier
+            * mark_price
+            or None,
+            "volume_24h_usd": as_float(raw.get("turnoverOf24h")) or None,
+            "maker_fee_rate": maker_fee,
+            "taker_fee_rate": taker_fee,
+            "fee_source": "venue_public_tier",
+            "contract_multiplier": multiplier,
+            "canonical_unit_multiplier": 1.0,
+            "observed_at": observed_at,
+            "raw": raw,
+        }
+
     def funding_history(
         self,
         symbol: str,

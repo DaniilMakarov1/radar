@@ -148,6 +148,66 @@ class AsterFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        symbol_query = urllib.parse.urlencode({"symbol": symbol})
+        premium = self.http.get_json(f"{self.base_url}/fapi/v1/premiumIndex?{symbol_query}")
+        if isinstance(premium, list):
+            premium = rows_by_symbol(premium).get(symbol, {})
+        if not isinstance(premium, dict) or not premium:
+            raise FundingDataError(f"Invalid Aster premium index for {symbol}")
+        ticker = self.http.get_json(f"{self.base_url}/fapi/v1/ticker/24hr?{symbol_query}")
+        if isinstance(ticker, list):
+            ticker = rows_by_symbol(ticker).get(symbol, {})
+        if not isinstance(ticker, dict):
+            ticker = {}
+        funding_info = self.http.get_json(f"{self.base_url}/fapi/v1/fundingInfo?{symbol_query}")
+        funding_rows = rows_by_symbol(funding_info)
+        funding = funding_rows.get(symbol, {})
+        previous = previous_market or {}
+        interval_hours = max(
+            0.25,
+            as_float(
+                funding.get("fundingIntervalHours"),
+                as_float(previous.get("funding_interval_hours"), 8.0),
+            ),
+        )
+        funding_rate = as_float(premium.get("lastFundingRate"))
+        mark_price = as_float(premium.get("markPrice"))
+        index_price = as_float(premium.get("indexPrice"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Aster reference prices unavailable for {symbol}")
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_cap": as_float(funding.get("fundingFeeCap")) or None,
+            "funding_rate_floor": as_float(funding.get("fundingFeeFloor")) or None,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": iso_from_milliseconds(
+                premium.get("nextFundingTime")
+            ),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": None,
+            "volume_24h_usd": as_float(ticker.get("quoteVolume")) or None,
+            "maker_fee_rate": 0.0,
+            "taker_fee_rate": 0.0004,
+            "fee_source": "venue_public_tier",
+            "contract_multiplier": 1.0,
+            "canonical_unit_multiplier": 1.0,
+            "observed_at": observed_at,
+            "raw": {"premium": premium, "ticker": ticker, "funding_info": funding},
+        }
+
     def funding_history(
         self,
         symbol: str,

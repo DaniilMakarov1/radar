@@ -148,6 +148,72 @@ class GateFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        contract = gate_object(
+            self.http.get_json(
+                f"{self.base_url}/api/v4/futures/{GATE_SETTLE}/contracts/"
+                f"{urllib.parse.quote(symbol, safe='')}"
+            ),
+            f"contract for {symbol}",
+        )
+        if not is_supported_gate_contract(contract):
+            raise FundingDataError(f"Gate contract not supported for {symbol}")
+        ticker_query = urllib.parse.urlencode({"contract": symbol})
+        tickers = gate_rows(
+            self.http.get_json(
+                f"{self.base_url}/api/v4/futures/{GATE_SETTLE}/tickers?{ticker_query}"
+            ),
+            f"ticker for {symbol}",
+        )
+        ticker = tickers[0] if tickers else {}
+        multiplier = as_float(contract.get("quanto_multiplier"))
+        if multiplier <= 0:
+            raise FundingDataError(f"Gate contract multiplier unavailable for {symbol}")
+        self._contract_multipliers[symbol] = multiplier
+        interval_hours = max(
+            1.0,
+            as_float(contract.get("funding_interval"), 28_800.0) / 3600.0,
+        )
+        funding_rate = as_float(
+            contract.get("funding_rate_indicative"),
+            as_float(contract.get("funding_rate")),
+        )
+        mark_price = as_float(contract.get("mark_price"))
+        index_price = as_float(contract.get("index_price"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Gate reference prices unavailable for {symbol}")
+        taker_fee = max(0.0, as_float(contract.get("taker_fee_rate"), 0.00075))
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": canonical_asset,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_next_estimate",
+            "next_funding_at": iso_from_milliseconds(
+                as_float(contract.get("funding_next_apply")) * 1000.0
+            ),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(contract.get("position_size"))
+            * multiplier
+            * mark_price
+            or None,
+            "volume_24h_usd": as_float(ticker.get("volume_24h_quote")) or None,
+            "taker_fee_rate": taker_fee,
+            "contract_multiplier": multiplier,
+            "canonical_unit_multiplier": 1.0,
+            "observed_at": observed_at,
+            "raw": {"contract": contract, "ticker": ticker},
+        }
+
     def funding_history(
         self,
         symbol: str,
