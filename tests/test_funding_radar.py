@@ -135,6 +135,7 @@ class FundingRadarTest(unittest.TestCase):
 
         self.assertFalse(venues & DEACTIVATED_FUNDING_VENUES)
         self.assertIn("risex", venues)
+        self.assertNotIn("paradex", venues)
 
     def test_core_public_clients_expose_verified_endpoint_identity(self) -> None:
         cases = [

@@ -115,6 +115,7 @@ def test_deactivated_venues_are_excluded_from_default_clients() -> None:
     venues = {client.venue for client in active_default_funding_clients()}
 
     assert not venues.intersection(DEACTIVATED_FUNDING_VENUES)
+    assert "paradex" not in venues
 
 
 def test_active_incompatible_venue_stays_research_only() -> None:
@@ -2975,12 +2976,16 @@ class _LightweightDiscoveryClient:
         next_funding_at: datetime,
         interval_hours: float = 1.0,
         mark_price: float = 100.0,
+        quote_asset: str = "USDT",
+        collateral_asset: str | None = None,
         include_fee: bool = True,
         include_volume: bool = True,
     ) -> None:
         self.venue = venue
         self.asset = asset
-        self.symbol = f"{asset}USDT"
+        self.quote_asset = quote_asset
+        self.collateral_asset = collateral_asset or quote_asset
+        self.symbol = f"{asset}{quote_asset}"
         self.funding_rate = funding_rate
         self.next_funding_at = next_funding_at
         self.interval_hours = interval_hours
@@ -2999,8 +3004,8 @@ class _LightweightDiscoveryClient:
             "symbol": self.symbol,
             "canonical_asset": self.asset,
             "base_asset": self.asset,
-            "quote_asset": "USDT",
-            "collateral_asset": "USDT",
+            "quote_asset": self.quote_asset,
+            "collateral_asset": self.collateral_asset,
             "contract_type": "linear_perpetual",
             "contract_kind": "linear_perpetual",
             "supports_discrete_funding": True,
@@ -3037,8 +3042,8 @@ class _LightweightDiscoveryClient:
             "supports_perpetuals": True,
             "is_linear_contract": True,
             "supports_discrete_funding": True,
-            "collateral_asset": "USDT",
-            "quote_asset": "USDT",
+            "collateral_asset": self.collateral_asset,
+            "quote_asset": self.quote_asset,
             "position_inclusion_rule": "perp_position_at_settlement",
             "entry_safety_buffer_seconds": 20,
             "exit_safety_buffer_seconds": 20,
@@ -3065,6 +3070,7 @@ def _lightweight_bot(
     clients: list[_LightweightDiscoveryClient],
     *,
     foreground_budget_seconds: float = 8.0,
+    stablecoin_price_provider=None,
 ):
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
@@ -3077,7 +3083,12 @@ def _lightweight_bot(
         scan_interval_seconds=300,
         lightweight_foreground_budget_seconds=foreground_budget_seconds,
     ).validated()
-    bot = PaperBot(store, config, clock=FakeClock(now, monotonic_start=100.0))
+    bot = PaperBot(
+        store,
+        config,
+        clock=FakeClock(now, monotonic_start=100.0),
+        stablecoin_price_provider=stablecoin_price_provider,
+    )
     bot.build_venue_clients = lambda: clients  # type: ignore[method-assign]
     return bot
 
@@ -3115,6 +3126,48 @@ def test_lightweight_discovery_adds_watch_route_without_orderbook(tmp_path) -> N
     assert {leg["funding_interval_hours"] for leg in route["legs"]} == {1.0, 4.0}
     assert long_client.orderbook_calls == 0
     assert short_client.orderbook_calls == 0
+
+
+def test_paper_lightweight_discovery_attaches_cross_stable_snapshot(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    long_client = _LightweightDiscoveryClient(
+        "binance",
+        funding_rate=-0.010,
+        next_funding_at=settlement,
+        quote_asset="USDT",
+    )
+    short_client = _LightweightDiscoveryClient(
+        "backpack",
+        funding_rate=0.010,
+        next_funding_at=settlement,
+        quote_asset="USDC",
+    )
+    bot = _lightweight_bot(
+        tmp_path,
+        now,
+        [long_client, short_client],
+        stablecoin_price_provider=_stablecoin_provider_for(now),
+    )
+
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["watch_routes_added"] == 1
+    route = next(iter(bot.hot_routes.values()))
+    plan_blockers = route["evidence"]["funding_route_plan"]["blockers"]
+    for blocker in (
+        "stablecoin_snapshot_missing",
+        "stablecoin_price_provider_unavailable",
+        "stablecoin_snapshot_not_pass",
+    ):
+        assert blocker not in plan_blockers
+    for leg in route["legs"]:
+        snapshot = leg["stablecoin_route_evaluation"]
+        assert snapshot["status"] == "PASS"
+        assert snapshot["stablecoin_pair"] == "USDT/USDC"
+        assert snapshot["source_identity"]["provider"] == "StaticStablecoinPriceProvider"
+    bot.shutdown_foreground_executors()
 
 
 def test_lightweight_discovery_keeps_late_venue_and_uses_it_next_pass(tmp_path) -> None:
@@ -5272,9 +5325,17 @@ def test_entry_does_not_call_long_history(tmp_path, monkeypatch) -> None:
         }
         for leg in route["legs"]
     ])
-    clients = _install_targeted_refresh_clients(type("RouteHolder", (), {"hot_routes": {route["route_key"]: route}})(), route["route_key"], route)
+    clients = _install_targeted_refresh_clients(
+        type("RouteHolder", (), {"hot_routes": {route["route_key"]: route}})(),
+        route["route_key"],
+        route,
+    )
     by_venue = {client.venue: client for client in clients}
-    monkeypatch.setattr(trader_module, "funding_client_for_venue", lambda venue, *a, **k: by_venue.get(str(venue).lower()))
+    monkeypatch.setattr(
+        trader_module,
+        "funding_client_for_venue",
+        lambda venue, *a, **k: by_venue.get(str(venue).lower()),
+    )
     monkeypatch.setattr(store, "funding_history_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("history disabled")))
     monkeypatch.setattr(store, "funding_orderbook_sequences", lambda *a, **k: (_ for _ in ()).throw(AssertionError("orderbook history disabled")))
     bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now))
@@ -5284,6 +5345,62 @@ def test_entry_does_not_call_long_history(tmp_path, monkeypatch) -> None:
     assert refreshed is not None
     assert by_venue["binance"].orderbook_calls == 1
     assert by_venue["bybit"].orderbook_calls == 1
+
+
+def test_direct_focused_recheck_attaches_cross_stable_snapshot(tmp_path, monkeypatch) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    import smart_money_radar.funding.trader as trader_module
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    route = _v2_runtime_route(now)
+    route["short_symbol"] = "BTCUSDC"
+    route["legs"][1]["symbol"] = "BTCUSDC"
+    route["legs"][1]["quote_asset"] = "USDC"
+    route["legs"][1]["collateral_asset"] = "USDC"
+    store.upsert_funding_instruments([
+        {
+            "venue": leg["venue"],
+            "symbol": leg["symbol"],
+            "canonical_asset": "BTC",
+            "base_asset": "BTC",
+            "quote_asset": leg["quote_asset"],
+            "collateral_asset": leg["collateral_asset"],
+            "contract_type": "linear_perpetual",
+            "contract_multiplier": 1.0,
+            "status": "active",
+            "observed_at": now.isoformat(),
+            "raw": {},
+        }
+        for leg in route["legs"]
+    ])
+    clients = _install_targeted_refresh_clients(type("RouteHolder", (), {"hot_routes": {route["route_key"]: route}})(), route["route_key"], route)
+    by_venue = {client.venue: client for client in clients}
+    monkeypatch.setattr(trader_module, "funding_client_for_venue", lambda venue, *a, **k: by_venue.get(str(venue).lower()))
+    bot = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        stablecoin_price_provider=_stablecoin_provider_for(now),
+    )
+
+    refreshed = bot.direct_focused_recheck_route(route)
+
+    assert refreshed is not None
+    for leg in refreshed["legs"]:
+        snapshot = leg["stablecoin_route_evaluation"]
+        assert snapshot["status"] == "PASS"
+        assert snapshot["stablecoin_pair"] == "USDT/USDC"
+    plan = build_settlement_capture_opportunity(
+        long_market=refreshed["legs"][0],
+        short_market=refreshed["legs"][1],
+        now=now,
+        target_notional=500.0,
+    )
+    plan_blockers = plan["blockers"]
+    assert "stablecoin_snapshot_missing" not in plan_blockers
 
 
 def test_empty_history_and_negative_old_history_produce_identical_entry_decision(tmp_path, monkeypatch) -> None:

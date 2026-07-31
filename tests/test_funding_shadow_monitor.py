@@ -1627,7 +1627,7 @@ def test_one_watch_route_does_not_suppress_another_opportunity(tmp_path) -> None
     assert result["opportunities"] >= 2
 
 
-def test_inventory_covers_all_twelve_primary_venues() -> None:
+def test_inventory_covers_all_active_primary_venues() -> None:
     fixture = json.loads(
         Path("tests/fixtures/funding_contracts/dex_shadow_primary.json").read_text()
     )
@@ -1637,6 +1637,7 @@ def test_inventory_covers_all_twelve_primary_venues() -> None:
     )
 
     assert {row["venue"] for row in inventory} == set(PRIMARY_SHADOW_VENUES)
+    assert "paradex" not in PRIMARY_SHADOW_VENUES
     risex_assets = {
         row["canonical_asset"]
         for row in fixture["markets"]

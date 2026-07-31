@@ -434,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
                     token_env_var="FUNDING_TELEGRAM_BOT_TOKEN",
                     chat_id_env_var="FUNDING_TELEGRAM_CHAT_ID",
                 ),
+                stablecoin_price_provider=PublicStablecoinPriceProvider(
+                    timeout_seconds=2.0,
+                ),
             )
             trader.run_loop()
             return 0

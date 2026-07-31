@@ -9,7 +9,6 @@ from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 PRIMARY_SHADOW_VENUES: tuple[str, ...] = (
     "risex",
     "hyperliquid",
-    "paradex",
     "extended",
     "edgex",
     "ethereal",

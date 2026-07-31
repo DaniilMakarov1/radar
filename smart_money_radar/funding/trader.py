@@ -87,6 +87,10 @@ from smart_money_radar.funding.service import (
 from smart_money_radar.funding.shadow_monitor import (
     adaptive_broad_sweep_interval_seconds,
 )
+from smart_money_radar.funding.stablecoins import (
+    StablecoinPriceProvider,
+    evaluate_stablecoin_route,
+)
 from smart_money_radar.funding.strategy_synchronized_funding import (
     build_settlement_capture_opportunity,
     gross_funding_pnl,
@@ -595,6 +599,7 @@ class PaperBot:
         notifier: TelegramNotifier | None = None,
         clock: Any | None = None,
         settlement_data_provider: Any | None = None,
+        stablecoin_price_provider: StablecoinPriceProvider | None = None,
     ) -> None:
         cfg = (config or PaperBotConfig()).validated()
         self.iterations = cfg.iterations
@@ -661,6 +666,8 @@ class PaperBot:
         self._lightweight_venue_cache: dict[str, dict[str, Any]] = {}
         self._lightweight_state_lock = Lock()
         self._last_lightweight_venue_health: dict[str, Any] = {}
+        self.stablecoin_price_provider = stablecoin_price_provider
+        self._stablecoin_route_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
         self.last_runtime_recovery: dict[str, Any] | None = None
         self.last_orphan_scan_recovery: dict[str, Any] | None = None
         self.store.init_db()
@@ -2007,6 +2014,11 @@ class PaperBot:
             }
             long_market, long_client = fresh_markets["long"]
             short_market, short_client = fresh_markets["short"]
+            long_market, short_market = self._attach_stablecoin_route_evaluation(
+                long_market,
+                short_market,
+                self.clock.now().astimezone(UTC).isoformat(),
+            )
             markets = [long_market, short_market]
             counts["instrument_count"] = self.store.upsert_funding_instruments(
                 [
@@ -3304,18 +3316,25 @@ class PaperBot:
                     if not long_venue or not short_venue or long_venue == short_venue:
                         continue
                     structurally_matched += 1
+                    long_route_market, short_route_market = (
+                        self._attach_stablecoin_route_evaluation(
+                            long_market,
+                            short_market,
+                            now.isoformat(),
+                        )
+                    )
                     pair_example = {
                         "asset": asset,
                         "long_venue": long_venue,
                         "short_venue": short_venue,
                     }
                     skew = settlement_skew_seconds(
-                        long_market.get("next_funding_at"),
-                        short_market.get("next_funding_at"),
+                        long_route_market.get("next_funding_at"),
+                        short_route_market.get("next_funding_at"),
                     )
                     route_readiness = evaluate_synchronized_route(
-                        long_market=long_market,
-                        short_market=short_market,
+                        long_market=long_route_market,
+                        short_market=short_route_market,
                         target_notional=float(self.config.target_notional_per_leg),
                         mode=EvaluationMode.DISCOVERY,
                         clients_by_venue=clients_by_venue,
@@ -3335,8 +3354,8 @@ class PaperBot:
                             )
                         route = self._lightweight_research_diagnostic_route(
                             asset,
-                            long_market,
-                            short_market,
+                            long_route_market,
+                            short_route_market,
                             route_readiness,
                             now,
                             settlement_skew_seconds_value=skew,
@@ -3363,8 +3382,8 @@ class PaperBot:
                     if route_readiness["verified_paper_ready"]:
                         verified_ready_pairs += 1
                     plan = build_settlement_capture_opportunity(
-                        long_market=long_market,
-                        short_market=short_market,
+                        long_market=long_route_market,
+                        short_market=short_route_market,
                         now=now,
                         target_notional=float(self.config.target_notional_per_leg),
                         max_response_age_seconds=float(
@@ -3385,8 +3404,8 @@ class PaperBot:
                                 "blockers": [str(item) for item in plan_blockers[:6]],
                             },
                         )
-                    long_mark = float(reference_price(long_market)[0] or 0.0)
-                    short_mark = float(reference_price(short_market)[0] or 0.0)
+                    long_mark = float(reference_price(long_route_market)[0] or 0.0)
+                    short_mark = float(reference_price(short_route_market)[0] or 0.0)
                     if long_mark <= 0 or short_mark <= 0:
                         reject(
                             "reference_price_missing",
@@ -3417,8 +3436,8 @@ class PaperBot:
                         continue
                     route = self._lightweight_watch_route(
                         asset,
-                        long_market,
-                        short_market,
+                        long_route_market,
+                        short_route_market,
                         quantity,
                         conservative_gross,
                         route_readiness,
@@ -3623,6 +3642,40 @@ class PaperBot:
             "rejection_details": dict(sorted(rejection_details.items())),
             "blocker_examples": blocker_examples,
         }
+
+    def _attach_stablecoin_route_evaluation(
+        self,
+        long_market: dict[str, Any],
+        short_market: dict[str, Any],
+        observed_at: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        long_collateral = str(
+            long_market.get("collateral_asset")
+            or long_market.get("settlement_collateral")
+            or long_market.get("quote_asset")
+            or ""
+        ).upper()
+        short_collateral = str(
+            short_market.get("collateral_asset")
+            or short_market.get("settlement_collateral")
+            or short_market.get("quote_asset")
+            or ""
+        ).upper()
+        key = (long_collateral, short_collateral)
+        snapshot = evaluate_stablecoin_route(
+            long_collateral=long_collateral,
+            short_collateral=short_collateral,
+            provider=self.stablecoin_price_provider,
+            observed_at=observed_at,
+            reference_notional=float(self.config.target_notional_per_leg),
+            funding_net_before_stablecoin_reserve=0.0,
+        )
+        self._stablecoin_route_snapshots[key] = dict(snapshot)
+        enriched = {
+            "stablecoin_route_evaluation": snapshot,
+            "stablecoin_risk": snapshot,
+        }
+        return {**long_market, **enriched}, {**short_market, **enriched}
 
     def _lightweight_capability_check(
         self,

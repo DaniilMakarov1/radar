@@ -10,6 +10,7 @@ DEACTIVATED_FUNDING_VENUES = {
     "drift",
     "htx",
     "phemex",
+    "paradex",
     "reya",
     "variational",
     "vertex_base",
