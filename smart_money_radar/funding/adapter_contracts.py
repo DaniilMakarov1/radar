@@ -21,6 +21,17 @@ PRIMARY_SHADOW_VENUES: tuple[str, ...] = (
 )
 
 USD_MAJOR_STABLE = "USD_MAJOR_STABLE"
+USD_OTHER_STABLE = "USD_OTHER_STABLE"
+USD_BRIDGED_STABLE = "USD_BRIDGED_STABLE"
+USD_SYNTHETIC = "USD_SYNTHETIC"
+USD_COMPARABLE_STABLE_FAMILIES = frozenset(
+    {
+        USD_MAJOR_STABLE,
+        USD_OTHER_STABLE,
+        USD_BRIDGED_STABLE,
+        USD_SYNTHETIC,
+    }
+)
 
 ADAPTER_STATUSES: tuple[str, ...] = (
     "PAPER_ELIGIBLE",
@@ -85,11 +96,11 @@ def collateral_family(asset: Any) -> str:
     if text in {"USD", "USDT", "USDC"}:
         return USD_MAJOR_STABLE
     if text == "USDE":
-        return "USD_SYNTHETIC"
+        return USD_SYNTHETIC
     if text in {"DAI", "USDT0"}:
-        return "USD_OTHER_STABLE"
+        return USD_OTHER_STABLE
     if text.endswith("USDC") and text != "USDC":
-        return "USD_BRIDGED_STABLE"
+        return USD_BRIDGED_STABLE
     return "UNKNOWN"
 
 

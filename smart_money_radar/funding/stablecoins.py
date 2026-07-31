@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
 
 from smart_money_radar.funding.adapter_contracts import (
+    USD_COMPARABLE_STABLE_FAMILIES,
     USD_MAJOR_STABLE,
     collateral_family,
 )
@@ -237,8 +238,8 @@ def stablecoin_reserve_bps(
 
 def stablecoin_pair_compatible(long_asset: Any, short_asset: Any) -> bool:
     return (
-        collateral_family(long_asset) == USD_MAJOR_STABLE
-        and collateral_family(short_asset) == USD_MAJOR_STABLE
+        collateral_family(long_asset) in USD_COMPARABLE_STABLE_FAMILIES
+        and collateral_family(short_asset) in USD_COMPARABLE_STABLE_FAMILIES
     )
 
 
@@ -257,10 +258,11 @@ def evaluate_stablecoin_route(
     requested_observed = _parse_time(observed_at) or datetime.now(UTC)
 
     def base_result(status: str, blockers: list[str], *, cross_stable: bool) -> dict[str, Any]:
+        comparable = stablecoin_pair_compatible(long_asset, short_asset)
         return {
             "schema_version": 1,
             "compatible": status != "RESEARCH_ONLY" or not blockers or "stablecoin_family_not_compatible" not in blockers,
-            "numeraire": "USD" if collateral_family(long_asset) == USD_MAJOR_STABLE and collateral_family(short_asset) == USD_MAJOR_STABLE else None,
+            "numeraire": "USD" if comparable else None,
             "stablecoin_pair": f"{long_asset}/{short_asset}",
             "canonical_pair": f"{long_asset}/{short_asset}",
             "direction": "long_collateral/short_collateral",

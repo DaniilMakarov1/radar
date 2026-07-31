@@ -18,6 +18,7 @@ from smart_money_radar.funding.readiness_policy import (
     modeled_fee_rate,
     rate_estimate_from_market,
 )
+from smart_money_radar.funding.stablecoins import stablecoin_pair_compatible
 from smart_money_radar.funding.settlement_contracts import (
     FundingSettlementContract,
     settlement_contract_from_market,
@@ -600,10 +601,7 @@ def _stablecoin_cost_gate(
             "cross_stable": False,
             "stablecoin_pair": f"{long_asset}/{short_asset}",
         }
-    if (
-        collateral_family(long_asset) != USD_MAJOR_STABLE
-        or collateral_family(short_asset) != USD_MAJOR_STABLE
-    ):
+    if not stablecoin_pair_compatible(long_asset, short_asset):
         return Decimal("0"), ["stablecoin_family_not_compatible"], {
             "status": "RESEARCH_ONLY",
             "cross_stable": True,

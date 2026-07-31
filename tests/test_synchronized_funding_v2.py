@@ -49,6 +49,7 @@ from smart_money_radar.funding.stablecoins import (
     StablecoinPrice,
     StaticStablecoinPriceProvider,
     evaluate_stablecoin_route,
+    stablecoin_pair_compatible,
 )
 from smart_money_radar.paper_bot.accounting import executable_paper_pnl
 from smart_money_radar.paper_bot.cycle_manager import evaluate_hold_history_reliability
@@ -6319,6 +6320,55 @@ def test_stablecoin_source_disagreement_blocks() -> None:
 
     assert "stablecoin_cross_source_disagreement" in snapshot["blockers"]
     assert "stablecoin_snapshot_not_pass" in plan["blockers"]
+
+
+def test_other_usd_stable_is_comparable_but_not_verified_without_prices() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT0",
+        short_collateral="USDC",
+        provider=_stablecoin_provider_for(now),
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+
+    assert stablecoin_pair_compatible("USDT0", "USDC")
+    assert snapshot["compatible"] is True
+    assert snapshot["numeraire"] == "USD"
+    assert snapshot["status"] == "RESEARCH_ONLY"
+    assert "insufficient_stablecoin_price_sources" in snapshot["blockers"]
+    assert "stablecoin_family_not_compatible" not in snapshot["blockers"]
+
+
+def test_other_usd_stable_late_gate_uses_snapshot_blockers() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    route = _v2_runtime_route(now)
+    route["legs"][0]["collateral_asset"] = "USDT0"
+    route["legs"][0]["quote_asset"] = "USDT0"
+    snapshot = evaluate_stablecoin_route(
+        long_collateral="USDT0",
+        short_collateral="USDT",
+        provider=_stablecoin_provider_for(now),
+        observed_at=now.isoformat(),
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=8.0,
+        adverse_stablecoin_change_1m_bps=[0.0] * 10,
+    )
+    route["legs"][0]["stablecoin_route_evaluation"] = snapshot
+    route["legs"][1]["stablecoin_route_evaluation"] = snapshot
+
+    plan = build_settlement_capture_opportunity(
+        long_market=route["legs"][0],
+        short_market=route["legs"][1],
+        now=now,
+        target_notional=500.0,
+    )
+
+    assert "stablecoin_family_not_compatible" not in plan["blockers"]
+    assert "stablecoin_snapshot_not_pass" in plan["blockers"]
+    assert "stablecoin_snapshot_prices_incomplete" in plan["blockers"]
 
 
 def test_focused_recheck_does_not_run_venue_wide_hot_path(tmp_path, monkeypatch) -> None:
