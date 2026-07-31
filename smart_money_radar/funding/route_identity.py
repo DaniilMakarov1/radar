@@ -554,6 +554,14 @@ def _focus_state(route: dict[str, Any], now: datetime, config: FocusedSelectionC
     readiness = _readiness(route)
     evidence = route.get("evidence") or {}
     hard_blockers = list(readiness.get("hard_blockers") or evidence.get("hard_blockers") or [])
+    focused_blockers = list(
+        dict.fromkeys(
+            [
+                *(route.get("focused_selection_blockers") or []),
+                *(evidence.get("focused_selection_blockers") or []),
+            ]
+        )
+    )
     verified = bool(readiness.get("verified_paper_ready") or evidence.get("verified_paper_ready"))
     experimental = bool(
         readiness.get("experimental_simulation_ready")
@@ -569,7 +577,11 @@ def _focus_state(route: dict[str, Any], now: datetime, config: FocusedSelectionC
     lead = _lead_seconds(route, now)
     inside_arm = lead is not None and 0.0 <= lead <= float(config.arm_window_seconds)
     inside_entry = lead is not None and 0.0 <= lead <= float(config.entry_max_lead_seconds)
-    eligible = bool(not hard_blockers and (verified or experimental or inside_arm or economically_observable))
+    eligible = bool(
+        not hard_blockers
+        and not focused_blockers
+        and (verified or experimental or inside_arm or economically_observable)
+    )
     return {
         "eligible": eligible,
         "verified": verified,
@@ -578,6 +590,7 @@ def _focus_state(route: dict[str, Any], now: datetime, config: FocusedSelectionC
         "inside_entry_window": inside_entry,
         "lead_seconds": lead,
         "hard_blockers": hard_blockers,
+        "focused_selection_blockers": focused_blockers,
     }
 
 
@@ -840,12 +853,18 @@ def select_focused_routes(
             deferred.append(annotated_route)
         annotated.append(annotated_route)
     for route in not_eligible:
+        focus_state = _focus_state(route, now, config)
+        focused_blockers = focus_state.get("focused_selection_blockers") or []
         annotated.append(
             _copy_with_focus(
                 route,
                 state="not_yet_eligible",
                 rank=None,
-                reason="outside_focus_window_or_not_economic",
+                reason=(
+                    str(focused_blockers[0])
+                    if focused_blockers
+                    else "outside_focus_window_or_not_economic"
+                ),
             )
         )
     return {

@@ -1631,8 +1631,12 @@ class PaperBot:
         return keys
 
     def apply_focused_selection(self, now: datetime) -> dict[str, Any]:
+        focused_clients_by_venue = self._focused_selection_clients_by_venue()
         selection = select_focused_routes(
-            list(self.discovered_routes.values()),
+            [
+                self._with_focused_selection_capability(route, focused_clients_by_venue)
+                for route in self.discovered_routes.values()
+            ],
             now=now.astimezone(UTC),
             config=self.focused_selection_config(),
             previous_selected_at=dict(self.focused_route_selected_at),
@@ -1666,6 +1670,65 @@ class PaperBot:
         }
         self.last_focused_selection = selection
         return selection
+
+    def _focused_selection_clients_by_venue(self) -> dict[str, FundingVenueClient]:
+        clients = self.build_venue_clients() or active_default_funding_clients()
+        return {
+            str(getattr(client, "venue", "")).lower(): client
+            for client in clients
+            if str(getattr(client, "venue", "")).lower()
+            and str(getattr(client, "venue", "")).lower() not in DEACTIVATED_FUNDING_VENUES
+        }
+
+    def _with_focused_selection_capability(
+        self,
+        route: dict[str, Any],
+        clients_by_venue: dict[str, FundingVenueClient],
+    ) -> dict[str, Any]:
+        blockers: list[str] = []
+        for side in ("long", "short"):
+            leg = leg_by_side(route.get("legs") or [], side) or {}
+            venue = str(leg.get("venue") or route.get(f"{side}_venue") or "").lower()
+            client = clients_by_venue.get(venue)
+            if client is None:
+                blockers.append(f"{side}_focused_client_missing")
+                continue
+            if not callable(getattr(client, "market_snapshot", None)):
+                blockers.extend(
+                    [
+                        "focused_symbol_snapshot_not_supported",
+                        f"{side}_focused_symbol_snapshot_not_supported",
+                    ]
+                )
+            if not callable(getattr(client, "orderbook", None)):
+                blockers.extend(
+                    [
+                        "focused_orderbook_not_supported",
+                        f"{side}_focused_orderbook_not_supported",
+                    ]
+                )
+        blockers = list(dict.fromkeys(blockers))
+        copied = dict(route)
+        evidence = dict(copied.get("evidence") or {})
+        if blockers:
+            existing = list(evidence.get("focused_selection_blockers") or [])
+            evidence["focused_selection_blockers"] = list(
+                dict.fromkeys([*existing, *blockers])
+            )
+            advisory = list(evidence.get("advisory_reasons") or [])
+            evidence["advisory_reasons"] = list(
+                dict.fromkeys([*advisory, "focused_route_capability_missing", *blockers])
+            )
+            flags = list(copied.get("risk_flags") or [])
+            copied["risk_flags"] = list(
+                dict.fromkeys([*flags, "focused_route_capability_missing"])
+            )
+            copied["focused_selection_blockers"] = evidence["focused_selection_blockers"]
+        else:
+            evidence.pop("focused_selection_blockers", None)
+            copied.pop("focused_selection_blockers", None)
+        copied["evidence"] = evidence
+        return copied
 
     def update_hot_routes(self, routes: list[dict[str, Any]]) -> None:
         now = datetime.now(UTC)

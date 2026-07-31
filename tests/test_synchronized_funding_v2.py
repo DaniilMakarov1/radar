@@ -3056,6 +3056,13 @@ class _LightweightDiscoveryClient:
             market["taker_fee_rate"] = 0.0005
         return [instrument], [market], []
 
+    def market_snapshot(self, symbol: str, asset: str, observed_at: str, previous: dict):
+        _instruments, markets, _warnings = self.catalog_and_markets(observed_at)
+        market = dict(markets[0])
+        market["symbol"] = symbol
+        market["canonical_asset"] = asset
+        return market
+
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100):
         self.orderbook_calls += 1
         raise AssertionError("lightweight discovery must not fetch orderbooks")
@@ -3167,6 +3174,38 @@ def test_paper_lightweight_discovery_attaches_cross_stable_snapshot(tmp_path) ->
         assert snapshot["status"] == "PASS"
         assert snapshot["stablecoin_pair"] == "USDT/USDC"
         assert snapshot["source_identity"]["provider"] == "StaticStablecoinPriceProvider"
+    bot.shutdown_foreground_executors()
+
+
+def test_focused_selection_skips_routes_without_symbol_snapshot(tmp_path) -> None:
+    class NoFocusedSnapshotClient(_LightweightDiscoveryClient):
+        market_snapshot = None
+
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    no_snapshot = NoFocusedSnapshotClient(
+        "hyperliquid",
+        funding_rate=-0.010,
+        next_funding_at=settlement,
+    )
+    focused_ready = _LightweightDiscoveryClient(
+        "binance",
+        funding_rate=0.010,
+        next_funding_at=settlement,
+    )
+    bot = _lightweight_bot(tmp_path, now, [no_snapshot, focused_ready])
+    summary = bot._run_lightweight_discovery()
+
+    assert summary is not None
+    assert summary["watch_routes_added"] == 1
+    assert len(bot.discovered_routes) == 1
+    assert len(bot.hot_routes) == 0
+    route = next(iter(bot.discovered_routes.values()))
+    evidence = route["evidence"]
+    assert route["focused_state"] == "not_yet_eligible"
+    assert "focused_route_capability_missing" in route["risk_flags"]
+    assert "focused_symbol_snapshot_not_supported" in evidence["focused_selection_blockers"]
+    assert len(summary["focused_selection"]["selected_route_keys"]) == 0
     bot.shutdown_foreground_executors()
 
 
