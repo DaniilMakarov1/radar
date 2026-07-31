@@ -1139,11 +1139,18 @@ def test_risex_valid_fixture_is_shadow_eligible() -> None:
     assert contract.collateral_family == USD_MAJOR_STABLE
 
 
-def test_risex_testnet_base_url_cannot_be_marked_mainnet() -> None:
-    from smart_money_radar.funding.adapters.risex import RiseXFundingClient
+def test_risex_mainnet_default_and_testnet_base_url_cannot_be_marked_mainnet() -> None:
+    from smart_money_radar.funding.adapters.risex import (
+        RISEX_TESTNET_API_URL,
+        RiseXFundingClient,
+    )
 
+    mainnet = RiseXFundingClient(environment="mainnet")
+    assert mainnet.environment == "mainnet"
+    assert mainnet.endpoint_identity.base_url == "https://api.rise.trade"
+    assert mainnet.endpoint_identity.environment_verified is True
     with pytest.raises(Exception, match="mainnet cannot use a testnet base_url"):
-        RiseXFundingClient(environment="mainnet")
+        RiseXFundingClient(base_url=RISEX_TESTNET_API_URL, environment="mainnet")
 
 
 def test_risex_testnet_cannot_match_mainnet() -> None:

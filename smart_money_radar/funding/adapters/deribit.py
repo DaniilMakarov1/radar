@@ -164,6 +164,75 @@ class DeribitFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"instrument_name": symbol})
+        ticker = deribit_result_object(
+            self.http.get_json(f"{self.base_url}/public/ticker?{query}"),
+            f"ticker for {symbol}",
+        )
+        if str(ticker.get("state") or "") != "open":
+            raise FundingDataError(f"Deribit ticker not open for {symbol}")
+        previous = previous_market or {}
+        previous_raw = (
+            previous.get("raw") if isinstance(previous.get("raw"), dict) else {}
+        )
+        instrument = (
+            previous_raw.get("instrument")
+            if isinstance(previous_raw.get("instrument"), dict)
+            else {}
+        )
+        base_asset = canonical_asset_symbol(
+            instrument.get("base_currency")
+            or ticker.get("base_currency")
+            or canonical_asset
+        )
+        if base_asset != canonical_asset_symbol(canonical_asset):
+            raise FundingDataError(f"Deribit symbol {symbol} does not match {canonical_asset}")
+        mark_price = as_float(ticker.get("mark_price"))
+        index_price = as_float(ticker.get("index_price"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Deribit reference prices unavailable for {symbol}")
+        funding_8h = as_float(ticker.get("funding_8h"))
+        maker_fee = as_float(instrument.get("maker_commission"), 0.0)
+        taker_fee = as_float(instrument.get("taker_commission"), 0.0005)
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": base_asset,
+            "funding_rate": funding_8h,
+            "funding_interval_hours": 8.0,
+            "hourly_funding_rate": funding_8h / 8.0,
+            "funding_rate_kind": "published_8h_estimate",
+            "next_funding_at": next_deribit_eight_hour(observed_at),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(ticker.get("open_interest")) * mark_price
+            or None,
+            "volume_24h_usd": as_float(
+                (ticker.get("stats") or {}).get("volume_usd")
+                if isinstance(ticker.get("stats"), dict)
+                else None
+            )
+            or None,
+            "maker_fee_rate": maker_fee,
+            "taker_fee_rate": taker_fee,
+            "fee_source": "venue_public_instrument",
+            "contract_multiplier": as_float(
+                instrument.get("contract_size"),
+                previous.get("contract_multiplier") or 1.0,
+            )
+            or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {"instrument": instrument, "ticker": ticker},
+        }
+
     def funding_history(
         self,
         symbol: str,

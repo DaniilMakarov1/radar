@@ -124,6 +124,65 @@ class ExtendedFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rows = extended_data(
+            self.http.get_json(f"{self.base_url}/api/v1/info/markets"),
+            "markets",
+        )
+        target = str(symbol or "").upper()
+        target_asset = clean_asset_symbol(canonical_asset)
+        for raw in rows:
+            if not is_supported_extended_market(raw):
+                continue
+            raw_symbol = str(raw.get("name") or "")
+            asset = clean_asset_symbol(raw.get("assetName"))
+            if raw_symbol.upper() != target and asset != target_asset:
+                continue
+            stats = raw.get("marketStats") if isinstance(raw.get("marketStats"), dict) else {}
+            mark_price = as_float(stats.get("markPrice"))
+            index_price = as_float(stats.get("indexPrice"))
+            if mark_price <= 0 or index_price <= 0:
+                raise FundingDataError(
+                    f"Extended reference prices unavailable for {symbol}"
+                )
+            funding_rate = as_float(stats.get("fundingRate"))
+            previous = previous_market or {}
+            return {
+                "venue": self.venue,
+                "symbol": raw_symbol,
+                "canonical_asset": asset,
+                "funding_rate": funding_rate,
+                "funding_interval_hours": EXTENDED_FUNDING_INTERVAL_HOURS,
+                "hourly_funding_rate": funding_rate,
+                "funding_rate_kind": "published_current_hour_estimate",
+                "next_funding_at": iso_from_milliseconds(stats.get("nextFundingRate")),
+                "mark_price": mark_price,
+                "index_price": index_price,
+                "open_interest_usd": as_float(stats.get("openInterest")) or None,
+                "volume_24h_usd": as_float(stats.get("dailyVolume")) or None,
+                "maker_fee_rate": EXTENDED_MAKER_FEE_RATE,
+                "taker_fee_rate": EXTENDED_TAKER_FEE_RATE,
+                "fee_source": "venue_public_flat_fee",
+                "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+                "canonical_unit_multiplier": previous.get(
+                    "canonical_unit_multiplier",
+                    1.0,
+                ),
+                "observed_at": observed_at,
+                "raw": {
+                    "market": raw,
+                    "asset_class": raw.get("category"),
+                    "funding_interval": "hourly",
+                },
+            }
+        raise FundingDataError(f"Extended symbol not found: {symbol}")
+
     def funding_history(
         self,
         symbol: str,

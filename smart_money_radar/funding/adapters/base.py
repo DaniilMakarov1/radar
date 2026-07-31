@@ -82,6 +82,10 @@ _KNOWN_ENDPOINTS: dict[tuple[str, str], tuple[str, str]] = {
         "testnet",
         "official_public_rest",
     ),
+    ("risex", "https://api.rise.trade"): (
+        "mainnet",
+        "official_public_rest",
+    ),
 }
 
 

@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from smart_money_radar.funding.adapters import FundingDataError
-from smart_money_radar.funding.adapters.risex import RISEX_API_URL, RiseXFundingClient
+from smart_money_radar.funding.adapters.risex import (
+    RISEX_TESTNET_API_URL,
+    RiseXFundingClient,
+)
 from smart_money_radar.storage import SQLiteStore
 
 
@@ -33,7 +36,7 @@ class RiseXProbeConfig:
     confirmation_timeout_seconds: float = 60.0
     no_telegram: bool = True
     confirm_testnet_canary: bool = False
-    base_url: str = RISEX_API_URL
+    base_url: str = RISEX_TESTNET_API_URL
     symbol: str | None = None
 
     def validated(self) -> "RiseXProbeConfig":
@@ -43,7 +46,7 @@ class RiseXProbeConfig:
         mode = str(self.mode or "public").strip().lower()
         if mode not in {"public", "testnet-canary"}:
             raise ValueError("mode must be public or testnet-canary")
-        base_url = str(self.base_url or RISEX_API_URL).strip()
+        base_url = str(self.base_url or RISEX_TESTNET_API_URL).strip()
         if "testnet" not in base_url.lower():
             raise ValueError("RiseX probe base_url must be explicitly testnet")
         max_notional = min(10.0, max(0.0, float(self.max_notional_usd)))

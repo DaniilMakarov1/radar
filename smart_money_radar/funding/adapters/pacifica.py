@@ -209,6 +209,102 @@ class PacificaFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        info = self._info_for_symbol(symbol, canonical_asset)
+        price_rows, _price_warning = self._prices_by_symbol()
+        fee_rates, _fee_warning = self._public_fee_rates()
+        raw_symbol = str(info.get("symbol") or symbol)
+        price_row = price_rows.get(raw_symbol) or price_rows.get(
+            clean_asset_symbol(canonical_asset),
+            {},
+        )
+        raw_next_funding_rate = price_row.get("next_funding") or info.get(
+            "next_funding_rate"
+        )
+        has_next_funding_rate = (
+            raw_next_funding_rate is not None
+            and str(raw_next_funding_rate).strip() != ""
+        )
+        published_rate = (
+            as_float(raw_next_funding_rate)
+            if has_next_funding_rate
+            else as_float(price_row.get("funding"), as_float(info.get("funding_rate")))
+        )
+        mark_price = pacifica_optional_float(price_row.get("mark"))
+        index_price = pacifica_optional_float(price_row.get("oracle"))
+        if not mark_price or not index_price:
+            raise FundingDataError(f"Pacifica reference prices unavailable for {symbol}")
+        source_event_at = iso_from_milliseconds(price_row.get("timestamp"))
+        previous = previous_market or {}
+        row = {
+            "venue": self.venue,
+            "symbol": raw_symbol,
+            "canonical_asset": clean_asset_symbol(
+                info.get("base_asset") or canonical_asset
+            ),
+            "funding_rate": published_rate,
+            "normalized_next_funding_rate": published_rate,
+            "funding_interval_hours": PACIFICA_FUNDING_INTERVAL_HOURS,
+            "hourly_funding_rate": published_rate,
+            "settlement_interval_seconds": 3600.0,
+            "displayed_rate_period_seconds": 3600.0,
+            "funding_rate_kind": (
+                "published_next_hour_estimate"
+                if has_next_funding_rate
+                else "published_current_hour_estimate"
+            ),
+            "funding_rate_semantics": "next_settlement",
+            "funding_rate_unit": "fraction_of_notional_per_settlement",
+            "funding_sign_convention": "positive_long_pays",
+            "raw_api_rate": raw_next_funding_rate,
+            "raw_rate_unit": "decimal_fraction_of_notional_per_hour",
+            "raw_rate_scale": "1",
+            "next_funding_at": next_utc_hour(source_event_at or observed_at),
+            "next_settlement_source": "derived_next_utc_hour_from_info_prices_timestamp",
+            "mark_price": mark_price,
+            "mark_price_kind": "info_prices_mark",
+            "index_price": index_price,
+            "index_price_kind": "info_prices_oracle",
+            "open_interest_usd": pacifica_optional_float(price_row.get("open_interest")),
+            "volume_24h_usd": pacifica_optional_float(price_row.get("volume_24h")),
+            "quantity_step": pacifica_optional_float(info.get("lot_size")),
+            "min_notional_usd": pacifica_optional_float(info.get("min_order_size")),
+            "supports_perpetuals": True,
+            "is_linear_contract": True,
+            "supports_discrete_funding": True,
+            "supports_public_shadow_mode": True,
+            "position_inclusion_rule": "open_position_during_hourly_funding_epoch",
+            "entry_safety_buffer_seconds": 30.0,
+            "exit_safety_buffer_seconds": 5.0,
+            "timing_policy_source": (
+                "official_hourly_funding_docs_plus_info_prices_timestamp"
+            ),
+            "source_event_at": source_event_at,
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {"info": info, "prices": price_row},
+        }
+        if fee_rates:
+            row.update(
+                {
+                    "maker_fee_rate": fee_rates["maker_fee_rate"],
+                    "taker_fee_rate": fee_rates["taker_fee_rate"],
+                    "fee_source": "info/fees_public_fee_levels_conservative_max",
+                    "fee_scope": "public_not_account_specific",
+                }
+            )
+        else:
+            row["fee_source"] = "fee_model_missing"
+            row["fee_model_missing"] = True
+        return apply_endpoint_identity([row], self.endpoint_identity)[0]
+
     def funding_history(
         self,
         symbol: str,
@@ -282,6 +378,24 @@ class PacificaFundingClient:
             "maker_fee_rate": max(maker_rates),
             "taker_fee_rate": max(taker_rates),
         }, None
+
+    def _info_for_symbol(self, symbol: str, canonical_asset: str) -> dict[str, Any]:
+        raw = self.http.get_json(f"{self.base_url}/info")
+        data = raw.get("data") if isinstance(raw, dict) else None
+        if not isinstance(data, list):
+            raise FundingDataError("Invalid Pacifica /info response")
+        target_symbol = str(symbol or "").upper()
+        target_asset = clean_asset_symbol(canonical_asset)
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("instrument_type") or "").lower() != "perpetual":
+                continue
+            raw_symbol = str(row.get("symbol") or "")
+            asset = clean_asset_symbol(row.get("base_asset") or raw_symbol)
+            if raw_symbol.upper() == target_symbol or asset == target_asset:
+                return row
+        raise FundingDataError(f"Pacifica market not found for {symbol}")
 
 
 def next_utc_hour(observed_at: str) -> str:

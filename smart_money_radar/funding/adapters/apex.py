@@ -143,6 +143,62 @@ class ApexFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = previous_market or {}
+        raw_previous = (
+            previous.get("raw") if isinstance(previous.get("raw"), dict) else {}
+        )
+        contract = (
+            raw_previous.get("contract")
+            if isinstance(raw_previous.get("contract"), dict)
+            else {}
+        )
+        if not contract:
+            contract = self._contract_for_symbol(symbol)
+        if (
+            not contract.get("enableTrade")
+            or not contract.get("enableFundingSettlement")
+            or contract.get("isPrelaunch")
+        ):
+            raise FundingDataError(f"ApeX contract not supported for {symbol}")
+        symbol_dash = str(contract.get("symbol") or symbol)
+        symbol_display = str(contract.get("symbolDisplayName") or symbol_dash.replace("-", ""))
+        ticker = self._ticker(symbol_display)
+        mark_price = as_float(ticker.get("markPrice"))
+        index_price = as_float(ticker.get("indexPrice"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"ApeX reference prices unavailable for {symbol}")
+        funding_rate = as_float(ticker.get("fundingRate"))
+        return {
+            "venue": self.venue,
+            "symbol": symbol_dash,
+            "canonical_asset": clean_asset_symbol(canonical_asset),
+            "funding_rate": funding_rate,
+            "funding_interval_hours": APEX_FUNDING_INTERVAL_HOURS,
+            "hourly_funding_rate": funding_rate,
+            "funding_rate_kind": "published_current_hour_estimate",
+            "next_funding_at": _parse_iso(ticker.get("nextFundingTime")),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(ticker.get("openInterest")) * mark_price
+            if as_float(ticker.get("openInterest")) > 0
+            else None,
+            "volume_24h_usd": as_float(ticker.get("turnover24h")) or None,
+            "maker_fee_rate": APEX_MAKER_FEE_RATE,
+            "taker_fee_rate": APEX_TAKER_FEE_RATE,
+            "fee_source": "venue_public_flat_fee",
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {"contract": contract, "ticker": ticker},
+        }
+
     def funding_history(
         self,
         symbol: str,
@@ -191,6 +247,29 @@ class ApexFundingClient:
         if not isinstance(data, list) or not data:
             raise FundingDataError(f"Invalid ApeX ticker for {symbol_display}")
         return data[0] if isinstance(data[0], dict) else {}
+
+    def _contract_for_symbol(self, symbol: str) -> dict[str, Any]:
+        raw_config = self.http.get_json(f"{self.base_url}/v3/config")
+        data = raw_config.get("data") if isinstance(raw_config, dict) else None
+        config = data.get("contractConfig") if isinstance(data, dict) else None
+        contracts = (
+            (config or {}).get("perpetualContract")
+            if isinstance(config, dict)
+            else None
+        )
+        if not isinstance(contracts, list):
+            raise FundingDataError("Invalid ApeX v3/config response")
+        target = str(symbol or "").replace("-", "").upper()
+        for contract in contracts:
+            if not isinstance(contract, dict):
+                continue
+            candidates = {
+                str(contract.get("symbol") or "").replace("-", "").upper(),
+                str(contract.get("symbolDisplayName") or "").upper(),
+            }
+            if target in candidates:
+                return contract
+        raise FundingDataError(f"ApeX contract not found for {symbol}")
 
 
 def _parse_ms(value: Any) -> int | None:

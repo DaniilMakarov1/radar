@@ -148,6 +148,71 @@ class EtherealFundingClient:
             {"product_id": product_id, "market_liquidity": raw},
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        product = self.product_for_symbol(symbol)
+        if not is_supported_ethereal_product(product):
+            raise FundingDataError(f"Ethereal product not supported for {symbol}")
+        product_id = str(product.get("id") or "")
+        price_rows = ethereal_map_by_product_id(
+            self.fetch_batch("/v1/product/market-price", "productIds", [product_id])
+        )
+        projected_rows = ethereal_map_by_product_id(
+            self.fetch_batch("/v1/funding/projected-rate", "productIds", [product_id])
+        )
+        price = price_rows.get(product_id, {})
+        projected = projected_rows.get(product_id, {})
+        best_bid = as_float(price.get("bestBidPrice"))
+        best_ask = as_float(price.get("bestAskPrice"))
+        index_price = as_float(price.get("oraclePrice"))
+        if best_bid <= 0 or best_ask <= 0 or index_price <= 0:
+            raise FundingDataError(f"Ethereal reference prices unavailable for {symbol}")
+        mark_price = (best_bid + best_ask) / 2.0
+        funding_rate = as_float(
+            projected.get("fundingRateProjected1h"),
+            as_float(
+                projected.get("fundingRate1h"),
+                as_float(product.get("fundingRate1h")),
+            ),
+        )
+        previous = previous_market or {}
+        maker_fee = max(0.0, as_float(product.get("makerFee"), 0.0))
+        taker_fee = max(0.0, as_float(product.get("takerFee"), 0.0003))
+        raw_volume = as_float(product.get("volume24h"))
+        return {
+            "venue": self.venue,
+            "symbol": str(product.get("ticker") or symbol),
+            "canonical_asset": clean_asset_symbol(canonical_asset),
+            "funding_rate": funding_rate,
+            "funding_interval_hours": ETHEREAL_FUNDING_INTERVAL_HOURS,
+            "hourly_funding_rate": funding_rate,
+            "funding_rate_kind": "published_projected_1h",
+            "next_funding_at": next_hour_after(observed_at),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(product.get("openInterest")) * mark_price
+            or None,
+            "volume_24h_usd": raw_volume * mark_price or None,
+            "maker_fee_rate": maker_fee,
+            "taker_fee_rate": taker_fee,
+            "fee_source": "venue_public_product_config",
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {
+                "product": product,
+                "market_price": price,
+                "projected_funding": projected,
+                "product_id": product_id,
+                "funding_interval": "hourly",
+            },
+        }
+
     def funding_history(
         self,
         symbol: str,

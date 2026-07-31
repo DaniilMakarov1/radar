@@ -191,6 +191,82 @@ class NadoFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        pair, contract = self._pair_and_contract_for_symbol(symbol, canonical_asset)
+        product_id = nado_positive_int(pair.get("product_id"))
+        ticker_id = str(pair.get("ticker_id") or symbol)
+        if product_id is None:
+            raise FundingDataError(f"Nado product id missing for {symbol}")
+        self._product_id_by_symbol[ticker_id] = product_id
+        funding_rates, _funding_warning = self._funding_rates_by_product_id([product_id])
+        raw_rate = funding_rates.get(product_id) or {}
+        raw_x18 = raw_rate.get("funding_rate_x18")
+        daily_rate = nado_rate_x18_to_decimal(raw_x18)
+        if daily_rate is None:
+            daily_rate = nado_decimal(contract.get("funding_rate"))
+        hourly_rate = (
+            daily_rate / Decimal("24") if daily_rate is not None else Decimal("0")
+        )
+        source_event_at = nado_epoch_seconds_iso(raw_rate.get("update_time"))
+        next_funding_at = nado_epoch_seconds_iso(
+            contract.get("next_funding_rate_timestamp")
+        )
+        previous = previous_market or {}
+        row = {
+            "venue": self.venue,
+            "symbol": ticker_id,
+            "canonical_asset": nado_canonical_base(
+                pair.get("base") or contract.get("base_currency") or canonical_asset
+            ),
+            "funding_rate": str(hourly_rate),
+            "normalized_next_funding_rate": str(hourly_rate),
+            "funding_interval_hours": 1.0,
+            "hourly_funding_rate": str(hourly_rate),
+            "settlement_interval_seconds": NADO_SETTLEMENT_INTERVAL_SECONDS,
+            "displayed_rate_period_seconds": NADO_DISPLAYED_RATE_PERIOD_SECONDS,
+            "funding_rate_kind": "published_latest_24h_x18",
+            "funding_rate_semantics": "unclear",
+            "funding_rate_unit": "fraction_of_notional_per_settlement",
+            "funding_sign_convention": "positive_long_pays",
+            "raw_api_rate": raw_x18,
+            "raw_rate_unit": "funding_rate_x18_24h",
+            "raw_rate_scale": "1e18",
+            "normalized_rate_decimal": str(hourly_rate),
+            "next_funding_at": next_funding_at,
+            "next_settlement_source": (
+                "archive_v2_contracts.next_funding_rate_timestamp"
+            ),
+            "source_event_at": source_event_at,
+            "source_sequence": raw_rate.get("update_time"),
+            "mark_price": as_float(contract.get("mark_price")) or None,
+            "index_price": as_float(contract.get("index_price")) or None,
+            "open_interest_usd": as_float(contract.get("open_interest_usd")) or None,
+            "volume_24h_usd": as_float(contract.get("quote_volume")) or None,
+            "supports_perpetuals": True,
+            "is_linear_contract": True,
+            "supports_discrete_funding": False,
+            "supports_public_shadow_mode": True,
+            "fee_source": "fee_model_missing",
+            "fee_model_missing": True,
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {
+                "pair": pair,
+                "contract": contract,
+                "funding_rate": raw_rate,
+            },
+        }
+        if not row["mark_price"] or not row["index_price"]:
+            raise FundingDataError(f"Nado reference prices unavailable for {symbol}")
+        return apply_endpoint_identity([row], self.endpoint_identity)[0]
+
     def funding_history(
         self,
         symbol: str,
@@ -261,6 +337,41 @@ class NadoFundingClient:
             if product_id is not None and isinstance(value, dict):
                 output[product_id] = value
         return output, None
+
+    def _pair_and_contract_for_symbol(
+        self,
+        symbol: str,
+        canonical_asset: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        pairs = nado_list(
+            self.http.get_json(f"{self.gateway_url}/pairs?market=perp"),
+            "Nado pairs",
+        )
+        contracts = nado_mapping(
+            self.http.get_json(f"{self.archive_v2_url}/contracts?edge=false"),
+            "Nado contracts",
+        )
+        target = str(symbol or "").upper()
+        target_asset = clean_asset_symbol(canonical_asset)
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            ticker_id = str(pair.get("ticker_id") or "")
+            contract = contracts.get(ticker_id)
+            if not isinstance(contract, dict):
+                continue
+            base_asset = nado_canonical_base(
+                pair.get("base") or contract.get("base_currency")
+            )
+            if ticker_id.upper() != target and base_asset != target_asset:
+                continue
+            if str(contract.get("product_type") or "").lower() != "perpetual":
+                continue
+            quote = str(pair.get("quote") or contract.get("quote_currency") or "")
+            if quote.upper() != "USDT0":
+                continue
+            return pair, contract
+        raise FundingDataError(f"Nado market not found for {symbol}")
 
 
 def nado_list(payload: Any, label: str) -> list[dict[str, Any]]:

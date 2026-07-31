@@ -3617,6 +3617,9 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
         client = funding_client_for_venue(venue)
         assert client is not None, f"Missing client for {venue}"
         assert client.venue == venue
+        assert callable(getattr(client, "market_snapshot", None)), (
+            f"Missing focused market_snapshot for {venue}"
+        )
 
 
 def test_funding_client_for_venue_rejects_deactivated() -> None:
@@ -3628,7 +3631,11 @@ def test_funding_client_for_venue_rejects_deactivated() -> None:
 
 
 def test_funding_client_factory_returns_verified_identity_for_research_data_venues() -> None:
-    for venue, environment in (("pacifica", "mainnet"), ("nado", "mainnet")):
+    for venue, environment in (
+        ("pacifica", "mainnet"),
+        ("nado", "mainnet"),
+        ("risex", "mainnet"),
+    ):
         client = funding_client_for_venue(venue)
         assert client is not None
         assert client.venue == venue

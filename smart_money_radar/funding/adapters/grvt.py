@@ -167,6 +167,68 @@ class GrvtFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = previous_market or {}
+        raw_previous = (
+            previous.get("raw") if isinstance(previous.get("raw"), dict) else {}
+        )
+        instrument = (
+            raw_previous.get("instrument")
+            if isinstance(raw_previous.get("instrument"), dict)
+            else {}
+        )
+        ticker = self._ticker(symbol)
+        mark_price = as_float(ticker.get("mark_price"))
+        index_price = as_float(ticker.get("index_price"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"GRVT reference prices unavailable for {symbol}")
+        interval_hours = max(
+            1.0,
+            as_float(
+                ticker.get("funding_interval_hours"),
+                as_float(
+                    instrument.get("funding_interval_hours"),
+                    previous.get("funding_interval_hours") or 8.0,
+                ),
+            ),
+        )
+        funding_rate = as_float(ticker.get("funding_rate")) / GRVT_FUNDING_RATE_SCALE
+        next_funding_ms = _ns_to_ms(ticker.get("next_funding_time"))
+        buy_vol = as_float(ticker.get("buy_volume_24h_b"))
+        sell_vol = as_float(ticker.get("sell_volume_24h_b"))
+        volume_24h = buy_vol + sell_vol if buy_vol or sell_vol else None
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": clean_asset_symbol(canonical_asset),
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_current",
+            "next_funding_at": iso_from_milliseconds(next_funding_ms)
+            if next_funding_ms
+            else None,
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(ticker.get("open_interest")) * mark_price
+            if as_float(ticker.get("open_interest")) > 0
+            else None,
+            "volume_24h_usd": volume_24h,
+            "maker_fee_rate": GRVT_MAKER_FEE_RATE,
+            "taker_fee_rate": GRVT_TAKER_FEE_RATE,
+            "fee_source": "venue_public_flat_fee",
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {"instrument": instrument, "ticker": ticker},
+        }
+
     def funding_history(
         self,
         symbol: str,

@@ -5320,7 +5320,7 @@ def funding_client_for_venue(
     venue_key = str(venue).lower()
     environment_key = str(environment or "mainnet").strip().lower()
     if environment_key == "auto":
-        environment_key = "testnet" if venue_key == "risex" else "mainnet"
+        environment_key = "mainnet"
     if environment_key not in {"mainnet", "testnet"}:
         return None
     if venue_key in DEACTIVATED_FUNDING_VENUES:
@@ -5364,8 +5364,6 @@ def funding_client_for_venue(
     if factory is None:
         return None
     if venue_key != "risex" and environment_key != "mainnet":
-        return None
-    if venue_key == "risex" and environment_key == "mainnet":
         return None
     if not fast:
         if venue_key == "risex":

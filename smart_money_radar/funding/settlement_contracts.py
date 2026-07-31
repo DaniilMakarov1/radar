@@ -106,24 +106,31 @@ FUNDING_SETTLEMENT_CONTRACT_REGISTRY: dict[tuple[str, str], FundingSettlementCon
     ("risex", "mainnet"): FundingSettlementContract(
         venue="risex",
         supported_environment="mainnet",
-        base_url=None,
+        base_url="https://api.rise.trade",
         accrual_model=FundingAccrualModel.UNKNOWN.value,
-        position_inclusion_rule=None,
+        position_inclusion_rule="perp_position_at_settlement",
         position_inclusion_rule_verified=False,
-        settlement_interval_seconds=None,
+        settlement_interval_seconds=3600.0,
         settlement_interval_dynamic=True,
-        displayed_rate_period_seconds=None,
-        next_settlement_source=None,
-        rate_per_settlement_derivation=None,
-        funding_notional_price_source=None,
+        displayed_rate_period_seconds=28_800.0,
+        next_settlement_source="v1/markets.next_funding_time",
+        rate_per_settlement_derivation="current_funding_rate from public market payload; semantics unverified",
+        funding_notional_price_source="mark_or_index_public_market_payload",
         assessment_jitter_before_seconds=None,
         assessment_jitter_after_seconds=None,
         settlement_confirmation_source=None,
         realized_payment_source=None,
-        official_evidence_urls=("https://www.rise.trade/en",),
+        official_evidence_urls=(
+            "https://www.rise.trade/en",
+            "https://developer.rise.trade/reference/general-information",
+        ),
         evidence_checked_at=_checked_at(),
-        verification_level=FundingSemanticsVerificationLevel.UNVERIFIED.value,
-        notes="No official mainnet API endpoint is declared in this repository.",
+        verification_level=FundingSemanticsVerificationLevel.PUBLIC_OBSERVED.value,
+        notes=(
+            "Mainnet public markets endpoint is declared for monitoring. Candidate "
+            "eligibility remains fail-closed until mainnet canary observations prove "
+            "snapshot/full or periodic-step settlement mechanics."
+        ),
     ),
     ("pacifica", "mainnet"): FundingSettlementContract(
         venue="pacifica",

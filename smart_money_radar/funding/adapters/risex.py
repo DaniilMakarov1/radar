@@ -21,7 +21,9 @@ from smart_money_radar.funding.normalization import (
 from smart_money_radar.funding.adapter_contracts import USD_MAJOR_STABLE
 
 
-RISEX_API_URL = "https://api.testnet.rise.trade"
+RISEX_MAINNET_API_URL = "https://api.rise.trade"
+RISEX_TESTNET_API_URL = "https://api.testnet.rise.trade"
+RISEX_API_URL = RISEX_MAINNET_API_URL
 RISEX_MAKER_FEE_RATE = 0.0001
 RISEX_TAKER_FEE_RATE = 0.0003
 RISEX_DEFAULT_FUNDING_INTERVAL_HOURS = 1.0
@@ -35,10 +37,19 @@ class RiseXFundingClient:
     def __init__(
         self,
         http: FundingHttpClient | None = None,
-        base_url: str = RISEX_API_URL,
+        base_url: str | None = None,
         environment: str | None = None,
     ) -> None:
         self.http = http or FundingHttpClient(min_delay_seconds=0.08)
+        requested_environment = str(
+            environment or os.environ.get("RISEX_ENVIRONMENT") or ""
+        ).strip().lower()
+        if base_url is None:
+            base_url = (
+                RISEX_TESTNET_API_URL
+                if requested_environment == "testnet"
+                else RISEX_MAINNET_API_URL
+            )
         self.base_url = base_url.rstrip("/")
         self.environment = risex_environment(environment, self.base_url)
         self.endpoint_identity = build_endpoint_identity(
@@ -201,6 +212,99 @@ class RiseXFundingClient:
             observed_at,
             {"market_id": market_id, "orderbook": raw},
         )
+
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        market = self.market_for_symbol(symbol)
+        raw_symbol = str((market.get("config") or {}).get("name") or symbol)
+        asset = risex_base_asset(market) or canonical_asset
+        if clean_asset_symbol(asset) != clean_asset_symbol(canonical_asset):
+            raise FundingDataError(f"RiseX symbol {symbol} does not match {canonical_asset}")
+        interval_hours = risex_interval_hours(market.get("funding_interval"))
+        funding_rate = as_float(market.get("current_funding_rate"))
+        hourly_funding_rate = funding_rate / interval_hours
+        published_funding_rate = as_float(
+            market.get("funding_rate_8h"),
+            funding_rate * 8.0,
+        )
+        if market_funding_looks_implausible(funding_rate, interval_hours):
+            raise FundingDataError(f"RiseX funding rate looked implausible for {symbol}")
+        mark_price = as_float(market.get("mark_price"))
+        index_price = as_float(market.get("index_price"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"RiseX reference prices unavailable for {symbol}")
+        market_id = str(market.get("market_id") or "")
+        if not market_id:
+            raise FundingDataError(f"RiseX market id missing for {symbol}")
+        previous = previous_market or {}
+        row = {
+            "venue": self.venue,
+            "symbol": raw_symbol,
+            "canonical_asset": clean_asset_symbol(asset),
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": hourly_funding_rate,
+            "funding_rate_kind": "published_current_interval_rate",
+            "normalized_next_funding_rate": funding_rate,
+            "funding_rate_semantics": "next_settlement",
+            "funding_rate_unit": "fraction_of_notional_per_settlement",
+            "funding_sign_convention": "positive_long_pays",
+            "published_funding_rate": published_funding_rate,
+            "published_funding_interval_hours": 8.0,
+            "funding_display_note": "published 8h equivalent; cashflow 1h",
+            "next_funding_at": iso_from_nanoseconds(market.get("next_funding_time")),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": risex_open_interest_usd(market),
+            "volume_24h_usd": as_float(market.get("quote_volume_24h")) or None,
+            "quantity_step": risex_quantity_step(market),
+            "min_quantity": risex_min_quantity(market),
+            "min_notional_usd": risex_min_notional(market),
+            "maker_fee_rate": RISEX_MAKER_FEE_RATE,
+            "taker_fee_rate": RISEX_TAKER_FEE_RATE,
+            "fee_source": "venue_public_tier1",
+            "funding_rate_cap": 0.04 * interval_hours,
+            "funding_rate_floor": -0.04 * interval_hours,
+            "environment": self.environment,
+            "contract_kind": previous.get("contract_kind", "linear_perpetual"),
+            "price_quote_currency": previous.get("price_quote_currency", "USDC"),
+            "settlement_collateral": previous.get("settlement_collateral", "USDC"),
+            "collateral_family": previous.get("collateral_family", USD_MAJOR_STABLE),
+            "supports_perpetuals": True,
+            "is_linear_contract": True,
+            "supports_discrete_funding": True,
+            "supports_public_shadow_mode": True,
+            "position_inclusion_rule": market.get("position_inclusion_rule"),
+            "entry_safety_buffer_seconds": market.get("entry_safety_buffer_seconds"),
+            "exit_safety_buffer_seconds": market.get("exit_safety_buffer_seconds"),
+            "timing_policy_source": market.get(
+                "timing_policy_source",
+                "adapter_risex_next_funding_time",
+            ),
+            "realized_history_semantics": market.get(
+                "realized_history_semantics",
+                "generic_history_unverified",
+            ),
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {
+                "market": market,
+                "market_id": market_id,
+                "funding_interval": market.get("funding_interval"),
+                "funding_rate_8h": market.get("funding_rate_8h"),
+                "funding_rate_units": (
+                    "current_funding_rate is per actual settlement interval; "
+                    "funding_rate_8h is audit-only"
+                ),
+            },
+        }
+        return apply_endpoint_identity([row], self.endpoint_identity)[0]
 
     def funding_history(
         self,

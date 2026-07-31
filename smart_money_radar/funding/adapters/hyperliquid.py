@@ -118,6 +118,97 @@ class HyperliquidFundingClient:
             )
         return instruments, markets, warnings
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self.http.post_json(
+            HYPERLIQUID_INFO_URL,
+            {"type": "metaAndAssetCtxs"},
+        )
+        if not isinstance(payload, list) or len(payload) < 2:
+            raise FundingDataError("Invalid Hyperliquid metaAndAssetCtxs response")
+        try:
+            predicted_payload = self.http.post_json(
+                HYPERLIQUID_INFO_URL,
+                {"type": "predictedFundings"},
+            )
+            predicted = hyperliquid_predicted_fundings(predicted_payload)
+        except FundingDataError:
+            predicted = {}
+        meta = payload[0] if isinstance(payload[0], dict) else {}
+        contexts = payload[1] if isinstance(payload[1], list) else []
+        universe = meta.get("universe", []) if isinstance(meta, dict) else []
+        target_symbol = str(symbol or "").upper()
+        target_asset = clean_asset_symbol(canonical_asset)
+        for index, raw in enumerate(universe):
+            if not isinstance(raw, dict) or index >= len(contexts):
+                continue
+            if raw.get("isDelisted"):
+                continue
+            raw_symbol = str(raw.get("name") or "")
+            asset = clean_asset_symbol(raw_symbol)
+            if raw_symbol.upper() != target_symbol and asset != target_asset:
+                continue
+            context = contexts[index] if isinstance(contexts[index], dict) else {}
+            mark_price = as_float(context.get("markPx"))
+            index_price = as_float(context.get("oraclePx"))
+            if mark_price <= 0 or index_price <= 0:
+                raise FundingDataError(
+                    f"Hyperliquid reference prices unavailable for {symbol}"
+                )
+            next_estimate = predicted.get(raw_symbol)
+            if next_estimate:
+                funding_rate = as_float(next_estimate.get("fundingRate"))
+                interval_hours = max(
+                    1.0,
+                    as_float(next_estimate.get("fundingIntervalHours"), 1.0),
+                )
+                next_funding_at = hyperliquid_next_funding_time(
+                    next_estimate.get("nextFundingTime"),
+                    observed_at,
+                    interval_hours,
+                )
+                rate_kind = "published_predicted_next"
+            else:
+                funding_rate = as_float(context.get("funding"))
+                interval_hours = 1.0
+                next_funding_at = next_utc_hour(observed_at)
+                rate_kind = "published_current_fallback"
+            previous = previous_market or {}
+            row = {
+                "venue": self.venue,
+                "symbol": raw_symbol,
+                "canonical_asset": asset,
+                "funding_rate": funding_rate,
+                "funding_interval_hours": interval_hours,
+                "hourly_funding_rate": funding_rate / interval_hours,
+                "funding_rate_kind": rate_kind,
+                "next_funding_at": next_funding_at,
+                "mark_price": mark_price,
+                "index_price": index_price,
+                "open_interest_usd": as_float(context.get("openInterest")) * mark_price,
+                "volume_24h_usd": as_float(context.get("dayNtlVlm")) or None,
+                "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+                "canonical_unit_multiplier": previous.get(
+                    "canonical_unit_multiplier",
+                    1.0,
+                ),
+                "observed_at": observed_at,
+                "raw": {"context": context, "predicted_funding": next_estimate},
+            }
+            if "taker_fee_rate" in previous:
+                row["taker_fee_rate"] = previous["taker_fee_rate"]
+            if "maker_fee_rate" in previous:
+                row["maker_fee_rate"] = previous["maker_fee_rate"]
+            if "fee_source" in previous:
+                row["fee_source"] = previous["fee_source"]
+            return row
+        raise FundingDataError(f"Hyperliquid symbol not found: {symbol}")
+
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
         payload = self.http.post_json(
             HYPERLIQUID_INFO_URL,

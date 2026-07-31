@@ -156,6 +156,72 @@ class EdgexFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = previous_market or {}
+        raw_previous = (
+            previous.get("raw") if isinstance(previous.get("raw"), dict) else {}
+        )
+        contract = (
+            raw_previous.get("contract")
+            if isinstance(raw_previous.get("contract"), dict)
+            else {}
+        )
+        if not contract:
+            contract = self._contract_for_symbol(symbol)
+        if not contract.get("enableTrade") or not contract.get("enableDisplay"):
+            raise FundingDataError(f"edgeX contract not supported for {symbol}")
+        contract_id = str(contract.get("contractId") or "")
+        contract_name = str(contract.get("contractName") or symbol)
+        if not contract_id:
+            raise FundingDataError(f"edgeX contract id unavailable for {symbol}")
+        ticker = self._ticker(contract_id)
+        mark_price = as_float(ticker.get("markPrice"))
+        index_price = as_float(ticker.get("indexPrice"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"edgeX reference prices unavailable for {symbol}")
+        interval_hours = max(
+            1.0,
+            as_float(
+                ticker.get("fundingRateIntervalMin"),
+                as_float(contract.get("fundingRateIntervalMin"), 240.0),
+            )
+            / 60.0,
+        )
+        funding_rate = as_float(ticker.get("fundingRate"))
+        return {
+            "venue": self.venue,
+            "symbol": contract_name,
+            "canonical_asset": clean_asset_symbol(canonical_asset),
+            "funding_rate": funding_rate,
+            "funding_interval_hours": interval_hours,
+            "hourly_funding_rate": funding_rate / interval_hours,
+            "funding_rate_kind": "published_current",
+            "next_funding_at": (
+                iso_from_milliseconds(_parse_ms(ticker.get("nextFundingTime")))
+                if _parse_ms(ticker.get("nextFundingTime"))
+                else None
+            ),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(ticker.get("openInterest")) * mark_price
+            if as_float(ticker.get("openInterest")) > 0
+            else None,
+            "volume_24h_usd": as_float(ticker.get("value")) or None,
+            "maker_fee_rate": as_float(contract.get("defaultMakerFeeRate")),
+            "taker_fee_rate": as_float(contract.get("defaultTakerFeeRate")),
+            "fee_source": "venue_public_flat_fee",
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {"contract": contract, "ticker": ticker},
+        }
+
     def funding_history(
         self,
         symbol: str,
@@ -231,14 +297,21 @@ class EdgexFundingClient:
             raise FundingDataError(f"Invalid edgeX ticker for contract {contract_id}")
         return data[0] if isinstance(data[0], dict) else {}
 
-    def _resolve_contract_id(self, symbol: str) -> str:
+    def _contract_for_symbol(self, symbol: str) -> dict[str, Any]:
         meta = self.http.get_json(f"{self.base_url}/api/v2/public/meta/getMetaData")
         data = meta.get("data") if isinstance(meta, dict) else None
         contracts = (data or {}).get("contractList") if isinstance(data, dict) else []
         for contract in contracts:
-            if isinstance(contract, dict) and str(contract.get("contractName") or "") == symbol:
-                return str(contract.get("contractId") or "")
+            if (
+                isinstance(contract, dict)
+                and str(contract.get("contractName") or "") == symbol
+            ):
+                return contract
         raise FundingDataError(f"edgeX contract not found for {symbol}")
+
+    def _resolve_contract_id(self, symbol: str) -> str:
+        contract = self._contract_for_symbol(symbol)
+        return str(contract.get("contractId") or "")
 
 
 def _parse_ms(value: Any) -> int | None:

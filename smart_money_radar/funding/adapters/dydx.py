@@ -90,6 +90,71 @@ class DydxFundingClient:
             )
         return instruments, markets, []
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self.http.get_json(f"{self.base_url}/perpetualMarkets")
+        raw_markets = payload.get("markets") if isinstance(payload, dict) else None
+        if not isinstance(raw_markets, dict):
+            raise FundingDataError("Invalid dYdX perpetualMarkets response")
+        target = str(symbol or "").upper()
+        target_asset = clean_asset_symbol(canonical_asset)
+        for market_key, raw in raw_markets.items():
+            if not isinstance(raw, dict) or raw.get("status") != "ACTIVE":
+                continue
+            raw_symbol = str(raw.get("ticker") or market_key or "")
+            asset = clean_asset_symbol(raw_symbol.removesuffix("-USD"))
+            if raw_symbol.upper() != target and asset != target_asset:
+                continue
+            oracle_price = as_float(raw.get("oraclePrice"))
+            if oracle_price <= 0:
+                raise FundingDataError(f"dYdX oracle price unavailable for {symbol}")
+            previous = previous_market or {}
+            previous_mark_price = as_float(previous.get("mark_price"))
+            mark_price = as_float(
+                raw.get("marketPrice"),
+                previous_mark_price or oracle_price,
+            )
+            if mark_price <= 0:
+                raise FundingDataError(f"dYdX reference price unavailable for {symbol}")
+            funding_rate = as_float(raw.get("nextFundingRate"))
+            return {
+                "venue": self.venue,
+                "symbol": raw_symbol,
+                "canonical_asset": asset,
+                "funding_rate": funding_rate,
+                "funding_interval_hours": 1.0,
+                "hourly_funding_rate": funding_rate,
+                "funding_rate_kind": "published_next_hour",
+                "next_funding_at": next_utc_hour(observed_at),
+                "mark_price": mark_price,
+                "mark_price_kind": (
+                    "market_price"
+                    if raw.get("marketPrice") is not None
+                    else previous.get("mark_price_kind", "oracle_price_proxy")
+                    if previous_mark_price > 0
+                    else "oracle_price_proxy"
+                ),
+                "index_price": oracle_price,
+                "open_interest_usd": as_float(raw.get("openInterest")) * oracle_price
+                or None,
+                "volume_24h_usd": as_float(raw.get("volume24H")) or None,
+                "taker_fee_rate": previous.get("taker_fee_rate", 0.0006),
+                "fee_source": previous.get("fee_source", "venue_public_default"),
+                "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+                "canonical_unit_multiplier": previous.get(
+                    "canonical_unit_multiplier",
+                    1.0,
+                ),
+                "observed_at": observed_at,
+                "raw": raw,
+            }
+        raise FundingDataError(f"dYdX symbol not found: {symbol}")
+
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
         encoded = urllib.parse.quote(symbol, safe="")
         payload = self.http.get_json(

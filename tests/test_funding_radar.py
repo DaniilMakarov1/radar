@@ -163,8 +163,8 @@ class FundingRadarTest(unittest.TestCase):
             (
                 RiseXFundingClient(),
                 "risex",
-                "testnet",
-                "https://api.testnet.rise.trade",
+                "mainnet",
+                "https://api.rise.trade",
             ),
         ]
 
@@ -188,7 +188,7 @@ class FundingRadarTest(unittest.TestCase):
             ),
             (PacificaFundingClient(http=FakePacificaHttp()), "pacifica", "mainnet"),
             (NadoFundingClient(http=FakeNadoHttp()), "nado", "mainnet"),
-            (RiseXFundingClient(http=FakeRiseXHttp()), "risex", "testnet"),
+            (RiseXFundingClient(http=FakeRiseXHttp()), "risex", "mainnet"),
         ]
 
         for client, venue, environment in cases:
@@ -4018,6 +4018,7 @@ class FundingRadarTest(unittest.TestCase):
         client = HyperliquidFundingClient(http=FakeHyperliquidHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, markets[0])
 
         self.assertEqual(warnings, [])
         self.assertEqual(len(instruments), 1)
@@ -4025,6 +4026,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.0008)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0008 / 8)
+        self.assertEqual(snapshot["funding_interval_hours"], 8)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0008 / 8)
 
     def test_backpack_adapter_filters_unsettled_history_and_reads_depth(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -4073,6 +4076,7 @@ class FundingRadarTest(unittest.TestCase):
         client = LighterFundingClient(http=FakeLighterHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC", observed_at)
         history = client.funding_history("BTC", 1, 1, observed_at)
 
@@ -4084,6 +4088,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(markets[0]["funding_rate"], -0.0009)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], -0.0009)
         self.assertAlmostEqual(markets[0]["published_funding_rate"], -0.0072)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], -0.0009)
+        self.assertEqual(snapshot["published_funding_interval_hours"], 8)
         self.assertEqual(markets[0]["published_funding_interval_hours"], 8)
         self.assertEqual(
             markets[0]["funding_rate_kind"],
@@ -4346,6 +4352,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTCUSD", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTCUSD", observed_at, limit=2)
         history = client.funding_history("BTCUSD", 1, 1, observed_at)
 
@@ -4359,6 +4366,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.000013)
         self.assertAlmostEqual(markets[0]["mark_price"], 100.0)
         self.assertAlmostEqual(markets[0]["index_price"], 99.8)
+        self.assertAlmostEqual(snapshot["funding_rate"], 0.000013)
+        self.assertAlmostEqual(snapshot["mark_price"], 100.0)
         self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0003)
         self.assertAlmostEqual(markets[0]["maker_fee_rate"], 0.0)
         self.assertEqual(book_row["bids"][0], [99.9, 2.0])
@@ -4375,6 +4384,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC-USD", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC-USD", observed_at, limit=2)
         history = client.funding_history("BTC-USD", 1, 1, observed_at)
 
@@ -4385,6 +4395,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.000013)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.000013)
+        self.assertEqual(snapshot["symbol"], "BTC-USD")
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.000013)
         self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.00025)
         self.assertAlmostEqual(markets[0]["maker_fee_rate"], 0.0)
         self.assertEqual(book_row["bids"][0], [99.9, 2.0])
@@ -4401,6 +4413,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC_USDT_Perp", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC_USDT_Perp", observed_at, limit=2)
         history = client.funding_history("BTC_USDT_Perp", 1, 8, observed_at)
 
@@ -4412,6 +4425,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.0003 / 100)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0003 / 100 / 8)
+        self.assertAlmostEqual(snapshot["funding_rate"], 0.0003 / 100)
+        self.assertAlmostEqual(snapshot["mark_price"], 65038.01)
         self.assertAlmostEqual(markets[0]["mark_price"], 65038.01)
         self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.00045)
         self.assertEqual(book_row["bids"][0], [65038.01, 3456.78])
@@ -4429,6 +4444,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTCUSDC", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTCUSDC", observed_at, limit=2)
         history = client.funding_history("BTCUSDC", 1, 4, observed_at)
 
@@ -4440,6 +4456,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 4)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.00005)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.00005 / 4)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.00005 / 4)
+        self.assertEqual(snapshot["next_funding_at"], "2026-07-24T16:00:00+00:00")
         self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.00038)
         self.assertEqual(book_row["bids"][0], [64214.3, 1.710])
         self.assertEqual(book_row["asks"][0], [64214.5, 0.032])
@@ -4454,6 +4472,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC-USDT", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC-USDT", observed_at, limit=2)
         history = client.funding_history("BTC-USDT", 1, 1, observed_at)
 
@@ -4465,6 +4484,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 1)
         self.assertAlmostEqual(markets[0]["funding_rate"], -0.00001397)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], -0.00001397)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], -0.00001397)
+        self.assertEqual(snapshot["next_funding_at"], "2026-07-14T13:00:00+00:00")
         self.assertEqual(book_row["bids"][0], [64365.2, 4.371])
         self.assertEqual(book_row["asks"][0], [64365.8, 5.112])
         self.assertEqual(len(history), 2)
@@ -4478,6 +4499,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC", observed_at, limit=2)
         history = client.funding_history("BTC", 1, 1, observed_at)
 
@@ -4493,6 +4515,8 @@ class FundingRadarTest(unittest.TestCase):
             markets[0]["funding_rate_kind"],
             "published_next_hour_estimate",
         )
+        self.assertAlmostEqual(snapshot["funding_rate"], 0.0000125)
+        self.assertEqual(snapshot["environment"], "mainnet")
         self.assertEqual(
             markets[0]["next_funding_at"],
             "2026-07-14T13:00:00+00:00",
@@ -4583,6 +4607,7 @@ class FundingRadarTest(unittest.TestCase):
         client = NadoFundingClient(http=FakeNadoHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC-PERP_USDT0", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC-PERP_USDT0", observed_at, limit=2)
         history = client.funding_history("BTC-PERP_USDT0", 1, 1, observed_at)
 
@@ -4598,6 +4623,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["displayed_rate_period_seconds"], 86400.0)
         self.assertEqual(markets[0]["settlement_interval_seconds"], 3600.0)
         self.assertAlmostEqual(float(markets[0]["funding_rate"]), 0.001)
+        self.assertAlmostEqual(float(snapshot["funding_rate"]), 0.001)
+        self.assertEqual(snapshot["environment"], "mainnet")
         self.assertEqual(markets[0]["funding_rate_semantics"], "unclear")
         self.assertEqual(markets[0]["fee_source"], "fee_model_missing")
         self.assertTrue(markets[0]["fee_model_missing"])
@@ -4648,6 +4675,7 @@ class FundingRadarTest(unittest.TestCase):
         )
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC/USDC", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC/USDC", observed_at, limit=2)
         history = client.funding_history("BTC/USDC", 1, 1, observed_at)
 
@@ -4666,6 +4694,8 @@ class FundingRadarTest(unittest.TestCase):
             "published 8h equivalent; cashflow 1h",
         )
         self.assertEqual(markets[0]["raw"]["funding_rate_8h"], "-0.008")
+        self.assertAlmostEqual(snapshot["funding_rate"], -0.001)
+        self.assertEqual(snapshot["environment"], "mainnet")
         self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
         self.assertAlmostEqual(markets[0]["maker_fee_rate"], 0.0001)
         self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0003)
@@ -4936,6 +4966,7 @@ class FundingRadarTest(unittest.TestCase):
         client = DydxFundingClient(http=FakeDydxHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC-USD", "BTC", observed_at, markets[0])
         book_row = client.orderbook("BTC-USD", observed_at)
         history = client.funding_history("BTC-USD", 1, 1, observed_at)
 
@@ -4944,6 +4975,8 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 1)
         self.assertEqual(markets[0]["hourly_funding_rate"], 0.0001)
         self.assertIsNone(markets[0]["mark_price"])
+        self.assertEqual(snapshot["mark_price"], 100.0)
+        self.assertEqual(snapshot["mark_price_kind"], "oracle_price_proxy")
         self.assertEqual(book_row["bids"][0], [99.9, 2.0])
         self.assertEqual(len(history), 2)
         self.assertEqual(history[-1]["hourly_funding_rate"], 0.0001)
@@ -4953,6 +4986,7 @@ class FundingRadarTest(unittest.TestCase):
         client = KrakenFundingClient(http=FakeKrakenHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("PF_XBTUSD", "BTC", observed_at, markets[0])
         book_row = client.orderbook("PF_XBTUSD", observed_at, limit=1)
         history = client.funding_history("PF_XBTUSD", 1, 1, observed_at)
 
@@ -4963,6 +4997,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 1)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.8 / 100)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.8 / 100)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.8 / 100)
         self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T13:00:00+00:00")
         self.assertEqual(book_row["bids"], [[99.9, 2.0]])
         self.assertEqual(book_row["asks"], [[100.1, 3.0]])
@@ -4996,6 +5031,12 @@ class FundingRadarTest(unittest.TestCase):
         client = DeribitFundingClient(http=FakeDeribitHttp())
 
         instruments, markets, warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot(
+            "BTC_USDC-PERPETUAL",
+            "BTC",
+            observed_at,
+            markets[0],
+        )
         book_row = client.orderbook("BTC_USDC-PERPETUAL", observed_at)
         history = client.funding_history(
             "BTC_USDC-PERPETUAL",
@@ -5010,6 +5051,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(markets[0]["funding_interval_hours"], 8)
         self.assertAlmostEqual(markets[0]["funding_rate"], 0.0008)
         self.assertAlmostEqual(markets[0]["hourly_funding_rate"], 0.0001)
+        self.assertAlmostEqual(snapshot["hourly_funding_rate"], 0.0001)
         self.assertEqual(markets[0]["next_funding_at"], "2026-07-14T16:00:00+00:00")
         self.assertEqual(markets[0]["maker_fee_rate"], 0.0)
         self.assertEqual(markets[0]["taker_fee_rate"], 0.0005)

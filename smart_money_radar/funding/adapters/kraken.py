@@ -138,6 +138,66 @@ class KrakenFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        tickers = kraken_rows(
+            self.http.get_json(f"{self.base_url}/tickers"),
+            "tickers",
+            f"ticker for {symbol}",
+        )
+        ticker = next(
+            (
+                row
+                for row in tickers
+                if str(row.get("symbol") or "").upper() == str(symbol or "").upper()
+            ),
+            None,
+        )
+        if not ticker or not is_supported_kraken_ticker(ticker):
+            raise FundingDataError(f"Kraken ticker unavailable for {symbol}")
+        base_asset = canonical_asset_symbol(
+            ticker.get("base") or kraken_pair_base(ticker.get("pair"))
+        )
+        if base_asset != canonical_asset_symbol(canonical_asset):
+            raise FundingDataError(f"Kraken symbol {symbol} does not match {canonical_asset}")
+        mark_price = as_float(ticker.get("markPrice"))
+        index_price = as_float(ticker.get("indexPrice"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Kraken reference prices unavailable for {symbol}")
+        rate = kraken_relative_funding_rate(
+            ticker,
+            mark_price=mark_price,
+            index_price=index_price,
+        )
+        previous = previous_market or {}
+        return {
+            "venue": self.venue,
+            "symbol": str(ticker.get("symbol") or symbol),
+            "canonical_asset": base_asset,
+            "funding_rate": rate,
+            "funding_interval_hours": 1.0,
+            "hourly_funding_rate": rate,
+            "funding_rate_kind": "published_next_hour_prediction",
+            "next_funding_at": next_utc_hour(observed_at),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(ticker.get("openInterest")) * mark_price
+            or None,
+            "volume_24h_usd": as_float(ticker.get("volumeQuote")) or None,
+            "maker_fee_rate": previous.get("maker_fee_rate", 0.0002),
+            "taker_fee_rate": previous.get("taker_fee_rate", 0.0005),
+            "fee_source": previous.get("fee_source", "venue_public_default"),
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": ticker,
+        }
+
     def funding_history(
         self,
         symbol: str,

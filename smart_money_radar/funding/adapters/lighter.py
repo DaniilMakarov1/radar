@@ -163,6 +163,98 @@ class LighterFundingClient:
             raw,
         )
 
+    def market_snapshot(
+        self,
+        symbol: str,
+        canonical_asset: str,
+        observed_at: str,
+        previous_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = previous_market or {}
+        previous_raw = previous.get("raw") if isinstance(previous.get("raw"), dict) else {}
+        spec = previous_raw.get("spec") if isinstance(previous_raw.get("spec"), dict) else {}
+        market_id = integer_or_none(previous.get("market_id") or spec.get("market_id"))
+        if market_id is None:
+            specs = lighter_rows(
+                self.http.get_json(f"{self.base_url}/api/v1/orderBooks"),
+                "order_books",
+                "markets",
+            )
+            for row in specs:
+                if str(row.get("symbol") or "") == symbol:
+                    spec = row
+                    market_id = integer_or_none(row.get("market_id"))
+                    break
+        if market_id is None:
+            raise FundingDataError(f"Lighter market id unavailable for {symbol}")
+        self._market_ids[symbol] = market_id
+
+        details = lighter_rows(
+            self.http.get_json(f"{self.base_url}/api/v1/orderBookDetails?filter=perp"),
+            "order_book_details",
+            "market details",
+        )
+        rates = lighter_rows(
+            self.http.get_json(f"{self.base_url}/api/v1/funding-rates"),
+            "funding_rates",
+            "funding rates",
+        )
+        detail = next(
+            (row for row in details if integer_or_none(row.get("market_id")) == market_id),
+            None,
+        )
+        funding = next(
+            (
+                row
+                for row in rates
+                if integer_or_none(row.get("market_id")) == market_id
+                and str(row.get("exchange") or "").lower() == self.venue
+            ),
+            None,
+        )
+        if not detail or not funding:
+            raise FundingDataError(f"Lighter focused market data unavailable for {symbol}")
+        mark_price = as_float(detail.get("mark_price"))
+        index_price = as_float(detail.get("index_price"))
+        if mark_price <= 0 or index_price <= 0:
+            raise FundingDataError(f"Lighter reference prices unavailable for {symbol}")
+        published_rate = as_float(funding.get("rate"))
+        hourly_funding_rate = published_rate / LIGHTER_CURRENT_FUNDING_PERIOD_HOURS
+        maker_fee = percentage_points_to_decimal(spec.get("maker_fee"))
+        taker_fee = percentage_points_to_decimal(spec.get("taker_fee"))
+        return {
+            "venue": self.venue,
+            "symbol": symbol,
+            "canonical_asset": clean_asset_symbol(canonical_asset),
+            "funding_rate": hourly_funding_rate,
+            "funding_interval_hours": 1.0,
+            "hourly_funding_rate": hourly_funding_rate,
+            "funding_rate_kind": "published_8h_equivalent_normalized_hourly",
+            "published_funding_rate": published_rate,
+            "published_funding_interval_hours": LIGHTER_CURRENT_FUNDING_PERIOD_HOURS,
+            "funding_display_note": "published 8h equivalent; cashflow hourly",
+            "next_funding_at": next_utc_hour(observed_at),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "open_interest_usd": as_float(detail.get("open_interest")) * mark_price
+            or None,
+            "volume_24h_usd": as_float(detail.get("daily_quote_token_volume")) or None,
+            "maker_fee_rate": maker_fee,
+            "taker_fee_rate": taker_fee,
+            "fee_source": "venue_public_account_type",
+            "contract_multiplier": previous.get("contract_multiplier") or 1.0,
+            "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "observed_at": observed_at,
+            "raw": {
+                "spec": spec,
+                "detail": detail,
+                "funding": funding,
+                "published_funding_rate": published_rate,
+                "published_funding_period_hours": LIGHTER_CURRENT_FUNDING_PERIOD_HOURS,
+                "normalization": "published_8h_rate_divided_by_8",
+            },
+        }
+
     def funding_history(
         self,
         symbol: str,
