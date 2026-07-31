@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 from smart_money_radar.funding.adapter_contracts import (
     USD_COMPARABLE_STABLE_FAMILIES,
     USD_MAJOR_STABLE,
+    USD_BRIDGED_STABLE_ALIASES,
     collateral_family,
 )
 
@@ -53,11 +54,29 @@ class StaticStablecoinPriceProvider:
 
 
 class PublicStablecoinPriceProvider:
-    """Fetch USDC/USDT prices from two independent public sources."""
+    """Fetch USD-stable prices from bounded public sources."""
 
     COINGECKO_IDS = {
         "USDC": "usd-coin",
         "USDT": "tether",
+        "USDE": "ethena-usde",
+        "USDT0": "usdt0",
+    }
+    COINBASE_CURRENCIES = {
+        "USDC": "USDC",
+        "USDT": "USDT",
+    }
+    DEFILLAMA_IDS = {
+        "USDC": "coingecko:usd-coin",
+        "USDT": "coingecko:tether",
+        "USDE": "coingecko:ethena-usde",
+        "USDT0": "coingecko:usdt0",
+    }
+    KRAKEN_USD_PAIRS = {
+        "USDE": "USDEUSD",
+    }
+    GECKOTERMINAL_SEARCH = {
+        "USDT0": "USDT0",
     }
 
     def __init__(
@@ -72,13 +91,37 @@ class PublicStablecoinPriceProvider:
 
     def prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
         symbol = str(asset or "").upper()
-        if symbol not in {"USDC", "USDT"}:
+        lookup_symbol = self._lookup_symbol(symbol)
+        sources = self._sources_for_symbol(lookup_symbol)
+        if not sources:
             return []
-        key = (symbol, ("coinbase", "coingecko"))
+        key = (symbol, sources)
         cached = self._cache.get(key)
         if cached is None or not self._cache_entry_fresh(cached):
-            self._cache[key] = self._fetch_prices(symbol, observed_at)
+            self._cache[key] = self._fetch_prices(symbol, lookup_symbol, observed_at)
         return list(self._cache[key])
+
+    @staticmethod
+    def _lookup_symbol(symbol: str) -> str:
+        normalized = symbol.replace("-", "").replace("_", "")
+        if symbol in USD_BRIDGED_STABLE_ALIASES or normalized in USD_BRIDGED_STABLE_ALIASES:
+            return "USDC"
+        return symbol
+
+    @classmethod
+    def _sources_for_symbol(cls, symbol: str) -> tuple[str, ...]:
+        sources: list[str] = []
+        if symbol in cls.COINBASE_CURRENCIES:
+            sources.append("coinbase")
+        if symbol in cls.COINGECKO_IDS:
+            sources.append("coingecko")
+        if symbol in cls.KRAKEN_USD_PAIRS:
+            sources.append("kraken")
+        if symbol not in cls.COINBASE_CURRENCIES and symbol in cls.DEFILLAMA_IDS:
+            sources.append("defillama")
+        if symbol in cls.GECKOTERMINAL_SEARCH:
+            sources.append("geckoterminal")
+        return tuple(sources)
 
     @staticmethod
     def _cache_entry_fresh(rows: list[StablecoinPrice]) -> bool:
@@ -96,21 +139,22 @@ class PublicStablecoinPriceProvider:
             seen_sources.add(str(row.source))
         return len(seen_sources) >= 2
 
-    def _fetch_prices(self, asset: str, observed_at: str) -> list[StablecoinPrice]:
+    def _fetch_prices(
+        self,
+        asset: str,
+        lookup_symbol: str,
+        observed_at: str,
+    ) -> list[StablecoinPrice]:
         rows: list[StablecoinPrice] = []
-        coingecko_id = self.COINGECKO_IDS.get(asset)
+        quality = (
+            "bridged_canonical_usdc_proxy"
+            if asset != lookup_symbol and lookup_symbol == "USDC"
+            else "current_snapshot_response_time"
+        )
+        coingecko_id = self.COINGECKO_IDS.get(lookup_symbol)
         if coingecko_id:
-            query = urllib.parse.urlencode(
-                {"ids": coingecko_id, "vs_currencies": "usd"}
-            )
-            payload, response_received_at = self._safe_fetch(
-                f"https://api.coingecko.com/api/v3/simple/price?{query}"
-            )
-            try:
-                price = float(payload[coingecko_id]["usd"])
-            except (TypeError, ValueError, KeyError):
-                price = 0.0
-            if price > 0:
+            price, response_received_at = self._coingecko_price(coingecko_id)
+            if price is not None:
                 rows.append(
                     StablecoinPrice(
                         asset,
@@ -118,28 +162,154 @@ class PublicStablecoinPriceProvider:
                         "coingecko",
                         "",
                         response_received_at,
-                        "current_snapshot_response_time",
+                        quality,
                     )
                 )
-        coinbase_payload, coinbase_response_received_at = self._safe_fetch(
-            f"https://api.coinbase.com/v2/exchange-rates?currency={asset}"
+        coinbase_currency = self.COINBASE_CURRENCIES.get(lookup_symbol)
+        if coinbase_currency:
+            price, response_received_at = self._coinbase_price(coinbase_currency)
+            if price is not None:
+                rows.append(
+                    StablecoinPrice(
+                        asset,
+                        price,
+                        "coinbase",
+                        "",
+                        response_received_at,
+                        quality,
+                    )
+                )
+        defillama_id = self.DEFILLAMA_IDS.get(lookup_symbol)
+        if defillama_id and len({row.source for row in rows}) < 2:
+            price, source_event_at, response_received_at = self._defillama_price(defillama_id)
+            if price is not None:
+                rows.append(
+                    StablecoinPrice(
+                        asset,
+                        price,
+                        "defillama",
+                        source_event_at,
+                        response_received_at,
+                        "defillama_current_price",
+                    )
+                )
+        geckoterminal_search = self.GECKOTERMINAL_SEARCH.get(lookup_symbol)
+        if geckoterminal_search and len({row.source for row in rows}) < 3:
+            price, response_received_at = self._geckoterminal_price(geckoterminal_search)
+            if price is not None:
+                rows.append(
+                    StablecoinPrice(
+                        asset,
+                        price,
+                        "geckoterminal",
+                        "",
+                        response_received_at,
+                        "public_dex_pool_usd_price",
+                    )
+                )
+        kraken_pair = self.KRAKEN_USD_PAIRS.get(lookup_symbol)
+        if kraken_pair:
+            price, response_received_at = self._kraken_usd_price(kraken_pair)
+            if price is not None:
+                rows.append(
+                    StablecoinPrice(
+                        asset,
+                        price,
+                        "kraken",
+                        "",
+                        response_received_at,
+                        "public_spot_usd_mid",
+                    )
+                )
+        return rows
+
+    def _coingecko_price(self, coingecko_id: str) -> tuple[float | None, str]:
+        query = urllib.parse.urlencode({"ids": coingecko_id, "vs_currencies": "usd"})
+        payload, response_received_at = self._safe_fetch(
+            f"https://api.coingecko.com/api/v3/simple/price?{query}"
         )
         try:
-            coinbase_price = float(coinbase_payload["data"]["rates"]["USD"])
+            price = float(payload[coingecko_id]["usd"])
         except (TypeError, ValueError, KeyError):
-            coinbase_price = 0.0
-        if coinbase_price > 0:
-            rows.append(
-                StablecoinPrice(
-                    asset,
-                    coinbase_price,
-                    "coinbase",
-                    "",
-                    coinbase_response_received_at,
-                    "current_snapshot_response_time",
-                )
-            )
-        return rows
+            price = 0.0
+        return (price if price > 0 else None), response_received_at
+
+    def _coinbase_price(self, currency: str) -> tuple[float | None, str]:
+        payload, response_received_at = self._safe_fetch(
+            f"https://api.coinbase.com/v2/exchange-rates?currency={currency}"
+        )
+        try:
+            price = float(payload["data"]["rates"]["USD"])
+        except (TypeError, ValueError, KeyError):
+            price = 0.0
+        return (price if price > 0 else None), response_received_at
+
+    def _defillama_price(self, asset_id: str) -> tuple[float | None, str, str]:
+        payload, response_received_at = self._safe_fetch(
+            f"https://coins.llama.fi/prices/current/{urllib.parse.quote(asset_id, safe=':')}"
+        )
+        row = (payload.get("coins") or {}).get(asset_id) if isinstance(payload, dict) else {}
+        try:
+            price = float(row["price"])
+        except (TypeError, ValueError, KeyError):
+            price = 0.0
+        try:
+            timestamp = float(row["timestamp"])
+        except (TypeError, ValueError, KeyError):
+            timestamp = 0.0
+        # DefiLlama's coin timestamp can lag the current response by minutes for
+        # stablecoins. Treat it like CoinGecko/Coinbase: current HTTP response
+        # is the freshness point, and quality identifies the source family.
+        return (price if price > 0 else None), "", response_received_at
+
+    def _geckoterminal_price(self, query: str) -> tuple[float | None, str]:
+        encoded = urllib.parse.urlencode({"query": query})
+        payload, response_received_at = self._safe_fetch(
+            f"https://api.geckoterminal.com/api/v2/search/pools?{encoded}"
+        )
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return None, response_received_at
+        best_price = 0.0
+        best_distance = math.inf
+        best_reserve = -1.0
+        for item in rows:
+            attrs = item.get("attributes") if isinstance(item, dict) else {}
+            name = str(attrs.get("name") or "").upper()
+            if str(query).upper() not in name:
+                continue
+            try:
+                price = float(attrs.get("base_token_price_usd") or 0.0)
+                reserve = float(attrs.get("reserve_in_usd") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            distance = abs(price - 1.0)
+            if price <= 0 or distance > 0.05:
+                continue
+            if distance < best_distance or (
+                math.isclose(distance, best_distance) and reserve > best_reserve
+            ):
+                best_price = price
+                best_distance = distance
+                best_reserve = reserve
+        return (best_price if best_price > 0 else None), response_received_at
+
+    def _kraken_usd_price(self, pair: str) -> tuple[float | None, str]:
+        payload, response_received_at = self._safe_fetch(
+            f"https://api.kraken.com/0/public/Ticker?pair={urllib.parse.quote(pair)}"
+        )
+        result = payload.get("result") if isinstance(payload, dict) else {}
+        row = result.get(pair) if isinstance(result, dict) else {}
+        if not row and isinstance(result, dict) and result:
+            row = next(iter(result.values()))
+        try:
+            bid = float((row.get("b") or [0])[0])
+            ask = float((row.get("a") or [0])[0])
+            last = float((row.get("c") or [0])[0])
+        except (TypeError, ValueError, KeyError, IndexError):
+            bid = ask = last = 0.0
+        price = ((bid + ask) / 2.0) if bid > 0 and ask > 0 else last
+        return (price if price > 0 else None), response_received_at
 
     def _safe_fetch(self, url: str) -> tuple[Any, str]:
         try:
@@ -199,6 +369,18 @@ def _fresh_prices(
         seen_sources.add(source)
         output.append(row)
     return output
+
+
+def _freshness_reference_time(
+    requested_observed: datetime,
+    rows: list[StablecoinPrice],
+) -> datetime:
+    reference = requested_observed.astimezone(UTC)
+    for row in rows:
+        event_at = _parse_time(row.source_event_at) or _parse_time(row.response_received_at)
+        if event_at is not None and event_at.astimezone(UTC) > reference:
+            reference = event_at.astimezone(UTC)
+    return reference
 
 
 def stablecoin_basis_bps(long_usd_price: float, short_usd_price: float) -> float:
@@ -327,14 +509,20 @@ def evaluate_stablecoin_route(
             ),
             "compatible": True,
         }
+    long_raw_prices = provider.prices(long_asset, observed_at)
+    short_raw_prices = provider.prices(short_asset, observed_at)
+    freshness_observed = _freshness_reference_time(
+        requested_observed,
+        [*long_raw_prices, *short_raw_prices],
+    ).isoformat()
     long_prices = _fresh_prices(
-        provider.prices(long_asset, observed_at),
-        observed_at,
+        long_raw_prices,
+        freshness_observed,
         max_age_seconds=5.0,
     )
     short_prices = _fresh_prices(
-        provider.prices(short_asset, observed_at),
-        observed_at,
+        short_raw_prices,
+        freshness_observed,
         max_age_seconds=5.0,
     )
     if len(long_prices) < 2 or len(short_prices) < 2:
@@ -352,8 +540,14 @@ def evaluate_stablecoin_route(
     short_values = [row.usd_price for row in short_prices]
     long_disagreement = stablecoin_basis_bps(min(long_values), max(long_values))
     short_disagreement = stablecoin_basis_bps(min(short_values), max(short_values))
+    max_disagreement = max(long_disagreement, short_disagreement)
+    major_pair = (
+        collateral_family(long_asset) == USD_MAJOR_STABLE
+        and collateral_family(short_asset) == USD_MAJOR_STABLE
+    )
+    source_disagreement_limit = 5.0 if major_pair else 25.0
     blockers: list[str] = []
-    if long_disagreement > 5.0 or short_disagreement > 5.0:
+    if max_disagreement > source_disagreement_limit:
         blockers.append("stablecoin_cross_source_disagreement")
     long_price = sum(long_values) / len(long_values)
     short_price = sum(short_values) / len(short_values)
@@ -362,6 +556,8 @@ def evaluate_stablecoin_route(
         basis,
         adverse_stablecoin_change_1m_bps or [],
     )
+    if not major_pair:
+        reserve = max(reserve, max_disagreement * 2.0)
     if basis > 30.0:
         blockers.append("stablecoin_basis_above_30bps")
     if reserve > 50.0:
@@ -391,6 +587,7 @@ def evaluate_stablecoin_route(
         "short_source_count": len(short_prices),
         "long_cross_source_disagreement_bps": long_disagreement,
         "short_cross_source_disagreement_bps": short_disagreement,
+        "source_disagreement_limit_bps": source_disagreement_limit,
         "current_stablecoin_basis_bps": basis,
         "stablecoin_reserve_bps": reserve,
         "stablecoin_reserve_usd": reserve_usd,

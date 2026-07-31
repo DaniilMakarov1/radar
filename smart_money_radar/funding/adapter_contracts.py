@@ -32,6 +32,17 @@ USD_COMPARABLE_STABLE_FAMILIES = frozenset(
         USD_SYNTHETIC,
     }
 )
+USD_BRIDGED_STABLE_ALIASES = frozenset(
+    {
+        "AXLUSDC",
+        "LZUSDC",
+        "USDCE",
+        "USDC.E",
+        "USDC.N",
+        "USDBC",
+        "WUSDC",
+    }
+)
 
 ADAPTER_STATUSES: tuple[str, ...] = (
     "PAPER_ELIGIBLE",
@@ -99,7 +110,12 @@ def collateral_family(asset: Any) -> str:
         return USD_SYNTHETIC
     if text in {"DAI", "USDT0"}:
         return USD_OTHER_STABLE
-    if text.endswith("USDC") and text != "USDC":
+    normalized = text.replace("-", "").replace("_", "")
+    if (
+        text in USD_BRIDGED_STABLE_ALIASES
+        or normalized in USD_BRIDGED_STABLE_ALIASES
+        or (text.endswith("USDC") and text != "USDC")
+    ):
         return USD_BRIDGED_STABLE
     return "UNKNOWN"
 

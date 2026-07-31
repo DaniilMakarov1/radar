@@ -275,6 +275,7 @@ class RiseXFundingClient:
             "price_quote_currency": previous.get("price_quote_currency", "USDC"),
             "settlement_collateral": previous.get("settlement_collateral", "USDC"),
             "collateral_family": previous.get("collateral_family", USD_MAJOR_STABLE),
+            "product_type": previous.get("product_type", "perpetual"),
             "supports_perpetuals": True,
             "is_linear_contract": True,
             "supports_discrete_funding": True,
@@ -494,7 +495,13 @@ def risex_environment(value: str | None, base_url: str) -> str:
 
 def risex_quantity_step(row: dict[str, Any]) -> float | None:
     config = row.get("config") if isinstance(row.get("config"), dict) else {}
-    for key in ("quantity_step", "min_order_increment", "order_size_increment", "lot_size"):
+    for key in (
+        "quantity_step",
+        "min_order_increment",
+        "order_size_increment",
+        "lot_size",
+        "step_size",
+    ):
         value = as_float(row.get(key), as_float(config.get(key)))
         if value > 0:
             return value
@@ -516,6 +523,10 @@ def risex_min_notional(row: dict[str, Any]) -> float | None:
         value = as_float(row.get(key), as_float(config.get(key)))
         if value > 0:
             return value
+    min_quantity = risex_min_quantity(row)
+    mark_price = as_float(row.get("mark_price"), as_float(row.get("index_price")))
+    if min_quantity and mark_price > 0:
+        return min_quantity * mark_price
     return None
 
 

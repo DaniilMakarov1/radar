@@ -6875,3 +6875,30 @@ def test_post_settlement_replan_records_new_generation_and_blocks_stale_timestam
     )
     assert stale_decision["decision"] == "close"
     assert stale_decision["reason"] == "next_cycle_stale_or_past_settlement"
+
+
+def test_dex_adapter_evidence_fields_flow_through_focused_snapshot() -> None:
+    from smart_money_radar.funding.adapters.hyperliquid import HyperliquidFundingClient
+    from smart_money_radar.funding.adapters.lighter import LighterFundingClient
+    from smart_money_radar.funding.adapters.dydx import DydxFundingClient
+
+    class _FakeHLHttp:
+        def post_json(self, url: str, payload: dict) -> Any:
+            if payload == {"type": "metaAndAssetCtxs"}:
+                return [
+                    {"universe": [{"name": "BTC", "isDelisted": False, "szDecimals": 4}]},
+                    [{"markPx": "100", "oraclePx": "100", "openInterest": "1000", "dayNtlVlm": "5000000", "funding": "0.0001"}],
+                ]
+            if payload == {"type": "predictedFundings"}:
+                return [["BTC", [["HlPerp", {"fundingRate": "0.0008", "nextFundingTime": 1784044800000, "fundingIntervalHours": 8}]]]]
+            raise AssertionError((url, payload))
+
+    observed_at = "2026-07-14T12:00:00+00:00"
+    hl = HyperliquidFundingClient(http=_FakeHLHttp())
+    _, hl_markets, _ = hl.catalog_and_markets(observed_at)
+    hl_snap = hl.market_snapshot("BTC", "BTC", observed_at, hl_markets[0])
+    assert hl_snap["endpoint_base_url"] == "https://api.hyperliquid.xyz/info"
+    assert hl_snap["environment_verified"] is True
+    assert hl_snap["quantity_step"] == 0.0001
+    assert hl_snap["product_type"] == "perpetual"
+    assert hl_snap["contract_multiplier"] != hl_snap["quantity_step"] or hl_snap["contract_multiplier"] == 1.0

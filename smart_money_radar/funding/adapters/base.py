@@ -59,6 +59,18 @@ _KNOWN_ENDPOINTS: dict[tuple[str, str], tuple[str, str]] = {
     ("bybit", "https://api.bybit.com"): ("mainnet", "official_public_rest"),
     ("okx", "https://app.okx.com"): ("mainnet", "official_public_rest"),
     ("okx", "https://www.okx.com"): ("mainnet", "official_public_rest"),
+    ("hyperliquid", "https://api.hyperliquid.xyz/info"): (
+        "mainnet",
+        "official_public_rest",
+    ),
+    ("lighter", "https://mainnet.zklighter.elliot.ai"): (
+        "mainnet",
+        "official_public_rest",
+    ),
+    ("dydx", "https://indexer.dydx.trade/v4"): (
+        "mainnet",
+        "official_public_rest",
+    ),
     ("pacifica", "https://api.pacifica.fi/api/v1"): (
         "mainnet",
         "official_public_rest",
@@ -162,6 +174,29 @@ def apply_endpoint_identity(
     for row in rows:
         row.update(fields)
     return rows
+
+
+def public_fee_evidence(
+    *,
+    venue: str,
+    liquidity_role: str,
+    source_identifier: str,
+    observed_at: str,
+    environment: str = "mainnet",
+    product_type: str = "perpetual",
+) -> dict[str, Any]:
+    return {
+        "source_kind": "official_public_fee_endpoint",
+        "source_identifier": source_identifier,
+        "trust_status": "OFFICIAL",
+        "venue": str(venue or "").lower(),
+        "liquidity_role": liquidity_role,
+        "fee_source_observed_at": observed_at,
+        "environment": environment,
+        "product_type": product_type,
+        "applicability": liquidity_role,
+        "evidence_version": "public-fee-evidence-v1",
+    }
 
 
 def as_float(value: Any, default: float = 0.0) -> float:

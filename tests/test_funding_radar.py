@@ -39,6 +39,7 @@ from smart_money_radar.funding.adapters.hyperliquid import (
     HyperliquidFundingClient,
     hyperliquid_next_funding_time,
     hyperliquid_predicted_fundings,
+    hyperliquid_quantity_step,
 )
 from smart_money_radar.funding.adapters.kucoin import KuCoinFundingClient
 from smart_money_radar.funding.adapters.kraken import (
@@ -4529,9 +4530,14 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(markets[0]["mark_price"], 64132.5)
         self.assertAlmostEqual(markets[0]["index_price"], 64131.9)
         self.assertAlmostEqual(markets[0]["taker_fee_rate"], 0.0005)
+        self.assertEqual(markets[0]["fee_source"], "official_public_fee_endpoint")
         self.assertEqual(
-            markets[0]["fee_source"],
-            "info/fees_public_fee_levels_conservative_max",
+            markets[0]["fee_evidence"]["taker"]["source_identifier"],
+            "https://pacifica.test/info/fees",
+        )
+        self.assertEqual(
+            markets[0]["fee_evidence"]["taker"]["trust_status"],
+            "OFFICIAL",
         )
         self.assertEqual(book_row["bids"][0], [64132.0, 0.785])
         self.assertEqual(book_row["asks"][0], [64133.0, 1.234])
@@ -5347,6 +5353,100 @@ class FundingRadarTest(unittest.TestCase):
         )
         self.assertEqual(len(dashboard["routes"]), 1)
 
+    def test_hyperliquid_focused_snapshot_carries_endpoint_identity_and_quantity_step(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = HyperliquidFundingClient(http=FakeHyperliquidHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, markets[0])
+
+        self.assertEqual(snapshot["endpoint_base_url"], "https://api.hyperliquid.xyz/info")
+        self.assertEqual(snapshot["endpoint_identity_provenance"], "official_public_rest")
+        self.assertEqual(snapshot["environment"], "mainnet")
+        self.assertTrue(snapshot["environment_verified"])
+        self.assertAlmostEqual(snapshot["quantity_step"], 0.001)
+        self.assertEqual(snapshot["product_type"], "perpetual")
+        self.assertEqual(snapshot["contract_multiplier"], 1.0)
+
+    def test_lighter_focused_snapshot_carries_endpoint_identity_and_product_type(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = LighterFundingClient(http=FakeLighterHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, markets[0])
+
+        self.assertEqual(snapshot["endpoint_base_url"], "https://mainnet.zklighter.elliot.ai")
+        self.assertEqual(snapshot["endpoint_identity_provenance"], "official_public_rest")
+        self.assertEqual(snapshot["environment"], "mainnet")
+        self.assertTrue(snapshot["environment_verified"])
+        self.assertEqual(snapshot["product_type"], "perpetual")
+        self.assertAlmostEqual(snapshot["quantity_step"], 0.001)
+        self.assertAlmostEqual(snapshot["min_quantity"], 0.001)
+        self.assertAlmostEqual(snapshot["min_notional_usd"], 10.0)
+
+    def test_dydx_focused_snapshot_carries_endpoint_identity_and_preserves_previous_evidence(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = DydxFundingClient(http=FakeDydxHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        previous = dict(markets[0])
+        previous["quantity_step"] = 0.001
+        previous["min_notional_usd"] = 5.0
+        snapshot = client.market_snapshot("BTC-USD", "BTC", observed_at, previous)
+
+        self.assertEqual(snapshot["endpoint_base_url"], "https://indexer.dydx.trade/v4")
+        self.assertEqual(snapshot["endpoint_identity_provenance"], "official_public_rest")
+        self.assertEqual(snapshot["environment"], "mainnet")
+        self.assertTrue(snapshot["environment_verified"])
+        self.assertEqual(snapshot["product_type"], "perpetual")
+        self.assertAlmostEqual(snapshot["quantity_step"], 0.001)
+        self.assertAlmostEqual(snapshot["min_notional_usd"], 5.0)
+
+    def test_pacifica_focused_snapshot_carries_product_type(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = PacificaFundingClient(http=FakePacificaHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, markets[0])
+
+        self.assertEqual(snapshot["product_type"], "perpetual")
+        self.assertEqual(snapshot["environment"], "mainnet")
+        self.assertTrue(snapshot["environment_verified"])
+
+    def test_risex_focused_snapshot_carries_product_type(self) -> None:
+        observed_at = "2026-07-14T12:30:00+00:00"
+        client = RiseXFundingClient(http=FakeRiseXHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC/USDC", "BTC", observed_at, markets[0])
+
+        self.assertEqual(snapshot["product_type"], "perpetual")
+        self.assertEqual(snapshot["environment"], "mainnet")
+        self.assertTrue(snapshot["environment_verified"])
+        self.assertAlmostEqual(snapshot["quantity_step"], 0.000001)
+        self.assertAlmostEqual(snapshot["min_quantity"], 0.00015)
+        self.assertAlmostEqual(snapshot["min_notional_usd"], 0.01503)
+
+    def test_nado_focused_snapshot_carries_product_type(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = NadoFundingClient(http=FakeNadoHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        snapshot = client.market_snapshot("BTC-PERP_USDT0", "BTC", observed_at, markets[0])
+
+        self.assertEqual(snapshot["product_type"], "perpetual")
+        self.assertEqual(snapshot["environment"], "mainnet")
+        self.assertTrue(snapshot["environment_verified"])
+
+    def test_contract_multiplier_cannot_satisfy_quantity_step(self) -> None:
+        observed_at = "2026-07-14T12:00:00+00:00"
+        client = HyperliquidFundingClient(http=FakeHyperliquidHttp())
+        _instruments, markets, _warnings = client.catalog_and_markets(observed_at)
+        previous = dict(markets[0])
+        previous["contract_multiplier"] = 10.0
+        previous_no_sz = dict(previous)
+        snapshot = client.market_snapshot("BTC", "BTC", observed_at, previous_no_sz)
+
+        self.assertNotEqual(snapshot.get("quantity_step"), snapshot["contract_multiplier"])
+        self.assertEqual(snapshot["contract_multiplier"], 10.0)
+
+    def test_hyperliquid_zero_size_decimals_means_integer_quantity_step(self) -> None:
+        self.assertEqual(hyperliquid_quantity_step({"szDecimals": 0}), 1.0)
+
 class FakeClient:
     def __init__(self, venue: str) -> None:
         self.venue = venue
@@ -5503,7 +5603,7 @@ class FakeHyperliquidHttp:
     def post_json(self, url: str, payload: dict[str, Any]) -> Any:
         if payload == {"type": "metaAndAssetCtxs"}:
             return [
-                {"universe": [{"name": "BTC", "isDelisted": False}]},
+                {"universe": [{"name": "BTC", "isDelisted": False, "szDecimals": 3}]},
                 [{
                     "markPx": "100",
                     "oraclePx": "100",
@@ -5769,6 +5869,9 @@ class FakeLighterHttp:
                 "status": "active",
                 "maker_fee": "0.0000",
                 "taker_fee": "0.0000",
+                "supported_size_decimals": 3,
+                "min_base_amount": "0.001",
+                "min_quote_amount": "10",
             }]}
         if "/orderBookDetails?" in url:
             return {"order_book_details": [{
@@ -5780,6 +5883,9 @@ class FakeLighterHttp:
                 "index_price": "100",
                 "open_interest": "10",
                 "daily_quote_token_volume": "100000",
+                "supported_size_decimals": 3,
+                "min_base_amount": "0.001",
+                "min_quote_amount": "10",
             }]}
         if url.endswith("/funding-rates"):
             return {"funding_rates": [{
@@ -6405,6 +6511,8 @@ class FakeRiseXHttp:
                             "config": {
                                 "name": "BTC/USDC",
                                 "unlocked": True,
+                                "step_size": "0.000001",
+                                "min_order_size": "0.00015",
                             },
                             "base_asset_symbol": "BTC/USDC",
                             "quote_asset_symbol": "USDC",

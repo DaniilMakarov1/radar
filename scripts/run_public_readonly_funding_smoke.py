@@ -34,14 +34,6 @@ from smart_money_radar.storage import SQLiteStore  # noqa: E402
 
 
 DEFAULT_VENUES = ("binance", "bybit", "okx")
-ROUTE_COMBINATIONS = (
-    ("binance", "bybit"),
-    ("bybit", "binance"),
-    ("binance", "okx"),
-    ("okx", "binance"),
-    ("bybit", "okx"),
-    ("okx", "bybit"),
-)
 
 
 class PublicFocusedSmokeBot(PaperBot):
@@ -138,6 +130,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Path for sanitized JSON output.",
     )
     parser.add_argument("--asset", default="BTC")
+    parser.add_argument(
+        "--venues",
+        default=",".join(DEFAULT_VENUES),
+        help="Comma-separated public venues to include in route permutations.",
+    )
     parser.add_argument("--target-notional", type=float, default=500.0)
     parser.add_argument("--timeout-seconds", type=float, default=8.0)
     parser.add_argument("--focused-route-count", type=int, default=6)
@@ -146,12 +143,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     observed_at = datetime.now(UTC).isoformat()
+    venue_names = tuple(
+        dict.fromkeys(
+            venue.strip().lower()
+            for venue in str(args.venues or "").split(",")
+            if venue.strip()
+        )
+    ) or DEFAULT_VENUES
+    route_combinations = tuple(
+        (long_venue, short_venue)
+        for long_venue in venue_names
+        for short_venue in venue_names
+        if long_venue != short_venue
+    )
     markets: dict[str, dict[str, Any]] = {}
     clients: dict[str, Any] = {}
     venue_results: dict[str, Any] = {}
     failures: list[str] = []
 
-    for venue in DEFAULT_VENUES:
+    for venue in venue_names:
         try:
             client = funding_client_for_venue(
                 venue,
@@ -229,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             }
 
     route_results: dict[str, Any] = {}
-    for long_venue, short_venue in ROUTE_COMBINATIONS:
+    for long_venue, short_venue in route_combinations:
         key = f"{long_venue}->{short_venue}"
         if long_venue not in markets or short_venue not in markets:
             route_results[key] = {
@@ -267,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
 
     focused_smoke = _run_focused_concurrency_smoke(
         markets=markets,
+        route_combinations=route_combinations,
         asset=str(args.asset).upper(),
         target_notional=float(args.target_notional),
         route_count=int(args.focused_route_count),
@@ -281,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "FAIL" if failures else "PASS",
         "observed_at": observed_at,
         "asset": str(args.asset).upper(),
+        "requested_venues": venue_names,
         "venues": venue_results,
         "routes": route_results,
         "focused_concurrency": focused_smoke,
@@ -302,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
 def _run_focused_concurrency_smoke(
     *,
     markets: dict[str, dict[str, Any]],
+    route_combinations: tuple[tuple[str, str], ...],
     asset: str,
     target_notional: float,
     route_count: int,
@@ -311,7 +324,7 @@ def _run_focused_concurrency_smoke(
 ) -> dict[str, Any]:
     selected_pairs = [
         pair
-        for pair in ROUTE_COMBINATIONS
+        for pair in route_combinations
         if pair[0] in markets and pair[1] in markets
     ][: max(0, route_count)]
     if len(selected_pairs) < route_count:
@@ -540,6 +553,9 @@ def _market_summary(market: dict[str, Any]) -> dict[str, Any]:
         "contract_type": market.get("contract_type") or market.get("contract_kind"),
         "contract_multiplier": market.get("contract_multiplier"),
         "canonical_unit_multiplier": market.get("canonical_unit_multiplier"),
+        "quantity_step": market.get("quantity_step"),
+        "min_quantity": market.get("min_quantity"),
+        "min_notional_usd": market.get("min_notional_usd") or market.get("min_notional"),
         "funding_rate_kind": market.get("funding_rate_kind"),
         "next_funding_at": market.get("next_funding_at"),
         "mark_price": market.get("mark_price"),

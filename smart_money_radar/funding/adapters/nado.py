@@ -252,6 +252,7 @@ class NadoFundingClient:
             "is_linear_contract": True,
             "supports_discrete_funding": False,
             "supports_public_shadow_mode": True,
+            "product_type": previous.get("product_type", "perpetual"),
             "fee_source": "fee_model_missing",
             "fee_model_missing": True,
             "contract_multiplier": previous.get("contract_multiplier") or 1.0,

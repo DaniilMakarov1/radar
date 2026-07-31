@@ -7,7 +7,10 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
+    public_fee_evidence,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -32,6 +35,12 @@ class LighterFundingClient:
     ) -> None:
         self.http = http or FundingHttpClient(min_delay_seconds=0.08)
         self.base_url = base_url.rstrip("/")
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
+        self.environment = self.endpoint_identity.environment
         self._market_ids: dict[str, int] = {}
 
     def catalog_and_markets(
@@ -79,6 +88,25 @@ class LighterFundingClient:
             interval_hours = 1.0
             maker_fee = percentage_points_to_decimal(raw.get("maker_fee"))
             taker_fee = percentage_points_to_decimal(raw.get("taker_fee"))
+            quantity_step = lighter_quantity_step(raw, detail)
+            min_quantity = as_float(raw.get("min_base_amount"), as_float(detail.get("min_base_amount"))) or None
+            min_notional = as_float(raw.get("min_quote_amount"), as_float(detail.get("min_quote_amount"))) or None
+            fee_evidence = {
+                "maker": public_fee_evidence(
+                    venue=self.venue,
+                    liquidity_role="maker",
+                    source_identifier=f"{self.base_url}/api/v1/orderBooks",
+                    observed_at=observed_at,
+                    environment=self.environment,
+                ),
+                "taker": public_fee_evidence(
+                    venue=self.venue,
+                    liquidity_role="taker",
+                    source_identifier=f"{self.base_url}/api/v1/orderBooks",
+                    observed_at=observed_at,
+                    environment=self.environment,
+                ),
+            }
             market_ids[symbol] = market_id
             instruments.append(
                 {
@@ -90,6 +118,9 @@ class LighterFundingClient:
                     "collateral_asset": "USDC",
                     "contract_type": "linear_perpetual",
                     "contract_multiplier": 1.0,
+                    "quantity_step": quantity_step,
+                    "min_quantity": min_quantity,
+                    "min_notional_usd": min_notional,
                     "status": "active",
                     "source_url": f"https://app.lighter.xyz/trade/{symbol}",
                     "observed_at": observed_at,
@@ -102,9 +133,17 @@ class LighterFundingClient:
                     "symbol": symbol,
                     "canonical_asset": asset,
                     "funding_rate": hourly_funding_rate,
+                    "normalized_next_funding_rate": hourly_funding_rate,
                     "funding_interval_hours": interval_hours,
                     "hourly_funding_rate": hourly_funding_rate,
                     "funding_rate_kind": "published_8h_equivalent_normalized_hourly",
+                    "funding_rate_semantics": "current_interval_estimate",
+                    "funding_rate_unit": "fraction_of_notional_per_settlement",
+                    "funding_sign_convention": "positive_long_pays",
+                    "settlement_interval_seconds": 3600.0,
+                    "displayed_rate_period_seconds": (
+                        LIGHTER_CURRENT_FUNDING_PERIOD_HOURS * 3600.0
+                    ),
                     "published_funding_rate": published_rate,
                     "published_funding_interval_hours": (
                         LIGHTER_CURRENT_FUNDING_PERIOD_HOURS
@@ -120,7 +159,12 @@ class LighterFundingClient:
                     ) or None,
                     "maker_fee_rate": maker_fee,
                     "taker_fee_rate": taker_fee,
-                    "fee_source": "venue_public_account_type",
+                    "fee_source": "official_public_fee_endpoint",
+                    "fee_evidence": fee_evidence,
+                    "fee_observed_at": observed_at,
+                    "quantity_step": quantity_step,
+                    "min_quantity": min_quantity,
+                    "min_notional_usd": min_notional,
                     "observed_at": observed_at,
                     "raw": {
                         "spec": raw,
@@ -135,7 +179,11 @@ class LighterFundingClient:
                 }
             )
         self._market_ids = market_ids
-        return instruments, markets, []
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            [],
+        )
 
     def orderbook(
         self,
@@ -222,14 +270,48 @@ class LighterFundingClient:
         hourly_funding_rate = published_rate / LIGHTER_CURRENT_FUNDING_PERIOD_HOURS
         maker_fee = percentage_points_to_decimal(spec.get("maker_fee"))
         taker_fee = percentage_points_to_decimal(spec.get("taker_fee"))
-        return {
+        quantity_step = lighter_quantity_step(spec, detail) or previous.get("quantity_step")
+        min_quantity = (
+            as_float(spec.get("min_base_amount"), as_float(detail.get("min_base_amount")))
+            or previous.get("min_quantity")
+        )
+        min_notional = (
+            as_float(spec.get("min_quote_amount"), as_float(detail.get("min_quote_amount")))
+            or previous.get("min_notional_usd")
+            or previous.get("min_notional")
+        )
+        fee_evidence = {
+            "maker": public_fee_evidence(
+                venue=self.venue,
+                liquidity_role="maker",
+                source_identifier=f"{self.base_url}/api/v1/orderBooks",
+                observed_at=observed_at,
+                environment=self.environment,
+            ),
+            "taker": public_fee_evidence(
+                venue=self.venue,
+                liquidity_role="taker",
+                source_identifier=f"{self.base_url}/api/v1/orderBooks",
+                observed_at=observed_at,
+                environment=self.environment,
+            ),
+        }
+        return apply_endpoint_identity([{
             "venue": self.venue,
             "symbol": symbol,
             "canonical_asset": clean_asset_symbol(canonical_asset),
             "funding_rate": hourly_funding_rate,
+            "normalized_next_funding_rate": hourly_funding_rate,
             "funding_interval_hours": 1.0,
             "hourly_funding_rate": hourly_funding_rate,
             "funding_rate_kind": "published_8h_equivalent_normalized_hourly",
+            "funding_rate_semantics": "current_interval_estimate",
+            "funding_rate_unit": "fraction_of_notional_per_settlement",
+            "funding_sign_convention": "positive_long_pays",
+            "settlement_interval_seconds": 3600.0,
+            "displayed_rate_period_seconds": (
+                LIGHTER_CURRENT_FUNDING_PERIOD_HOURS * 3600.0
+            ),
             "published_funding_rate": published_rate,
             "published_funding_interval_hours": LIGHTER_CURRENT_FUNDING_PERIOD_HOURS,
             "funding_display_note": "published 8h equivalent; cashflow hourly",
@@ -241,9 +323,15 @@ class LighterFundingClient:
             "volume_24h_usd": as_float(detail.get("daily_quote_token_volume")) or None,
             "maker_fee_rate": maker_fee,
             "taker_fee_rate": taker_fee,
-            "fee_source": "venue_public_account_type",
+            "fee_source": "official_public_fee_endpoint",
+            "fee_evidence": fee_evidence,
+            "fee_observed_at": observed_at,
+            "quantity_step": quantity_step,
+            "min_quantity": min_quantity,
+            "min_notional_usd": min_notional,
             "contract_multiplier": previous.get("contract_multiplier") or 1.0,
             "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "product_type": previous.get("product_type", "perpetual"),
             "observed_at": observed_at,
             "raw": {
                 "spec": spec,
@@ -253,7 +341,7 @@ class LighterFundingClient:
                 "published_funding_period_hours": LIGHTER_CURRENT_FUNDING_PERIOD_HOURS,
                 "normalization": "published_8h_rate_divided_by_8",
             },
-        }
+        }], self.endpoint_identity)[0]
 
     def funding_history(
         self,
@@ -350,6 +438,18 @@ def lighter_rows(payload: Any, field: str, label: str) -> list[dict[str, Any]]:
 
 def percentage_points_to_decimal(value: Any) -> float:
     return max(0.0, as_float(value)) / 100.0
+
+
+def lighter_quantity_step(*rows: dict[str, Any]) -> float | None:
+    for row in rows:
+        decimals = integer_or_none(row.get("supported_size_decimals") or row.get("size_decimals"))
+        if decimals is not None and decimals >= 0:
+            return 10 ** (-decimals)
+        for key in ("quantity_step", "step_size", "base_step_size"):
+            value = as_float(row.get(key))
+            if value > 0:
+                return value
+    return None
 
 
 def aggregate_lighter_orders(rows: Any) -> list[list[float]]:

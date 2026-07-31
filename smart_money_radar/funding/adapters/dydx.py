@@ -7,7 +7,9 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -29,6 +31,12 @@ class DydxFundingClient:
     ) -> None:
         self.http = http or FundingHttpClient()
         self.base_url = base_url.rstrip("/")
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
+        self.environment = self.endpoint_identity.environment
 
     def catalog_and_markets(
         self,
@@ -74,9 +82,15 @@ class DydxFundingClient:
                     "symbol": symbol,
                     "canonical_asset": base_asset,
                     "funding_rate": funding_rate,
+                    "normalized_next_funding_rate": funding_rate,
                     "funding_interval_hours": 1.0,
                     "hourly_funding_rate": funding_rate,
                     "funding_rate_kind": "published_next_hour",
+                    "funding_rate_semantics": "next_settlement",
+                    "funding_rate_unit": "fraction_of_notional_per_settlement",
+                    "funding_sign_convention": "positive_long_pays",
+                    "settlement_interval_seconds": 3600.0,
+                    "displayed_rate_period_seconds": 3600.0,
                     "next_funding_at": next_funding_at,
                     "mark_price": None,
                     "mark_price_kind": "orderbook_mid_at_route_evaluation",
@@ -88,7 +102,11 @@ class DydxFundingClient:
                     "raw": raw,
                 }
             )
-        return instruments, markets, []
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            [],
+        )
 
     def market_snapshot(
         self,
@@ -122,14 +140,22 @@ class DydxFundingClient:
             if mark_price <= 0:
                 raise FundingDataError(f"dYdX reference price unavailable for {symbol}")
             funding_rate = as_float(raw.get("nextFundingRate"))
-            return {
+            step_size = as_float(raw.get("stepSize"))
+            min_notional = as_float(raw.get("minNotional"))
+            row = {
                 "venue": self.venue,
                 "symbol": raw_symbol,
                 "canonical_asset": asset,
                 "funding_rate": funding_rate,
+                "normalized_next_funding_rate": funding_rate,
                 "funding_interval_hours": 1.0,
                 "hourly_funding_rate": funding_rate,
                 "funding_rate_kind": "published_next_hour",
+                "funding_rate_semantics": "next_settlement",
+                "funding_rate_unit": "fraction_of_notional_per_settlement",
+                "funding_sign_convention": "positive_long_pays",
+                "settlement_interval_seconds": 3600.0,
+                "displayed_rate_period_seconds": 3600.0,
                 "next_funding_at": next_utc_hour(observed_at),
                 "mark_price": mark_price,
                 "mark_price_kind": (
@@ -150,9 +176,13 @@ class DydxFundingClient:
                     "canonical_unit_multiplier",
                     1.0,
                 ),
+                "product_type": previous.get("product_type", "perpetual"),
+                "quantity_step": step_size or previous.get("quantity_step"),
+                "min_notional_usd": min_notional or previous.get("min_notional_usd"),
                 "observed_at": observed_at,
                 "raw": raw,
             }
+            return apply_endpoint_identity([row], self.endpoint_identity)[0]
         raise FundingDataError(f"dYdX symbol not found: {symbol}")
 
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:

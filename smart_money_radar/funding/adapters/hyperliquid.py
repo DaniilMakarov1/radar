@@ -6,7 +6,9 @@ from typing import Any
 from smart_money_radar.funding.adapters.base import (
     FundingDataError,
     FundingHttpClient,
+    apply_endpoint_identity,
     as_float,
+    build_endpoint_identity,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -26,6 +28,13 @@ class HyperliquidFundingClient:
             min_delay_seconds=0.3,
             max_retries=6,
         )
+        self.base_url = HYPERLIQUID_INFO_URL
+        self.endpoint_identity = build_endpoint_identity(
+            venue=self.venue,
+            base_url=self.base_url,
+            requested_environment="mainnet",
+        )
+        self.environment = self.endpoint_identity.environment
 
     def catalog_and_markets(
         self,
@@ -92,6 +101,8 @@ class HyperliquidFundingClient:
                     "collateral_asset": "USDC",
                     "contract_type": "linear_perpetual",
                     "contract_multiplier": 1.0,
+                    "product_type": "perpetual",
+                    "quantity_step": hyperliquid_quantity_step(raw),
                     "status": "active",
                     "source_url": f"https://app.hyperliquid.xyz/trade/{symbol}",
                     "observed_at": observed_at,
@@ -104,9 +115,19 @@ class HyperliquidFundingClient:
                     "symbol": symbol,
                     "canonical_asset": canonical_asset,
                     "funding_rate": funding_rate,
+                    "normalized_next_funding_rate": funding_rate,
                     "funding_interval_hours": interval_hours,
                     "hourly_funding_rate": funding_rate / interval_hours,
                     "funding_rate_kind": rate_kind,
+                    "funding_rate_semantics": (
+                        "next_settlement"
+                        if rate_kind == "published_predicted_next"
+                        else "current_interval_fallback"
+                    ),
+                    "funding_rate_unit": "fraction_of_notional_per_settlement",
+                    "funding_sign_convention": "positive_long_pays",
+                    "settlement_interval_seconds": interval_hours * 3600.0,
+                    "displayed_rate_period_seconds": interval_hours * 3600.0,
                     "next_funding_at": next_funding_at,
                     "mark_price": mark_price,
                     "index_price": index_price,
@@ -116,7 +137,11 @@ class HyperliquidFundingClient:
                     "raw": {"context": context, "predicted_funding": next_estimate},
                 }
             )
-        return instruments, markets, warnings
+        return (
+            apply_endpoint_identity(instruments, self.endpoint_identity),
+            apply_endpoint_identity(markets, self.endpoint_identity),
+            warnings,
+        )
 
     def market_snapshot(
         self,
@@ -179,14 +204,25 @@ class HyperliquidFundingClient:
                 next_funding_at = next_utc_hour(observed_at)
                 rate_kind = "published_current_fallback"
             previous = previous_market or {}
+            quantity_step = hyperliquid_quantity_step(raw)
             row = {
                 "venue": self.venue,
                 "symbol": raw_symbol,
                 "canonical_asset": asset,
                 "funding_rate": funding_rate,
+                "normalized_next_funding_rate": funding_rate,
                 "funding_interval_hours": interval_hours,
                 "hourly_funding_rate": funding_rate / interval_hours,
                 "funding_rate_kind": rate_kind,
+                "funding_rate_semantics": (
+                    "next_settlement"
+                    if rate_kind == "published_predicted_next"
+                    else "current_interval_fallback"
+                ),
+                "funding_rate_unit": "fraction_of_notional_per_settlement",
+                "funding_sign_convention": "positive_long_pays",
+                "settlement_interval_seconds": interval_hours * 3600.0,
+                "displayed_rate_period_seconds": interval_hours * 3600.0,
                 "next_funding_at": next_funding_at,
                 "mark_price": mark_price,
                 "index_price": index_price,
@@ -197,6 +233,8 @@ class HyperliquidFundingClient:
                     "canonical_unit_multiplier",
                     1.0,
                 ),
+                "product_type": previous.get("product_type", "perpetual"),
+                "quantity_step": quantity_step,
                 "observed_at": observed_at,
                 "raw": {"context": context, "predicted_funding": next_estimate},
             }
@@ -206,7 +244,7 @@ class HyperliquidFundingClient:
                 row["maker_fee_rate"] = previous["maker_fee_rate"]
             if "fee_source" in previous:
                 row["fee_source"] = previous["fee_source"]
-            return row
+            return apply_endpoint_identity([row], self.endpoint_identity)[0]
         raise FundingDataError(f"Hyperliquid symbol not found: {symbol}")
 
     def orderbook(self, symbol: str, observed_at: str, limit: int = 100) -> dict[str, Any]:
@@ -314,6 +352,16 @@ def hyperliquid_next_funding_time(
         )
         candidate += interval * (elapsed_intervals + 1)
     return candidate.astimezone(UTC).isoformat()
+
+
+def hyperliquid_quantity_step(row: dict[str, Any]) -> float | None:
+    try:
+        decimals = int(row.get("szDecimals"))
+    except (TypeError, ValueError):
+        return None
+    if decimals < 0:
+        return None
+    return 10 ** (-decimals)
 
 
 def hyperliquid_predicted_fundings(payload: Any) -> dict[str, dict[str, Any]]:

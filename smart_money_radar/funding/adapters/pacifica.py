@@ -10,6 +10,7 @@ from smart_money_radar.funding.adapters.base import (
     apply_endpoint_identity,
     as_float,
     build_endpoint_identity,
+    public_fee_evidence,
 )
 from smart_money_radar.funding.normalization import (
     clean_asset_symbol,
@@ -159,12 +160,19 @@ class PacificaFundingClient:
                 "raw": {"info": row, "prices": price_row},
             }
             if fee_rates:
+                fee_evidence = pacifica_fee_evidence(
+                    self.base_url,
+                    observed_at,
+                    self.environment,
+                )
                 market.update(
                     {
                         "maker_fee_rate": fee_rates["maker_fee_rate"],
                         "taker_fee_rate": fee_rates["taker_fee_rate"],
-                        "fee_source": "info/fees_public_fee_levels_conservative_max",
+                        "fee_source": "official_public_fee_endpoint",
                         "fee_scope": "public_not_account_specific",
+                        "fee_evidence": fee_evidence,
+                        "fee_observed_at": observed_at,
                     }
                 )
             else:
@@ -288,16 +296,24 @@ class PacificaFundingClient:
             "source_event_at": source_event_at,
             "contract_multiplier": previous.get("contract_multiplier") or 1.0,
             "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
+            "product_type": previous.get("product_type", "perpetual"),
             "observed_at": observed_at,
             "raw": {"info": info, "prices": price_row},
         }
         if fee_rates:
+            fee_evidence = pacifica_fee_evidence(
+                self.base_url,
+                observed_at,
+                self.environment,
+            )
             row.update(
                 {
                     "maker_fee_rate": fee_rates["maker_fee_rate"],
                     "taker_fee_rate": fee_rates["taker_fee_rate"],
-                    "fee_source": "info/fees_public_fee_levels_conservative_max",
+                    "fee_source": "official_public_fee_endpoint",
                     "fee_scope": "public_not_account_specific",
+                    "fee_evidence": fee_evidence,
+                    "fee_observed_at": observed_at,
                 }
             )
         else:
@@ -430,3 +446,27 @@ def pacifica_non_negative_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
+
+
+def pacifica_fee_evidence(
+    base_url: str,
+    observed_at: str,
+    environment: str,
+) -> dict[str, dict[str, Any]]:
+    source_identifier = f"{base_url.rstrip('/')}/info/fees"
+    return {
+        "maker": public_fee_evidence(
+            venue="pacifica",
+            liquidity_role="maker",
+            source_identifier=source_identifier,
+            observed_at=observed_at,
+            environment=environment,
+        ),
+        "taker": public_fee_evidence(
+            venue="pacifica",
+            liquidity_role="taker",
+            source_identifier=source_identifier,
+            observed_at=observed_at,
+            environment=environment,
+        ),
+    }

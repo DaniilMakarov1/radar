@@ -12,6 +12,7 @@ import pytest
 from smart_money_radar.cli import main
 from smart_money_radar.funding.adapter_contracts import (
     PRIMARY_SHADOW_VENUES,
+    USD_BRIDGED_STABLE,
     USD_MAJOR_STABLE,
     collateral_family,
     funding_adapter_contract_from_market,
@@ -1341,6 +1342,108 @@ def test_public_stablecoin_provider_uses_two_sources_and_caches() -> None:
     assert len(calls) == 4
 
 
+def test_public_stablecoin_provider_prices_usde_usdt0_and_bridged_usdc() -> None:
+    def fetch_json(url: str, _timeout: float) -> Any:
+        if "coingecko" in url and "ethena-usde" in url:
+            return {"ethena-usde": {"usd": 0.9997}}
+        if "kraken" in url and "USDEUSD" in url:
+            return {"result": {"USDEUSD": {"b": ["0.9996"], "a": ["0.9998"], "c": ["0.9997"]}}}
+        if "coins.llama.fi" in url and "usdt0" in url:
+            return {"coins": {"coingecko:usdt0": {"price": 0.9991, "timestamp": 1_784_044_800}}}
+        if "coingecko" in url and "usdt0" in url:
+            return {"usdt0": {"usd": 0.9990}}
+        if "geckoterminal" in url:
+            return {
+                "data": [{
+                    "attributes": {
+                        "name": "USDT0 / USDC",
+                        "base_token_price_usd": "0.9992",
+                        "reserve_in_usd": "1000000",
+                    }
+                }]
+            }
+        if "coingecko" in url and "usd-coin" in url:
+            return {"usd-coin": {"usd": 0.9999}}
+        if "coinbase" in url and "USDC" in url:
+            return {"data": {"rates": {"USD": "1.0000"}}}
+        raise AssertionError(url)
+
+    provider = PublicStablecoinPriceProvider(fetch_json=fetch_json)
+    observed_at = datetime.now(UTC).isoformat()
+
+    assert {row.source for row in provider.prices("USDe", observed_at)} == {
+        "coingecko",
+        "kraken",
+    }
+    assert {row.source for row in provider.prices("USDT0", observed_at)} == {
+        "coingecko",
+        "defillama",
+        "geckoterminal",
+    }
+    bridged = provider.prices("USDC.E", observed_at)
+    assert {row.source for row in bridged} == {"coingecko", "coinbase"}
+    assert all(row.asset == "USDC.E" for row in bridged)
+    assert all(row.quality == "bridged_canonical_usdc_proxy" for row in bridged)
+    assert collateral_family("USDC.E") == USD_BRIDGED_STABLE
+
+
+def test_non_major_stable_source_disagreement_passes_only_with_extra_reserve() -> None:
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    provider = StaticStablecoinPriceProvider(
+        {
+            "USDT0": [
+                StablecoinPrice("USDT0", 0.9990, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDT0", 1.0002, "source-b", now.isoformat(), now.isoformat()),
+            ],
+            "USDC": [
+                StablecoinPrice("USDC", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDC", 1.0001, "source-b", now.isoformat(), now.isoformat()),
+            ],
+        }
+    )
+
+    result = evaluate_stablecoin_route(
+        long_collateral="USDT0",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=now.isoformat(),
+        reference_notional=1_000.0,
+        funding_net_before_stablecoin_reserve=12.0,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["source_disagreement_limit_bps"] == 25.0
+    assert result["stablecoin_reserve_bps"] > 10.0
+
+
+def test_non_major_stable_large_source_disagreement_stays_research_only() -> None:
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    provider = StaticStablecoinPriceProvider(
+        {
+            "USDT0": [
+                StablecoinPrice("USDT0", 0.9900, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDT0", 1.0100, "source-b", now.isoformat(), now.isoformat()),
+            ],
+            "USDC": [
+                StablecoinPrice("USDC", 1.0000, "source-a", now.isoformat(), now.isoformat()),
+                StablecoinPrice("USDC", 1.0001, "source-b", now.isoformat(), now.isoformat()),
+            ],
+        }
+    )
+
+    result = evaluate_stablecoin_route(
+        long_collateral="USDT0",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=now.isoformat(),
+        reference_notional=1_000.0,
+        funding_net_before_stablecoin_reserve=12.0,
+    )
+
+    assert result["status"] == "RESEARCH_ONLY"
+    assert "stablecoin_cross_source_disagreement" in result["blockers"]
+
+
 def test_cross_stable_without_price_data_remains_research_only() -> None:
     result = evaluate_stablecoin_route(
         long_collateral="USDC",
@@ -2315,3 +2418,20 @@ def test_shadow_mode_does_not_query_history_or_orderbooks(tmp_path) -> None:
     assert client_b.orderbook_calls == 0
     assert client_a.history_calls == 0
     assert client_b.history_calls == 0
+
+
+def test_dex_adapter_evidence_fields_are_preserved_in_shadow_inventory() -> None:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    client = _ShadowClient(
+        "hyperliquid",
+        collateral="USDC",
+        funding_rate=0.001,
+        settlement=settlement,
+        environment="mainnet",
+        quantity_step=0.001,
+    )
+    market_row = client.market(now.isoformat())
+    assert market_row["venue"] == "hyperliquid"
+    assert market_row.get("environment") == "mainnet"
+    assert market_row.get("quantity_step") == 0.001
