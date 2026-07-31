@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from smart_money_radar.funding.adapter_contracts import (
+    USD_COMPARABLE_STABLE_FAMILIES,
     USD_MAJOR_STABLE,
     collateral_family,
 )
@@ -111,11 +112,7 @@ INCOMPATIBLE_CONTRACT_KINDS = {
     "pre_market",
 }
 
-USD_OTHER_STABLE_FAMILIES = {
-    "USD_OTHER_STABLE",
-    "USD_BRIDGED_STABLE",
-    "USD_SYNTHETIC",
-}
+USD_OTHER_STABLE_FAMILIES = USD_COMPARABLE_STABLE_FAMILIES - {USD_MAJOR_STABLE}
 
 
 @dataclass(frozen=True)
