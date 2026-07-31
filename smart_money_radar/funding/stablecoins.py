@@ -253,10 +253,6 @@ class PublicStablecoinPriceProvider:
             price = float(row["price"])
         except (TypeError, ValueError, KeyError):
             price = 0.0
-        try:
-            timestamp = float(row["timestamp"])
-        except (TypeError, ValueError, KeyError):
-            timestamp = 0.0
         # DefiLlama's coin timestamp can lag the current response by minutes for
         # stablecoins. Treat it like CoinGecko/Coinbase: current HTTP response
         # is the freshness point, and quality identifies the source family.
