@@ -103,6 +103,28 @@ RATE_KIND_MIN_UNCERTAINTY_BPS = {
 
 EXACT_NEXT_RATE_KINDS = {RateEstimateKind.PUBLISHED_NEXT}
 
+ESTIMATE_PAPER_ALLOWED_VERIFIED_BLOCKERS = frozenset({
+    "long_exact_next_rate_missing",
+    "short_exact_next_rate_missing",
+    "rate_confidence_below_verified_threshold",
+})
+
+
+def estimated_paper_blockers(verified_blockers: list[str]) -> list[str]:
+    """Return blockers that still apply to estimate-based paper entry.
+
+    This deliberately does not change VERIFIED_PAPER. The estimate-based paper
+    mode can use the latest typed funding estimate instead of an exact next
+    settlement rate, so exact-next and verified-rate-confidence blockers are
+    removed. Fee, sizing, paper_enabled, live-disabled, execution, settlement,
+    accounting, collateral, environment, endpoint, and product blockers remain.
+    """
+    return [
+        reason
+        for reason in verified_blockers
+        if reason not in ESTIMATE_PAPER_ALLOWED_VERIFIED_BLOCKERS
+    ]
+
 RATE_KIND_TO_SEMANTICS: dict[str, str] = {
     "published_next_estimate": "next_settlement",
     "published_next_hour": "next_settlement",

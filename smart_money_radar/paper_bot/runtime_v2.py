@@ -10,7 +10,10 @@ from smart_money_radar.funding.route_identity import (
     ROUTE_IDENTITY_SCHEMA_VERSION,
     route_identity_summary,
 )
-from smart_money_radar.funding.readiness_policy import EvaluationMode
+from smart_money_radar.funding.readiness_policy import (
+    EvaluationMode,
+    estimated_paper_blockers,
+)
 from smart_money_radar.funding.strategy_synchronized_funding import (
     EventWindowPlannerConfig,
     FundingRoutePlan,
@@ -346,7 +349,15 @@ class SynchronizedFundingRuntimeV2:
         self.config = config
         self.clock = clock
         self.observations_by_route = observations_by_route
+        self.estimate_paper_enabled = bool(
+            getattr(config, "estimate_paper_enabled", False)
+        )
         self.settlement_data_provider = settlement_data_provider
+        planner_mode = (
+            EvaluationMode.EXPERIMENTAL_PAPER
+            if self.estimate_paper_enabled
+            else EvaluationMode.VERIFIED_PAPER
+        )
         self.planner = planner or FundingSettlementPlanner(
             EventWindowPlannerConfig(
                 max_strategy_hold_seconds=float(
@@ -401,7 +412,7 @@ class SynchronizedFundingRuntimeV2:
                     getattr(config, "reviewed_static_fee_max_age_seconds", 30.0 * 24.0 * 60.0 * 60.0)
                 ),
             ),
-            evaluation_mode=EvaluationMode.VERIFIED_PAPER,
+            evaluation_mode=planner_mode,
         )
 
     def _cycle_events_for_scheduled_at(
@@ -1886,21 +1897,54 @@ class SynchronizedFundingRuntimeV2:
         planner = (plan or {}).get("planner") or {}
         readiness = planner.get("route_readiness") or {}
         blockers: list[str] = []
-        if str(planner.get("evaluation_mode") or "") != EvaluationMode.VERIFIED_PAPER.value:
-            blockers.append("verified_runtime_requires_verified_paper_evaluation")
-        if not bool(readiness.get("verified_paper_ready")):
-            blockers.append("verified_paper_ready_false")
-        blockers.extend(str(reason) for reason in readiness.get("mode_blockers") or [])
-        blockers.extend(str(reason) for reason in readiness.get("verified_paper_blockers") or [])
+        raw_verified_blockers = [
+            str(reason) for reason in readiness.get("verified_paper_blockers") or []
+        ]
+        mode_blockers = [
+            str(reason) for reason in readiness.get("mode_blockers") or []
+        ]
+        if self.estimate_paper_enabled:
+            if (
+                str(planner.get("evaluation_mode") or "")
+                != EvaluationMode.EXPERIMENTAL_PAPER.value
+            ):
+                blockers.append("estimate_runtime_requires_experimental_paper_evaluation")
+            filtered_verified = estimated_paper_blockers(raw_verified_blockers)
+            estimate_ready = (
+                bool(
+                    readiness.get("experimental_simulation_ready")
+                    or readiness.get("experimental_paper_ready")
+                )
+                and not filtered_verified
+            )
+            if not estimate_ready:
+                blockers.append("estimated_paper_ready_false")
+                blockers.extend(filtered_verified)
+        else:
+            if (
+                str(planner.get("evaluation_mode") or "")
+                != EvaluationMode.VERIFIED_PAPER.value
+            ):
+                blockers.append("verified_runtime_requires_verified_paper_evaluation")
+            if not bool(readiness.get("verified_paper_ready")):
+                blockers.append("verified_paper_ready_false")
+            blockers.extend(raw_verified_blockers)
+        blockers.extend(mode_blockers)
         return {
             "passed": not blockers,
             "evaluation_mode": planner.get("evaluation_mode"),
             "verified_paper_ready": bool(readiness.get("verified_paper_ready")),
+            "estimate_paper_enabled": self.estimate_paper_enabled,
             "experimental_simulation_ready": bool(
                 readiness.get("experimental_simulation_ready")
                 or readiness.get("experimental_paper_ready")
             ),
             "blockers": list(dict.fromkeys(reason for reason in blockers if reason)),
+            "estimated_paper_blockers": (
+                estimated_paper_blockers(raw_verified_blockers)
+                if self.estimate_paper_enabled
+                else []
+            ),
             "route_readiness": readiness,
         }
 
@@ -3582,7 +3626,11 @@ class SynchronizedFundingRuntimeV2:
                 missing.append(
                     f"{side}_{fee_status.get('blocker') or 'fee_provenance_unverified'}"
                 )
-            if optional_float(leg.get("normalized_next_funding_rate")) is None:
+            exact_rate = optional_float(leg.get("normalized_next_funding_rate"))
+            estimate_rate = optional_float(leg.get("rate_estimate_per_settlement"))
+            if exact_rate is None and (
+                not self.estimate_paper_enabled or estimate_rate is None
+            ):
                 missing.append(f"{side}_normalized_next_funding_rate_missing")
         return missing
 

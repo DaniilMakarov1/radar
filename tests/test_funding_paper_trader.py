@@ -306,10 +306,16 @@ def test_lightweight_discovery_defaults_and_window_validation() -> None:
 
     assert default.lightweight_foreground_budget_seconds == pytest.approx(8.0)
     assert default.lightweight_route_horizon_seconds == pytest.approx(3_600.0)
+    assert default.estimate_paper_enabled is False
     assert constrained.lightweight_foreground_budget_seconds == pytest.approx(30.0)
     assert constrained.lightweight_cache_ttl_seconds == pytest.approx(30.0)
     assert constrained.lightweight_route_horizon_seconds == pytest.approx(900.0)
     assert constrained.lightweight_watch_window_seconds == pytest.approx(900.0)
+
+
+def test_estimate_paper_entry_requires_explicit_config() -> None:
+    assert PaperBotConfig().validated().estimate_paper_enabled is False
+    assert PaperBotConfig(estimate_paper_enabled=True).validated().estimate_paper_enabled is True
 
 
 def test_selected_route_strategy_supports_all_strategy_classes() -> None:

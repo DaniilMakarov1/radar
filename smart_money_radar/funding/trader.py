@@ -287,6 +287,7 @@ class PaperBotConfig:
     post_settlement_schedule_probe_seconds: int = 5
     post_settlement_hold_decision_seconds: int = 30
     hold_enabled: bool = True
+    estimate_paper_enabled: bool = False
     entry_history_required: bool = False
     entry_history_mode: str = "disabled"
     hold_history_window_days: int = 30
@@ -427,6 +428,7 @@ class PaperBotConfig:
                 min(int(self.post_settlement_hold_decision_seconds), 900),
             ),
             hold_enabled=bool(self.hold_enabled),
+            estimate_paper_enabled=bool(self.estimate_paper_enabled),
             entry_history_required=False,
             entry_history_mode="disabled",
             hold_history_window_days=max(1, min(int(self.hold_history_window_days), 365)),

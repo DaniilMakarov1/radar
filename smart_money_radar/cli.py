@@ -924,6 +924,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     funding_paper_trader.add_argument("--no-spread-monitoring", action="store_true")
     funding_paper_trader.add_argument(
+        "--allow-estimated-funding-paper-entry",
+        dest="estimate_paper_enabled",
+        action="store_true",
+        help=(
+            "Experimental: allow paper entry to use the latest typed funding "
+            "estimate when an exact next settlement rate is unavailable. "
+            "This does not enable live trading or VERIFIED_PAPER readiness."
+        ),
+    )
+    funding_paper_trader.add_argument(
         "--account-fee-evidence-max-age-seconds",
         type=float,
         default=24.0 * 60.0 * 60.0,
@@ -1271,6 +1281,7 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         focused_recheck_enabled=not args.no_focused_recheck,
         venue_set=venue_set,
         spread_arb_enabled=getattr(args, "spread_arb", False),
+        estimate_paper_enabled=bool(getattr(args, "estimate_paper_enabled", False)),
         basis_stop_loss_bps=getattr(args, "basis_stop_loss_bps", 200.0),
         common_price_move_alert_fraction=(
             float(getattr(args, "common_price_move_alert_pct", 5.0) or 0.0) / 100.0

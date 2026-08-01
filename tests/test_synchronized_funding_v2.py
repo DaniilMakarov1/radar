@@ -1769,6 +1769,17 @@ def _v2_runtime_route(
     }
 
 
+def _mark_route_rates_as_current_estimates(route: dict) -> dict:
+    for leg in route["legs"]:
+        rate = leg.pop("normalized_next_funding_rate")
+        leg["funding_rate"] = rate
+        leg["rate_estimate_per_settlement"] = rate
+        leg["funding_rate_kind"] = "published_current_interval_rate"
+        leg["funding_rate_semantics"] = "current_interval_estimate"
+        leg["exact_next_rate_available"] = False
+    return route
+
+
 def _valid_v2_observation(
     at: datetime,
     next_at: datetime,
@@ -2350,7 +2361,11 @@ def test_v2_entry_rejects_missing_normalized_next_funding_rate(tmp_path) -> None
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
-    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now))
+    bot = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+    )
     route = _v2_runtime_route(now)
     route["legs"][0].pop("normalized_next_funding_rate")
     capture_id = capture_position_id_for_route(route)
@@ -2372,6 +2387,107 @@ def test_v2_entry_rejects_missing_normalized_next_funding_rate(tmp_path) -> None
         or "long_next_rate_missing" in result.get("blockers", [])
     )
     assert store.funding_capture_position_by_id(capture_id)["state"] == "DISCOVERED"
+
+
+def test_estimated_funding_paper_entry_is_disabled_by_default(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated(), clock=FakeClock(now))
+    route = _mark_route_rates_as_current_estimates(_v2_runtime_route(now))
+    capture_id = capture_position_id_for_route(route)
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is False
+    assert result["reason"] == "route_plan_blocked"
+    assert result["verified_readiness"]["evaluation_mode"] == "VERIFIED_PAPER"
+    assert "verified_paper_ready_false" in result["blockers"]
+    assert "long_exact_next_rate_missing" in result["blockers"]
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "DISCOVERED"
+
+
+def test_estimated_funding_paper_entry_opt_in_opens_with_latest_snapshot_estimate(
+    tmp_path,
+) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    config = PaperBotConfig(
+        telegram_enabled=False,
+        estimate_paper_enabled=True,
+        venue_starting_balance=10_000.0,
+        target_notional_per_leg=500.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    route = _mark_route_rates_as_current_estimates(_v2_runtime_route(now))
+    capture_id = capture_position_id_for_route(route)
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is True
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "OPEN"
+    plan = position["config"]["funding_route_plan"]
+    readiness = plan["planner"]["route_readiness"]
+    assert plan["planner"]["evaluation_mode"] == "EXPERIMENTAL_PAPER"
+    assert readiness["verified_paper_ready"] is False
+    assert readiness["experimental_simulation_ready"] is True
+    assert readiness["funding_cashflow_status"] == "ESTIMATED_ONLY"
+    assert readiness["rate_estimates"]["long"]["exact_next_rate_available"] is False
+    assert readiness["rate_estimates"]["short"]["exact_next_rate_available"] is False
+    assert plan["conservative_funding_cashflow_usd"] > 0
+
+
+def test_estimated_funding_paper_entry_still_requires_verified_fee_evidence(
+    tmp_path,
+) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    store.ensure_funding_paper_accounts(["binance", "bybit"], 10_000.0)
+    config = PaperBotConfig(
+        telegram_enabled=False,
+        estimate_paper_enabled=True,
+        venue_starting_balance=10_000.0,
+        target_notional_per_leg=500.0,
+    ).validated()
+    bot = PaperBot(store, config, clock=FakeClock(now))
+    route = _mark_route_rates_as_current_estimates(_v2_runtime_route(now))
+    for key in ("fee_source", "fee_evidence", "fee_observed_at", "fee_reviewed_at"):
+        route["legs"][0].pop(key, None)
+    _seed_attempt_observations(bot, route, now)
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is False
+    assert result["reason"] == "route_plan_blocked"
+    assert result["verified_readiness"]["evaluation_mode"] == "EXPERIMENTAL_PAPER"
+    assert any("fee" in blocker for blocker in result["blockers"])
 
 
 def test_hold_proceeds_while_prior_reconciliation_pending(tmp_path) -> None:
