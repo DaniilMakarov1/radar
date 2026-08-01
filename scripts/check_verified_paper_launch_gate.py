@@ -272,11 +272,14 @@ def _check_fee_freshness() -> dict[str, Any]:
     )
     for label, status in {
         "fresh_static": fresh_static,
-        "public_endpoint": public,
         "account_endpoint": account,
     }.items():
         if status["verified"] is not True:
             raise AssertionError(f"{label} fee evidence not verified: {status}")
+    if public["verified"] is not False:
+        raise AssertionError(f"public_endpoint fee evidence unexpectedly verified: {public}")
+    if public.get("blocker") != "taker_fee_account_applicability_unverified":
+        raise AssertionError(f"public_endpoint fee blocker mismatch: {public}")
     return {
         "stale_static": {
             "fee_evidence_kind": stale["fee_evidence_kind"],
@@ -291,6 +294,11 @@ def _check_fee_freshness() -> dict[str, Any]:
             "static": fresh_static["fee_evidence_kind"],
             "public": public["fee_evidence_kind"],
             "account": account["fee_evidence_kind"],
+        },
+        "public_endpoint": {
+            "verified": public["verified"],
+            "blocker": public["blocker"],
+            "account_applicable": public["account_applicable"],
         },
     }
 
