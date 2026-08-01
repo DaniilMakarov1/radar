@@ -2435,3 +2435,223 @@ def test_dex_adapter_evidence_fields_are_preserved_in_shadow_inventory() -> None
     assert market_row["venue"] == "hyperliquid"
     assert market_row.get("environment") == "mainnet"
     assert market_row.get("quantity_step") == 0.001
+
+
+# ---------------------------------------------------------------------------
+# Stablecoin route tests
+# ---------------------------------------------------------------------------
+
+
+def test_usdc_e_canonical_usdc_proxy_observable_but_not_pass() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "coinbase", observed_at, observed_at,
+                            source_group="coinbase",
+                            freshness_basis="response_time_current_snapshot_contract"),
+        ],
+        "USDC.E": [
+            StablecoinPrice("USDC.E", 1.0001, "coingecko", observed_at, observed_at,
+                            quality="bridged_canonical_usdc_proxy",
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract",
+                            token_identity_verified=False),
+            StablecoinPrice("USDC.E", 1.0000, "defillama", observed_at, observed_at,
+                            quality="bridged_canonical_usdc_proxy",
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract",
+                            token_identity_verified=False),
+        ],
+    })
+    result = evaluate_stablecoin_route(
+        long_collateral="USDC.E",
+        short_collateral="USDT",
+        provider=provider,
+        observed_at=observed_at,
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=5.0,
+    )
+    assert result["status"] != "PASS"
+    assert any("bridged" in b or "proxy" in b or "token_identity" in b
+               for b in result["blockers"])
+
+
+def test_coingecko_defillama_coingecko_backed_count_as_one_group() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "defillama", observed_at, observed_at,
+                            source_group="coingecko", upstream="coingecko",
+                            freshness_basis="source_event_defillama_timestamp"),
+        ],
+    })
+    from smart_money_radar.funding.stablecoins import _eligible_source_groups
+
+    groups = _eligible_source_groups(provider.prices("USDC", observed_at))
+    assert groups == {"coingecko"}
+
+
+def test_coingecko_independent_dex_two_groups_when_token_verified() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDT": [
+            StablecoinPrice("USDT", 0.9999, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDT", 1.0000, "geckoterminal", observed_at, observed_at,
+                            source_group="geckoterminal",
+                            freshness_basis="response_time_current_snapshot_contract",
+                            token_identity_verified=True),
+        ],
+    })
+    from smart_money_radar.funding.stablecoins import _eligible_source_groups
+
+    groups = _eligible_source_groups(provider.prices("USDT", observed_at))
+    assert groups == {"coingecko", "geckoterminal"}
+
+
+def test_defillama_stale_source_timestamp_fresh_response_is_stale_price() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    stale_event = "2026-07-29T00:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDT": [
+            StablecoinPrice("USDT", 0.9999, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDT", 1.0000, "coinbase", observed_at, observed_at,
+                            source_group="coinbase",
+                            freshness_basis="response_time_current_snapshot_contract"),
+        ],
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "defillama", stale_event, observed_at,
+                            source_group="defillama",
+                            freshness_basis="source_event_defillama_timestamp"),
+        ],
+    })
+    result = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=observed_at,
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=5.0,
+    )
+    assert result["status"] != "PASS"
+    assert any("insufficient" in b or "source" in b for b in result["blockers"])
+    assert "defillama" in result["short_available_source_groups"]
+    assert "defillama" not in result["short_eligible_source_groups"]
+
+
+def test_source_without_event_timestamp_has_no_invented_source_event_at() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    price = StablecoinPrice(
+        "USDC", 1.0, "coingecko", "", observed_at,
+        source_group="coingecko",
+        freshness_basis="response_time_current_snapshot_contract",
+    )
+    assert price.source_event_at == ""
+    assert price.freshness_basis == "response_time_current_snapshot_contract"
+
+
+def test_usdt0_same_asset_trusted_shortcut_not_applied() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    result = evaluate_stablecoin_route(
+        long_collateral="USDT0",
+        short_collateral="USDT0",
+        provider=None,
+        observed_at=observed_at,
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=5.0,
+    )
+    assert result["status"] != "PASS"
+
+
+def test_usdt_usdc_major_pair_passes_with_independent_fresh_sources() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDT": [
+            StablecoinPrice("USDT", 0.9999, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDT", 1.0000, "coinbase", observed_at, observed_at,
+                            source_group="coinbase",
+                            freshness_basis="response_time_current_snapshot_contract"),
+        ],
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "coinbase", observed_at, observed_at,
+                            source_group="coinbase",
+                            freshness_basis="response_time_current_snapshot_contract"),
+        ],
+    })
+    result = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=observed_at,
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=5.0,
+    )
+    assert result["status"] == "PASS"
+
+
+def test_large_disagreement_research_only() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDT": [
+            StablecoinPrice("USDT", 0.95, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDT", 1.05, "coinbase", observed_at, observed_at,
+                            source_group="coinbase",
+                            freshness_basis="response_time_current_snapshot_contract"),
+        ],
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "coinbase", observed_at, observed_at,
+                            source_group="coinbase",
+                            freshness_basis="response_time_current_snapshot_contract"),
+        ],
+    })
+    result = evaluate_stablecoin_route(
+        long_collateral="USDT",
+        short_collateral="USDC",
+        provider=provider,
+        observed_at=observed_at,
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=5.0,
+    )
+    assert result["status"] != "PASS"
+    assert any("basis" in b or "disagreement" in b or "reserve" in b
+               for b in result["blockers"])
+
+
+def test_non_independent_source_labels_do_not_satisfy_two_source_gate() -> None:
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "defillama", observed_at, observed_at,
+                            source_group="coingecko", upstream="coingecko",
+                            freshness_basis="source_event_defillama_timestamp"),
+        ],
+    })
+    from smart_money_radar.funding.stablecoins import _eligible_source_groups
+    prices = provider.prices("USDC", observed_at)
+    groups = _eligible_source_groups(prices)
+    assert len(groups) == 1

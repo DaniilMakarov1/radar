@@ -38,6 +38,9 @@ def _fee_market(
     reviewed_at: str | None = None,
     account_observed_at: str | None = None,
     rate: float = 0.0005,
+    fee_scope: str | None = None,
+    account_applicability: str | None = None,
+    conservative_worst_case: bool = False,
 ) -> dict:
     evidence = {
         "fee_evidence_kind": kind,
@@ -57,6 +60,12 @@ def _fee_market(
         "applicability": "taker",
         "evidence_version": "test-fee-v1",
     }
+    if fee_scope is not None:
+        evidence["fee_scope"] = fee_scope
+    if account_applicability is not None:
+        evidence["account_applicability"] = account_applicability
+    if conservative_worst_case:
+        evidence["conservative_worst_case"] = True
     if observed_at:
         evidence["observed_at"] = observed_at
         evidence["fee_source_observed_at"] = observed_at
@@ -96,7 +105,7 @@ def test_static_fee_schedule_ignores_fresh_market_snapshot_after_review_expirati
     assert "fee_fallback_used" in modeled["risk_flags"]
 
 
-def test_fresh_static_public_endpoint_and_account_fee_evidence_verify() -> None:
+def test_fresh_fee_evidence_distinguishes_public_and_account_applicability() -> None:
     static_status = fee_evidence_status(_fee_market(reviewed_at=NOW.isoformat()), now=NOW)
     website_schedule_status = fee_evidence_status(
         _fee_market(
@@ -114,6 +123,17 @@ def test_fresh_static_public_endpoint_and_account_fee_evidence_verify() -> None:
         ),
         now=NOW,
     )
+    public_worst_case_status = fee_evidence_status(
+        _fee_market(
+            kind=FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT,
+            source_kind="official_public_fee_endpoint",
+            observed_at=NOW.isoformat(),
+            fee_scope="public_worst_case_schedule",
+            account_applicability="conservative_worst_case_all_accounts",
+            conservative_worst_case=True,
+        ),
+        now=NOW,
+    )
     account_status = fee_evidence_status(
         _fee_market(
             kind=FEE_EVIDENCE_KIND_ACCOUNT_ENDPOINT,
@@ -128,8 +148,11 @@ def test_fresh_static_public_endpoint_and_account_fee_evidence_verify() -> None:
     assert website_schedule_status["fee_evidence_kind"] == FEE_EVIDENCE_KIND_REVIEWED_STATIC_SCHEDULE
     assert website_schedule_status["fee_source_observed_at"] is None
     assert website_schedule_status["observed_at"] == NOW.isoformat()
-    assert public_status["verified"] is True
+    assert public_status["verified"] is False
+    assert public_status["blocker"] == "taker_fee_account_applicability_unverified"
     assert public_status["fee_source_observed_at"] == NOW.isoformat()
+    assert public_worst_case_status["verified"] is True
+    assert public_worst_case_status["conservative_worst_case"] is True
     assert account_status["verified"] is True
     assert account_status["account_fee_observed_at"] == NOW.isoformat()
 

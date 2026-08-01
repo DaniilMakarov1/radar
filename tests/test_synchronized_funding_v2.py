@@ -6902,3 +6902,651 @@ def test_dex_adapter_evidence_fields_flow_through_focused_snapshot() -> None:
     assert hl_snap["quantity_step"] == 0.0001
     assert hl_snap["product_type"] == "perpetual"
     assert hl_snap["contract_multiplier"] != hl_snap["quantity_step"] or hl_snap["contract_multiplier"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Lighter quantity step tests
+# ---------------------------------------------------------------------------
+
+
+def test_lighter_supported_size_decimals_zero_gives_step_one() -> None:
+    from smart_money_radar.funding.adapters.lighter import lighter_quantity_step
+
+    step = lighter_quantity_step({"supported_size_decimals": 0})
+    assert step == pytest.approx(1.0)
+
+
+def test_lighter_size_decimals_zero_gives_step_one() -> None:
+    from smart_money_radar.funding.adapters.lighter import lighter_quantity_step
+
+    step = lighter_quantity_step({"size_decimals": 0})
+    assert step == pytest.approx(1.0)
+
+
+def test_lighter_missing_supported_positive_size_decimals_works() -> None:
+    from smart_money_radar.funding.adapters.lighter import lighter_quantity_step
+
+    step = lighter_quantity_step({"size_decimals": 3})
+    assert step == pytest.approx(0.001)
+
+
+def test_lighter_negative_decimals_returns_none_without_explicit_step() -> None:
+    from smart_money_radar.funding.adapters.lighter import lighter_quantity_step
+
+    assert lighter_quantity_step({"supported_size_decimals": -1}) is None
+    assert lighter_quantity_step({"size_decimals": -2}) is None
+
+
+def test_lighter_invalid_decimals_returns_none() -> None:
+    from smart_money_radar.funding.adapters.lighter import lighter_quantity_step
+
+    assert lighter_quantity_step({"supported_size_decimals": "abc"}) is None
+
+
+def test_lighter_maker_public_only_minimum_does_not_satisfy_verified_taker_readiness() -> None:
+    from smart_money_radar.funding.fees import fee_evidence_status
+
+    market = {
+        "venue": "lighter",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:lighter:fee",
+            "trust_status": "OFFICIAL",
+            "venue": "lighter",
+            "liquidity_role": "maker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "maker",
+            "evidence_version": "v1",
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(market, "taker")
+    assert status["verified"] is False
+
+
+def test_lighter_public_tier_fee_does_not_become_account_verified() -> None:
+    from smart_money_radar.funding.fees import fee_evidence_status
+
+    market = {
+        "venue": "lighter",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:lighter:public",
+            "trust_status": "OFFICIAL",
+            "venue": "lighter",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(market, "taker")
+    assert status["verified"] is False
+    assert status["blocker"] == "taker_fee_account_applicability_unverified"
+    assert status["fee_evidence_kind"] != "ACCOUNT_ENDPOINT"
+
+
+# ---------------------------------------------------------------------------
+# Fee evidence tests
+# ---------------------------------------------------------------------------
+
+
+def test_fee_account_endpoint_verified() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0004,
+        "fee_source": "official_account_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_account_fee_endpoint",
+            "source_identifier": "test:binance:account",
+            "trust_status": "VERIFIED",
+            "venue": "binance",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "account_fee_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(
+        market,
+        "taker",
+        now=datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+    )
+    assert status["verified"] is True
+    assert status["fee_evidence_kind"] == "ACCOUNT_ENDPOINT"
+
+
+def test_fee_public_account_independent_schedule_blocked() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:binance:public",
+            "trust_status": "OFFICIAL",
+            "venue": "binance",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(market, "taker")
+    assert status["verified"] is False
+    assert status["blocker"] is not None
+
+
+def test_fee_public_tiered_account_dependent_schedule_blocked() -> None:
+    market = {
+        "venue": "bybit",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0006,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:bybit:tiered",
+            "trust_status": "OFFICIAL",
+            "venue": "bybit",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+            "fee_scope": "account_tier_dependent",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(market, "taker")
+    assert status["verified"] is False
+
+
+def test_fee_reviewed_static_worst_case_schedule_verified() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:binance:worst_case",
+            "trust_status": "OFFICIAL",
+            "venue": "binance",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "fee_scope": "reviewed_static_worst_case_schedule",
+            "conservative_worst_case": True,
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(market, "taker")
+    assert status["verified"] is True
+
+
+def test_fee_stale_public_evidence_blocked() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:binance:stale",
+            "trust_status": "OFFICIAL",
+            "venue": "binance",
+            "liquidity_role": "taker",
+            "observed_at": "2026-01-01T00:00:00+00:00",
+            "reviewed_at": "2026-01-01T00:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "fee_scope": "public_worst_case_schedule",
+            "conservative_worst_case": True,
+            "fee_source_observed_at": "2026-01-01T00:00:00+00:00",
+        },
+        "fee_observed_at": "2026-01-01T00:00:00+00:00",
+        "fee_reviewed_at": "2026-01-01T00:00:00+00:00",
+    }
+    status = fee_evidence_status(
+        market, "taker",
+        now=datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+    )
+    assert status["verified"] is False
+    assert "stale" in (status["blocker"] or "")
+
+
+def test_fee_stale_account_evidence_blocked() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0004,
+        "fee_source": "official_account_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_account_fee_endpoint",
+            "source_identifier": "test:binance:account_stale",
+            "trust_status": "VERIFIED",
+            "venue": "binance",
+            "liquidity_role": "taker",
+            "observed_at": "2026-01-01T00:00:00+00:00",
+            "reviewed_at": "2026-01-01T00:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "account_fee_observed_at": "2026-01-01T00:00:00+00:00",
+        },
+        "fee_observed_at": "2026-01-01T00:00:00+00:00",
+        "fee_reviewed_at": "2026-01-01T00:00:00+00:00",
+    }
+    status = fee_evidence_status(
+        market, "taker",
+        now=datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+    )
+    assert status["verified"] is False
+    assert "stale" in (status["blocker"] or "")
+
+
+def test_fee_env_product_role_venue_mismatch_blocked() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:bybit:mismatch",
+            "trust_status": "OFFICIAL",
+            "venue": "bybit",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "evidence_version": "v1",
+            "fee_scope": "public_worst_case_schedule",
+            "conservative_worst_case": True,
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(
+        market,
+        "taker",
+        now=datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+    )
+    assert status["verified"] is False
+    assert "mismatch" in (status["blocker"] or "")
+
+
+def test_fee_missing_evidence_version_blocked() -> None:
+    market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        "taker_fee_rate": 0.0005,
+        "fee_source": "official_public_fee_endpoint",
+        "fee_evidence": {
+            "source_kind": "official_public_fee_endpoint",
+            "source_identifier": "test:binance:no_version",
+            "trust_status": "OFFICIAL",
+            "venue": "binance",
+            "liquidity_role": "taker",
+            "observed_at": "2026-07-30T12:00:00+00:00",
+            "reviewed_at": "2026-07-30T12:00:00+00:00",
+            "environment": "mainnet",
+            "market_type": "linear_perpetual",
+            "product_type": "linear_perpetual",
+            "applicability": "taker",
+            "fee_scope": "public_worst_case_schedule",
+            "conservative_worst_case": True,
+            "fee_source_observed_at": "2026-07-30T12:00:00+00:00",
+        },
+        "fee_observed_at": "2026-07-30T12:00:00+00:00",
+        "fee_reviewed_at": "2026-07-30T12:00:00+00:00",
+    }
+    status = fee_evidence_status(
+        market,
+        "taker",
+        now=datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+    )
+    assert status["verified"] is False
+    assert "version" in (status["blocker"] or "")
+
+
+def test_fee_zero_fee_valid() -> None:
+    from smart_money_radar.funding.fees import fee_rate_value
+
+    market = {"venue": "test", "taker_fee_rate": 0.0}
+    assert fee_rate_value(market, "taker") == pytest.approx(0.0)
+
+
+def test_fee_negative_maker_rebate_valid() -> None:
+    from smart_money_radar.funding.fees import fee_rate_value
+
+    market = {"venue": "test", "maker_fee_rate": -0.0001}
+    assert fee_rate_value(market, "maker") == pytest.approx(-0.0001)
+
+
+def test_fee_negative_taker_invalid() -> None:
+    from smart_money_radar.funding.fees import fee_rate_value
+
+    market = {"venue": "test", "taker_fee_rate": -0.0001}
+    assert fee_rate_value(market, "taker") is None
+
+
+# ---------------------------------------------------------------------------
+# Readiness/runtime additional tests
+# ---------------------------------------------------------------------------
+
+
+def test_positive_control_cex_paper_path_works() -> None:
+    from smart_money_radar.funding.readiness_policy import evaluate_synchronized_route
+    now = "2026-07-30T12:00:00+00:00"
+    long_market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        **_trusted_paper_market_fields("binance", now),
+        "symbol": "BTCUSDT",
+        "canonical_asset": "BTC",
+        "funding_rate": -0.008,
+        "normalized_next_funding_rate": -0.008,
+        "funding_rate_kind": "published_next_estimate",
+        "funding_interval_hours": 1.0,
+        "hourly_funding_rate": -0.008,
+        "taker_fee_rate": 0.0005,
+        "funding_rate_semantics": "next_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
+        "next_funding_at": "2026-07-30T13:00:00+00:00",
+        "mark_price": 100_000.0,
+        "index_price": 100_000.0,
+        "quantity_step": 0.001,
+        "min_notional_usd": 5.0,
+        "collateral_asset": "USDT",
+        "quote_asset": "USDT",
+        "contract_kind": "linear_perpetual",
+        "position_inclusion_rule": "perp_position_at_settlement",
+        "position_inclusion_rule_verified": True,
+        "entry_safety_buffer_seconds": 20,
+        "exit_safety_buffer_seconds": 20,
+        "timing_policy_source": "adapter_binance_test",
+        "bids": [[99_990.0, 10.0]],
+        "asks": [[100_010.0, 10.0]],
+        "best_bid": 99_990.0,
+        "best_ask": 100_010.0,
+        "orderbook_depth_available": True,
+        "orderbook_response_received_at": now,
+        "orderbook_event_time": now,
+        "response_received_at": now,
+        "source_event_at": now,
+        "observed_at": now,
+    }
+    short_market = {
+        **long_market,
+        "venue": "bybit",
+        "symbol": "BTCUSDT",
+        "funding_rate": 0.010,
+        "normalized_next_funding_rate": 0.010,
+        "hourly_funding_rate": 0.010,
+        "taker_fee_rate": 0.00055,
+        "fee_evidence": _trusted_fee_evidence("bybit", now),
+        "fee_observed_at": now,
+        "fee_reviewed_at": now,
+        "endpoint_base_url": "https://api.bybit.test",
+        "endpoint_identity_provenance": "test-fixture:bybit:endpoint:v1",
+        "endpoint_client_version": "test-client-v1",
+        "endpoint_verified_at": now,
+        "timing_policy_source": "adapter_bybit_test",
+    }
+    result = evaluate_synchronized_route(
+        long_market=long_market,
+        short_market=short_market,
+        target_notional=500.0,
+        mode=EvaluationMode.VERIFIED_PAPER,
+        clients_by_venue={"binance": True, "bybit": True},
+    )
+    assert result["verified_paper_ready"] is True
+
+
+def test_synchronized_runtime_v2_uses_verified_paper_mode() -> None:
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+    import inspect
+    source = inspect.getsource(SynchronizedFundingRuntimeV2)
+    assert "VERIFIED_PAPER" in source
+
+
+def test_current_predicted_route_does_not_open() -> None:
+    from smart_money_radar.funding.readiness_policy import evaluate_synchronized_route
+    now = "2026-07-30T12:00:00+00:00"
+    long_market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        **_trusted_paper_market_fields("binance", now),
+        "symbol": "BTCUSDT",
+        "canonical_asset": "BTC",
+        "funding_rate": -0.008,
+        "normalized_next_funding_rate": -0.008,
+        "funding_rate_kind": "published_current_fallback",
+        "funding_interval_hours": 1.0,
+        "hourly_funding_rate": -0.008,
+        "taker_fee_rate": 0.0005,
+        "funding_rate_semantics": "next_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
+        "next_funding_at": "2026-07-30T13:00:00+00:00",
+        "mark_price": 100_000.0,
+        "index_price": 100_000.0,
+        "quantity_step": 0.001,
+        "min_notional_usd": 5.0,
+        "collateral_asset": "USDT",
+        "quote_asset": "USDT",
+        "contract_kind": "linear_perpetual",
+        "position_inclusion_rule": "perp_position_at_settlement",
+        "position_inclusion_rule_verified": True,
+        "entry_safety_buffer_seconds": 20,
+        "exit_safety_buffer_seconds": 20,
+        "timing_policy_source": "adapter_binance_test",
+        "bids": [[99_990.0, 10.0]],
+        "asks": [[100_010.0, 10.0]],
+        "best_bid": 99_990.0,
+        "best_ask": 100_010.0,
+        "orderbook_depth_available": True,
+        "orderbook_response_received_at": now,
+        "orderbook_event_time": now,
+        "response_received_at": now,
+        "source_event_at": now,
+        "observed_at": now,
+    }
+    short_market = {
+        **long_market,
+        "venue": "bybit",
+        "funding_rate": 0.010,
+        "normalized_next_funding_rate": 0.010,
+        "hourly_funding_rate": 0.010,
+        "taker_fee_rate": 0.00055,
+        "fee_evidence": _trusted_fee_evidence("bybit", now),
+        "fee_observed_at": now,
+        "fee_reviewed_at": now,
+        "endpoint_base_url": "https://api.bybit.test",
+        "endpoint_identity_provenance": "test-fixture:bybit:endpoint:v1",
+        "endpoint_client_version": "test-client-v1",
+        "endpoint_verified_at": now,
+        "timing_policy_source": "adapter_bybit_test",
+    }
+    result = evaluate_synchronized_route(
+        long_market=long_market,
+        short_market=short_market,
+        target_notional=500.0,
+        mode=EvaluationMode.VERIFIED_PAPER,
+        clients_by_venue={"binance": True, "bybit": True},
+    )
+    assert result["verified_paper_ready"] is False
+
+
+def test_bridged_proxy_stablecoin_route_does_not_open() -> None:
+    from smart_money_radar.funding.stablecoins import evaluate_stablecoin_route, StaticStablecoinPriceProvider
+    observed_at = "2026-07-30T12:00:00+00:00"
+    provider = StaticStablecoinPriceProvider({
+        "USDC": [
+            StablecoinPrice("USDC", 1.0001, "coingecko", observed_at, observed_at,
+                            source_group="coingecko", freshness_basis="response_time_current_snapshot_contract"),
+            StablecoinPrice("USDC", 1.0000, "coinbase", observed_at, observed_at,
+                            source_group="coinbase", freshness_basis="response_time_current_snapshot_contract"),
+        ],
+        "USDC.E": [
+            StablecoinPrice("USDC.E", 1.0001, "coingecko", observed_at, observed_at,
+                            quality="bridged_canonical_usdc_proxy", source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract",
+                            token_identity_verified=False),
+            StablecoinPrice("USDC.E", 1.0000, "defillama", observed_at, observed_at,
+                            quality="bridged_canonical_usdc_proxy", source_group="coingecko",
+                            freshness_basis="response_time_current_snapshot_contract",
+                            token_identity_verified=False),
+        ],
+    })
+    result = evaluate_stablecoin_route(
+        long_collateral="USDC.E",
+        short_collateral="USDT",
+        provider=provider,
+        observed_at=observed_at,
+        reference_notional=500.0,
+        funding_net_before_stablecoin_reserve=5.0,
+    )
+    assert result["status"] != "PASS"
+    assert any("bridged" in b or "proxy" in b for b in result["blockers"])
+
+
+def test_account_unverified_fee_route_does_not_open() -> None:
+    from smart_money_radar.funding.readiness_policy import evaluate_synchronized_route
+    now = "2026-07-30T12:00:00+00:00"
+    long_market = {
+        "venue": "binance",
+        "environment": "mainnet",
+        **_trusted_paper_market_fields("binance", now),
+        "symbol": "BTCUSDT",
+        "canonical_asset": "BTC",
+        "funding_rate": -0.008,
+        "normalized_next_funding_rate": -0.008,
+        "funding_rate_kind": "published_next_estimate",
+        "funding_interval_hours": 1.0,
+        "hourly_funding_rate": -0.008,
+        "taker_fee_rate": 0.0005,
+        "funding_rate_semantics": "next_settlement",
+        "funding_rate_unit": "fraction_of_notional_per_settlement",
+        "funding_sign_convention": "positive_long_pays",
+        "next_funding_at": "2026-07-30T13:00:00+00:00",
+        "mark_price": 100_000.0,
+        "index_price": 100_000.0,
+        "quantity_step": 0.001,
+        "min_notional_usd": 5.0,
+        "collateral_asset": "USDT",
+        "quote_asset": "USDT",
+        "contract_kind": "linear_perpetual",
+        "position_inclusion_rule": "perp_position_at_settlement",
+        "position_inclusion_rule_verified": True,
+        "entry_safety_buffer_seconds": 20,
+        "exit_safety_buffer_seconds": 20,
+        "timing_policy_source": "adapter_binance_test",
+        "bids": [[99_990.0, 10.0]],
+        "asks": [[100_010.0, 10.0]],
+        "best_bid": 99_990.0,
+        "best_ask": 100_010.0,
+        "orderbook_depth_available": True,
+        "orderbook_response_received_at": now,
+        "orderbook_event_time": now,
+        "response_received_at": now,
+        "source_event_at": now,
+        "observed_at": now,
+    }
+    unverified_fee = {
+        "source_kind": "official_public_fee_endpoint",
+        "source_identifier": "test:bybit:public_only",
+        "trust_status": "OFFICIAL",
+        "venue": "bybit",
+        "liquidity_role": "taker",
+        "observed_at": now,
+        "reviewed_at": now,
+        "environment": "mainnet",
+        "market_type": "linear_perpetual",
+        "product_type": "linear_perpetual",
+        "applicability": "taker",
+        "evidence_version": "v1",
+        "fee_source_observed_at": now,
+    }
+    short_market = {
+        **long_market,
+        "venue": "bybit",
+        "funding_rate": 0.010,
+        "normalized_next_funding_rate": 0.010,
+        "hourly_funding_rate": 0.010,
+        "fee_evidence": unverified_fee,
+        "fee_observed_at": now,
+        "fee_reviewed_at": now,
+        "endpoint_base_url": "https://api.bybit.test",
+        "endpoint_identity_provenance": "test-fixture:bybit:endpoint:v1",
+        "endpoint_client_version": "test-client-v1",
+        "endpoint_verified_at": now,
+        "timing_policy_source": "adapter_bybit_test",
+    }
+    result = evaluate_synchronized_route(
+        long_market=long_market,
+        short_market=short_market,
+        target_notional=500.0,
+        mode=EvaluationMode.VERIFIED_PAPER,
+        clients_by_venue={"binance": True, "bybit": True},
+    )
+    assert result["verified_paper_ready"] is False
+    assert any("fee" in b for b in result["mode_blockers"])

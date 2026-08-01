@@ -264,15 +264,26 @@ class FundingRadarTest(unittest.TestCase):
             "bybit": "perp_position_at_funding_timestamp",
             "okx": "swap_position_at_funding_time",
         }
+        expected_semantics = {
+            "binance": "next_settlement",
+            "bybit": "next_settlement",
+            "okx": "current_interval_estimate",
+        }
         for venue, market in btc_by_venue.items():
             with self.subTest(venue=venue):
-                self.assertEqual(market["funding_rate_semantics"], "next_settlement")
+                self.assertEqual(market["funding_rate_semantics"], expected_semantics[venue])
                 self.assertEqual(
                     market["funding_rate_unit"],
                     "fraction_of_notional_per_settlement",
                 )
                 self.assertEqual(market["funding_sign_convention"], "positive_long_pays")
-                self.assertIsNotNone(market.get("normalized_next_funding_rate"))
+                if venue == "okx":
+                    self.assertNotIn("normalized_next_funding_rate", market)
+                    self.assertFalse(market["exact_next_rate_available"])
+                    self.assertIsNotNone(market.get("rate_estimate_per_settlement"))
+                else:
+                    self.assertIsNotNone(market.get("normalized_next_funding_rate"))
+                    self.assertTrue(market["exact_next_rate_available"])
                 self.assertEqual(
                     market["normalization_evidence"]["evidence_version"],
                     NORMALIZATION_EVIDENCE_VERSION,
@@ -285,6 +296,28 @@ class FundingRadarTest(unittest.TestCase):
                 self.assertEqual(market["position_inclusion_rule"], expected_rules[venue])
                 self.assertGreater(float(market["quantity_step"]), 0.0)
                 self.assertGreater(float(market["min_notional_usd"]), 0.0)
+
+    def test_lightweight_discovery_does_not_invent_source_event_from_response_time(self) -> None:
+        now = datetime(2026, 7, 14, 15, 58, 30, tzinfo=UTC)
+        client = OKXFundingClient(http=FakeOKXHttp(), use_websocket=False)
+        with TemporaryDirectory() as directory:
+            bot = self._lightweight_bot_for_clients(Path(directory), now, [client])
+            try:
+                markets, warnings = bot._fetch_lightweight_market_snapshots(
+                    [client],
+                    now.isoformat(),
+                )
+            finally:
+                bot.shutdown_foreground_executors()
+
+        self.assertEqual(warnings, [])
+        btc = next(row for row in markets if row.get("canonical_asset") == "BTC")
+        self.assertEqual(btc["response_received_at"], now.isoformat())
+        self.assertNotIn("source_event_at", btc)
+        self.assertEqual(
+            btc["source_freshness_basis"],
+            "response_time_current_snapshot_contract",
+        )
 
     def test_lightweight_discovery_watch_uses_only_positive_verified_direction(self) -> None:
         class HighBinanceHttp(FakeBinanceHttp):
@@ -4537,8 +4570,13 @@ class FundingRadarTest(unittest.TestCase):
         )
         self.assertEqual(
             markets[0]["fee_evidence"]["taker"]["trust_status"],
-            "OFFICIAL",
+            "REVIEWED",
         )
+        self.assertEqual(
+            markets[0]["fee_evidence"]["taker"]["fee_scope"],
+            "public_worst_case_schedule",
+        )
+        self.assertTrue(markets[0]["fee_evidence"]["taker"]["conservative_worst_case"])
         self.assertEqual(book_row["bids"][0], [64132.0, 0.785])
         self.assertEqual(book_row["asks"][0], [64133.0, 1.234])
         self.assertEqual(len(history), 1)
@@ -4631,7 +4669,9 @@ class FundingRadarTest(unittest.TestCase):
         self.assertAlmostEqual(float(markets[0]["funding_rate"]), 0.001)
         self.assertAlmostEqual(float(snapshot["funding_rate"]), 0.001)
         self.assertEqual(snapshot["environment"], "mainnet")
-        self.assertEqual(markets[0]["funding_rate_semantics"], "unclear")
+        self.assertEqual(markets[0]["funding_rate_semantics"], "derived_current_interval_estimate")
+        self.assertIsNot(markets[0].get("exact_next_rate_available"), True)
+        self.assertNotIn("normalized_next_funding_rate", markets[0])
         self.assertEqual(markets[0]["fee_source"], "fee_model_missing")
         self.assertTrue(markets[0]["fee_model_missing"])
         self.assertEqual(book_row["bids"][0], [116215.0, 0.128])
@@ -4980,9 +5020,15 @@ class FundingRadarTest(unittest.TestCase):
         self.assertEqual(len(instruments), 1)
         self.assertEqual(markets[0]["funding_interval_hours"], 1)
         self.assertEqual(markets[0]["hourly_funding_rate"], 0.0001)
+        self.assertEqual(markets[0]["funding_rate_kind"], "published_next_hour_estimate")
+        self.assertEqual(markets[0]["funding_rate_semantics"], "forecast_next_settlement")
+        self.assertNotIn("normalized_next_funding_rate", markets[0])
         self.assertIsNone(markets[0]["mark_price"])
         self.assertEqual(snapshot["mark_price"], 100.0)
         self.assertEqual(snapshot["mark_price_kind"], "oracle_price_proxy")
+        self.assertEqual(snapshot["funding_rate_kind"], "published_next_hour_estimate")
+        self.assertEqual(snapshot["funding_rate_semantics"], "forecast_next_settlement")
+        self.assertNotIn("normalized_next_funding_rate", snapshot)
         self.assertEqual(book_row["bids"][0], [99.9, 2.0])
         self.assertEqual(len(history), 2)
         self.assertEqual(history[-1]["hourly_funding_rate"], 0.0001)
@@ -8052,6 +8098,145 @@ def forecast_schedule(hours: int) -> dict[str, Any]:
             }
         ],
     }
+
+# ---------------------------------------------------------------------------
+# Smoke script pair selection tests
+# ---------------------------------------------------------------------------
+
+
+class SmokePairSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import importlib.util
+        import pathlib
+        spec = importlib.util.spec_from_file_location(
+            "smoke_script",
+            pathlib.Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "run_public_readonly_funding_smoke.py",
+        )
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def test_sample_mode_selects_limited_pairs(self) -> None:
+        pairs = [("a", "b"), ("b", "a"), ("a", "c"), ("c", "a")]
+        selected, info = self.module._select_focused_pairs(
+            mode="sample",
+            available_pairs=pairs,
+            successful_venues=("a", "b", "c"),
+            sample_count=2,
+        )
+        assert len(selected) == 2
+        assert selected == [("a", "b"), ("b", "a")]
+
+    def test_all_mode_selects_every_pair(self) -> None:
+        pairs = [("a", "b"), ("b", "a"), ("a", "c"), ("c", "a")]
+        selected, info = self.module._select_focused_pairs(
+            mode="all",
+            available_pairs=pairs,
+            successful_venues=("a", "b", "c"),
+            sample_count=2,
+        )
+        assert len(selected) == 4
+
+    def test_coverage_mode_each_venue_appears_long_and_short(self) -> None:
+        pairs = [("a", "b"), ("b", "a"), ("a", "c"), ("c", "a"), ("b", "c"), ("c", "b")]
+        selected, info = self.module._select_focused_pairs(
+            mode="coverage",
+            available_pairs=pairs,
+            successful_venues=("a", "b", "c"),
+            sample_count=2,
+        )
+        long_venues = {p[0] for p in selected}
+        short_venues = {p[1] for p in selected}
+        assert long_venues == {"a", "b", "c"}
+        assert short_venues == {"a", "b", "c"}
+        assert info["coverage_complete"] is True
+
+    def test_focused_concurrency_summary_reports_started_coverage_not_refreshed_routes(self) -> None:
+        assert (
+            self.module._focused_concurrency_summary(
+                started_pair_count=6,
+                available_pair_count=30,
+                mode="sample",
+            )
+            == "6/30 sampled"
+        )
+        assert (
+            self.module._focused_concurrency_summary(
+                started_pair_count=11,
+                available_pair_count=30,
+                mode="coverage",
+            )
+            == "11/30 coverage"
+        )
+        assert (
+            self.module._focused_concurrency_summary(
+                started_pair_count=30,
+                available_pair_count=30,
+                mode="all",
+            )
+            == "30/30 all"
+        )
+
+    def test_honest_coverage_incomplete_when_venue_missing(self) -> None:
+        pairs = [("a", "b"), ("b", "a")]
+        selected, info = self.module._select_focused_pairs(
+            mode="coverage",
+            available_pairs=pairs,
+            successful_venues=("a", "b", "c"),
+            sample_count=6,
+        )
+        assert info["coverage_complete"] is False
+        assert info["long_venue_coverage"].get("c") is False
+
+    def test_fewer_available_venues_sample(self) -> None:
+        pairs = [("a", "b")]
+        selected, info = self.module._select_focused_pairs(
+            mode="sample",
+            available_pairs=pairs,
+            successful_venues=("a", "b"),
+            sample_count=10,
+        )
+        assert len(selected) == 1
+
+    def test_venue_failure_excluded_from_pairs(self) -> None:
+        pairs = [("a", "b"), ("b", "a"), ("a", "c"), ("c", "a")]
+        selected, info = self.module._select_focused_pairs(
+            mode="coverage",
+            available_pairs=pairs,
+            successful_venues=("a", "b"),
+            sample_count=10,
+        )
+        assert all("c" not in p for p in selected)
+
+    def test_zero_routes_returns_empty(self) -> None:
+        selected, info = self.module._select_focused_pairs(
+            mode="sample",
+            available_pairs=[],
+            successful_venues=(),
+            sample_count=5,
+        )
+        assert selected == []
+        assert info["coverage_complete"] is False
+
+    def test_no_positions_no_ledger_no_running_scans_in_smoke_output(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+        output_path = Path(tempfile.mkdtemp()) / "smoke_test.json"
+        result = self.module.main([
+            "--output", str(output_path),
+            "--venues", "nonexistent_venue_xyz",
+            "--timeout-seconds", "1",
+            "--focused-mode", "sample",
+        ])
+        assert result == 1
+        payload = json.loads(output_path.read_text())
+        assert payload["positions_created"] == 0
+        assert payload["ledger_events_created"] == 0
+        assert payload["remaining_running_scan_count"] == 0
+        assert payload["live_trading_enabled"] is False
+
 
 if __name__ == "__main__":
     unittest.main()

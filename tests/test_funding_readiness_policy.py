@@ -297,7 +297,7 @@ def test_dydx_oracle_price_is_discovery_reference_when_mark_missing() -> None:
     dydx = _market(
         "dydx",
         -0.006,
-        kind="published_next_hour",
+        kind="published_next_hour_estimate",
         mark_price=None,
         index_price=100.0,
         oracle_price=100.0,
@@ -439,3 +439,152 @@ def test_verified_planner_uses_late_gates_but_discovery_planner_does_not() -> No
     assert "long_quantity_step_missing" not in discovery_plan.blockers
     assert "long_quantity_step_missing" in verified_plan.blockers
     assert discovery_plan.planner["route_readiness"]["economically_observable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Rate semantics tests for each adapter kind
+# ---------------------------------------------------------------------------
+
+
+def test_hyperliquid_predicted_rate_is_observable_but_not_exact_for_verified() -> None:
+    market = _market("hyperliquid", 0.003, kind="published_predicted_next")
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.003)
+    assert estimate["exact_next_rate_available"] is False
+    assert "rate_forecast_or_predicted" in estimate["rate_estimate_risk_flags"]
+
+    verified = _route(long=market, mode=EvaluationMode.VERIFIED_PAPER)
+    assert verified["verified_paper_ready"] is False
+    assert "long_exact_next_rate_missing" in verified["mode_blockers"]
+
+
+def test_hyperliquid_current_fallback_is_weaker_and_not_exact() -> None:
+    market = _market("hyperliquid", 0.003, kind="published_current_fallback")
+    market.pop("normalized_next_funding_rate")
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.003)
+    assert estimate["exact_next_rate_available"] is False
+    assert estimate["rate_estimate_confidence"] < 0.5
+    assert "exact_next_rate_unavailable" in estimate["rate_estimate_risk_flags"]
+
+
+def test_lighter_derived_8h_to_1h_keeps_rate_estimate_but_no_exact_field() -> None:
+    market = _market(
+        "lighter",
+        0.001,
+        kind="published_8h_equivalent_normalized_hourly",
+    )
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.001)
+    assert estimate["exact_next_rate_available"] is False
+    assert "rate_estimate_not_exact_next" in estimate["rate_estimate_risk_flags"]
+
+
+def test_pacifica_next_funding_zero_keeps_zero_no_truthiness_fallback() -> None:
+    market = _market(
+        "pacifica",
+        0.0,
+        kind="published_current_hour_estimate",
+        oracle_price=100.0,
+    )
+    market["next_funding_at"] = "2026-07-30T12:00:00+00:00"
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.0)
+    assert estimate["exact_next_rate_available"] is False
+
+
+def test_pacifica_missing_next_funding_is_current_estimate_exact_false() -> None:
+    market = _market(
+        "pacifica",
+        0.002,
+        kind="published_current_hour_estimate",
+        oracle_price=100.0,
+    )
+    market["next_funding_at"] = None
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.002)
+    assert estimate["exact_next_rate_available"] is False
+
+
+def test_risex_current_funding_rate_exact_false() -> None:
+    market = _market(
+        "risex",
+        0.004,
+        kind="published_current_interval_rate",
+    )
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.004)
+    assert estimate["exact_next_rate_available"] is False
+    assert "rate_estimate_not_exact_next" in estimate["rate_estimate_risk_flags"]
+
+
+def test_nado_derived_24h_rate_exact_false() -> None:
+    market = _market(
+        "nado",
+        0.003,
+        kind="published_latest_24h_x18",
+    )
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(0.003)
+    assert estimate["exact_next_rate_available"] is False
+
+
+def test_dydx_next_funding_rate_is_forecast_without_verified_exact_contract() -> None:
+    market = _market("dydx", -0.006, kind="published_next_hour_estimate")
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_kind"] == RateEstimateKind.PUBLISHED_FORECAST.value
+    assert estimate["exact_next_rate_available"] is False
+    assert estimate["rate_estimate_per_settlement"] == pytest.approx(-0.006)
+    assert "rate_forecast_or_predicted" in estimate["rate_estimate_risk_flags"]
+
+
+def test_current_predicted_derived_rates_fail_verified_blockers() -> None:
+    for kind in (
+        "published_current_fallback",
+        "published_predicted_next",
+        "published_8h_equivalent_normalized_hourly",
+    ):
+        market = _market("test_venue", 0.003, kind=kind)
+        if kind == "published_current_fallback":
+            market.pop("normalized_next_funding_rate", None)
+        verified = _route(long=market, mode=EvaluationMode.VERIFIED_PAPER)
+        assert verified["verified_paper_ready"] is False, kind
+        assert "long_exact_next_rate_missing" in verified["mode_blockers"], kind
+
+
+def test_focused_observations_use_rate_estimate_per_settlement_not_zero() -> None:
+    market = _market("lighter", 0.001, kind="published_8h_equivalent_normalized_hourly")
+    estimate = rate_estimate_from_market(market)
+
+    assert estimate["rate_estimate_per_settlement"] is not None
+    assert estimate["rate_estimate_per_settlement"] != 0.0
+    assert abs(estimate["rate_estimate_per_settlement"]) > 0
+
+
+def test_synthetic_focused_snapshots_remain_verified_paper_ready_false() -> None:
+    synthetic_venues = [
+        ("hyperliquid", "published_predicted_next"),
+        ("lighter", "published_8h_equivalent_normalized_hourly"),
+        ("dydx", "published_next_hour_estimate"),
+        ("pacifica", "published_current_hour_estimate"),
+        ("risex", "published_current_interval_rate"),
+        ("nado", "published_latest_24h_x18"),
+    ]
+    for venue, kind in synthetic_venues:
+        kwargs: dict[str, Any] = {"kind": kind}
+        if venue == "pacifica":
+            kwargs["oracle_price"] = 100.0
+        market = _market(venue, 0.003, **kwargs)
+        if kind == "published_current_fallback":
+            market.pop("normalized_next_funding_rate", None)
+        verified = _route(long=market, mode=EvaluationMode.VERIFIED_PAPER)
+        assert verified["verified_paper_ready"] is False, f"{venue}/{kind}"
+        assert len(verified["mode_blockers"]) > 0, f"{venue}/{kind} should have blockers"
