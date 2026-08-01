@@ -33,6 +33,7 @@ from smart_money_radar.funding.risex_probe import (
     RiseXProbeConfig,
     classify_risex_funding_semantics_observation,
     redact_secret_payload,
+    risex_probe_snapshot_observation,
     run_risex_funding_probe,
 )
 from smart_money_radar.funding.settlement_contracts import (
@@ -2273,6 +2274,128 @@ def test_risex_public_probe_confirms_boundary_only_from_history(
     assert result["boundary_event_attempt_count"] == 1
     assert result["boundary_event_observed_count"] == 1
     assert result["public_settlement_confirmed_count"] == 1
+
+
+def test_risex_probe_snapshot_labels_current_rate_as_observed_estimate() -> None:
+    observation = risex_probe_snapshot_observation(
+        probe_run_id="test-run-001",
+        market={
+            "venue": "risex",
+            "symbol": "BTC/USDC",
+            "environment": "testnet",
+            "next_funding_at": "2026-08-01T13:00:00+00:00",
+            "funding_rate": 0.0005,
+            "funding_interval_hours": 1,
+            "funding_rate_kind": "published_current_interval_rate",
+            "funding_rate_semantics": "current_interval_estimate",
+            "mark_price": 115000.0,
+            "index_price": 114950.0,
+        },
+        interval_seconds=3600.0,
+        warnings=[],
+        classification="MARKET_SNAPSHOT",
+        actual_offset_seconds=None,
+    )
+
+    assert observation["predicted_rate"] is None
+    assert observation["observed_rate_estimate"] == pytest.approx(0.0005)
+    assert observation["exact_next_rate_available"] is False
+    assert observation["rate_semantics"] == "current_interval_estimate"
+    assert "rate_is_observed_estimate" in observation["rate_risk_flags"]
+    metadata = observation["raw_evidence_metadata"]["rate_diagnostics"]
+    assert metadata["rate_label"] == "observed_rate_estimate"
+    assert metadata["legacy_predicted_rate"] is None
+
+
+def test_risex_probe_snapshot_does_not_persist_non_exact_normalized_rate_as_predicted() -> None:
+    observation = risex_probe_snapshot_observation(
+        probe_run_id="test-run-002",
+        market={
+            "venue": "risex",
+            "symbol": "BTC/USDC",
+            "environment": "testnet",
+            "next_funding_at": "2026-08-01T13:00:00+00:00",
+            "funding_rate": 0.0004,
+            "rate_estimate_per_settlement": 0.0004,
+            "normalized_next_funding_rate": 0.0004,
+            "funding_rate_kind": "published_current_interval_rate",
+            "funding_rate_semantics": "current_interval_estimate",
+            "exact_next_rate_available": False,
+            "mark_price": 115000.0,
+            "index_price": 114950.0,
+        },
+        interval_seconds=3600.0,
+        warnings=[],
+        classification="MARKET_SNAPSHOT",
+        actual_offset_seconds=-10.0,
+    )
+
+    assert observation["predicted_rate"] is None
+    assert observation["observed_rate_estimate"] == pytest.approx(0.0004)
+    assert observation["raw_evidence_metadata"]["rate_diagnostics"]["rate_label"] == (
+        "observed_rate_estimate"
+    )
+
+
+def test_risex_probe_snapshot_does_not_truthify_string_false_exact_flag() -> None:
+    observation = risex_probe_snapshot_observation(
+        probe_run_id="test-run-string-false",
+        market={
+            "venue": "risex",
+            "symbol": "BTC/USDC",
+            "environment": "testnet",
+            "next_funding_at": "2026-08-01T13:00:00+00:00",
+            "funding_rate": 0.0004,
+            "normalized_next_funding_rate": 0.0004,
+            "funding_rate_kind": "published_next_estimate",
+            "funding_rate_semantics": "next_settlement",
+            "exact_next_rate_available": "false",
+            "mark_price": 115000.0,
+            "index_price": 114950.0,
+        },
+        interval_seconds=3600.0,
+        warnings=[],
+        classification="MARKET_SNAPSHOT",
+        actual_offset_seconds=-5.0,
+    )
+
+    assert observation["predicted_rate"] is None
+    assert observation["exact_next_rate_available"] is False
+    assert observation["raw_evidence_metadata"]["rate_diagnostics"]["rate_label"] == (
+        "observed_rate_estimate"
+    )
+
+
+def test_risex_probe_snapshot_legacy_predicted_rate_requires_exact_next_contract() -> None:
+    observation = risex_probe_snapshot_observation(
+        probe_run_id="test-run-003",
+        market={
+            "venue": "risex",
+            "symbol": "BTC/USDC",
+            "environment": "testnet",
+            "next_funding_at": "2026-08-01T13:00:00+00:00",
+            "funding_rate": 0.0005,
+            "normalized_next_funding_rate": 0.0005,
+            "funding_interval_hours": 1,
+            "funding_rate_kind": "published_next_estimate",
+            "funding_rate_semantics": "next_settlement",
+            "exact_next_rate_available": True,
+            "mark_price": 115000.0,
+            "index_price": 114950.0,
+        },
+        interval_seconds=3600.0,
+        warnings=[],
+        classification="PUBLIC_SETTLEMENT_CONFIRMED",
+        actual_offset_seconds=0.5,
+    )
+
+    assert observation["predicted_rate"] == pytest.approx(0.0005)
+    assert observation["observed_rate_estimate"] == pytest.approx(0.0005)
+    assert observation["exact_next_rate_available"] is True
+    assert observation["rate_risk_flags"] == []
+    assert observation["raw_evidence_metadata"]["rate_diagnostics"]["rate_label"] == (
+        "exact_next_funding_rate"
+    )
 
 
 def test_testnet_canary_requires_explicit_flag(tmp_path) -> None:

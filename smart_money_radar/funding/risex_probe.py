@@ -447,6 +447,7 @@ def risex_probe_snapshot_observation(
     classification: str,
     actual_offset_seconds: float | None,
 ) -> dict[str, Any]:
+    rate_diagnostics = risex_probe_rate_diagnostics(market)
     return {
         "probe_run_id": probe_run_id,
         "venue": "risex",
@@ -458,7 +459,11 @@ def risex_probe_snapshot_observation(
         "entry_lead_seconds": actual_offset_seconds,
         "hold_duration_seconds": None,
         "size": None,
-        "predicted_rate": market.get("normalized_next_funding_rate"),
+        "predicted_rate": rate_diagnostics["legacy_predicted_rate"],
+        "observed_rate_estimate": rate_diagnostics["observed_rate_estimate"],
+        "exact_next_rate_available": rate_diagnostics["exact_next_rate_available"],
+        "rate_semantics": rate_diagnostics["rate_semantics"],
+        "rate_risk_flags": rate_diagnostics["rate_risk_flags"],
         "rate_period_seconds": interval_seconds,
         "expected_full_payment": None,
         "expected_prorata_payment": None,
@@ -479,14 +484,63 @@ def risex_probe_snapshot_observation(
                         "funding_rate",
                         "normalized_next_funding_rate",
                         "funding_interval_hours",
+                        "funding_rate_kind",
+                        "funding_rate_semantics",
+                        "exact_next_rate_available",
                         "published_funding_rate",
                         "published_funding_interval_hours",
                         "mark_price",
                         "index_price",
                     )
                 },
+                "rate_diagnostics": rate_diagnostics,
                 "actual_offset_seconds": actual_offset_seconds,
                 "warnings": warnings,
             }
         ),
     }
+
+
+def risex_probe_rate_diagnostics(market: dict[str, Any]) -> dict[str, Any]:
+    semantics = str(
+        market.get("funding_rate_semantics") or "current_interval_estimate"
+    ).strip().lower()
+    normalized_next = market.get("normalized_next_funding_rate")
+    exact_next = (
+        risex_probe_exact_next_flag(market.get("exact_next_rate_available"))
+        and semantics == "next_settlement"
+        and normalized_next is not None
+    )
+    observed_estimate = market.get("rate_estimate_per_settlement")
+    if observed_estimate is None:
+        observed_estimate = market.get("funding_rate")
+    if observed_estimate is None:
+        observed_estimate = normalized_next
+
+    risk_flags: list[str] = []
+    if not exact_next:
+        risk_flags.extend(
+            [
+                "rate_is_observed_estimate",
+                "exact_next_rate_unavailable",
+            ]
+        )
+    return {
+        "observed_rate_estimate": observed_estimate,
+        "legacy_predicted_rate": normalized_next if exact_next else None,
+        "exact_next_rate_available": exact_next,
+        "rate_semantics": semantics,
+        "rate_estimate_kind": market.get("rate_estimate_kind")
+        or market.get("funding_rate_kind"),
+        "rate_label": "exact_next_funding_rate" if exact_next else "observed_rate_estimate",
+        "rate_risk_flags": list(dict.fromkeys(risk_flags)),
+    }
+
+
+def risex_probe_exact_next_flag(value: Any) -> bool:
+    if value is True:
+        return True
+    if value is False or value in (None, ""):
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes"}
