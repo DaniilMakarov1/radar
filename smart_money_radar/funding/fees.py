@@ -369,6 +369,10 @@ def fee_evidence_status(
         "expires_at": None,
         "fallback_required": True,
         "uncertainty_reserve_required": True,
+        "fee_scope": None,
+        "account_applicability": None,
+        "account_applicable": False,
+        "conservative_worst_case": False,
         "blocker": None,
     }
     override_status = fee_override_status(venue, role)
@@ -435,6 +439,10 @@ def fee_evidence_status(
             "observed_at": _timestamp_iso(observed),
             "reviewed_at": _timestamp_iso(reviewed),
             "trust_status": trust_status or "UNKNOWN",
+            "fee_scope": evidence.get("fee_scope"),
+            "account_applicability": evidence.get("account_applicability"),
+            "account_applicable": bool(evidence.get("account_applicable")),
+            "conservative_worst_case": bool(evidence.get("conservative_worst_case")),
         }
     )
 
@@ -455,6 +463,29 @@ def fee_evidence_status(
     if not source_identifier:
         status["blocker"] = f"{role}_fee_source_identifier_missing"
         return status
+    if evidence_kind == FEE_EVIDENCE_KIND_PUBLIC_FEE_ENDPOINT:
+        fee_scope = str(evidence.get("fee_scope") or "").strip().lower()
+        account_applicability = str(
+            evidence.get("account_applicability") or ""
+        ).strip().lower()
+        account_applicable = bool(evidence.get("account_applicable")) or account_applicability in {
+            "account_specific",
+            "account_verified",
+        }
+        conservative_worst_case = bool(evidence.get("conservative_worst_case")) or fee_scope in {
+            "public_worst_case_schedule",
+            "reviewed_static_worst_case_schedule",
+        } or account_applicability in {
+            "public_worst_case_schedule",
+            "conservative_worst_case_all_accounts",
+        }
+        status["account_applicable"] = account_applicable
+        status["conservative_worst_case"] = conservative_worst_case
+        if not account_applicable and not conservative_worst_case:
+            status["verified"] = False
+            status["trust_status"] = "UNVERIFIED"
+            status["blocker"] = f"{role}_fee_account_applicability_unverified"
+            return status
     if trust_status not in TRUSTED_FEE_STATUSES:
         status["trust_status"] = trust_status or "UNVERIFIED"
         status["blocker"] = f"{role}_fee_trust_status_unverified"

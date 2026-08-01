@@ -21,6 +21,7 @@ from smart_money_radar.funding.adapters.base import (
 )
 from smart_money_radar.funding.incentives import UNKNOWN_INCENTIVES
 from smart_money_radar.funding.normalization import normalize_catalog_canonical_units
+from smart_money_radar.funding.readiness_policy import rate_estimate_from_market
 from smart_money_radar.funding.settlement_contracts import (
     settlement_contract_from_market,
 )
@@ -1007,10 +1008,12 @@ class FundingShadowMonitor:
             short_market.get("index_price")
         ) is None:
             blockers.append("index_price_missing")
-        long_rate = optional_float(long_market.get("normalized_next_funding_rate"))
-        short_rate = optional_float(short_market.get("normalized_next_funding_rate"))
+        long_rate_estimate = rate_estimate_from_market(long_market)
+        short_rate_estimate = rate_estimate_from_market(short_market)
+        long_rate = optional_float(long_rate_estimate.get("rate_estimate_per_settlement"))
+        short_rate = optional_float(short_rate_estimate.get("rate_estimate_per_settlement"))
         if long_rate is None or short_rate is None:
-            blockers.append("normalized_next_funding_rate_missing")
+            blockers.append("usable_funding_rate_estimate_missing")
         if not long_market.get("response_received_at") or not short_market.get(
             "response_received_at"
         ):

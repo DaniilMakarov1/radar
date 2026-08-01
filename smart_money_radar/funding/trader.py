@@ -2285,8 +2285,6 @@ class PaperBot:
         market.setdefault("request_started_at", request_started_at)
         market.setdefault("response_received_at", response_received_at)
         market.setdefault("normalized_at", response_received_at)
-        if market.get("source_event_at") in (None, ""):
-            market["source_event_at"] = market.get("observed_at") or response_received_at
         market = apply_declared_venue_capability_contract(market)
         market = normalize_synchronized_capture_market(
             market,
@@ -3178,8 +3176,6 @@ class PaperBot:
             row.setdefault("request_started_at", started_at)
             row.setdefault("response_received_at", received_at)
             row.setdefault("normalized_at", received_at)
-            if row.get("source_event_at") in (None, ""):
-                row["source_event_at"] = row.get("observed_at") or received_at
             row["lightweight_cache_age_seconds"] = cache_age_seconds
             row = apply_declared_venue_capability_contract(row)
             row = normalize_synchronized_capture_market(
@@ -4122,6 +4118,7 @@ class PaperBot:
             ),
             "venue_server_time": market.get("venue_server_time"),
             "source_event_at": market.get("source_event_at"),
+            "source_freshness_basis": market.get("source_freshness_basis"),
             "mark_price": mark_price,
             "discovery_reference_price": market.get("discovery_reference_price"),
             "discovery_reference_price_kind": market.get(
@@ -4447,7 +4444,8 @@ class PaperBot:
             "response_received_at": book.get("response_received_at") or orderbook_response_at,
             "normalized_at": market.get("normalized_at") or market_response_at,
             "venue_server_time": market.get("venue_server_time") or book.get("venue_server_time"),
-            "source_event_at": market.get("source_event_at") or book.get("orderbook_event_time"),
+            "source_event_at": market.get("source_event_at"),
+            "source_freshness_basis": market.get("source_freshness_basis"),
             "orderbook_request_started_at": book.get("request_started_at") or request_started_at,
             "orderbook_response_received_at": book.get("response_received_at") or orderbook_response_at,
             "orderbook_event_time": book.get("orderbook_event_time") or orderbook_response_at,

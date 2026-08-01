@@ -103,6 +103,32 @@ RATE_KIND_MIN_UNCERTAINTY_BPS = {
 
 EXACT_NEXT_RATE_KINDS = {RateEstimateKind.PUBLISHED_NEXT}
 
+RATE_KIND_TO_SEMANTICS: dict[str, str] = {
+    "published_next_estimate": "next_settlement",
+    "published_next_hour": "next_settlement",
+    "published_next_hour_estimate": "forecast_next_settlement",
+    "published_predicted_next": "predicted_next_settlement",
+    "published_next_hour_prediction": "predicted_next_settlement",
+    "published_forecast": "forecast_next_settlement",
+    "published_projected_1h": "forecast_next_settlement",
+    "published_current_estimate": "current_interval_estimate",
+    "published_current": "current_interval_estimate",
+    "published_current_interval_rate": "current_interval_estimate",
+    "published_current_hour_estimate": "current_interval_estimate",
+    "published_8h_equivalent_normalized_hourly": "derived_current_interval_estimate",
+    "published_latest_24h_x18": "derived_current_interval_estimate",
+    "published_latest_hour_x18": "derived_current_interval_estimate",
+    "published_predicted_24h_hourly": "derived_current_interval_estimate",
+    "published_current_fallback": "current_interval_fallback",
+    "published_last_settlement": "last_settlement_reference",
+    "last_settlement_reference": "last_settlement_reference",
+}
+
+EXACT_NEXT_RATE_KIND_STRINGS: frozenset[str] = frozenset({
+    "published_next_estimate",
+    "published_next_hour",
+})
+
 INCOMPATIBLE_CONTRACT_KINDS = {
     "delivery",
     "future",
@@ -588,10 +614,18 @@ def _market_soft_flags(
         flags.append("quantity_step_missing")
         assumptions.append("continuous theoretical sizing used in discovery")
         missing.append("quantity_step")
+    if market.get("min_quantity_taker_applicable") is False:
+        flags.append("taker_min_quantity_unverified")
+        assumptions.append("public minimum quantity was not proven applicable to taker/IOC sizing")
+        missing.append("taker_min_quantity")
     if positive_float(market.get("min_notional_usd")) is None and positive_float(market.get("min_notional")) is None:
         flags.append("min_notional_missing")
         assumptions.append("minimum notional not enforced until focused/verified stage")
         missing.append("min_notional")
+    elif market.get("min_notional_taker_applicable") is False:
+        flags.append("taker_min_notional_unverified")
+        assumptions.append("public minimum notional was not proven applicable to taker/IOC sizing")
+        missing.append("taker_min_notional")
     if positive_float(market.get("min_quantity")) is None:
         flags.append("min_quantity_missing")
         missing.append("min_quantity")
@@ -955,6 +989,8 @@ def _route_economics(
         "verified"
         if positive_float(long_market.get("quantity_step")) is not None
         and positive_float(short_market.get("quantity_step")) is not None
+        and long_market.get("min_quantity_taker_applicable") is not False
+        and short_market.get("min_quantity_taker_applicable") is not False
         and (
             positive_float(long_market.get("min_notional_usd")) is not None
             or positive_float(long_market.get("min_notional")) is not None
@@ -963,6 +999,8 @@ def _route_economics(
             positive_float(short_market.get("min_notional_usd")) is not None
             or positive_float(short_market.get("min_notional")) is not None
         )
+        and long_market.get("min_notional_taker_applicable") is not False
+        and short_market.get("min_notional_taker_applicable") is not False
         else "provisional"
     )
     return {
@@ -1051,8 +1089,12 @@ def _verified_blockers(
             blockers.append(f"{side}_product_type_unverified")
         if positive_float(market.get("quantity_step")) is None:
             blockers.append(f"{side}_quantity_step_missing")
+        if market.get("min_quantity_taker_applicable") is False:
+            blockers.append(f"{side}_taker_min_quantity_missing")
         if positive_float(market.get("min_notional_usd")) is None and positive_float(market.get("min_notional")) is None:
             blockers.append(f"{side}_min_notional_missing")
+        elif market.get("min_notional_taker_applicable") is False:
+            blockers.append(f"{side}_taker_min_notional_missing")
         if not bool(modeled_fee_rate(market, now=now)["verified"]):
             blockers.append(f"{side}_fee_evidence_unverified")
     for flag in risk_flags:

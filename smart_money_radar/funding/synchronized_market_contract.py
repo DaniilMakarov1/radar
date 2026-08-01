@@ -11,6 +11,8 @@ from smart_money_radar.funding.fees import (
 )
 from smart_money_radar.funding.readiness_policy import (
     DEFAULT_FUNDING_RISK_POLICY,
+    RATE_KIND_TO_SEMANTICS,
+    normalized_rate_kind,
     attach_rate_estimate,
     optional_float as policy_optional_float,
 )
@@ -47,9 +49,13 @@ _VERSIONED_FEE_TRUST_STATUSES = {
 
 @dataclass(frozen=True)
 class SynchronizedRateContract:
-    allowed_rate_kinds: tuple[str, ...]
+    observable_rate_kinds: tuple[str, ...]
     source_identifier: str
     source_kind: str = "venue_adapter_verified_contract"
+    exact_next_rate_kinds: tuple[str, ...] = ()
+
+    def registered_rate_kinds(self) -> frozenset[str]:
+        return frozenset((*self.observable_rate_kinds, *self.exact_next_rate_kinds))
 
 
 @dataclass(frozen=True)
@@ -62,23 +68,25 @@ class VerifiedFeeContract:
 
 SYNCHRONIZED_RATE_CONTRACTS: dict[str, SynchronizedRateContract] = {
     "binance": SynchronizedRateContract(
-        allowed_rate_kinds=("published_next_estimate",),
+        observable_rate_kinds=(),
         source_identifier="premiumIndex.lastFundingRate + fundingInfo.fundingIntervalHours",
+        exact_next_rate_kinds=("published_next_estimate",),
     ),
     "bybit": SynchronizedRateContract(
-        allowed_rate_kinds=("published_next_estimate",),
+        observable_rate_kinds=(),
         source_identifier="v5/market/tickers.fundingRate + instruments-info.fundingInterval",
+        exact_next_rate_kinds=("published_next_estimate",),
     ),
     "okx": SynchronizedRateContract(
-        allowed_rate_kinds=("published_current_estimate",),
+        observable_rate_kinds=("published_current_estimate",),
         source_identifier="public/funding-rate.fundingRate + prevFundingTime/fundingTime",
     ),
     "lighter": SynchronizedRateContract(
-        allowed_rate_kinds=("published_8h_equivalent_normalized_hourly",),
+        observable_rate_kinds=("published_8h_equivalent_normalized_hourly",),
         source_identifier="funding-rates.rate divided by published 8h period",
     ),
     "hyperliquid": SynchronizedRateContract(
-        allowed_rate_kinds=(
+        observable_rate_kinds=(
             "published_predicted_next",
             "published_current_fallback",
             "published_next_hour_prediction",
@@ -86,25 +94,28 @@ SYNCHRONIZED_RATE_CONTRACTS: dict[str, SynchronizedRateContract] = {
         source_identifier="predictedFundings.fundingRate or assetCtx.funding hourly fallback",
     ),
     "dydx": SynchronizedRateContract(
-        allowed_rate_kinds=("published_next_hour",),
-        source_identifier="perpetualMarkets.nextFundingRate hourly settlement estimate",
+        observable_rate_kinds=("published_next_hour_estimate",),
+        source_identifier=(
+            "perpetualMarkets.nextFundingRate hourly funding estimate; "
+            "exact next settlement contract unverified"
+        ),
     ),
     "pacifica": SynchronizedRateContract(
-        allowed_rate_kinds=(
+        observable_rate_kinds=(
             "published_next_hour_estimate",
             "published_current_hour_estimate",
         ),
         source_identifier="info/prices next_funding or current funding hourly estimate",
     ),
     "nado": SynchronizedRateContract(
-        allowed_rate_kinds=(
+        observable_rate_kinds=(
             "published_latest_24h_x18",
             "published_predicted_24h_hourly",
         ),
         source_identifier="archive contracts funding_rate_x18 24h divided by 24",
     ),
     "risex": SynchronizedRateContract(
-        allowed_rate_kinds=("published_current_interval_rate",),
+        observable_rate_kinds=("published_current_interval_rate",),
         source_identifier="markets.current_funding_rate per funding interval",
     ),
 }
@@ -261,20 +272,30 @@ def _normalize_next_rate(
     if rate_contract is None:
         return
     kind = str(row.get("funding_rate_kind") or "").strip()
-    if kind not in set(rate_contract.allowed_rate_kinds):
+    if kind not in rate_contract.registered_rate_kinds():
         return
+    semantics = RATE_KIND_TO_SEMANTICS.get(kind, "unknown")
+    row["funding_rate_semantics"] = semantics
+    row["funding_rate_unit"] = "fraction_of_notional_per_settlement"
+    row["funding_sign_convention"] = "positive_long_pays"
+    row.setdefault("raw_funding_rate", row.get("funding_rate"))
+    row.setdefault("raw_funding_rate_unit", "fraction_of_notional_per_settlement")
+    row["rate_estimate_kind"] = normalized_rate_kind(kind).value
+    if row.get("source_event_at") in (None, ""):
+        row.setdefault("source_freshness_basis", "response_time_current_snapshot_contract")
     rate = _optional_float(row.get("funding_rate"))
     interval_hours = _optional_float(row.get("funding_interval_hours"))
     if rate is None or interval_hours is None or interval_hours <= 0:
         return
     if not row.get("next_funding_at"):
         return
-    row["funding_rate_semantics"] = "next_settlement"
-    row["funding_rate_unit"] = "fraction_of_notional_per_settlement"
-    row["funding_sign_convention"] = "positive_long_pays"
-    row.setdefault("raw_funding_rate", row.get("funding_rate"))
-    row.setdefault("raw_funding_rate_unit", "fraction_of_notional_per_settlement")
-    row["normalized_next_funding_rate"] = rate
+    row["rate_estimate_per_settlement"] = rate
+    is_exact_next = kind in set(rate_contract.exact_next_rate_kinds)
+    derivation = (
+        contract.rate_per_settlement_derivation
+        if is_exact_next
+        else "observable rate estimate per settlement; not verified exact next cashflow"
+    )
     row["normalization_evidence"] = {
         "evidence_version": NORMALIZATION_EVIDENCE_VERSION,
         "venue": venue,
@@ -283,13 +304,20 @@ def _normalize_next_rate(
         "source_kind": rate_contract.source_kind,
         "source_identifier": rate_contract.source_identifier,
         "funding_rate_kind": kind,
+        "funding_rate_semantics": semantics,
         "funding_rate_unit": "fraction_of_notional_per_settlement",
         "funding_sign_convention": "positive_long_pays",
-        "rate_per_settlement_derivation": contract.rate_per_settlement_derivation,
+        "rate_per_settlement_derivation": derivation,
         "settlement_contract_evidence_checked_at": contract.evidence_checked_at,
+        "exact_next_rate_available": is_exact_next,
+        "source_freshness_basis": row.get("source_freshness_basis"),
         "observed_at": observed,
         "reviewed_at": FEE_CONTRACT_REVIEWED_AT,
     }
+    if is_exact_next:
+        row["normalized_next_funding_rate"] = rate
+    else:
+        row.pop("normalized_next_funding_rate", None)
 
 
 def _attach_fee_evidence(row: dict[str, Any], observed: str) -> None:

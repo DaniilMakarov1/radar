@@ -2591,6 +2591,7 @@ def route_leg(
         "normalized_at": market.get("normalized_at"),
         "venue_server_time": market.get("venue_server_time"),
         "source_event_at": market.get("source_event_at"),
+        "source_freshness_basis": market.get("source_freshness_basis"),
         "orderbook_request_started_at": book.get("request_started_at"),
         "orderbook_response_received_at": book.get("response_received_at"),
         "orderbook_event_time": book.get("orderbook_event_time"),

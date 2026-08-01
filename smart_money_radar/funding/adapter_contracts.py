@@ -267,12 +267,14 @@ def adapter_contract_reasons(
         reasons.append("contract_kind_not_linear_perpetual")
     if contract.funding_rate_semantics != "next_settlement":
         reasons.append("funding_semantics_not_next_settlement")
+        reasons.append("exact_next_rate_missing")
+    else:
+        if market.get("normalized_next_funding_rate") is None:
+            reasons.append("normalized_next_funding_rate_missing")
     if contract.funding_rate_unit != "fraction_of_notional_per_settlement":
         reasons.append("funding_rate_unit_not_fraction_per_settlement")
     if contract.funding_sign_convention != "positive_long_pays":
         reasons.append("funding_sign_convention_not_positive_long_pays")
-    if market.get("normalized_next_funding_rate") is None:
-        reasons.append("normalized_next_funding_rate_missing")
     if market.get("next_funding_at") in (None, ""):
         reasons.append("next_funding_at_missing")
     if _optional_float(market.get("mark_price")) is None:
@@ -316,6 +318,7 @@ def adapter_contract_status(
         "environment_missing",
         "contract_kind_not_linear_perpetual",
         "funding_semantics_not_next_settlement",
+        "exact_next_rate_missing",
         "funding_rate_unit_not_fraction_per_settlement",
         "funding_sign_convention_not_positive_long_pays",
         "normalized_next_funding_rate_missing",

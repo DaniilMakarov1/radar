@@ -120,7 +120,11 @@ class LighterFundingClient:
                     "contract_multiplier": 1.0,
                     "quantity_step": quantity_step,
                     "min_quantity": min_quantity,
+                    "min_quantity_scope": "public_market_metadata_taker_unverified",
+                    "min_quantity_taker_applicable": False,
                     "min_notional_usd": min_notional,
+                    "min_notional_scope": "public_market_metadata_taker_unverified",
+                    "min_notional_taker_applicable": False,
                     "status": "active",
                     "source_url": f"https://app.lighter.xyz/trade/{symbol}",
                     "observed_at": observed_at,
@@ -133,11 +137,10 @@ class LighterFundingClient:
                     "symbol": symbol,
                     "canonical_asset": asset,
                     "funding_rate": hourly_funding_rate,
-                    "normalized_next_funding_rate": hourly_funding_rate,
                     "funding_interval_hours": interval_hours,
                     "hourly_funding_rate": hourly_funding_rate,
                     "funding_rate_kind": "published_8h_equivalent_normalized_hourly",
-                    "funding_rate_semantics": "current_interval_estimate",
+                    "funding_rate_semantics": "derived_current_interval_estimate",
                     "funding_rate_unit": "fraction_of_notional_per_settlement",
                     "funding_sign_convention": "positive_long_pays",
                     "settlement_interval_seconds": 3600.0,
@@ -164,7 +167,11 @@ class LighterFundingClient:
                     "fee_observed_at": observed_at,
                     "quantity_step": quantity_step,
                     "min_quantity": min_quantity,
+                    "min_quantity_scope": "public_market_metadata_taker_unverified",
+                    "min_quantity_taker_applicable": False,
                     "min_notional_usd": min_notional,
+                    "min_notional_scope": "public_market_metadata_taker_unverified",
+                    "min_notional_taker_applicable": False,
                     "observed_at": observed_at,
                     "raw": {
                         "spec": raw,
@@ -301,11 +308,10 @@ class LighterFundingClient:
             "symbol": symbol,
             "canonical_asset": clean_asset_symbol(canonical_asset),
             "funding_rate": hourly_funding_rate,
-            "normalized_next_funding_rate": hourly_funding_rate,
             "funding_interval_hours": 1.0,
             "hourly_funding_rate": hourly_funding_rate,
             "funding_rate_kind": "published_8h_equivalent_normalized_hourly",
-            "funding_rate_semantics": "current_interval_estimate",
+            "funding_rate_semantics": "derived_current_interval_estimate",
             "funding_rate_unit": "fraction_of_notional_per_settlement",
             "funding_sign_convention": "positive_long_pays",
             "settlement_interval_seconds": 3600.0,
@@ -328,7 +334,11 @@ class LighterFundingClient:
             "fee_observed_at": observed_at,
             "quantity_step": quantity_step,
             "min_quantity": min_quantity,
+            "min_quantity_scope": "public_market_metadata_taker_unverified",
+            "min_quantity_taker_applicable": False,
             "min_notional_usd": min_notional,
+            "min_notional_scope": "public_market_metadata_taker_unverified",
+            "min_notional_taker_applicable": False,
             "contract_multiplier": previous.get("contract_multiplier") or 1.0,
             "canonical_unit_multiplier": previous.get("canonical_unit_multiplier", 1.0),
             "product_type": previous.get("product_type", "perpetual"),
@@ -440,9 +450,20 @@ def percentage_points_to_decimal(value: Any) -> float:
     return max(0.0, as_float(value)) / 100.0
 
 
+def _size_decimals(row: dict[str, Any]) -> int | None:
+    for key in ("supported_size_decimals", "size_decimals"):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            continue
+        value = integer_or_none(raw)
+        if value is not None:
+            return value
+    return None
+
+
 def lighter_quantity_step(*rows: dict[str, Any]) -> float | None:
     for row in rows:
-        decimals = integer_or_none(row.get("supported_size_decimals") or row.get("size_decimals"))
+        decimals = _size_decimals(row)
         if decimals is not None and decimals >= 0:
             return 10 ** (-decimals)
         for key in ("quantity_step", "step_size", "base_step_size"):

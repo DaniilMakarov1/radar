@@ -140,6 +140,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--focused-route-count", type=int, default=6)
     parser.add_argument("--route-workers", type=int, default=6)
     parser.add_argument("--focused-io-workers", type=int, default=0)
+    parser.add_argument(
+        "--focused-mode",
+        choices=("sample", "coverage", "all"),
+        default="sample",
+        help=(
+            "Focused pair selection mode: "
+            "sample=limited count, coverage=each venue appears as long+short, "
+            "all=every available directed pair."
+        ),
+    )
     args = parser.parse_args(argv)
 
     observed_at = datetime.now(UTC).isoformat()
@@ -275,6 +285,24 @@ def main(argv: list[str] | None = None) -> int:
             },
         }
 
+    successful_venues = tuple(v for v, r in venue_results.items() if r.get("status") == "PASS")
+    failed_venues = tuple(v for v, r in venue_results.items() if r.get("status") != "PASS")
+    available_pairs = [
+        pair for pair in route_combinations
+        if pair[0] in markets and pair[1] in markets
+    ]
+    readiness_evaluated_count = sum(
+        1 for r in route_results.values() if r.get("status") == "PASS"
+    )
+
+    focused_mode = str(args.focused_mode)
+    focused_pairs, coverage_info = _select_focused_pairs(
+        mode=focused_mode,
+        available_pairs=available_pairs,
+        successful_venues=successful_venues,
+        sample_count=int(args.focused_route_count),
+    )
+
     focused_smoke = _run_focused_concurrency_smoke(
         markets=markets,
         route_combinations=route_combinations,
@@ -284,24 +312,76 @@ def main(argv: list[str] | None = None) -> int:
         route_workers=int(args.route_workers),
         focused_io_workers=int(args.focused_io_workers),
         timeout_seconds=float(args.timeout_seconds),
+        focused_pairs=focused_pairs,
     )
     if focused_smoke["status"] != "PASS":
         failures.append(f"focused_concurrency: {focused_smoke.get('reason')}")
+
+    readiness_pass_count = sum(
+        1 for r in route_results.values()
+        if r.get("status") == "PASS" and r.get("verified_paper_ready") is True
+    )
+    readiness_total = readiness_evaluated_count
+    focused_available_total = len(available_pairs)
+    focused_started = int(
+        focused_smoke.get("focused_started_count", focused_smoke.get("outer_started", 0))
+        or 0
+    )
+    focused_terminal = int(focused_smoke.get("terminal_scan_count", 0) or 0)
+    focused_refreshed = int(
+        focused_smoke.get("refreshed_route_result_count", focused_smoke.get("refreshed_count", 0))
+        or 0
+    )
 
     payload = {
         "status": "FAIL" if failures else "PASS",
         "observed_at": observed_at,
         "asset": str(args.asset).upper(),
-        "requested_venues": venue_names,
+        "requested_venues": list(venue_names),
+        "successful_venues": list(successful_venues),
+        "failed_venues": list(failed_venues),
+        "directed_pair_count": len(route_combinations),
+        "readiness_evaluated_pair_count": readiness_evaluated_count,
+        "focused_pair_count": len(focused_pairs),
+        "focused_available_pair_count": focused_available_total,
+        "focused_started_pair_count": focused_started,
+        "focused_terminal_scan_count": focused_terminal,
+        "focused_refreshed_route_count": focused_refreshed,
+        "focused_pairs": [f"{l}->{s}" for l, s in focused_pairs],
+        "focused_mode": focused_mode,
+        "long_venue_coverage": coverage_info["long_venue_coverage"],
+        "short_venue_coverage": coverage_info["short_venue_coverage"],
+        "coverage_complete": coverage_info["coverage_complete"],
+        "remaining_running_scan_count": focused_smoke.get("remaining_running_scan_count", 0),
+        "positions_created": focused_smoke.get("position_count", 0),
+        "ledger_events_created": focused_smoke.get("paper_event_ledger_count", 0),
+        "live_trading_enabled": False,
         "venues": venue_results,
         "routes": route_results,
-        "focused_concurrency": focused_smoke,
+        "readiness_matrix": {
+            "summary": f"{readiness_pass_count}/{readiness_total}",
+            "evaluated": readiness_total,
+            "verified_paper_ready": readiness_pass_count,
+        },
+        "focused_concurrency": {
+            **focused_smoke,
+            "summary": _focused_concurrency_summary(
+                started_pair_count=focused_started,
+                available_pair_count=focused_available_total,
+                mode=focused_mode,
+            ),
+            "coverage_basis": "focused_started_pairs_over_available_directed_pairs",
+            "terminal_scan_summary": f"{focused_terminal}/{len(focused_pairs)} terminal",
+            "refreshed_route_summary": f"{focused_refreshed}/{len(focused_pairs)} refreshed",
+        },
         "failures": failures,
         "notes": {
             "credentials_used": False,
             "raw_responses_included": False,
             "real_orders_sent": False,
             "live_trading_enabled": False,
+            "focused_mode": focused_mode,
+            "scope": "public_readonly_smoke_diagnostics_only",
         },
     }
     output = Path(args.output).expanduser()
@@ -309,6 +389,69 @@ def main(argv: list[str] | None = None) -> int:
     output.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
     print(json.dumps({"status": payload["status"], "output": str(output)}, sort_keys=True))
     return 0 if payload["status"] == "PASS" else 1
+
+
+def _select_focused_pairs(
+    *,
+    mode: str,
+    available_pairs: list[tuple[str, str]],
+    successful_venues: tuple[str, ...],
+    sample_count: int,
+) -> tuple[list[tuple[str, str]], dict[str, Any]]:
+    successful = set(successful_venues)
+    eligible_pairs = [
+        pair for pair in available_pairs if pair[0] in successful and pair[1] in successful
+    ]
+    if not eligible_pairs:
+        return [], {
+            "long_venue_coverage": {venue: False for venue in successful_venues},
+            "short_venue_coverage": {venue: False for venue in successful_venues},
+            "coverage_complete": False,
+        }
+    if mode == "all":
+        selected = list(eligible_pairs)
+    elif mode == "coverage":
+        selected = _coverage_pairs(eligible_pairs, successful_venues)
+    else:
+        selected = list(eligible_pairs)[: max(0, sample_count)]
+    long_coverage: dict[str, bool] = {}
+    short_coverage: dict[str, bool] = {}
+    for venue in successful_venues:
+        long_coverage[venue] = any(pair[0] == venue for pair in selected)
+        short_coverage[venue] = any(pair[1] == venue for pair in selected)
+    coverage_complete = all(long_coverage.values()) and all(short_coverage.values())
+    return selected, {
+        "long_venue_coverage": long_coverage,
+        "short_venue_coverage": short_coverage,
+        "coverage_complete": coverage_complete,
+    }
+
+
+def _coverage_pairs(
+    available_pairs: list[tuple[str, str]],
+    successful_venues: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    selected: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    long_covered: set[str] = set()
+    short_covered: set[str] = set()
+    for venue in successful_venues:
+        if venue not in long_covered:
+            for pair in available_pairs:
+                if pair[0] == venue and pair not in seen:
+                    selected.append(pair)
+                    seen.add(pair)
+                    long_covered.add(venue)
+                    break
+    for venue in successful_venues:
+        if venue not in short_covered:
+            for pair in available_pairs:
+                if pair[1] == venue and pair not in seen:
+                    selected.append(pair)
+                    seen.add(pair)
+                    short_covered.add(venue)
+                    break
+    return selected
 
 
 def _run_focused_concurrency_smoke(
@@ -321,13 +464,17 @@ def _run_focused_concurrency_smoke(
     route_workers: int,
     focused_io_workers: int,
     timeout_seconds: float,
+    focused_pairs: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
-    selected_pairs = [
-        pair
-        for pair in route_combinations
-        if pair[0] in markets and pair[1] in markets
-    ][: max(0, route_count)]
-    if len(selected_pairs) < route_count:
+    if focused_pairs is not None:
+        selected_pairs = list(focused_pairs)
+    else:
+        selected_pairs = [
+            pair
+            for pair in route_combinations
+            if pair[0] in markets and pair[1] in markets
+        ][: max(0, route_count)]
+    if focused_pairs is None and len(selected_pairs) < route_count:
         return {
             "status": "FAIL",
             "reason": "insufficient_public_markets_for_focused_routes",
@@ -405,6 +552,10 @@ def _run_focused_concurrency_smoke(
         "route_workers": bot.config.hot_route_recheck_workers,
         "focused_io_workers": bot.config.focused_io_workers,
         "outer_started": bot.outer_started,
+        "selected_pair_count": len(selected_pairs),
+        "focused_started_count": bot.outer_started,
+        "terminal_scan_count": terminal_count,
+        "refreshed_route_result_count": len(refreshed),
         "refreshed_count": len(refreshed),
         "scan_statuses": scan_statuses,
         "remaining_running_scan_count": running_scan_count,
@@ -415,6 +566,16 @@ def _run_focused_concurrency_smoke(
         "live_trading_enabled": False,
         "routes": bot.route_telemetry,
     }
+
+
+def _focused_concurrency_summary(
+    *,
+    started_pair_count: int,
+    available_pair_count: int,
+    mode: str,
+) -> str:
+    label = "sampled" if mode == "sample" else mode
+    return f"{started_pair_count}/{available_pair_count} {label}"
 
 
 def _focused_smoke_route(
@@ -475,6 +636,10 @@ def _focused_smoke_leg(
         "base_quantity": quantity,
         "funding_rate": market.get("funding_rate"),
         "normalized_next_funding_rate": market.get("normalized_next_funding_rate"),
+        "rate_estimate_per_settlement": market.get("rate_estimate_per_settlement"),
+        "rate_estimate_kind": market.get("rate_estimate_kind"),
+        "exact_next_rate_available": market.get("exact_next_rate_available"),
+        "source_freshness_basis": market.get("source_freshness_basis"),
         "funding_interval_hours": market.get("funding_interval_hours"),
         "hourly_funding_rate": market.get("hourly_funding_rate"),
         "funding_rate_kind": market.get("funding_rate_kind"),
@@ -557,6 +722,9 @@ def _market_summary(market: dict[str, Any]) -> dict[str, Any]:
         "min_quantity": market.get("min_quantity"),
         "min_notional_usd": market.get("min_notional_usd") or market.get("min_notional"),
         "funding_rate_kind": market.get("funding_rate_kind"),
+        "rate_estimate_kind": market.get("rate_estimate_kind"),
+        "rate_estimate_per_settlement": market.get("rate_estimate_per_settlement"),
+        "exact_next_rate_available": market.get("exact_next_rate_available"),
         "next_funding_at": market.get("next_funding_at"),
         "mark_price": market.get("mark_price"),
         "index_price": market.get("index_price"),
@@ -580,6 +748,9 @@ def _market_normalization(market: dict[str, Any]) -> dict[str, Any]:
     evidence = market.get("normalization_evidence") or {}
     return {
         "normalized_next_funding_rate": market.get("normalized_next_funding_rate"),
+        "rate_estimate_per_settlement": market.get("rate_estimate_per_settlement"),
+        "rate_estimate_kind": market.get("rate_estimate_kind"),
+        "exact_next_rate_available": market.get("exact_next_rate_available"),
         "funding_rate_unit": market.get("funding_rate_unit"),
         "funding_sign_convention": market.get("funding_sign_convention"),
         "normalization_source_kind": evidence.get("source_kind"),

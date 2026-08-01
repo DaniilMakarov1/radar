@@ -489,9 +489,19 @@ def funding_events_from_market(
             "funding_rate",
             raw_event.get("rate", market.get("funding_rate")),
         )
-        event_market["normalized_next_funding_rate"] = raw_event.get(
-            "normalized_next_funding_rate",
-            raw_event.get("rate_per_next_settlement", event_market.get("funding_rate")),
+        explicit_normalized_rate = raw_event.get("normalized_next_funding_rate")
+        explicit_next_rate = raw_event.get("rate_per_next_settlement")
+        if explicit_normalized_rate is not None:
+            event_market["normalized_next_funding_rate"] = explicit_normalized_rate
+        elif explicit_next_rate is not None and bool(market.get("exact_next_rate_available")):
+            event_market["normalized_next_funding_rate"] = explicit_next_rate
+        else:
+            event_market.pop("normalized_next_funding_rate", None)
+        event_market["rate_estimate_per_settlement"] = raw_event.get(
+            "rate_estimate_per_settlement",
+            explicit_next_rate
+            if explicit_next_rate is not None
+            else event_market.get("rate_estimate_per_settlement", event_market.get("funding_rate")),
         )
         event_market["raw_funding_rate"] = raw_event.get(
             "raw_api_rate",
@@ -1057,6 +1067,7 @@ def _freshness_blockers(
     blockers: list[str] = []
     response_at = parse_time(market.get("response_received_at"))
     source_at = parse_time(market.get("source_event_at"))
+    source_freshness_basis = str(market.get("source_freshness_basis") or "").strip()
     if response_at is None:
         blockers.append("response_timestamp_missing")
     else:
@@ -1064,7 +1075,8 @@ def _freshness_blockers(
         if age < -max_response_age_seconds or age > max_response_age_seconds:
             blockers.append("response_timestamp_stale")
     if source_at is None:
-        blockers.append("source_event_timestamp_missing")
+        if source_freshness_basis != "response_time_current_snapshot_contract":
+            blockers.append("source_event_timestamp_missing")
     else:
         age = (now.astimezone(UTC) - source_at.astimezone(UTC)).total_seconds()
         if age < -max_source_age_seconds or age > max_source_age_seconds:

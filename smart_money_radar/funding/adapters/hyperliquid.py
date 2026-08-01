@@ -115,12 +115,11 @@ class HyperliquidFundingClient:
                     "symbol": symbol,
                     "canonical_asset": canonical_asset,
                     "funding_rate": funding_rate,
-                    "normalized_next_funding_rate": funding_rate,
                     "funding_interval_hours": interval_hours,
                     "hourly_funding_rate": funding_rate / interval_hours,
                     "funding_rate_kind": rate_kind,
                     "funding_rate_semantics": (
-                        "next_settlement"
+                        "predicted_next_settlement"
                         if rate_kind == "published_predicted_next"
                         else "current_interval_fallback"
                     ),
@@ -210,12 +209,11 @@ class HyperliquidFundingClient:
                 "symbol": raw_symbol,
                 "canonical_asset": asset,
                 "funding_rate": funding_rate,
-                "normalized_next_funding_rate": funding_rate,
                 "funding_interval_hours": interval_hours,
                 "hourly_funding_rate": funding_rate / interval_hours,
                 "funding_rate_kind": rate_kind,
                 "funding_rate_semantics": (
-                    "next_settlement"
+                    "predicted_next_settlement"
                     if rate_kind == "published_predicted_next"
                     else "current_interval_fallback"
                 ),

@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
 
 from smart_money_radar.funding.adapter_contracts import (
+    USD_BRIDGED_STABLE,
     USD_COMPARABLE_STABLE_FAMILIES,
     USD_MAJOR_STABLE,
     USD_BRIDGED_STABLE_ALIASES,
@@ -26,6 +27,14 @@ class StablecoinPrice:
     source_event_at: str
     response_received_at: str
     quality: str = "observed"
+    source_group: str = ""
+    upstream: str = ""
+    price_method: str = ""
+    network: str = ""
+    asset_identifier: str = ""
+    freshness_basis: str = ""
+    token_identity_verified: bool = True
+    direct_token_identity: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +44,14 @@ class StablecoinPrice:
             "source_event_at": self.source_event_at,
             "response_received_at": self.response_received_at,
             "quality": self.quality,
+            "source_group": self.source_group,
+            "upstream": self.upstream,
+            "price_method": self.price_method,
+            "network": self.network,
+            "asset_identifier": self.asset_identifier,
+            "freshness_basis": self.freshness_basis,
+            "token_identity_verified": self.token_identity_verified,
+            "direct_token_identity": self.direct_token_identity,
         }
 
 
@@ -128,16 +145,17 @@ class PublicStablecoinPriceProvider:
         if len(rows) < 2:
             return False
         now = datetime.now(UTC)
-        seen_sources: set[str] = set()
+        seen_groups: set[str] = set()
         for row in rows:
-            event_at = _parse_time(row.source_event_at) or _parse_time(row.response_received_at)
+            event_at = _price_event_time(row)
             if event_at is None or row.usd_price <= 0:
                 return False
             age = (now - event_at.astimezone(UTC)).total_seconds()
-            if age < -1.0 or age > 5.0:
+            max_age = _price_max_age_seconds(row, default_max_age_seconds=5.0)
+            if age < -1.0 or age > max_age:
                 return False
-            seen_sources.add(str(row.source))
-        return len(seen_sources) >= 2
+            seen_groups.add(row.source_group or str(row.source))
+        return len(seen_groups) >= 2
 
     def _fetch_prices(
         self,
@@ -146,11 +164,13 @@ class PublicStablecoinPriceProvider:
         observed_at: str,
     ) -> list[StablecoinPrice]:
         rows: list[StablecoinPrice] = []
+        is_bridged_proxy = asset != lookup_symbol and lookup_symbol == "USDC"
         quality = (
             "bridged_canonical_usdc_proxy"
-            if asset != lookup_symbol and lookup_symbol == "USDC"
+            if is_bridged_proxy
             else "current_snapshot_response_time"
         )
+        snapshot_freshness = "response_time_current_snapshot_contract"
         coingecko_id = self.COINGECKO_IDS.get(lookup_symbol)
         if coingecko_id:
             price, response_received_at = self._coingecko_price(coingecko_id)
@@ -163,6 +183,13 @@ class PublicStablecoinPriceProvider:
                         "",
                         response_received_at,
                         quality,
+                        source_group="coingecko",
+                        upstream="coingecko",
+                        price_method="aggregated_market_price",
+                        asset_identifier=coingecko_id,
+                        freshness_basis=snapshot_freshness,
+                        token_identity_verified=not is_bridged_proxy,
+                        direct_token_identity=not is_bridged_proxy,
                     )
                 )
         coinbase_currency = self.COINBASE_CURRENCIES.get(lookup_symbol)
@@ -177,6 +204,13 @@ class PublicStablecoinPriceProvider:
                         "",
                         response_received_at,
                         quality,
+                        source_group="coinbase",
+                        upstream="coinbase",
+                        price_method="exchange_rate_usd_conversion",
+                        asset_identifier=coinbase_currency,
+                        freshness_basis=snapshot_freshness,
+                        token_identity_verified=not is_bridged_proxy,
+                        direct_token_identity=not is_bridged_proxy,
                     )
                 )
         defillama_id = self.DEFILLAMA_IDS.get(lookup_symbol)
@@ -191,6 +225,13 @@ class PublicStablecoinPriceProvider:
                         source_event_at,
                         response_received_at,
                         "defillama_current_price",
+                        source_group="coingecko",
+                        upstream="coingecko",
+                        price_method="defillama_aggregated_price",
+                        asset_identifier=defillama_id,
+                        freshness_basis="source_event_defillama_timestamp" if source_event_at else snapshot_freshness,
+                        token_identity_verified=not is_bridged_proxy,
+                        direct_token_identity=not is_bridged_proxy,
                     )
                 )
         geckoterminal_search = self.GECKOTERMINAL_SEARCH.get(lookup_symbol)
@@ -205,6 +246,13 @@ class PublicStablecoinPriceProvider:
                         "",
                         response_received_at,
                         "public_dex_pool_usd_price",
+                        source_group="geckoterminal",
+                        upstream="geckoterminal",
+                        price_method="dex_pool_search",
+                        asset_identifier=geckoterminal_search,
+                        freshness_basis=snapshot_freshness,
+                        token_identity_verified=False,
+                        direct_token_identity=False,
                     )
                 )
         kraken_pair = self.KRAKEN_USD_PAIRS.get(lookup_symbol)
@@ -219,6 +267,13 @@ class PublicStablecoinPriceProvider:
                         "",
                         response_received_at,
                         "public_spot_usd_mid",
+                        source_group="kraken",
+                        upstream="kraken",
+                        price_method="spot_mid_price",
+                        asset_identifier=kraken_pair,
+                        freshness_basis=snapshot_freshness,
+                        token_identity_verified=not is_bridged_proxy,
+                        direct_token_identity=not is_bridged_proxy,
                     )
                 )
         return rows
@@ -253,10 +308,9 @@ class PublicStablecoinPriceProvider:
             price = float(row["price"])
         except (TypeError, ValueError, KeyError):
             price = 0.0
-        # DefiLlama's coin timestamp can lag the current response by minutes for
-        # stablecoins. Treat it like CoinGecko/Coinbase: current HTTP response
-        # is the freshness point, and quality identifies the source family.
-        return (price if price > 0 else None), "", response_received_at
+        raw_timestamp = row.get("timestamp") if isinstance(row, dict) else None
+        source_event_at = _defillama_timestamp_to_iso(raw_timestamp)
+        return (price if price > 0 else None), source_event_at, response_received_at
 
     def _geckoterminal_price(self, query: str) -> tuple[float | None, str]:
         encoded = urllib.parse.urlencode({"query": query})
@@ -327,6 +381,23 @@ class PublicStablecoinPriceProvider:
             return json.loads(response.read().decode("utf-8"))
 
 
+def _defillama_timestamp_to_iso(raw: Any) -> str:
+    if raw is None or raw == "":
+        return ""
+    try:
+        numeric = int(raw)
+    except (TypeError, ValueError):
+        return ""
+    if numeric <= 0:
+        return ""
+    if numeric > 10_000_000_000:
+        numeric = numeric // 1000
+    try:
+        return datetime.fromtimestamp(numeric, tz=UTC).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
 def _parse_time(value: Any) -> datetime | None:
     if not value:
         return None
@@ -339,6 +410,29 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+_CURRENT_SNAPSHOT_FRESHNESS = "response_time_current_snapshot_contract"
+_CURRENT_SNAPSHOT_MAX_AGE_SECONDS = 3.0
+
+
+def _price_event_time(row: StablecoinPrice) -> datetime | None:
+    event_at = _parse_time(row.source_event_at)
+    if event_at is not None:
+        return event_at
+    if row.freshness_basis == _CURRENT_SNAPSHOT_FRESHNESS:
+        return _parse_time(row.response_received_at)
+    return None
+
+
+def _price_max_age_seconds(
+    row: StablecoinPrice,
+    *,
+    default_max_age_seconds: float,
+) -> float:
+    if not row.source_event_at and row.freshness_basis == _CURRENT_SNAPSHOT_FRESHNESS:
+        return min(float(default_max_age_seconds), _CURRENT_SNAPSHOT_MAX_AGE_SECONDS)
+    return float(default_max_age_seconds)
+
+
 def _fresh_prices(
     rows: list[StablecoinPrice],
     observed_at: str,
@@ -347,22 +441,21 @@ def _fresh_prices(
 ) -> list[StablecoinPrice]:
     observed = _parse_time(observed_at) or datetime.now(UTC)
     output: list[StablecoinPrice] = []
-    seen_sources: set[str] = set()
+    seen_groups: set[str] = set()
     for row in rows:
         if row.usd_price <= 0:
             continue
-        event_at = _parse_time(row.source_event_at) or _parse_time(
-            row.response_received_at
-        )
+        event_at = _price_event_time(row)
         if event_at is None:
             continue
         age = (observed.astimezone(UTC) - event_at.astimezone(UTC)).total_seconds()
-        if age < -1.0 or age > max_age_seconds:
+        row_max_age = _price_max_age_seconds(row, default_max_age_seconds=max_age_seconds)
+        if age < -1.0 or age > row_max_age:
             continue
-        source = str(row.source)
-        if source in seen_sources:
+        group = row.source_group or str(row.source)
+        if group in seen_groups:
             continue
-        seen_sources.add(source)
+        seen_groups.add(group)
         output.append(row)
     return output
 
@@ -373,10 +466,33 @@ def _freshness_reference_time(
 ) -> datetime:
     reference = requested_observed.astimezone(UTC)
     for row in rows:
-        event_at = _parse_time(row.source_event_at) or _parse_time(row.response_received_at)
+        event_at = _price_event_time(row)
         if event_at is not None and event_at.astimezone(UTC) > reference:
             reference = event_at.astimezone(UTC)
     return reference
+
+
+def _eligible_source_groups(rows: list[StablecoinPrice]) -> set[str]:
+    groups: set[str] = set()
+    for row in rows:
+        if row.usd_price <= 0:
+            continue
+        if row.source_group == "geckoterminal" and not row.token_identity_verified:
+            continue
+        group = row.source_group or str(row.source)
+        groups.add(group)
+    return groups
+
+
+def _available_source_groups(rows: list[StablecoinPrice]) -> set[str]:
+    groups: set[str] = set()
+    for row in rows:
+        if row.usd_price <= 0:
+            continue
+        if _parse_time(row.response_received_at) is None:
+            continue
+        groups.add(row.source_group or str(row.source))
+    return groups
 
 
 def stablecoin_basis_bps(long_usd_price: float, short_usd_price: float) -> float:
@@ -521,16 +637,66 @@ def evaluate_stablecoin_route(
         freshness_observed,
         max_age_seconds=5.0,
     )
-    if len(long_prices) < 2 or len(short_prices) < 2:
+    long_eligible_groups = _eligible_source_groups(long_prices)
+    short_eligible_groups = _eligible_source_groups(short_prices)
+    long_available_groups = _available_source_groups(long_raw_prices)
+    short_available_groups = _available_source_groups(short_raw_prices)
+    insufficient_blockers: list[str] = []
+    if len(long_eligible_groups) < 2:
+        insufficient_blockers.append("insufficient_stablecoin_price_sources")
+    if len(short_eligible_groups) < 2:
+        if "insufficient_stablecoin_price_sources" not in insufficient_blockers:
+            insufficient_blockers.append("insufficient_stablecoin_price_sources")
+    bridged_blockers: list[str] = []
+    for asset_label, asset_name, asset_prices in (
+        ("long", long_asset, long_prices),
+        ("short", short_asset, short_prices),
+    ):
+        if collateral_family(asset_name) != USD_BRIDGED_STABLE:
+            continue
+        all_proxy = all(
+            row.quality == "bridged_canonical_usdc_proxy" for row in asset_prices
+        ) if asset_prices else True
+        has_direct = any(row.direct_token_identity for row in asset_prices)
+        if all_proxy:
+            bridged_blockers.append("bridged_stablecoin_proxy_only")
+        if not has_direct:
+            bridged_blockers.append("bridged_stablecoin_direct_price_missing")
+        bridged_blockers.append("bridged_asset_contract_identity_unverified")
+    bridged_blockers = list(dict.fromkeys(bridged_blockers))
+    if insufficient_blockers or bridged_blockers:
+        all_blockers = insufficient_blockers + bridged_blockers
         return {
-            **base_result(
-                "RESEARCH_ONLY",
-                ["insufficient_stablecoin_price_sources"],
-                cross_stable=True,
-            ),
+            **base_result("RESEARCH_ONLY", all_blockers, cross_stable=True),
             "compatible": True,
             "long_source_count": len(long_prices),
             "short_source_count": len(short_prices),
+            "long_raw_source_count": len(long_raw_prices),
+            "short_raw_source_count": len(short_raw_prices),
+            "long_eligible_source_groups": sorted(long_eligible_groups),
+            "short_eligible_source_groups": sorted(short_eligible_groups),
+            "long_available_source_groups": sorted(long_available_groups),
+            "short_available_source_groups": sorted(short_available_groups),
+            "source_identity": {
+                "provider": type(provider).__name__,
+                "sources": sorted({str(row.source) for row in [*long_raw_prices, *short_raw_prices] if row.source}),
+                "long_eligible_source_groups": sorted(long_eligible_groups),
+                "short_eligible_source_groups": sorted(short_eligible_groups),
+                "long_available_source_groups": sorted(long_available_groups),
+                "short_available_source_groups": sorted(short_available_groups),
+            },
+            "prices": {
+                "long": [row.as_dict() for row in long_prices],
+                "short": [row.as_dict() for row in short_prices],
+                long_asset: [row.as_dict() for row in long_prices],
+                short_asset: [row.as_dict() for row in short_prices],
+            },
+            "raw_prices": {
+                "long": [row.as_dict() for row in long_raw_prices],
+                "short": [row.as_dict() for row in short_raw_prices],
+                long_asset: [row.as_dict() for row in long_raw_prices],
+                short_asset: [row.as_dict() for row in short_raw_prices],
+            },
         }
     long_values = [row.usd_price for row in long_prices]
     short_values = [row.usd_price for row in short_prices]
@@ -542,7 +708,7 @@ def evaluate_stablecoin_route(
         and collateral_family(short_asset) == USD_MAJOR_STABLE
     )
     source_disagreement_limit = 5.0 if major_pair else 25.0
-    blockers: list[str] = []
+    blockers: list[str] = list(bridged_blockers)
     if max_disagreement > source_disagreement_limit:
         blockers.append("stablecoin_cross_source_disagreement")
     long_price = sum(long_values) / len(long_values)
@@ -561,8 +727,7 @@ def evaluate_stablecoin_route(
     reserve_usd = max(0.0, float(reference_notional)) * reserve / 10_000.0
     all_prices = [*long_prices, *short_prices]
     source_times = [
-        _parse_time(row.source_event_at) or _parse_time(row.response_received_at)
-        for row in all_prices
+        _price_event_time(row) for row in all_prices
     ]
     source_times = [row.astimezone(UTC) for row in source_times if row is not None]
     snapshot_observed = min(source_times) if source_times else requested_observed.astimezone(UTC)
@@ -576,6 +741,10 @@ def evaluate_stablecoin_route(
         "source_identity": {
             "provider": type(provider).__name__,
             "sources": sources,
+            "long_eligible_source_groups": sorted(long_eligible_groups),
+            "short_eligible_source_groups": sorted(short_eligible_groups),
+            "long_available_source_groups": sorted(long_available_groups),
+            "short_available_source_groups": sorted(short_available_groups),
         },
         "long_collateral_usd_price": long_price,
         "short_collateral_usd_price": short_price,

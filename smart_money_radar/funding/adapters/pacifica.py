@@ -74,9 +74,9 @@ class PacificaFundingClient:
                 continue
 
             price_row = price_rows.get(symbol, {})
-            raw_next_funding_rate = price_row.get("next_funding") or row.get(
-                "next_funding_rate"
-            )
+            raw_next_funding_rate = price_row.get("next_funding")
+            if raw_next_funding_rate is None:
+                raw_next_funding_rate = row.get("next_funding_rate")
             has_next_funding_rate = (
                 raw_next_funding_rate is not None
                 and str(raw_next_funding_rate).strip() != ""
@@ -115,7 +115,6 @@ class PacificaFundingClient:
                 "symbol": symbol,
                 "canonical_asset": canonical_asset,
                 "funding_rate": published_rate,
-                "normalized_next_funding_rate": published_rate,
                 "funding_interval_hours": PACIFICA_FUNDING_INTERVAL_HOURS,
                 "hourly_funding_rate": published_rate,
                 "settlement_interval_seconds": 3600.0,
@@ -125,7 +124,11 @@ class PacificaFundingClient:
                     if has_next_funding_rate
                     else "published_current_hour_estimate"
                 ),
-                "funding_rate_semantics": "next_settlement",
+                "funding_rate_semantics": (
+                    "forecast_next_settlement"
+                    if has_next_funding_rate
+                    else "current_interval_estimate"
+                ),
                 "funding_rate_unit": "fraction_of_notional_per_settlement",
                 "funding_sign_convention": "positive_long_pays",
                 "raw_api_rate": raw_next_funding_rate,
@@ -232,9 +235,9 @@ class PacificaFundingClient:
             clean_asset_symbol(canonical_asset),
             {},
         )
-        raw_next_funding_rate = price_row.get("next_funding") or info.get(
-            "next_funding_rate"
-        )
+        raw_next_funding_rate = price_row.get("next_funding")
+        if raw_next_funding_rate is None:
+            raw_next_funding_rate = info.get("next_funding_rate")
         has_next_funding_rate = (
             raw_next_funding_rate is not None
             and str(raw_next_funding_rate).strip() != ""
@@ -257,7 +260,6 @@ class PacificaFundingClient:
                 info.get("base_asset") or canonical_asset
             ),
             "funding_rate": published_rate,
-            "normalized_next_funding_rate": published_rate,
             "funding_interval_hours": PACIFICA_FUNDING_INTERVAL_HOURS,
             "hourly_funding_rate": published_rate,
             "settlement_interval_seconds": 3600.0,
@@ -267,7 +269,11 @@ class PacificaFundingClient:
                 if has_next_funding_rate
                 else "published_current_hour_estimate"
             ),
-            "funding_rate_semantics": "next_settlement",
+            "funding_rate_semantics": (
+                "forecast_next_settlement"
+                if has_next_funding_rate
+                else "current_interval_estimate"
+            ),
             "funding_rate_unit": "fraction_of_notional_per_settlement",
             "funding_sign_convention": "positive_long_pays",
             "raw_api_rate": raw_next_funding_rate,
@@ -461,6 +467,7 @@ def pacifica_fee_evidence(
             source_identifier=source_identifier,
             observed_at=observed_at,
             environment=environment,
+            conservative_worst_case=True,
         ),
         "taker": public_fee_evidence(
             venue="pacifica",
@@ -468,5 +475,6 @@ def pacifica_fee_evidence(
             source_identifier=source_identifier,
             observed_at=observed_at,
             environment=environment,
+            conservative_worst_case=True,
         ),
     }

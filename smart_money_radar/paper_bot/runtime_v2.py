@@ -159,7 +159,13 @@ def _leg_mark(leg: dict[str, Any]) -> float:
 
 
 def _leg_rate(leg: dict[str, Any]) -> float:
-    return float(optional_float(leg.get("normalized_next_funding_rate")) or 0.0)
+    rate = optional_float(leg.get("rate_estimate_per_settlement"))
+    if rate is not None:
+        return float(rate)
+    rate = optional_float(leg.get("normalized_next_funding_rate"))
+    if rate is not None:
+        return float(rate)
+    return 0.0
 
 
 def _leg_fee_rate(leg: dict[str, Any]) -> float:

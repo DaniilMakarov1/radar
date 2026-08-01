@@ -184,18 +184,35 @@ def public_fee_evidence(
     observed_at: str,
     environment: str = "mainnet",
     product_type: str = "perpetual",
+    fee_evidence_kind: str = "PUBLIC_FEE_ENDPOINT",
+    account_applicable: bool = False,
+    conservative_worst_case: bool = False,
 ) -> dict[str, Any]:
+    fee_scope = (
+        "public_worst_case_schedule"
+        if conservative_worst_case
+        else "public_account_unverified_schedule"
+    )
     return {
         "source_kind": "official_public_fee_endpoint",
         "source_identifier": source_identifier,
-        "trust_status": "OFFICIAL",
+        "trust_status": "REVIEWED" if conservative_worst_case else "PUBLIC_UNVERIFIED",
         "venue": str(venue or "").lower(),
         "liquidity_role": liquidity_role,
         "fee_source_observed_at": observed_at,
         "environment": environment,
         "product_type": product_type,
         "applicability": liquidity_role,
-        "evidence_version": "public-fee-evidence-v1",
+        "fee_scope": fee_scope,
+        "account_applicability": (
+            "public_worst_case_schedule"
+            if conservative_worst_case
+            else "account_applicability_unverified"
+        ),
+        "fee_evidence_kind": fee_evidence_kind,
+        "account_applicable": bool(account_applicable),
+        "conservative_worst_case": bool(conservative_worst_case),
+        "evidence_version": "public-fee-evidence-v2",
     }
 
 
