@@ -13,6 +13,7 @@ from smart_money_radar.funding.route_identity import (
 from smart_money_radar.funding.readiness_policy import (
     EvaluationMode,
     estimated_paper_blockers,
+    modeled_fee_rate,
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
     EventWindowPlannerConfig,
@@ -172,11 +173,8 @@ def _leg_rate(leg: dict[str, Any]) -> float:
 
 
 def _leg_fee_rate(leg: dict[str, Any]) -> float:
-    return float(
-        optional_float(leg.get("fee_rate"))
-        if optional_float(leg.get("fee_rate")) is not None
-        else optional_float(leg.get("taker_fee_rate")) or 0.0
-    )
+    modeled = modeled_fee_rate(leg)
+    return float(modeled.get("fee_rate") or 0.0)
 
 
 def _synthetic_levels(price: float, quantity: float) -> list[list[float]]:
@@ -226,8 +224,8 @@ def build_focused_observation(
     *,
     now: datetime,
     phase: str = "entry",
-    max_age_seconds: float = 5.0,
-    max_response_skew_seconds: float = 1.0,
+    max_age_seconds: float = 10.0,
+    max_response_skew_seconds: float = 5.0,
 ) -> dict[str, Any]:
     legs = route.get("legs") or []
     long_leg = leg_by_side(legs, "long") or {}
@@ -414,6 +412,17 @@ class SynchronizedFundingRuntimeV2:
             ),
             evaluation_mode=planner_mode,
         )
+
+    def _entry_snapshot_skew_seconds(self) -> float:
+        if self.estimate_paper_enabled:
+            return float(
+                getattr(
+                    self.config,
+                    "experimental_max_cross_venue_snapshot_skew_seconds",
+                    15.0,
+                )
+            )
+        return float(getattr(self.config, "max_cross_venue_snapshot_skew_seconds", 5.0))
 
     def _cycle_events_for_scheduled_at(
         self,
@@ -1453,11 +1462,23 @@ class SynchronizedFundingRuntimeV2:
             "long_next_funding_rate": optional_float(long_route_leg.get("normalized_next_funding_rate")),
             "short_next_funding_rate": optional_float(short_route_leg.get("normalized_next_funding_rate")),
         }
-        if long_age > 2.0 or short_age > 2.0 or cross_skew > 1.0:
+        max_focused_age_seconds = float(
+            getattr(self.config, "focused_observation_age_target_seconds", 10.0)
+        )
+        max_skew_seconds = self._entry_snapshot_skew_seconds()
+        if (
+            long_age > max_focused_age_seconds
+            or short_age > max_focused_age_seconds
+            or cross_skew > max_skew_seconds
+        ):
             return {
                 **base,
                 "quality": "INVALID_STALE",
-                "reason": "current_snapshot_stale_or_skewed",
+                "reason": (
+                    "snapshot_stale"
+                    if long_age > max_focused_age_seconds or short_age > max_focused_age_seconds
+                    else "cross_venue_skew"
+                ),
                 "risk_state": "DEGRADED",
                 "long_entry_price": long_entry_price,
                 "short_entry_price": short_entry_price,
@@ -1885,7 +1906,8 @@ class SynchronizedFundingRuntimeV2:
                 continue
             if leg.get("paper_enabled") is not True:
                 venue = str(leg.get("venue") or label)
-                reasons.append(f"{venue}_paper_disabled")
+                if not self.estimate_paper_enabled:
+                    reasons.append(f"{venue}_paper_disabled")
             if leg.get("live_enabled") is True:
                 reasons.append("unexpected_live_enabled_in_paper_runtime")
         return list(dict.fromkeys(reasons))
@@ -2051,9 +2073,7 @@ class SynchronizedFundingRuntimeV2:
             route,
             now=now,
             max_age_seconds=float(self.config.max_entry_snapshot_age_seconds),
-            max_response_skew_seconds=float(
-                self.config.max_cross_venue_snapshot_skew_seconds
-            ),
+            max_response_skew_seconds=self._entry_snapshot_skew_seconds(),
         )
         route_plan_gross = optional_float(route_plan.get("conservative_funding_cashflow_usd"))
         if route_plan_gross is not None:
@@ -2066,9 +2086,7 @@ class SynchronizedFundingRuntimeV2:
                 observation,
                 now=now,
                 max_age_seconds=float(self.config.max_entry_snapshot_age_seconds),
-                max_response_skew_seconds=float(
-                    self.config.max_cross_venue_snapshot_skew_seconds
-                ),
+                max_response_skew_seconds=self._entry_snapshot_skew_seconds(),
             )
             observation["snapshot_valid"] = bool(validation["valid"])
             observation["invalid_reason"] = (
@@ -2100,7 +2118,7 @@ class SynchronizedFundingRuntimeV2:
         if not (float(self.config.entry_min_lead_seconds) <= lead <= float(self.config.entry_max_lead_seconds)):
             return {
                 "opened": False,
-                "reason": "outside_entry_window",
+                "reason": "entry_window_missed",
                 "lead_seconds": lead,
                 "route_plan": route_plan,
             }
@@ -2731,15 +2749,19 @@ class SynchronizedFundingRuntimeV2:
             max_age_seconds = (
                 float(self.config.max_entry_snapshot_age_seconds)
                 if phase == "entry"
-                else 2.0
+                else float(
+                    getattr(
+                        self.config,
+                        "focused_observation_age_target_seconds",
+                        10.0,
+                    )
+                )
             )
             if validate_focused_observation(
                 row,
                 now=now,
                 max_age_seconds=max_age_seconds,
-                max_response_skew_seconds=float(
-                    self.config.max_cross_venue_snapshot_skew_seconds
-                ),
+                max_response_skew_seconds=self._entry_snapshot_skew_seconds(),
             )["valid"]:
                 valid.append(row)
         return valid
@@ -2884,6 +2906,13 @@ class SynchronizedFundingRuntimeV2:
         if long_price <= 0 or short_price <= 0:
             return {"quantity": 0.0, "reason": "zero_price"}
         target = float(self.config.target_notional_per_leg)
+        min_fraction = float(getattr(self.config, "target_notional_min_fraction", 0.90))
+        max_fraction = max(
+            min_fraction,
+            float(getattr(self.config, "target_notional_max_fraction", 1.10)),
+        )
+        min_target_notional = target * min_fraction
+        max_target_notional = target * max_fraction
         q_raw = min(target / long_price, target / short_price)
         if long_step > 0 and short_step > 0:
             scale = 10**8
@@ -2895,20 +2924,79 @@ class SynchronizedFundingRuntimeV2:
             return {"quantity": 0.0, "reason": "missing_quantity_step"}
         if common_step <= 0:
             return {"quantity": 0.0, "reason": "invalid_common_step"}
-        q = math.floor(q_raw / common_step) * common_step
-        long_notional = q * long_price
-        short_notional = q * short_price
-        if q < max(long_min_qty, short_min_qty):
-            return {"quantity": 0.0, "reason": "below_min_quantity"}
-        if long_notional < long_min_notional:
-            return {"quantity": 0.0, "reason": "below_long_min_notional"}
-        if short_notional < short_min_notional:
-            return {"quantity": 0.0, "reason": "below_short_min_notional"}
-        if long_notional < 450 or short_notional < 450:
-            return {"quantity": 0.0, "reason": "below_notional_floor_450"}
-        if long_notional > 500 or short_notional > 500:
-            return {"quantity": 0.0, "reason": "above_notional_cap_500"}
-        return {"quantity": q, "reason": None}
+        base_units = max(0, math.floor(q_raw / common_step))
+        min_qty_units = math.ceil(max(long_min_qty, short_min_qty) / common_step)
+        candidate_units = sorted(
+            {
+                unit
+                for unit in range(
+                    max(1, min(base_units, min_qty_units) - 2),
+                    max(base_units, min_qty_units) + 4,
+                )
+                if unit > 0
+            }
+        )
+        candidates: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for units in candidate_units:
+            q = units * common_step
+            long_notional = q * long_price
+            short_notional = q * short_price
+            item = {
+                "quantity": q,
+                "long_notional": long_notional,
+                "short_notional": short_notional,
+                "target_notional": target,
+                "target_notional_min_fraction": min_fraction,
+                "target_notional_max_fraction": max_fraction,
+                "min_target_notional": min_target_notional,
+                "max_target_notional": max_target_notional,
+                "common_quantity_step": common_step,
+            }
+            reason = None
+            if q < max(long_min_qty, short_min_qty):
+                reason = "below_min_quantity"
+            elif long_notional < long_min_notional:
+                reason = "below_long_min_notional"
+            elif short_notional < short_min_notional:
+                reason = "below_short_min_notional"
+            elif long_notional < min_target_notional or short_notional < min_target_notional:
+                reason = "below_target_notional_min_fraction"
+            elif long_notional > max_target_notional or short_notional > max_target_notional:
+                reason = "above_target_notional_max_fraction"
+            if reason is None:
+                candidates.append(item)
+            else:
+                rejected.append({**item, "reason": reason})
+        if candidates:
+            selected = min(
+                candidates,
+                key=lambda item: max(
+                    abs(float(item["long_notional"]) - target),
+                    abs(float(item["short_notional"]) - target),
+                ),
+            )
+            return {**selected, "reason": None}
+        fallback = min(
+            rejected,
+            key=lambda item: max(
+                abs(float(item["long_notional"]) - target),
+                abs(float(item["short_notional"]) - target),
+            ),
+            default={
+                "quantity": 0.0,
+                "long_notional": 0.0,
+                "short_notional": 0.0,
+                "target_notional": target,
+                "target_notional_min_fraction": min_fraction,
+                "target_notional_max_fraction": max_fraction,
+                "min_target_notional": min_target_notional,
+                "max_target_notional": max_target_notional,
+                "common_quantity_step": common_step,
+                "reason": "quantity_invalid",
+            },
+        )
+        return {**fallback, "quantity": 0.0}
 
     def _target_quantity(self, route: dict[str, Any]) -> float:
         result = self._compute_target_quantity(route)
@@ -2925,14 +3013,25 @@ class SynchronizedFundingRuntimeV2:
                 return {"quantity": 0.0, "reason": f"{side}_quantity_step_missing"}
             if optional_float(leg.get("min_quantity")) is None:
                 return {"quantity": 0.0, "reason": f"{side}_min_quantity_missing"}
-            if optional_float(leg.get("min_notional")) is None:
+            if (
+                optional_float(leg.get("min_notional")) is None
+                and optional_float(leg.get("min_notional_usd")) is None
+            ):
                 return {"quantity": 0.0, "reason": f"{side}_min_notional_missing"}
         long_step = float(long_leg.get("quantity_step") or 0.0)
         short_step = float(short_leg.get("quantity_step") or 0.0)
         long_min_qty = float(long_leg.get("min_quantity") or 0.0)
         short_min_qty = float(short_leg.get("min_quantity") or 0.0)
-        long_min_notional = float(long_leg.get("min_notional") or 0.0)
-        short_min_notional = float(short_leg.get("min_notional") or 0.0)
+        long_min_notional = float(
+            optional_float(long_leg.get("min_notional"))
+            if optional_float(long_leg.get("min_notional")) is not None
+            else optional_float(long_leg.get("min_notional_usd")) or 0.0
+        )
+        short_min_notional = float(
+            optional_float(short_leg.get("min_notional"))
+            if optional_float(short_leg.get("min_notional")) is not None
+            else optional_float(short_leg.get("min_notional_usd")) or 0.0
+        )
         return self._compute_common_quantity(
             long_price=long_price,
             short_price=short_price,
@@ -2960,6 +3059,7 @@ class SynchronizedFundingRuntimeV2:
             return {
                 "passed": False,
                 "reason": str(quantity_result.get("reason") or "quantity_invalid"),
+                "sizing": quantity_result,
             }
         max_total = int(getattr(self.config, "max_open_positions_total", 1))
         max_per_venue = int(getattr(self.config, "max_open_positions_per_venue", 1))
@@ -2989,7 +3089,15 @@ class SynchronizedFundingRuntimeV2:
         long_notional = quantity * long_price
         short_notional = quantity * short_price
         if current_exposure + long_notional + short_notional > max_exposure:
-            return {"passed": False, "reason": "max_gross_exposure_usd"}
+            return {
+                "passed": False,
+                "reason": "max_gross_exposure_usd",
+                "sizing": quantity_result,
+                "current_exposure": current_exposure,
+                "long_notional": long_notional,
+                "short_notional": short_notional,
+                "max_gross_exposure_usd": max_exposure,
+            }
         leverage = float(getattr(self.config, "leverage", 1.0) or 1.0)
         reserve_fraction = float(getattr(self.config, "collateral_reserve_fraction", 0.25))
         for side, leg, leg_notional in (
@@ -3013,8 +3121,9 @@ class SynchronizedFundingRuntimeV2:
                     "venue": venue,
                     "required": required_cash,
                     "available": available,
+                    "sizing": quantity_result,
                 }
-        return {"passed": True, "reason": None}
+        return {"passed": True, "reason": None, "sizing": quantity_result}
 
     def _reserve_collateral(
         self,
@@ -3258,6 +3367,7 @@ class SynchronizedFundingRuntimeV2:
             return {
                 "state": "FAILED",
                 "attempt_id": attempt_id,
+                "reason": "fill_deadline_missed" if not deadline_ok else "partial_or_late_fill_unwound",
                 "quantity": 0.0,
                 "target_quantity": q,
                 "long_entry_price": long_fill["average_fill_price"],
@@ -3289,6 +3399,9 @@ class SynchronizedFundingRuntimeV2:
         return {
             "state": state,
             "attempt_id": attempt_id,
+            "reason": None if state == "OPEN" else (
+                "fill_deadline_missed" if not deadline_ok else "entry_fill_failed"
+            ),
             "quantity": min(long_fill["filled_quantity"], short_fill["filled_quantity"]),
             "target_quantity": q,
             "long_entry_price": long_fill["average_fill_price"],
@@ -3590,10 +3703,14 @@ class SynchronizedFundingRuntimeV2:
             route,
             now=now,
             phase="hold",
-            max_age_seconds=2.0,
-            max_response_skew_seconds=float(
-                self.config.max_cross_venue_snapshot_skew_seconds
+            max_age_seconds=float(
+                getattr(
+                    self.config,
+                    "focused_observation_age_target_seconds",
+                    10.0,
+                )
             ),
+            max_response_skew_seconds=self._entry_snapshot_skew_seconds(),
         )
         self._store_observation(
             route,
@@ -3620,9 +3737,10 @@ class SynchronizedFundingRuntimeV2:
             if optional_float(leg.get("index_price")) is None:
                 missing.append(f"{side}_index_price_missing")
             if optional_float(leg.get("fee_rate")) is None and optional_float(leg.get("taker_fee_rate")) is None:
-                missing.append(f"{side}_fee_rate_missing")
+                if not self.estimate_paper_enabled:
+                    missing.append(f"{side}_fee_rate_missing")
             fee_status = fee_evidence_status(leg, "taker")
-            if not bool(fee_status.get("verified")):
+            if not bool(fee_status.get("verified")) and not self.estimate_paper_enabled:
                 missing.append(
                     f"{side}_{fee_status.get('blocker') or 'fee_provenance_unverified'}"
                 )
@@ -3681,12 +3799,20 @@ class SynchronizedFundingRuntimeV2:
         )
         targeted = (route.get("evidence") or {}).get("targeted_refresh") or {}
         snapshot_id = targeted.get("snapshot_id")
+        long_rate_ready = optional_float(long_leg.get("normalized_next_funding_rate")) is not None
+        short_rate_ready = optional_float(short_leg.get("normalized_next_funding_rate")) is not None
+        if self.estimate_paper_enabled:
+            long_rate_ready = long_rate_ready or optional_float(long_leg.get("rate_estimate_per_settlement")) is not None
+            short_rate_ready = short_rate_ready or optional_float(short_leg.get("rate_estimate_per_settlement")) is not None
+        max_focused_age_seconds = float(
+            getattr(self.config, "focused_observation_age_target_seconds", 10.0)
+        )
         fresh = (
-            long_age <= 2.0
-            and short_age <= 2.0
-            and cross_skew <= 1.0
-            and optional_float(long_leg.get("normalized_next_funding_rate")) is not None
-            and optional_float(short_leg.get("normalized_next_funding_rate")) is not None
+            long_age <= max_focused_age_seconds
+            and short_age <= max_focused_age_seconds
+            and cross_skew <= self._entry_snapshot_skew_seconds()
+            and long_rate_ready
+            and short_rate_ready
             and targeted.get("quality") == "FRESH"
             and bool(snapshot_id)
         )

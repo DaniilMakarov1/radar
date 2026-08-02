@@ -184,6 +184,7 @@ def test_soft_gaps_do_not_block_discovery_but_block_verified_paper() -> None:
     assert discovery["structurally_eligible"] is True
     assert discovery["economically_observable"] is True
     assert discovery["experimental_paper_ready"] is True
+    assert discovery["paper_mode"] == "EXPERIMENTAL_PAPER"
     assert discovery["funding_cashflow_status"] == "ESTIMATED_ONLY"
     for flag in (
         "long_estimated_rate_used",
@@ -203,6 +204,109 @@ def test_soft_gaps_do_not_block_discovery_but_block_verified_paper() -> None:
         "long_fee_evidence_unverified",
     ):
         assert blocker in verified["mode_blockers"]
+
+
+def test_typed_estimate_without_exact_next_rate_is_experimental_paper_ready() -> None:
+    long_market = _market(
+        "hyperliquid",
+        -0.006,
+        kind="published_current_interval_rate",
+    )
+    short_market = _market(
+        "lighter",
+        0.006,
+        kind="published_current_interval_rate",
+    )
+    for market in (long_market, short_market):
+        rate = market.pop("normalized_next_funding_rate")
+        market["rate_estimate_per_settlement"] = rate
+        market["rate_estimate_kind"] = "published_current_interval_rate"
+
+    result = _route(
+        long=long_market,
+        short=short_market,
+        mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+
+    assert result["experimental_paper_ready"] is True
+    assert result["verified_paper_ready"] is False
+    assert result["paper_mode"] == "EXPERIMENTAL_PAPER"
+    assert result["mode_blockers"] == []
+    assert "long_exact_next_rate_missing" in result["verified_paper_blockers"]
+    assert "short_exact_next_rate_missing" in result["verified_paper_blockers"]
+    assert "long_exact_next_rate_missing" in result["experimental_warnings"]
+    assert result["rate_estimates"]["long"]["rate_estimate_source"]
+
+
+def test_unverified_fee_is_experimental_warning_with_reserve_not_paper_blocker() -> None:
+    long_market = _market("hyperliquid", -0.006, fee=False)
+    short_market = _market("lighter", 0.006)
+
+    result = _route(
+        long=long_market,
+        short=short_market,
+        mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+
+    assert result["experimental_paper_ready"] is True
+    assert result["mode_blockers"] == []
+    assert "long_fee_evidence_unverified" in result["verified_paper_blockers"]
+    assert "long_fee_evidence_unverified" in result["experimental_warnings"]
+    fee = result["fee_evidence"]["long"]
+    assert fee["fee_estimated"] is True
+    assert fee["fee_not_verified"] is True
+    assert fee["fee_reserve_bps"] > 0
+    assert fee["fee_source"]
+
+
+def test_live_enabled_remains_hard_blocker_for_experimental_paper() -> None:
+    long_market = _market("hyperliquid", -0.006)
+    long_market["live_enabled"] = True
+
+    result = _route(
+        long=long_market,
+        mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+
+    assert result["experimental_paper_ready"] is False
+    assert "long_unexpected_live_enabled_in_paper_runtime" in result["hard_blockers"]
+    assert "long_unexpected_live_enabled_in_paper_runtime" in result["mode_blockers"]
+
+
+@pytest.mark.parametrize(
+    ("venue", "kind"),
+    [
+        ("hyperliquid", "published_predicted_next"),
+        ("lighter", "published_8h_equivalent_normalized_hourly"),
+        ("dydx", "published_next_hour_estimate"),
+        ("pacifica", "published_current_hour_estimate"),
+        ("nado", "published_latest_24h_x18"),
+        ("risex", "published_current_interval_rate"),
+    ],
+)
+def test_dex_like_routes_are_not_blocked_by_exact_rate_policy_in_experimental_paper(
+    venue: str,
+    kind: str,
+) -> None:
+    long_market = _market(venue, -0.006, kind=kind, fee=False)
+    long_market["paper_enabled"] = False
+    rate = long_market.pop("normalized_next_funding_rate")
+    long_market["rate_estimate_per_settlement"] = rate
+    long_market["rate_estimate_kind"] = kind
+
+    result = _route(
+        long=long_market,
+        mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+
+    assert result["hard_blockers"] == []
+    assert result["experimental_paper_ready"] is True
+    assert result["paper_mode"] == "EXPERIMENTAL_PAPER"
+    assert "long_exact_next_rate_missing" in result["verified_paper_blockers"]
+    assert "long_paper_enabled_false" in result["verified_paper_blockers"]
+    assert "long_exact_next_rate_missing" not in result["mode_blockers"]
+    assert "long_paper_enabled_false" not in result["mode_blockers"]
+    assert "long_exact_next_rate_missing" in result["experimental_warnings"]
 
 
 @pytest.mark.parametrize(

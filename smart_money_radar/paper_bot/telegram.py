@@ -472,7 +472,9 @@ def status_route_line(
         "collateral_usdt0_risk": "COLLATERAL RISK",
     }
     badges: list[str] = []
-    if paper_mode in {"EXPERIMENTAL_SIMULATION", "EXPERIMENTAL"}:
+    if paper_mode in {"EXPERIMENTAL_PAPER"}:
+        badges.append("EXPERIMENTAL PAPER")
+    elif paper_mode in {"EXPERIMENTAL_SIMULATION", "EXPERIMENTAL"}:
         badges.append("SIMULATION READY")
     elif paper_mode in {"VERIFIED_PAPER", "VERIFIED"}:
         badges.append("VERIFIED PAPER")

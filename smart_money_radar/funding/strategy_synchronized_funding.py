@@ -595,6 +595,8 @@ def _stablecoin_cost_gate(
     long_market: dict[str, Any],
     short_market: dict[str, Any],
     now: datetime,
+    target_notional: float,
+    evaluation_mode: EvaluationMode,
 ) -> tuple[Decimal, list[str], dict[str, Any]]:
     long_asset = str(long_market.get("collateral_asset") or long_market.get("quote_asset") or "").upper()
     short_asset = str(short_market.get("collateral_asset") or short_market.get("quote_asset") or "").upper()
@@ -631,6 +633,39 @@ def _stablecoin_cost_gate(
         {},
     )
     if not snapshot:
+        major_pair = (
+            collateral_family(long_asset) == USD_MAJOR_STABLE
+            and collateral_family(short_asset) == USD_MAJOR_STABLE
+        )
+        if evaluation_mode is EvaluationMode.EXPERIMENTAL_PAPER and major_pair:
+            reserve_bps = Decimal("25")
+            reserve_usd = (
+                _non_negative_decimal(target_notional)
+                * reserve_bps
+                / Decimal("10000")
+            )
+            return reserve_usd, [], {
+                "schema_version": 1,
+                "status": "EXPERIMENTAL_PAPER_ALLOWED",
+                "cross_stable": True,
+                "stablecoin_pair": expected_pair,
+                "canonical_pair": expected_pair,
+                "long_asset": long_asset,
+                "short_asset": short_asset,
+                "current_stablecoin_basis_bps": 0.0,
+                "stablecoin_basis_assumed": True,
+                "provider_unavailable": True,
+                "reserve_bps": float(reserve_bps),
+                "stablecoin_reserve_bps": float(reserve_bps),
+                "stablecoin_reserve_usd": float(reserve_usd),
+                "source_identity": {"provider": None, "sources": []},
+                "blockers": ["stablecoin_snapshot_missing"],
+                "assumptions": [
+                    "provider_unavailable",
+                    "stablecoin_basis_assumed",
+                    "USDC/USDT USD-family collateral priced at par for experimental paper with conservative reserve"
+                ],
+            }
         return Decimal("0"), [
             "stablecoin_snapshot_pair_mismatch" if snapshots else "stablecoin_snapshot_missing"
         ], {
@@ -663,19 +698,36 @@ def _stablecoin_cost_gate(
         blockers.append("stablecoin_snapshot_expires_at_missing")
     elif now.astimezone(UTC) > expires_at.astimezone(UTC):
         blockers.append("stablecoin_snapshot_expired")
-    if str(snapshot.get("status") or "").upper() != "PASS":
+    snapshot_status = str(snapshot.get("status") or "").upper()
+    experimental_allowed = (
+        evaluation_mode is EvaluationMode.EXPERIMENTAL_PAPER
+        and snapshot_status == "EXPERIMENTAL_PAPER_ALLOWED"
+        and collateral_family(long_asset) == USD_MAJOR_STABLE
+        and collateral_family(short_asset) == USD_MAJOR_STABLE
+    )
+    if experimental_allowed:
+        blockers = [
+            reason
+            for reason in blockers
+            if reason
+            not in {
+                "stablecoin_price_provider_unavailable",
+                "stablecoin_snapshot_missing",
+            }
+        ]
+    if snapshot_status != "PASS" and not experimental_allowed:
         blockers.append("stablecoin_snapshot_not_pass")
     source_identity = snapshot.get("source_identity") if isinstance(snapshot.get("source_identity"), dict) else {}
-    if not source_identity.get("provider") or not source_identity.get("sources"):
+    if (not source_identity.get("provider") or not source_identity.get("sources")) and not experimental_allowed:
         blockers.append("stablecoin_snapshot_source_missing")
     prices = snapshot.get("prices") if isinstance(snapshot.get("prices"), dict) else {}
-    if not prices or (
+    if not experimental_allowed and (not prices or (
         not prices.get("long")
         and not prices.get(long_asset)
     ) or (
         not prices.get("short")
         and not prices.get(short_asset)
-    ):
+    )):
         blockers.append("stablecoin_snapshot_prices_incomplete")
     reserve = _non_negative_decimal(snapshot.get("stablecoin_reserve_usd"))
     return reserve, list(dict.fromkeys(blockers)), snapshot
@@ -761,6 +813,8 @@ def _planned_costs(
         long_market=long_market,
         short_market=short_market,
         now=now,
+        target_notional=target_notional,
+        evaluation_mode=evaluation_mode,
     )
     blockers.extend(stablecoin_blockers)
     stablecoin_reserve = max(
@@ -877,7 +931,9 @@ def _planned_costs(
             expires_at=stablecoin_snapshot.get("expires_at"),
             target_notional_usd=reference_decimal,
             status=str(stablecoin_snapshot.get("status") or "CONSERVATIVE_CONFIGURED"),
-            verified=not stablecoin_blockers,
+            verified=not stablecoin_blockers
+            and str(stablecoin_snapshot.get("status") or "").upper() == "PASS",
+            assumptions=tuple(str(item) for item in stablecoin_snapshot.get("assumptions") or ()),
             blocker_if_missing=stablecoin_blockers[0] if stablecoin_blockers else None,
         ),
         _cost_estimate(
@@ -1686,8 +1742,8 @@ def validate_focused_observation(
     observation: dict[str, Any],
     *,
     now: datetime,
-    max_age_seconds: float = 5.0,
-    max_response_skew_seconds: float = 1.0,
+    max_age_seconds: float = 10.0,
+    max_response_skew_seconds: float = 5.0,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     long_age = float(observation.get("long_age_seconds") or 0.0)
@@ -1700,14 +1756,17 @@ def validate_focused_observation(
     short_book_executable = bool(observation.get("short_book_executable"))
     capabilities_passed = bool(observation.get("capabilities_passed"))
     if long_age > max_age_seconds:
+        reasons.append("snapshot_stale")
         reasons.append(f"long_age_exceeds_{max_age_seconds}s")
     if short_age > max_age_seconds:
+        reasons.append("snapshot_stale")
         reasons.append(f"short_age_exceeds_{max_age_seconds}s")
     if long_response_at is not None and short_response_at is not None:
         response_skew = abs(
             (long_response_at.astimezone(UTC) - short_response_at.astimezone(UTC)).total_seconds()
         )
         if response_skew > max_response_skew_seconds:
+            reasons.append("cross_venue_skew")
             reasons.append(
                 f"response_skew_{response_skew:.3f}s_exceeds_{max_response_skew_seconds}s"
             )
@@ -1721,6 +1780,7 @@ def validate_focused_observation(
         reasons.append("short_book_not_executable")
     if not capabilities_passed:
         reasons.append("capabilities_not_passed")
+    reasons = list(dict.fromkeys(reasons))
     return {
         "valid": not reasons,
         "reasons": reasons,
@@ -1767,6 +1827,7 @@ def entry_underwriting(
     if span < minimum_span_seconds:
         reasons.append(f"observation_span_{span:.1f}s_below_{minimum_span_seconds}s")
     if latest_age is None or latest_age > max_latest_age_seconds:
+        reasons.append("snapshot_stale")
         reasons.append(
             f"latest_observation_age_{latest_age}s_exceeds_{max_latest_age_seconds}s"
             if latest_age is not None
@@ -1783,7 +1844,7 @@ def entry_underwriting(
     conservative_funding = conservative_fraction * min(gross_values) if gross_values else 0.0
     return {
         "eligible": not reasons,
-        "reasons": reasons,
+        "reasons": list(dict.fromkeys(reasons)),
         "observation_count": len(observations),
         "observation_span_seconds": span,
         "latest_observation_age_seconds": latest_age,

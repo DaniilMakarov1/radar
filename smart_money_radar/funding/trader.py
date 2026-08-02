@@ -271,7 +271,7 @@ class PaperBotConfig:
     auto_add_margin: bool = False
     max_open_positions_total: int = 1
     max_open_positions_per_venue: int = 1
-    max_gross_exposure_usd: float = 1_000.0
+    max_gross_exposure_usd: float = 1_100.0
     entry_target_lead_seconds: float = 30.0
     entry_min_lead_seconds: float = 25.0
     entry_max_lead_seconds: float = 35.0
@@ -279,15 +279,17 @@ class PaperBotConfig:
     settlement_alignment_tolerance_seconds: float = 1.0
     arm_window_seconds: int = 120
     final_recheck_freeze_seconds: int = 0
-    max_entry_snapshot_age_seconds: float = 5.0
-    max_cross_venue_snapshot_skew_seconds: float = 1.0
+    max_entry_snapshot_age_seconds: float = 20.0
+    max_cross_venue_snapshot_skew_seconds: float = 5.0
+    experimental_max_cross_venue_snapshot_skew_seconds: float = 15.0
+    focused_observation_age_target_seconds: float = 10.0
     settlement_grace_seconds: int = 30
     max_settlement_publication_lag_seconds: int = 300
     no_normal_exit_before_settlement_plus_seconds: int = 20
     post_settlement_schedule_probe_seconds: int = 5
     post_settlement_hold_decision_seconds: int = 30
     hold_enabled: bool = True
-    estimate_paper_enabled: bool = False
+    estimate_paper_enabled: bool = True
     entry_history_required: bool = False
     entry_history_mode: str = "disabled"
     hold_history_window_days: int = 30
@@ -337,6 +339,8 @@ class PaperBotConfig:
     account_fee_evidence_max_age_seconds: float = 24.0 * 60.0 * 60.0
     public_fee_endpoint_max_age_seconds: float = 7.0 * 24.0 * 60.0 * 60.0
     reviewed_static_fee_max_age_seconds: float = 30.0 * 24.0 * 60.0 * 60.0
+    target_notional_min_fraction: float = 0.90
+    target_notional_max_fraction: float = 1.10
 
     def validated(self) -> "PaperBotConfig":
         strategies = list(normalize_strategy_set(self.strategy_set))
@@ -406,6 +410,14 @@ class PaperBotConfig:
             max_cross_venue_snapshot_skew_seconds=max(
                 0.1,
                 min(float(self.max_cross_venue_snapshot_skew_seconds), 60.0),
+            ),
+            experimental_max_cross_venue_snapshot_skew_seconds=max(
+                0.1,
+                min(float(self.experimental_max_cross_venue_snapshot_skew_seconds), 60.0),
+            ),
+            focused_observation_age_target_seconds=max(
+                0.1,
+                min(float(self.focused_observation_age_target_seconds), 300.0),
             ),
             settlement_grace_seconds=max(
                 0,
@@ -573,6 +585,14 @@ class PaperBotConfig:
                 60.0,
                 float(self.reviewed_static_fee_max_age_seconds),
             ),
+            target_notional_min_fraction=max(
+                0.0,
+                min(float(self.target_notional_min_fraction), 10.0),
+            ),
+            target_notional_max_fraction=max(
+                0.0,
+                min(float(self.target_notional_max_fraction), 10.0),
+            ),
         ).normalized_entry_leads()
 
     def normalized_entry_leads(self) -> "PaperBotConfig":
@@ -584,6 +604,10 @@ class PaperBotConfig:
                 **asdict(self),
                 "entry_min_lead_seconds": minimum,
                 "entry_max_lead_seconds": maximum,
+                "target_notional_max_fraction": max(
+                    float(self.target_notional_min_fraction),
+                    float(self.target_notional_max_fraction),
+                ),
             }
         )
 
@@ -3753,6 +3777,7 @@ class PaperBot:
             observed_at=observed_at,
             reference_notional=float(self.config.target_notional_per_leg),
             funding_net_before_stablecoin_reserve=0.0,
+            allow_experimental_paper_fallback=bool(self.config.estimate_paper_enabled),
         )
         self._stablecoin_route_snapshots[key] = dict(snapshot)
         enriched = {
@@ -3922,7 +3947,7 @@ class PaperBot:
             or route_readiness.get("experimental_paper_ready")
         )
         paper_mode = route_readiness.get("paper_mode") or (
-            "EXPERIMENTAL_SIMULATION"
+            "EXPERIMENTAL_PAPER"
             if experimental_simulation_ready
             else "RESEARCH"
         )
@@ -3998,8 +4023,10 @@ class PaperBot:
                 "accounting_confidence": route_readiness.get("accounting_confidence"),
                 "hard_blockers": route_readiness.get("hard_blockers") or [],
                 "risk_flags": route_readiness.get("risk_flags") or [],
+                "experimental_warnings": route_readiness.get("experimental_warnings") or [],
                 "assumptions": route_readiness.get("assumptions") or [],
                 "missing_capabilities": route_readiness.get("missing_capabilities") or [],
+                "fee_evidence": route_readiness.get("fee_evidence") or {},
                 "not_verified_alpha": route_readiness.get("not_verified_alpha"),
                 "lightweight_discovery": {
                     "observed_at": now.astimezone(UTC).isoformat(),
@@ -4037,6 +4064,7 @@ class PaperBot:
                 "conservative_expected_net": conservative_expected_net,
                 "synchronized_capability_passed": bool(
                     route_readiness.get("verified_paper_ready")
+                    or route_readiness.get("experimental_paper_ready")
                 ),
                 "experimental_simulation_ready": experimental_simulation_ready,
                 "experimental_paper_ready": bool(
@@ -4044,7 +4072,7 @@ class PaperBot:
                 ),
                 "experimental_paper_ready_deprecated": True,
                 "verified_paper_ready": bool(route_readiness.get("verified_paper_ready")),
-                "capability_rejections": route_readiness.get("verified_paper_blockers") or [],
+                "capability_rejections": route_readiness.get("mode_blockers") or [],
                 "capability_check": route_readiness,
                 "blocking_reasons": [],
                 "blocking_risk_flags": [],
@@ -4540,7 +4568,11 @@ class PaperBot:
                 missing.append(f"{side}_mark_missing")
             if optional_float(leg.get("index_price")) is None:
                 missing.append(f"{side}_index_missing")
-            if optional_float(leg.get("normalized_next_funding_rate")) is None:
+            exact_rate = optional_float(leg.get("normalized_next_funding_rate"))
+            estimate_rate = optional_float(leg.get("rate_estimate_per_settlement"))
+            if exact_rate is None and (
+                not self.config.estimate_paper_enabled or estimate_rate is None
+            ):
                 missing.append(f"{side}_normalized_next_funding_rate_missing")
             if parse_iso(leg.get("next_funding_at")) is None:
                 missing.append(f"{side}_next_funding_at_missing")
@@ -4563,8 +4595,16 @@ class PaperBot:
         long_age = (now_utc - long_response).total_seconds()
         short_age = (now_utc - short_response).total_seconds()
         cross_skew = abs((long_response - short_response).total_seconds())
-        if long_age > 2.0 or short_age > 2.0 or cross_skew > 1.0:
-            return "STALE", "response_stale_or_skewed"
+        max_age_seconds = float(self.config.focused_observation_age_target_seconds)
+        max_skew_seconds = (
+            float(self.config.experimental_max_cross_venue_snapshot_skew_seconds)
+            if self.config.estimate_paper_enabled
+            else float(self.config.max_cross_venue_snapshot_skew_seconds)
+        )
+        if long_age > max_age_seconds or short_age > max_age_seconds:
+            return "STALE", "snapshot_stale"
+        if cross_skew > max_skew_seconds:
+            return "STALE", "cross_venue_skew"
         return "FRESH", None
 
     def process_open_positions(self) -> list[str]:

@@ -415,15 +415,18 @@ live positive routes, best live net, and median gross/cost. Near-miss route rows
 are kept out of the decision screen.
 
 When no route qualifies, the dashboard shows a sequential economics funnel for
-routes with at least $500 capacity: gross carry covering the complete execution
-cost, positive median PnL, positive Q25 PnL, and Q25 clearing the actionable
-profit threshold. Thin routes do not inflate these counters or the blocker summary.
+routes with at least the configured target-relative capacity floor (90% of the
+$500 default target): gross carry covering the complete execution cost, positive
+median PnL, positive Q25 PnL, and Q25 clearing the actionable profit threshold.
+Thin routes do not inflate these counters or the blocker summary.
 It also shows the horizon, Q25 and median PnL, `P(net > 0)`, decay half-life,
 conditional regime survival, remaining-duration quantiles, authorization deadline,
 and settlement-by-settlement forecast.
-Routes with less than $500 executable capacity per leg are omitted from both the
-Candidates and Watch views. `Position / leg` is the optimized modeled notional;
-`Capacity` is the larger maximum allowed by current two-sided depth.
+Routes below the target-relative executable capacity floor are omitted from both
+the Candidates and Watch views. `Position / leg` is the optimized modeled
+notional; default paper sizing targets $500 per leg and accepts 90%-110% of that
+target after exchange quantity-step rounding. `Capacity` is the larger maximum
+allowed by current two-sided depth.
 
 Automatic refresh is disabled in the dashboard by default. Manual `Update` always
 requests fresh current funding and selected orderbooks from venues; settled
@@ -444,8 +447,12 @@ Paper entries use `synchronized_funding_capture_v2`: both legs must have the sam
 next settlement within 1 second, and entry is authorized only from T-35 to T-25
 seconds before that settlement. The target is T-30, both simulated fills must be
 done by T-20, and the route snapshot must be no older than
-`--max-entry-snapshot-age-seconds` (2 seconds by default). The old 0-15 second
-entry window and 30-second freeze-window fallback are disabled by default.
+`--max-entry-snapshot-age-seconds` (20 seconds by default). Focused/hot
+observations target <=10 seconds, and cross-venue snapshot skew defaults to 5
+seconds for verified paper and 15 seconds for experimental paper. The old 0-15
+second entry window and 30-second freeze-window fallback are disabled by
+default. The default paper trader allows EXPERIMENTAL_PAPER typed funding
+estimates; pass `--no-estimated-funding-paper-entry` for a verified-only run.
 
 For the default synchronized strategy, spread convergence is always zero expected
 profit. Settlement-capture sizing and blockers use funding-only net economics;

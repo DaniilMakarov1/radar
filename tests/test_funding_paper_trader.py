@@ -52,17 +52,17 @@ def test_format_seconds_shows_overdue_settlement() -> None:
     assert format_seconds(-75) == "просрочено 1m 15s"
 
 
-def test_telegram_uses_simulation_ready_not_experimental_paper() -> None:
+def test_telegram_uses_experimental_paper_badge_for_experimental_paper() -> None:
     now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
     route = paper_route(now, long_lead=90, short_lead=90)
-    route["evidence"]["paper_mode"] = "EXPERIMENTAL_SIMULATION"
-    route["evidence"]["experimental_simulation_ready"] = True
-    route["evidence"]["readiness_level"] = "experimental_simulation_ready"
+    route["evidence"]["paper_mode"] = "EXPERIMENTAL_PAPER"
+    route["evidence"]["experimental_paper_ready"] = True
+    route["evidence"]["readiness_level"] = "experimental_paper_ready"
 
     line = status_route_line(route, 1)
 
-    assert "SIMULATION READY" in line
-    assert "EXPERIMENTAL PAPER" not in line
+    assert "EXPERIMENTAL PAPER" in line
+    assert "SIMULATION READY" not in line
 
 
 def paper_route(
@@ -306,16 +306,36 @@ def test_lightweight_discovery_defaults_and_window_validation() -> None:
 
     assert default.lightweight_foreground_budget_seconds == pytest.approx(8.0)
     assert default.lightweight_route_horizon_seconds == pytest.approx(3_600.0)
-    assert default.estimate_paper_enabled is False
+    assert default.estimate_paper_enabled is True
     assert constrained.lightweight_foreground_budget_seconds == pytest.approx(30.0)
     assert constrained.lightweight_cache_ttl_seconds == pytest.approx(30.0)
     assert constrained.lightweight_route_horizon_seconds == pytest.approx(900.0)
     assert constrained.lightweight_watch_window_seconds == pytest.approx(900.0)
 
 
-def test_estimate_paper_entry_requires_explicit_config() -> None:
-    assert PaperBotConfig().validated().estimate_paper_enabled is False
+def test_estimate_paper_entry_is_default_and_can_be_disabled() -> None:
+    assert PaperBotConfig().validated().estimate_paper_enabled is True
+    assert PaperBotConfig(estimate_paper_enabled=False).validated().estimate_paper_enabled is False
     assert PaperBotConfig(estimate_paper_enabled=True).validated().estimate_paper_enabled is True
+
+
+def test_funding_paper_trader_cli_defaults_to_estimated_paper_and_can_opt_out() -> None:
+    from smart_money_radar.cli import build_parser, funding_paper_trader_config
+
+    parser = build_parser()
+    default_args = parser.parse_args(["funding-paper-trader", "--iterations", "1", "--no-telegram"])
+    verified_only_args = parser.parse_args(
+        [
+            "funding-paper-trader",
+            "--iterations",
+            "1",
+            "--no-telegram",
+            "--no-estimated-funding-paper-entry",
+        ]
+    )
+
+    assert funding_paper_trader_config(default_args).estimate_paper_enabled is True
+    assert funding_paper_trader_config(verified_only_args).estimate_paper_enabled is False
 
 
 def test_selected_route_strategy_supports_all_strategy_classes() -> None:
@@ -607,17 +627,17 @@ def test_entry_rejects_stale_snapshot_inside_final_window() -> None:
     assert "entry_snapshot_stale" in decision["reasons"]
 
 
-def test_default_entry_snapshot_age_boundary_is_five_seconds() -> None:
+def test_default_entry_snapshot_age_boundary_is_twenty_seconds() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
         entry_min_lead_seconds=0,
         entry_max_lead_seconds=60,
     ).validated()
     at_boundary = paper_route(now, long_lead=30, short_lead=30)
-    at_boundary["observed_at"] = (now - timedelta(seconds=5)).isoformat()
+    at_boundary["observed_at"] = (now - timedelta(seconds=20)).isoformat()
     over_boundary = paper_route(now, long_lead=30, short_lead=30)
     over_boundary["observed_at"] = (
-        now - timedelta(seconds=5.001)
+        now - timedelta(seconds=20.001)
     ).isoformat()
 
     accepted = route_entry_decision(
@@ -633,7 +653,7 @@ def test_default_entry_snapshot_age_boundary_is_five_seconds() -> None:
         config,
     )
 
-    assert config.max_entry_snapshot_age_seconds == 5.0
+    assert config.max_entry_snapshot_age_seconds == 20.0
     assert "entry_snapshot_stale" not in accepted["reasons"]
     assert "entry_snapshot_stale" in rejected["reasons"]
 

@@ -107,6 +107,29 @@ ESTIMATE_PAPER_ALLOWED_VERIFIED_BLOCKERS = frozenset({
     "long_exact_next_rate_missing",
     "short_exact_next_rate_missing",
     "rate_confidence_below_verified_threshold",
+    "long_paper_enabled_false",
+    "short_paper_enabled_false",
+    "long_environment_unverified",
+    "short_environment_unverified",
+    "long_endpoint_base_url_missing",
+    "short_endpoint_base_url_missing",
+    "long_endpoint_identity_unverified",
+    "short_endpoint_identity_unverified",
+    "long_product_type_unverified",
+    "short_product_type_unverified",
+    "settlement_semantics_not_verified",
+    "settlement_accounting_not_verified",
+    "verified_ioc_execution_evidence_missing",
+    "long_fee_evidence_unverified",
+    "short_fee_evidence_unverified",
+    "long_quantity_step_missing",
+    "short_quantity_step_missing",
+    "long_taker_min_quantity_missing",
+    "short_taker_min_quantity_missing",
+    "long_min_notional_missing",
+    "short_min_notional_missing",
+    "long_taker_min_notional_missing",
+    "short_taker_min_notional_missing",
 })
 
 
@@ -115,9 +138,10 @@ def estimated_paper_blockers(verified_blockers: list[str]) -> list[str]:
 
     This deliberately does not change VERIFIED_PAPER. The estimate-based paper
     mode can use the latest typed funding estimate instead of an exact next
-    settlement rate, so exact-next and verified-rate-confidence blockers are
-    removed. Fee, sizing, paper_enabled, live-disabled, execution, settlement,
-    accounting, collateral, environment, endpoint, and product blockers remain.
+    settlement rate. Verified-only evidence gaps become experimental warnings;
+    live-enabled, non-executable, structurally unsafe, deactivated,
+    quarantined, incompatible-collateral, and unknown contract/rate semantics
+    remain hard blockers.
     """
     return [
         reason
@@ -518,6 +542,22 @@ def modeled_fee_rate(
         base += risk_policy.fee_uncertainty_reserve_bps / 10_000.0
     return {
         "fee_rate": max(0.0, float(base)),
+        "fee_estimated": not verified,
+        "fee_source": (
+            str(
+                fee_status.get("source_identifier")
+                or fee_status.get("source_kind")
+                or "verified_fee"
+            )
+            if verified
+            else str(
+                fee_status.get("source_identifier")
+                or fee_status.get("source_kind")
+                or ("venue_default" if default_rate is not None else "global_fallback")
+            )
+        ),
+        "fee_reserve_bps": 0.0 if verified else risk_policy.fee_uncertainty_reserve_bps,
+        "fee_not_verified": not verified,
         "verified": verified,
         "source_rate": numeric_rate,
         "venue_default_rate": default_rate,
@@ -553,6 +593,8 @@ def _market_contract_hard_blockers(
 ) -> list[str]:
     venue = str(market.get("venue") or "").lower()
     hard: list[str] = []
+    if market.get("live_enabled") is True:
+        hard.append("unexpected_live_enabled_in_paper_runtime")
     if venue in DEACTIVATED_FUNDING_VENUES:
         hard.append("venue_deactivated")
     if venue == "variational":
@@ -856,6 +898,27 @@ def evaluate_synchronized_route(
     risk_flags = list(dict.fromkeys(str(flag) for flag in risk_flags if flag))
     assumptions = list(dict.fromkeys(str(item) for item in assumptions if item))
     missing = list(dict.fromkeys(str(item) for item in missing if item))
+    modeled_fees = economics.get("modeled_fee_rates") or {}
+    fee_evidence = {
+        side: {
+            "fee_rate": fee.get("fee_rate"),
+            "fee_estimated": bool(fee.get("fee_estimated")),
+            "fee_source": fee.get("fee_source"),
+            "fee_reserve_bps": fee.get("fee_reserve_bps"),
+            "fee_not_verified": bool(fee.get("fee_not_verified")),
+            "verified": bool(fee.get("verified")),
+            "source_rate": fee.get("source_rate"),
+            "venue_default_rate": fee.get("venue_default_rate"),
+            "global_fallback_rate": fee.get("global_fallback_rate"),
+            "risk_flags": fee.get("risk_flags") or [],
+            "assumptions": fee.get("assumptions") or [],
+            "evidence_status": fee.get("evidence_status") or {},
+        }
+        for side, fee in (
+            ("long", modeled_fees.get("long") or {}),
+            ("short", modeled_fees.get("short") or {}),
+        )
+    }
 
     economically_observable = not hard and economics.get("raw_expected_funding_usd") is not None
     experimental_simulation_ready = (
@@ -915,10 +978,18 @@ def evaluate_synchronized_route(
         "paper_mode": (
             "VERIFIED_PAPER"
             if verified_ready
-            else "EXPERIMENTAL_SIMULATION"
+            else "EXPERIMENTAL_PAPER"
             if experimental_simulation_ready
             else None
         ),
+        "experimental_warnings": [
+            reason
+            for reason in verified_blockers
+            if reason in ESTIMATE_PAPER_ALLOWED_VERIFIED_BLOCKERS
+        ]
+        if experimental_simulation_ready
+        else [],
+        "fee_evidence": fee_evidence,
         "funding_cashflow_status": "CONFIRMED_ONLY" if verified_ready else "ESTIMATED_ONLY",
         "execution_status": economics.get("execution_status"),
         "settlement_semantics_status": (

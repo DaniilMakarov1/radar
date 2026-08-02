@@ -788,8 +788,38 @@ def build_parser() -> argparse.ArgumentParser:
     funding_paper_trader.add_argument(
         "--max-entry-snapshot-age-seconds",
         type=float,
-        default=5.0,
+        default=20.0,
         help="Maximum route and focused-observation age usable for paper entry.",
+    )
+    funding_paper_trader.add_argument(
+        "--focused-observation-age-target-seconds",
+        type=float,
+        default=10.0,
+        help="Target maximum age for focused/hot observations outside entry underwriting.",
+    )
+    funding_paper_trader.add_argument(
+        "--max-cross-venue-snapshot-skew-seconds",
+        type=float,
+        default=5.0,
+        help="Maximum cross-venue snapshot skew for verified paper.",
+    )
+    funding_paper_trader.add_argument(
+        "--experimental-max-cross-venue-snapshot-skew-seconds",
+        type=float,
+        default=15.0,
+        help="Maximum cross-venue snapshot skew for experimental paper.",
+    )
+    funding_paper_trader.add_argument(
+        "--target-notional-min-fraction",
+        type=float,
+        default=0.90,
+        help="Minimum accepted leg notional as a fraction of target notional.",
+    )
+    funding_paper_trader.add_argument(
+        "--target-notional-max-fraction",
+        type=float,
+        default=1.10,
+        help="Maximum accepted leg notional as a fraction of target notional.",
     )
     funding_paper_trader.add_argument(
         "--settlement-alignment-tolerance-seconds",
@@ -927,10 +957,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-estimated-funding-paper-entry",
         dest="estimate_paper_enabled",
         action="store_true",
+        default=True,
         help=(
-            "Experimental: allow paper entry to use the latest typed funding "
-            "estimate when an exact next settlement rate is unavailable. "
+            "Default: allow paper entry to use the latest typed funding estimate "
+            "when an exact next settlement rate is unavailable. "
             "This does not enable live trading or VERIFIED_PAPER readiness."
+        ),
+    )
+    funding_paper_trader.add_argument(
+        "--no-estimated-funding-paper-entry",
+        dest="estimate_paper_enabled",
+        action="store_false",
+        help=(
+            "Use verified-only paper entry gates and reject routes without exact "
+            "next-settlement funding rates."
         ),
     )
     funding_paper_trader.add_argument(
@@ -1254,6 +1294,17 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         arm_window_seconds=args.arm_window_seconds,
         final_recheck_freeze_seconds=args.final_recheck_freeze_seconds,
         max_entry_snapshot_age_seconds=args.max_entry_snapshot_age_seconds,
+        focused_observation_age_target_seconds=(
+            args.focused_observation_age_target_seconds
+        ),
+        max_cross_venue_snapshot_skew_seconds=(
+            args.max_cross_venue_snapshot_skew_seconds
+        ),
+        experimental_max_cross_venue_snapshot_skew_seconds=(
+            args.experimental_max_cross_venue_snapshot_skew_seconds
+        ),
+        target_notional_min_fraction=args.target_notional_min_fraction,
+        target_notional_max_fraction=args.target_notional_max_fraction,
         settlement_grace_seconds=args.settlement_grace_seconds,
         max_settlement_publication_lag_seconds=(
             args.max_settlement_publication_lag_seconds
@@ -1281,7 +1332,7 @@ def funding_paper_trader_config(args: argparse.Namespace) -> PaperBotConfig:
         focused_recheck_enabled=not args.no_focused_recheck,
         venue_set=venue_set,
         spread_arb_enabled=getattr(args, "spread_arb", False),
-        estimate_paper_enabled=bool(getattr(args, "estimate_paper_enabled", False)),
+        estimate_paper_enabled=bool(getattr(args, "estimate_paper_enabled", True)),
         basis_stop_loss_bps=getattr(args, "basis_stop_loss_bps", 200.0),
         common_price_move_alert_fraction=(
             float(getattr(args, "common_price_move_alert_pct", 5.0) or 0.0) / 100.0

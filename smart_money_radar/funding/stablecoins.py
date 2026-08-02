@@ -546,6 +546,7 @@ def evaluate_stablecoin_route(
     reference_notional: float,
     funding_net_before_stablecoin_reserve: float,
     adverse_stablecoin_change_1m_bps: list[float] | None = None,
+    allow_experimental_paper_fallback: bool = False,
 ) -> dict[str, Any]:
     long_asset = str(long_collateral or "").upper()
     short_asset = str(short_collateral or "").upper()
@@ -613,6 +614,38 @@ def evaluate_stablecoin_route(
             "numeraire": None,
         }
     if provider is None:
+        major_pair = (
+            collateral_family(long_asset) == USD_MAJOR_STABLE
+            and collateral_family(short_asset) == USD_MAJOR_STABLE
+        )
+        if major_pair and allow_experimental_paper_fallback:
+            reserve_bps = 25.0
+            reserve_usd = max(0.0, float(reference_notional)) * reserve_bps / 10_000.0
+            return {
+                **base_result(
+                    "EXPERIMENTAL_PAPER_ALLOWED",
+                    ["stablecoin_price_provider_unavailable"],
+                    cross_stable=True,
+                ),
+                "compatible": True,
+                "current_stablecoin_basis_bps": 0.0,
+                "stablecoin_basis_assumed": True,
+                "provider_unavailable": True,
+                "reserve_bps": reserve_bps,
+                "stablecoin_reserve_bps": reserve_bps,
+                "stablecoin_reserve_usd": reserve_usd,
+                "funding_net_before_stablecoin_reserve": (
+                    funding_net_before_stablecoin_reserve
+                ),
+                "funding_net_after_stablecoin_reserve": (
+                    funding_net_before_stablecoin_reserve - reserve_usd
+                ),
+                "assumptions": [
+                    "provider_unavailable",
+                    "stablecoin_basis_assumed",
+                    "USDC/USDT USD-family collateral priced at par for experimental paper with conservative reserve"
+                ],
+            }
         return {
             **base_result(
                 "RESEARCH_ONLY",

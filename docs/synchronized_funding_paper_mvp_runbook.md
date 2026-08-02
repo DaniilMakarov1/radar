@@ -58,8 +58,10 @@ Useful for public smoke:
 Live execution must remain disabled. Do not set live-order credentials for this
 MVP run. Keep Telegram disabled with `--no-telegram` for smoke commands.
 
-Fee overrides are allowed only as explicit configured evidence inputs for paper
-tests. Bare numeric fees without provenance fail closed.
+Fee overrides are allowed only as explicit configured evidence inputs for
+VERIFIED_PAPER tests. In default EXPERIMENTAL_PAPER runs, unverified fees must
+carry conservative reserves and visible evidence instead of silently becoming
+verified fees.
 
 ## Venue Scope
 
@@ -101,7 +103,9 @@ Public smoke:
 - MVP is paper-only and deterministic for local verification.
 - HOLD requires reliable reconciled history; insufficient history closes or
   treats the next cycle as a fresh independent entry.
-- Cross USDC/USDT routes share USD collateral class only when a fresh
-  stablecoin snapshot passes peg/freshness/source gates.
+- Cross USDC/USDT routes share the USD-family collateral class. Verified paper
+  requires fresh independent stablecoin sources; experimental paper may proceed
+  without the provider only with explicit `provider_unavailable`,
+  `stablecoin_basis_assumed`, and conservative reserve evidence.
 - Full scans are background work and are not required for the hot lifecycle
   scenario.

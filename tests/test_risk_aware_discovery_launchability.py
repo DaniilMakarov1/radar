@@ -185,11 +185,13 @@ def _route(
             "route_variant_key": key,
             "verified_paper_ready": verified,
             "experimental_simulation_ready": experimental,
-            "paper_mode": "VERIFIED_PAPER" if verified else "EXPERIMENTAL_SIMULATION",
+            "experimental_paper_ready": experimental,
+            "paper_mode": "VERIFIED_PAPER" if verified else "EXPERIMENTAL_PAPER",
             "readiness_policy": {
                 "hard_blockers": [],
                 "verified_paper_ready": verified,
                 "experimental_simulation_ready": experimental,
+                "experimental_paper_ready": experimental,
                 "rate_confidence": 0.95 if verified else 0.45,
                 "execution_confidence": 0.95 if verified else 0.35,
                 "settlement_confidence": 0.95 if verified else 0.40,
@@ -283,7 +285,7 @@ def test_route_identity_and_route_dedup_keeps_exact_variants_deterministic(tmp_p
     assert route_variant_rank_sort_key(best_a) == route_variant_rank_sort_key(best_b)
 
 
-def test_focused_capacity_100_watch_routes_stays_visible_and_limited() -> None:
+def test_focused_capacity_100_watch_routes_stays_visible_without_deferral() -> None:
     routes = [
         _route(index, verified=index < 5, experimental=True, net=20.0 - index * 0.1)
         for index in range(100)
@@ -299,20 +301,26 @@ def test_focused_capacity_100_watch_routes_stays_visible_and_limited() -> None:
     )
 
     assert len(selection["routes"]) == 100
-    assert len(selection["focused_routes"]) == 12
-    assert len(selection["deferred_routes"]) == 88
+    assert len(selection["focused_routes"]) == 100
+    assert len(selection["deferred_routes"]) == 0
     selected_keys = set(selection["selected_route_keys"])
     assert {f"variant-{index:03d}" for index in range(5)} <= selected_keys
     assert all(
-        route["evidence"]["focused_selection"]["state"] == "deferred"
-        for route in selection["deferred_routes"]
+        route["evidence"]["focused_selection"]["state"] == "selected"
+        for route in selection["focused_routes"]
     )
     assert all(
-        "focused_capacity_deferred" in route["risk_flags"]
-        for route in selection["deferred_routes"]
+        "focused_capacity_deferred" not in route["risk_flags"]
+        for route in selection["routes"]
     )
-    assert len(selection["focused_routes"]) < len(routes)
-    assert route_summary(selection["deferred_routes"][0])["focused_state"] == "deferred"
+    assert len(selection["focused_routes"]) == len(routes)
+    assert "focused_capacity_soft_limit_exceeded" in selection["capacity_warnings"]
+    assert selection["config"]["capacity_limits_are_advisory"] is True
+    assert all(
+        "focused_capacity_soft_limit_exceeded"
+        in route["evidence"]["focused_selection"]["capacity_warnings"]
+        for route in selection["focused_routes"]
+    )
 
     open_route = _route(500, verified=True, experimental=True, net=-100.0)
     open_selection = select_focused_routes(
@@ -322,13 +330,11 @@ def test_focused_capacity_100_watch_routes_stays_visible_and_limited() -> None:
         open_position_route_keys={open_route["route_key"]},
     )
     assert open_selection["selected_route_keys"][0] == open_route["route_key"]
-    assert len(
-        [
-            route
-            for route in open_selection["focused_routes"]
-            if route["route_key"] != open_route["route_key"]
-        ]
-    ) <= 1
+    assert len(open_selection["focused_routes"]) == 6
+    assert all(
+        "focused_capacity_deferred" not in route["risk_flags"]
+        for route in open_selection["focused_routes"]
+    )
 
 
 def test_focused_shortlist_verified_route_preempts_sticky_experimental() -> None:
@@ -352,14 +358,14 @@ def test_focused_shortlist_verified_route_preempts_sticky_experimental() -> None
     )
 
     assert "variant-099" in second["selected_route_keys"]
-    assert len(second["focused_routes"]) == 3
-    deferred_keys = set(second["deferred_route_keys"])
-    assert deferred_keys & {route["route_key"] for route in experimental}
+    assert second["selected_route_keys"][0] == "variant-099"
+    assert len(second["focused_routes"]) == 4
+    assert second["deferred_route_keys"] == []
     assert any(route["route_key"] == "variant-099" for route in second["focused_routes"])
-    assert any(route["route_key"] in deferred_keys for route in second["routes"])
+    assert all(route["focused_state"] == "selected" for route in second["routes"])
 
 
-def test_focused_capacity_venue_concentration_limit() -> None:
+def test_focused_capacity_venue_concentration_is_advisory_not_blocking() -> None:
     concentrated = [
         _route(index, long_venue="binance", short_venue=f"venue{index}", net=100 - index)
         for index in range(30)
@@ -383,8 +389,10 @@ def test_focused_capacity_venue_concentration_limit() -> None:
         ),
     )
 
-    assert len(selection["focused_routes"]) == 10
-    assert sum(1 for route in selection["focused_routes"] if route["long_venue"] == "binance") <= 3
+    assert len(selection["focused_routes"]) == 60
+    assert len(selection["deferred_routes"]) == 0
+    assert "focused_per_venue_soft_limit_exceeded" in selection["capacity_warnings"]
+    assert sum(1 for route in selection["focused_routes"] if route["long_venue"] == "binance") == 30
     assert any(route["long_venue"] != "binance" for route in selection["focused_routes"])
 
 
@@ -399,7 +407,11 @@ def test_open_position_plus_100_watch_routes_scheduler_keeps_p0_first(tmp_path, 
     bot.discovered_routes = {route["route_key"]: route for route in (_route(index) for index in range(100))}
     bot.apply_focused_selection(NOW)
     assert len(bot.discovered_routes) == 100
-    assert len(bot.hot_routes) <= 8
+    assert len(bot.hot_routes) == 100
+    assert all(
+        "focused_capacity_deferred" not in route["risk_flags"]
+        for route in bot.hot_routes.values()
+    )
     calls: list[str] = []
     monkeypatch.setattr(bot, "has_open_exposure", lambda: True)
     monkeypatch.setattr(bot, "run_open_position_iteration", lambda: calls.append("open_poll") or {"mode": "open_positions", "open_position_count": 1})

@@ -244,11 +244,17 @@ def focused_recheck_capacity_check(
         return {
             "sufficient": False,
             "reason": "focused_recheck_capacity_insufficient",
-            "entry_forbidden": True,
+            "entry_forbidden": False,
+            "warning_only": True,
+            "watch_route_count": watch_route_count,
+            "max_focused_routes": max_focused_routes,
+            "target_cadence_seconds": target_cadence_seconds,
         }
     return {
         "sufficient": True,
         "watch_route_count": watch_route_count,
+        "max_focused_routes": max_focused_routes,
         "target_cadence_seconds": target_cadence_seconds,
         "entry_forbidden": False,
+        "warning_only": False,
     }

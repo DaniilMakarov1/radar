@@ -59,6 +59,17 @@ python3 -m smart_money_radar.cli funding-paper-export
 - Do not show negative-PnL routes as candidates. They may be diagnostics, but not actionable candidates.
 - Do not let deleted modules affect Funding UI startup. The Funding dashboard must load even if archived modules are absent.
 
+## History-Learned Worker Rules
+
+- Implement only the scoped task. Do not expand product scope, add research modules, or promote a venue because it appears promising.
+- Do not convert zero candidates into candidates by weakening gates. Add or preserve funnel diagnostics and fail closed.
+- Before touching a venue adapter or funding formula, prove the rate unit, interval, next settlement timestamp, public/final source, mark source, symbol identity, and collateral assumptions.
+- Do not treat estimates, spread convergence, or long raw history as realized paper PnL.
+- Keep scanner output separate from paper eligibility: routes remain `watch` or diagnostics until focused observations and executable books satisfy the v2 rules.
+- Preserve route identity across symbol, collateral, market type, environment/profile, and settlement timestamps.
+- Do not block hot focused checks with full scans or slow discovery work.
+- Return exact changed files, tests run, and risks. Codex must verify the production call graph and final diff before accepting the worker result.
+
 ## Funding Contract
 
 Every market row must obey this contract:
@@ -90,8 +101,10 @@ The production paper strategy is `synchronized_funding_capture_v2`:
 - Initial entry target: T-30 seconds.
 - Entry is allowed only in the T-35 to T-25 second window.
 - Both legs must be simulated-filled no later than T-20.
-- Entry snapshot age must be <= 2 seconds.
-- Cross-venue snapshot skew should be <= 1 second when adapter timestamps are available.
+- Latest focused observation age target is <= 10 seconds.
+- Default paper entry snapshot age must be <= 20 seconds.
+- Cross-venue snapshot skew default is <= 5 seconds for VERIFIED_PAPER and <= 15 seconds for EXPERIMENTAL_PAPER.
+- Default paper entry is EXPERIMENTAL_PAPER-capable; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
 - The old 15-second freeze-window fallback is disabled by default.
 - After settlement, probe next schedules around T+5 and decide hold/close around T+30.
 - Normal close before T+20 is disallowed except for hard-risk events.

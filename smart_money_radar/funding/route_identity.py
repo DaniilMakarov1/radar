@@ -677,10 +677,6 @@ def _copy_with_focus(
     evidence = dict(copied.get("evidence") or {})
     flags = list(dict.fromkeys([*(copied.get("risk_flags") or []), *(evidence.get("risk_flags") or [])]))
     advisory = list(evidence.get("advisory_reasons") or [])
-    if state == "deferred":
-        if "focused_capacity_deferred" not in flags:
-            flags.append("focused_capacity_deferred")
-        advisory.append("focused_capacity_deferred")
     copied["risk_flags"] = list(dict.fromkeys(flags))
     evidence["risk_flags"] = list(dict.fromkeys([*(evidence.get("risk_flags") or []), *flags]))
     evidence["advisory_reasons"] = list(dict.fromkeys(advisory))
@@ -744,6 +740,24 @@ def select_focused_routes(
         )
         for route in ranked
     }
+    venue_counts_all: dict[str, int] = {}
+    experimental_total = 0
+    for route in ranked:
+        state = _focus_state(route, now, config)
+        if state["experimental"] and not state["verified"]:
+            experimental_total += 1
+        long_venue, short_venue = _route_venues(route)
+        venue_counts_all[long_venue] = venue_counts_all.get(long_venue, 0) + 1
+        venue_counts_all[short_venue] = venue_counts_all.get(short_venue, 0) + 1
+    capacity_warnings: list[str] = []
+    if len(ranked) > int(config.max_focused_routes):
+        capacity_warnings.append("focused_capacity_soft_limit_exceeded")
+    if experimental_total > int(config.max_experimental_focused_routes):
+        capacity_warnings.append("experimental_focused_capacity_soft_limit_exceeded")
+    per_venue = int(config.max_focused_routes_per_venue)
+    if per_venue > 0 and any(count > per_venue for count in venue_counts_all.values()):
+        capacity_warnings.append("focused_per_venue_soft_limit_exceeded")
+    capacity_warnings = list(dict.fromkeys(capacity_warnings))
     protected: list[dict[str, Any]] = []
     normal: list[dict[str, Any]] = []
     for route in ranked:
@@ -758,46 +772,18 @@ def select_focused_routes(
 
     selected: list[dict[str, Any]] = []
     selected_keys: set[str] = set()
-    venue_counts: dict[str, int] = {}
-    experimental_count = 0
 
     def can_add(route: dict[str, Any], *, protected_route: bool) -> bool:
         route_key = _route_key(route)
         if route_key in selected_keys:
             return False
-        if route_key in open_keys:
-            return True
-        if len([r for r in selected if _route_key(r) not in open_keys]) >= int(config.max_focused_routes):
-            return False
-        state = _focus_state(route, now, config)
-        if (
-            state["experimental"]
-            and not state["verified"]
-            and route_key not in submitted_keys
-            and experimental_count >= int(config.max_experimental_focused_routes)
-        ):
-            return False
-        per_venue = int(config.max_focused_routes_per_venue)
-        if per_venue > 0 and not protected_route:
-            long_venue, short_venue = _route_venues(route)
-            if venue_counts.get(long_venue, 0) >= per_venue:
-                return False
-            if venue_counts.get(short_venue, 0) >= per_venue:
-                return False
         return True
 
     def add(route: dict[str, Any], *, protected_route: bool) -> bool:
-        nonlocal experimental_count
         if not can_add(route, protected_route=protected_route):
             return False
         selected.append(route)
         selected_keys.add(_route_key(route))
-        long_venue, short_venue = _route_venues(route)
-        venue_counts[long_venue] = venue_counts.get(long_venue, 0) + 1
-        venue_counts[short_venue] = venue_counts.get(short_venue, 0) + 1
-        state = _focus_state(route, now, config)
-        if state["experimental"] and not state["verified"]:
-            experimental_count += 1
         return True
 
     for route in protected:
@@ -819,18 +805,8 @@ def select_focused_routes(
     for route in normal:
         add(route, protected_route=False)
 
-    cutoff_rank = max(
-        (rank_by_key.get(_route_key(route), 0) for route in selected if _route_key(route) not in open_keys),
-        default=0,
-    )
+    cutoff_rank = 0
     cutoff_score = None
-    cutoff_candidates = [
-        score_by_key.get(_route_key(route))
-        for route in selected
-        if _route_key(route) not in open_keys
-    ]
-    if cutoff_candidates:
-        cutoff_score = max(cutoff_candidates)
 
     annotated: list[dict[str, Any]] = []
     focused: list[dict[str, Any]] = []
@@ -844,13 +820,20 @@ def select_focused_routes(
         else:
             annotated_route = _copy_with_focus(
                 route,
-                state="deferred",
+                state="not_yet_eligible",
                 rank=rank,
-                reason="focused_capacity_deferred",
-                cutoff_rank=cutoff_rank or None,
-                cutoff_score=cutoff_score,
+                reason="focus_dedupe_suppressed",
             )
-            deferred.append(annotated_route)
+        if capacity_warnings:
+            evidence = dict(annotated_route.get("evidence") or {})
+            focused_selection = dict(evidence.get("focused_selection") or {})
+            focused_selection["capacity_warnings"] = capacity_warnings
+            focused_selection["capacity_limits_are_advisory"] = True
+            evidence["focused_selection"] = focused_selection
+            advisory = list(evidence.get("advisory_reasons") or [])
+            advisory.extend(capacity_warnings)
+            evidence["advisory_reasons"] = list(dict.fromkeys(advisory))
+            annotated_route["evidence"] = evidence
         annotated.append(annotated_route)
     for route in not_eligible:
         focus_state = _focus_state(route, now, config)
@@ -878,11 +861,13 @@ def select_focused_routes(
         "deferred_route_keys": [_route_key(route) for route in deferred],
         "cutoff_rank": cutoff_rank,
         "cutoff_score": list(cutoff_score) if cutoff_score is not None else None,
+        "capacity_warnings": capacity_warnings,
         "config": {
             "max_focused_routes": int(config.max_focused_routes),
             "max_experimental_focused_routes": int(config.max_experimental_focused_routes),
             "max_focused_routes_per_venue": int(config.max_focused_routes_per_venue),
             "focused_selection_hysteresis": int(config.focused_selection_hysteresis),
             "focused_selection_min_ttl_seconds": float(config.focused_selection_min_ttl_seconds),
+            "capacity_limits_are_advisory": True,
         },
     }
