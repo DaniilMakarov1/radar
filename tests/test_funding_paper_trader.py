@@ -147,6 +147,43 @@ def paper_route(
     return route
 
 
+def test_research_paper_mode_does_not_crash_strategy_selection() -> None:
+    now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    route = paper_route(now, long_lead=90, short_lead=90, live_net=2.0)
+    route["status"] = "research_only"
+    strategy = {
+        "selection_model": "lightweight_discovery_v1",
+        "strategy_name": "synchronized_funding_capture",
+        "strategy_class": "synchronized_funding_capture",
+        "eligible": False,
+        "expected_net_pnl": 2.0,
+        "funding_pnl_component": 2.5,
+        "execution_cost": 0.5,
+        "actionable_profit_threshold": 0.0,
+        "reasons": ["research_only_hard_blocked"],
+    }
+    route["evidence"].update(
+        {
+            "paper_mode": "RESEARCH",
+            "strategy_candidates": [strategy],
+            "selected_strategy": strategy,
+            "strategy_classification": strategy,
+            "blocking_risk_flags": ["research_only_hard_blocked"],
+        }
+    )
+    config = PaperBotConfig().validated()
+
+    assert selected_route_strategy(route, config.strategy_set) is None
+    monitor = route_monitor_decision(route, now, config)
+    entry = route_entry_decision(route, accounts(), now, config)
+
+    assert not monitor["hot"]
+    assert "no_allowed_strategy_candidate" in monitor["reasons"]
+    assert not entry["eligible"]
+    assert "route_not_candidate" in entry["reasons"]
+    assert "no_allowed_strategy_candidate" in entry["reasons"]
+
+
 def accounts() -> dict:
     return {
         "aster": {"available_balance": 1_000.0},

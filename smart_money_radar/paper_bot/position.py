@@ -475,11 +475,33 @@ def selected_route_strategy(
     return selected
 
 
+def synchronized_route_evaluation_mode(route: dict[str, Any]) -> str | None:
+    evidence = route.get("evidence") or {}
+    raw_mode = str(evidence.get("paper_mode") or "").strip().upper()
+    if raw_mode in {"EXPERIMENTAL_PAPER", "VERIFIED_PAPER"}:
+        return raw_mode
+    if raw_mode:
+        return None
+    if bool(evidence.get("verified_paper_ready")):
+        return "VERIFIED_PAPER"
+    if bool(
+        evidence.get("experimental_simulation_ready")
+        or evidence.get("experimental_paper_ready")
+    ):
+        return "EXPERIMENTAL_PAPER"
+    return "VERIFIED_PAPER"
+
+
 def synchronized_strategy_from_route(route: dict[str, Any]) -> dict[str, Any] | None:
+    if route.get("status") != "paper_candidate":
+        return None
     evidence = route.get("evidence") or {}
     selected = evidence.get("selected_strategy") or evidence.get(
         "strategy_classification"
     ) or {}
+    evaluation_mode = synchronized_route_evaluation_mode(route)
+    if evaluation_mode is None:
+        return None
     funding_component = optional_float(selected.get("funding_pnl_component"))
     if funding_component is None:
         funding_component = optional_float(evidence.get("current_nowcast_gross"))
@@ -509,13 +531,8 @@ def synchronized_strategy_from_route(route: dict[str, Any]) -> dict[str, Any] | 
         actionable_profit_threshold=threshold,
         blocking_risk_flags=list(evidence.get("blocking_risk_flags") or []),
         decision_mode=str(evidence.get("decision_mode") or "settlement_capture"),
-        evaluation_mode=str(evidence.get("paper_mode") or "VERIFIED_PAPER"),
+        evaluation_mode=evaluation_mode,
     )
-    if route.get("status") != "paper_candidate":
-        candidate["eligible"] = False
-        candidate["reasons"] = list(candidate.get("reasons") or []) + [
-            "route_not_paper_candidate",
-        ]
     return candidate if candidate.get("eligible") else None
 
 

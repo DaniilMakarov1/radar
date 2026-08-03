@@ -3946,6 +3946,12 @@ def test_lightweight_discovery_keeps_risex_hard_blocked_route_research_only(
     assert bot.discovered_routes
     assert not bot.hot_routes
 
+    bot.update_hot_routes(routes)
+    opened = bot.process_entry_candidates(routes, recheck_before_open=False)
+
+    assert opened == []
+    assert not bot.hot_routes
+
 
 def test_lightweight_discovery_does_not_call_legacy_strategy_builder(
     tmp_path,
