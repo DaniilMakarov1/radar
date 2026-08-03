@@ -30,6 +30,25 @@ if [[ "$funding_telegram_enabled" != "1" ]]; then
   funding_telegram_arg=(--no-telegram)
 fi
 
+funding_min_seconds() {
+  awk -v value="$1" -v minimum="$2" 'BEGIN {
+    numeric = value + 0
+    floor = minimum + 0
+    if (numeric < floor) {
+      print floor
+    } else {
+      print numeric
+    }
+  }'
+}
+
+funding_entry_snapshot_age_seconds="$(
+  funding_min_seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-20}" 20
+)"
+funding_focused_recheck_route_timeout_seconds="$(
+  funding_min_seconds "${FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-20}" 20
+)"
+
 mkdir -p "$LOG_DIR"
 
 funding_bot_pid() {
@@ -98,13 +117,30 @@ if command -v screen >/dev/null 2>&1; then
     if [[ "$funding_telegram_enabled" != "1" ]]; then
       telegram_arg="--no-telegram"
     fi
+    funding_min_seconds() {
+      awk -v value="$1" -v minimum="$2" '"'"'BEGIN {
+        numeric = value + 0
+        floor = minimum + 0
+        if (numeric < floor) {
+          print floor
+        } else {
+          print numeric
+        }
+      }'"'"'
+    }
+    funding_entry_snapshot_age_seconds="$(
+      funding_min_seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-20}" 20
+    )"
+    funding_focused_recheck_route_timeout_seconds="$(
+      funding_min_seconds "${FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-20}" 20
+    )"
     exec python3 -m smart_money_radar.cli funding-paper-trader \
       --target-notional "${FUNDING_PAPER_TARGET_NOTIONAL:-500}" \
       --entry-min-lead-seconds "${FUNDING_PAPER_ENTRY_MIN_LEAD_SECONDS:-25}" \
       --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-35}" \
       --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-120}" \
       --final-recheck-freeze-seconds "${FUNDING_PAPER_FINAL_RECHECK_FREEZE_SECONDS:-0}" \
-      --max-entry-snapshot-age-seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-5}" \
+      --max-entry-snapshot-age-seconds "$funding_entry_snapshot_age_seconds" \
       --max-settlement-publication-lag-seconds "${FUNDING_PAPER_MAX_SETTLEMENT_PUBLICATION_LAG_SECONDS:-300}" \
       --min-live-net-profit "${FUNDING_PAPER_MIN_LIVE_NET_PROFIT:-0}" \
       --scan-interval-seconds "${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-300}" \
@@ -112,7 +148,7 @@ if command -v screen >/dev/null 2>&1; then
       --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-1}" \
       --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
       --focused-io-workers "${FUNDING_PAPER_FOCUSED_IO_WORKERS:-0}" \
-      --focused-recheck-route-timeout-seconds "${FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-8}" \
+      --focused-recheck-route-timeout-seconds "$funding_focused_recheck_route_timeout_seconds" \
       --lightweight-foreground-budget-seconds "${FUNDING_PAPER_LIGHTWEIGHT_FOREGROUND_BUDGET_SECONDS:-8}" \
       --lightweight-cache-ttl-seconds "${FUNDING_PAPER_LIGHTWEIGHT_CACHE_TTL_SECONDS:-180}" \
       --lightweight-route-horizon-seconds "${FUNDING_PAPER_LIGHTWEIGHT_ROUTE_HORIZON_SECONDS:-3600}" \
@@ -146,7 +182,7 @@ nohup python3 -m smart_money_radar.cli funding-paper-trader \
   --entry-max-lead-seconds "${FUNDING_PAPER_ENTRY_MAX_LEAD_SECONDS:-35}" \
   --arm-window-seconds "${FUNDING_PAPER_ARM_WINDOW_SECONDS:-120}" \
   --final-recheck-freeze-seconds "${FUNDING_PAPER_FINAL_RECHECK_FREEZE_SECONDS:-0}" \
-  --max-entry-snapshot-age-seconds "${FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-5}" \
+  --max-entry-snapshot-age-seconds "$funding_entry_snapshot_age_seconds" \
   --max-settlement-publication-lag-seconds "${FUNDING_PAPER_MAX_SETTLEMENT_PUBLICATION_LAG_SECONDS:-300}" \
   --min-live-net-profit "${FUNDING_PAPER_MIN_LIVE_NET_PROFIT:-0}" \
   --scan-interval-seconds "${FUNDING_PAPER_SCAN_INTERVAL_SECONDS:-300}" \
@@ -154,7 +190,7 @@ nohup python3 -m smart_money_radar.cli funding-paper-trader \
   --hot-interval-seconds "${FUNDING_PAPER_HOT_INTERVAL_SECONDS:-1}" \
   --hot-route-recheck-workers "${FUNDING_PAPER_HOT_ROUTE_RECHECK_WORKERS:-6}" \
   --focused-io-workers "${FUNDING_PAPER_FOCUSED_IO_WORKERS:-0}" \
-  --focused-recheck-route-timeout-seconds "${FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-8}" \
+  --focused-recheck-route-timeout-seconds "$funding_focused_recheck_route_timeout_seconds" \
   --lightweight-foreground-budget-seconds "${FUNDING_PAPER_LIGHTWEIGHT_FOREGROUND_BUDGET_SECONDS:-8}" \
   --lightweight-cache-ttl-seconds "${FUNDING_PAPER_LIGHTWEIGHT_CACHE_TTL_SECONDS:-180}" \
   --lightweight-route-horizon-seconds "${FUNDING_PAPER_LIGHTWEIGHT_ROUTE_HORIZON_SECONDS:-3600}" \

@@ -2879,6 +2879,14 @@ class SynchronizedFundingRuntimeV2:
             entry_basis_reserve_usd=basis_reserve_usd,
             entry_legging_reserve_usd=legging_reserve_usd,
             reference_notional=reference,
+            evaluation_mode=(
+                ((route_plan or {}).get("planner") or {}).get("evaluation_mode")
+                or (
+                    EvaluationMode.EXPERIMENTAL_PAPER.value
+                    if self.estimate_paper_enabled
+                    else EvaluationMode.VERIFIED_PAPER.value
+                )
+            ),
         )
         result["entry_basis_reserve_bps"] = basis_reserve_bps
         result["entry_legging_reserve_bps"] = legging_reserve_bps

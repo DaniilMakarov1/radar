@@ -112,7 +112,7 @@ def route_entry_decision(
     ):
         reasons.append("entry_snapshot_stale")
     required_live_net = required_live_net_profit(route, config)
-    if live_net <= 0:
+    if live_net < 0:
         if "live_net_not_positive" not in reasons:
             reasons.append("live_net_not_positive")
     elif live_net < required_live_net:
@@ -184,7 +184,7 @@ def route_monitor_decision(
         reasons.append("no_allowed_strategy_candidate")
     live_net = strategy_expected_net(route, selected_strategy)
     required_live_net = required_live_net_profit(route, config)
-    if live_net <= 0:
+    if live_net < 0:
         reasons.append("live_net_not_positive")
     elif live_net < required_live_net:
         reasons.append("live_net_below_required_profit")
@@ -509,6 +509,7 @@ def synchronized_strategy_from_route(route: dict[str, Any]) -> dict[str, Any] | 
         actionable_profit_threshold=threshold,
         blocking_risk_flags=list(evidence.get("blocking_risk_flags") or []),
         decision_mode=str(evidence.get("decision_mode") or "settlement_capture"),
+        evaluation_mode=str(evidence.get("paper_mode") or "VERIFIED_PAPER"),
     )
     if route.get("status") != "paper_candidate":
         candidate["eligible"] = False
@@ -1345,6 +1346,6 @@ def status_publishable_candidate(
         if selected is not None
         else None
     )
-    if live_net is None or live_net <= 0:
+    if live_net is None or live_net < 0:
         return False
     return live_net >= required_live_net_profit(route, config)

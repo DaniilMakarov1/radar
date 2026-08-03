@@ -229,6 +229,93 @@ def test_initial_entry_economics_thresholds() -> None:
     assert not failed["eligible"]
 
 
+def test_experimental_entry_economics_allows_nonnegative_net_with_advisories() -> None:
+    candidate = initial_entry_economics(
+        conservative_funding_gross=0.80,
+        baseline_round_trip_book_cost=0.20,
+        total_round_trip_fee_estimate=0.20,
+        entry_basis_reserve_usd=0.20,
+        entry_legging_reserve_usd=0.20,
+        reference_notional=500.0,
+        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+    negative = initial_entry_economics(
+        conservative_funding_gross=0.79,
+        baseline_round_trip_book_cost=0.20,
+        total_round_trip_fee_estimate=0.20,
+        entry_basis_reserve_usd=0.20,
+        entry_legging_reserve_usd=0.20,
+        reference_notional=500.0,
+        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+    verified = initial_entry_economics(
+        conservative_funding_gross=0.80,
+        baseline_round_trip_book_cost=0.20,
+        total_round_trip_fee_estimate=0.20,
+        entry_basis_reserve_usd=0.20,
+        entry_legging_reserve_usd=0.20,
+        reference_notional=500.0,
+        evaluation_mode=EvaluationMode.VERIFIED_PAPER,
+    )
+
+    assert candidate["eligible"]
+    assert candidate["minimum_initial_expected_net_pnl"] == 0.0
+    assert candidate["initial_expected_net_pnl"] == pytest.approx(0.0)
+    assert "advisory_conservative_funding_below_minimum" in candidate["warnings"]
+    assert "advisory_initial_expected_net_below_minimum" in candidate["warnings"]
+    assert negative["initial_expected_net_pnl"] < 0.0
+    assert not negative["eligible"]
+    assert not verified["eligible"]
+
+
+def test_experimental_strategy_candidate_relaxes_old_profit_and_coverage_thresholds() -> None:
+    candidate = synchronized_strategy_candidate(
+        {"funding_notional": 500.0, "execution_cost": 3.20, "basis_stress_loss": 0.0},
+        current_funding_gross=3.70,
+        actionable_profit_threshold=1.0,
+        blocking_risk_flags=[],
+        decision_mode="settlement_capture",
+        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+    below_old_gross = synchronized_strategy_candidate(
+        {"funding_notional": 500.0, "execution_cost": 0.80, "basis_stress_loss": 0.0},
+        current_funding_gross=0.80,
+        actionable_profit_threshold=1.0,
+        blocking_risk_flags=[],
+        decision_mode="settlement_capture",
+        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+    negative = synchronized_strategy_candidate(
+        {"funding_notional": 500.0, "execution_cost": 3.20, "basis_stress_loss": 0.0},
+        current_funding_gross=3.19,
+        actionable_profit_threshold=1.0,
+        blocking_risk_flags=[],
+        decision_mode="settlement_capture",
+        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+    )
+    verified = synchronized_strategy_candidate(
+        {"funding_notional": 500.0, "execution_cost": 3.20, "basis_stress_loss": 0.0},
+        current_funding_gross=3.70,
+        actionable_profit_threshold=1.0,
+        blocking_risk_flags=[],
+        decision_mode="settlement_capture",
+        evaluation_mode=EvaluationMode.VERIFIED_PAPER,
+    )
+
+    assert candidate["eligible"]
+    assert candidate["expected_net_pnl"] == pytest.approx(0.50)
+    assert candidate["actionable_profit_threshold"] == 0.0
+    assert "advisory_initial_expected_net_below_minimum" in candidate["warnings"]
+    assert "advisory_initial_cost_coverage_below_minimum" in candidate["warnings"]
+    assert below_old_gross["eligible"]
+    assert below_old_gross["expected_net_pnl"] == pytest.approx(0.0)
+    assert "advisory_conservative_funding_below_minimum" in below_old_gross["warnings"]
+    assert not negative["eligible"]
+    assert "initial_expected_net_below_zero" in negative["reasons"]
+    assert not verified["eligible"]
+    assert "initial_expected_net_below_minimum" in verified["reasons"]
+
+
 @pytest.mark.parametrize(
     ("wait_seconds", "expected_bps"),
     [(3600, 25.0), (7200, 50.0), (10_800, 75.0), (14_400, 100.0)],
@@ -3494,6 +3581,45 @@ def test_lightweight_discovery_adds_watch_route_without_orderbook(tmp_path) -> N
     assert short_client.orderbook_calls == 0
 
 
+def test_lightweight_route_plan_uses_active_experimental_paper_mode(tmp_path) -> None:
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+    settlement = now + timedelta(seconds=90)
+    long_client = _LightweightDiscoveryClient(
+        "binance",
+        funding_rate=-0.006,
+        next_funding_at=settlement,
+    )
+    short_client = _LightweightDiscoveryClient(
+        "bybit",
+        funding_rate=0.006,
+        next_funding_at=settlement,
+    )
+    bot = _lightweight_bot(tmp_path, now, [long_client, short_client])
+    _instruments, long_markets, _warnings = long_client.catalog_and_markets(now.isoformat())
+    _instruments, short_markets, _warnings = short_client.catalog_and_markets(now.isoformat())
+    markets = [*long_markets, *short_markets]
+    for market in markets:
+        market["funding_rate_kind"] = "published_current_fallback"
+        market.pop("normalized_next_funding_rate", None)
+
+    routes, summary = bot._build_lightweight_watch_routes(
+        markets,
+        {"binance": long_client, "bybit": short_client},
+        now,
+    )
+
+    assert summary["watch_routes_added"] == 1
+    route = routes[0]
+    evidence = route["evidence"]
+    route_plan = evidence["funding_route_plan"]
+    assert evidence["capability_check"]["evaluation_mode"] == EvaluationMode.EXPERIMENTAL_PAPER.value
+    assert route_plan["planner"]["evaluation_mode"] == EvaluationMode.EXPERIMENTAL_PAPER.value
+    assert evidence["paper_mode"] == "EXPERIMENTAL_PAPER"
+    assert evidence["experimental_simulation_ready"] is True
+    assert "long_exact_next_rate_missing" in evidence["experimental_warnings"]
+    assert "long_exact_next_rate_missing" not in evidence["capability_rejections"]
+
+
 def test_paper_lightweight_discovery_attaches_cross_stable_snapshot(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
@@ -6719,6 +6845,34 @@ def test_experimental_paper_cross_stable_without_provider_uses_reserve_and_opens
     assert stablecoin_reserve["verified"] is False
     assert float(stablecoin_reserve["value"]) > 0.0
     assert "provider_unavailable" in str(stablecoin_reserve["assumptions"])
+
+
+def test_experimental_paper_sub_one_net_can_reach_opening_pipeline(tmp_path) -> None:
+    from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
+
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot = _paper_bot_for_route(tmp_path, now)
+    route = _v2_runtime_route(now)
+    route["legs"][0]["funding_rate"] = -0.0040
+    route["legs"][0]["normalized_next_funding_rate"] = -0.0040
+    route["legs"][1]["funding_rate"] = 0.0065
+    route["legs"][1]["normalized_next_funding_rate"] = 0.0065
+    capture_id = capture_position_id_for_route(route)
+    _seed_attempt_observations(bot, route, now)
+    for observation in bot.v2_observations_by_route[route_entry_key(route)]:
+        observation["gross_funding_pnl"] = 4.20
+
+    result = bot.synchronized_runtime.consider_route(
+        route,
+        {row["venue"]: row for row in store.funding_paper_account_rows()},
+    )
+
+    assert result["opened"] is True
+    economics = result["economics"]
+    assert economics["evaluation_mode"] == EvaluationMode.EXPERIMENTAL_PAPER.value
+    assert 0.0 <= economics["initial_expected_net_pnl"] < 1.0
+    assert "advisory_initial_expected_net_below_minimum" in economics["warnings"]
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "OPEN"
 
 
 def test_major_stablecoin_without_provider_is_experimental_paper_allowed() -> None:

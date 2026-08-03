@@ -310,7 +310,7 @@ class PaperBotConfig:
     hot_interval_seconds: float = 1.0
     hot_route_recheck_workers: int = 6
     focused_io_workers: int = 0
-    focused_recheck_route_timeout_seconds: float = 8.0
+    focused_recheck_route_timeout_seconds: float = 20.0
     focused_orphan_scan_recovery_seconds: int = 300
     max_focused_routes: int = 20
     max_experimental_focused_routes: int = 6
@@ -1538,6 +1538,17 @@ class PaperBot:
         result["hot_route_count"] = stage_counts["monitor"]
         result["urgent_route_count"] = stage_counts["urgent"]
         result["qualified_route_count"] = stage_counts["qualified"]
+        result["active_experimental_paper_route_count"] = sum(
+            1
+            for route in [*publishable_routes, *all_watch_routes]
+            if str((route.get("evidence") or {}).get("paper_mode") or "").upper()
+            == "EXPERIMENTAL_PAPER"
+            and bool(
+                (route.get("evidence") or {}).get("experimental_simulation_ready")
+                or (route.get("evidence") or {}).get("experimental_paper_ready")
+            )
+        )
+        result["hidden_detected_route_count"] = len(all_watch_routes) - len(visible_watch_routes)
         result.setdefault(
             "venue_health",
             dict(self._last_lightweight_venue_health),
@@ -1558,7 +1569,10 @@ class PaperBot:
                 ]
             ],
             "internal_watch_count": len(all_watch_routes),
-            "hidden_detected_route_count": len(all_watch_routes) - len(visible_watch_routes),
+            "hidden_detected_route_count": result["hidden_detected_route_count"],
+            "active_experimental_paper_route_count": result[
+                "active_experimental_paper_route_count"
+            ],
             "discovery_funnel": stage_counts,
             "venue_health": result.get("venue_health") or {},
         }
@@ -1581,7 +1595,7 @@ class PaperBot:
             target_notional=self.config.target_notional_per_leg,
             horizon_mode="next_settlement",
             horizon_hours=None,
-            near_miss_full_depth_routes=0,
+            near_miss_full_depth_routes=50,
             history_refresh_hours=0.25,
             max_live_history_markets=24,
             orderbook_cache_ttl_seconds=0,
@@ -1605,7 +1619,7 @@ class PaperBot:
             target_notional=self.config.target_notional_per_leg,
             horizon_mode="next_settlement",
             horizon_hours=None,
-            near_miss_full_depth_routes=0,
+            near_miss_full_depth_routes=50,
             history_refresh_hours=48.0,
             max_live_history_markets=0,
             orderbook_cache_ttl_seconds=0,
@@ -3289,6 +3303,11 @@ class PaperBot:
         rejection_details: dict[str, dict[str, Any]] = {}
         blocker_examples: list[dict[str, Any]] = []
         nearest_settlement_seconds: float | None = None
+        paper_evaluation_mode = (
+            EvaluationMode.EXPERIMENTAL_PAPER
+            if self.config.estimate_paper_enabled
+            else EvaluationMode.DISCOVERY
+        )
 
         def reject(
             reason: str,
@@ -3444,7 +3463,7 @@ class PaperBot:
                         long_market=long_route_market,
                         short_market=short_route_market,
                         target_notional=float(self.config.target_notional_per_leg),
-                        mode=EvaluationMode.DISCOVERY,
+                        mode=paper_evaluation_mode,
                         clients_by_venue=clients_by_venue,
                     )
                     if route_readiness["hard_blockers"]:
@@ -3500,6 +3519,7 @@ class PaperBot:
                         max_source_age_seconds=float(
                             self.config.lightweight_cache_ttl_seconds
                         ),
+                        evaluation_mode=paper_evaluation_mode,
                     )
                     plan_blockers = list(plan.get("blockers") or [])
                     for reason in plan_blockers:
@@ -3796,7 +3816,11 @@ class PaperBot:
             long_market=long_market,
             short_market=short_market,
             target_notional=float(self.config.target_notional_per_leg),
-            mode=EvaluationMode.DISCOVERY,
+            mode=(
+                EvaluationMode.EXPERIMENTAL_PAPER
+                if self.config.estimate_paper_enabled
+                else EvaluationMode.DISCOVERY
+            ),
             clients_by_venue=clients_by_venue,
         )
         reasons = list(readiness.get("hard_blockers") or [])
@@ -5460,7 +5484,7 @@ def status_publishable_detected_route(route: dict[str, Any]) -> bool:
     ):
         net = optional_float(value)
         if net is not None:
-            return net > 0.0
+            return net >= 0.0
     return False
 
 def should_record_disarmed_event(decision: dict[str, Any]) -> bool:

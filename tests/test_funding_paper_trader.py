@@ -658,6 +658,21 @@ def test_default_entry_snapshot_age_boundary_is_twenty_seconds() -> None:
     assert "entry_snapshot_stale" in rejected["reasons"]
 
 
+def test_default_focused_recheck_route_timeout_is_twenty_seconds() -> None:
+    config = PaperBotConfig().validated()
+
+    assert config.focused_recheck_route_timeout_seconds == 20.0
+
+
+def test_paper_bot_scan_configs_keep_near_miss_full_depth_enabled(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "radar.sqlite")
+    store.init_db()
+    bot = PaperBot(store, PaperBotConfig(telegram_enabled=False).validated())
+
+    assert bot.scan_config().near_miss_full_depth_routes == 50
+    assert bot.focused_scan_config().near_miss_full_depth_routes == 50
+
+
 def test_entry_requires_route_actionable_profit_threshold() -> None:
     now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
     config = PaperBotConfig(
@@ -1728,6 +1743,30 @@ def test_status_report_hides_negative_detected_routes(tmp_path) -> None:
     assert "Routes detected: 1" in notifier.messages[0]
     assert "Top detected routes" not in notifier.messages[0]
     assert "Preliminary funding before focused costs" not in notifier.messages[0]
+
+
+def test_status_report_distinguishes_active_experimental_and_hidden_detected() -> None:
+    message = status_report_message(
+        {
+            "mode": "hot_routes",
+            "funding_scan_id": None,
+            "detected_route_count": 5,
+            "early_route_count": 1,
+            "watch_stage_route_count": 2,
+            "hot_route_count": 1,
+            "urgent_route_count": 1,
+            "active_experimental_paper_route_count": 3,
+            "hidden_detected_route_count": 2,
+        },
+        [],
+        [],
+        {"open_position_count": 0, "closed_trade_count": 0, "realized_pnl": 0},
+        PaperBotConfig(status_report_interval_seconds=1_800),
+    )
+
+    assert "Routes detected: 5" in message
+    assert "Early: 1 | Watch: 2 | Monitor: 1 | Urgent: 1" in message
+    assert "Active experimental paper: 3 | Hidden/blocked: 2" in message
 
 
 def test_status_report_bounds_many_verbose_detected_routes_for_telegram(tmp_path) -> None:
@@ -3723,3 +3762,50 @@ def test_position_spread_fields_round_trip_through_db(tmp_path) -> None:
     assert closed["entry_cross_spread"] == 0.42
     assert closed["entry_basis_bps"] == -35.0
     assert closed["actual_basis_pnl"] == -1.5
+
+
+# --- Startup script default tests ---
+
+_STARTUP_SCRIPTS = ("start_funding_bot.sh", "run_funding_bot_launchd.sh")
+
+
+def _read_startup_script(name: str) -> str:
+    scripts_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"
+    )
+    with open(os.path.join(scripts_dir, name)) as fh:
+        return fh.read()
+
+
+@pytest.mark.parametrize("script_name", _STARTUP_SCRIPTS)
+def test_startup_default_entry_snapshot_age_is_20(script_name: str) -> None:
+    content = _read_startup_script(script_name)
+    assert "FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-20" in content, (
+        f"{script_name}: expected default snapshot age 20"
+    )
+
+
+@pytest.mark.parametrize("script_name", _STARTUP_SCRIPTS)
+def test_startup_no_stale_snapshot_age_default_5(script_name: str) -> None:
+    content = _read_startup_script(script_name)
+    assert "FUNDING_PAPER_MAX_ENTRY_SNAPSHOT_AGE_SECONDS:-5" not in content, (
+        f"{script_name}: still contains stale snapshot age default :-5"
+    )
+
+
+@pytest.mark.parametrize("script_name", _STARTUP_SCRIPTS)
+def test_startup_default_focused_recheck_route_timeout_is_20(
+    script_name: str,
+) -> None:
+    content = _read_startup_script(script_name)
+    assert (
+        "FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-20" in content
+    ), f"{script_name}: expected default focused recheck route timeout 20"
+
+
+@pytest.mark.parametrize("script_name", _STARTUP_SCRIPTS)
+def test_startup_no_stale_focused_recheck_timeout_8(script_name: str) -> None:
+    content = _read_startup_script(script_name)
+    assert "FUNDING_PAPER_FOCUSED_RECHECK_ROUTE_TIMEOUT_SECONDS:-8" not in content, (
+        f"{script_name}: still contains stale focused recheck route timeout :-8"
+    )

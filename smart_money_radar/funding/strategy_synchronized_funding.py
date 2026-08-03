@@ -1520,7 +1520,13 @@ def initial_entry_economics(
     entry_basis_reserve_usd: float,
     entry_legging_reserve_usd: float,
     reference_notional: float,
+    evaluation_mode: EvaluationMode | str = EvaluationMode.VERIFIED_PAPER,
 ) -> dict[str, Any]:
+    mode = (
+        evaluation_mode
+        if isinstance(evaluation_mode, EvaluationMode)
+        else EvaluationMode(str(evaluation_mode).upper())
+    )
     modeled_cost = (
         max(0.0, float(baseline_round_trip_book_cost))
         + max(0.0, float(total_round_trip_fee_estimate))
@@ -1532,10 +1538,20 @@ def initial_entry_economics(
     expected_net = funding - modeled_cost
     coverage = funding / modeled_cost if modeled_cost > 0 else math.inf if funding > 0 else 0.0
     gross_threshold = max(2.50, reference * 0.005)
-    net_threshold = max(1.00, reference * 0.002)
+    strict_net_threshold = max(1.00, reference * 0.002)
+    net_threshold = 0.0 if mode is EvaluationMode.EXPERIMENTAL_PAPER else strict_net_threshold
+    advisory_warnings: list[str] = []
+    if mode is EvaluationMode.EXPERIMENTAL_PAPER:
+        if funding < gross_threshold:
+            advisory_warnings.append("advisory_conservative_funding_below_minimum")
+        if expected_net < strict_net_threshold:
+            advisory_warnings.append("advisory_initial_expected_net_below_minimum")
+        if coverage < 1.50:
+            advisory_warnings.append("advisory_initial_cost_coverage_below_minimum")
     return {
         "strategy_name": STRATEGY_NAME,
         "strategy_version": STRATEGY_VERSION,
+        "evaluation_mode": mode.value,
         "conservative_funding_gross": funding,
         "baseline_round_trip_book_cost": max(0.0, float(baseline_round_trip_book_cost)),
         "total_round_trip_fee_estimate": max(0.0, float(total_round_trip_fee_estimate)),
@@ -1548,11 +1564,17 @@ def initial_entry_economics(
         "initial_cost_coverage_ratio": coverage,
         "minimum_conservative_funding_gross": gross_threshold,
         "minimum_initial_expected_net_pnl": net_threshold,
+        "strict_minimum_initial_expected_net_pnl": strict_net_threshold,
         "eligible": (
-            funding >= gross_threshold
-            and expected_net >= net_threshold
-            and coverage >= 1.50
+            expected_net >= 0.0
+            if mode is EvaluationMode.EXPERIMENTAL_PAPER
+            else (
+                funding >= gross_threshold
+                and expected_net >= strict_net_threshold
+                and coverage >= 1.50
+            )
         ),
+        "warnings": advisory_warnings,
         "expected_spread_convergence_pnl": 0.0,
     }
 
@@ -1680,13 +1702,20 @@ def synchronized_strategy_candidate(
     actionable_profit_threshold: float,
     blocking_risk_flags: list[str],
     decision_mode: str,
+    evaluation_mode: EvaluationMode | str = EvaluationMode.VERIFIED_PAPER,
 ) -> dict[str, Any]:
+    mode = (
+        evaluation_mode
+        if isinstance(evaluation_mode, EvaluationMode)
+        else EvaluationMode(str(evaluation_mode).upper())
+    )
     funding_notional = float(row.get("funding_notional") or row.get("notional") or 0.0)
     execution_cost = float(row.get("execution_cost") or 0.0)
     basis_stress_loss = max(0.0, float(row.get("basis_stress_loss") or 0.0))
     conservative_funding = float(current_funding_gross)
     expected_net = conservative_funding - execution_cost - basis_stress_loss
-    threshold = max(float(actionable_profit_threshold or 0.0), 1.0, funding_notional * 0.002)
+    strict_threshold = max(float(actionable_profit_threshold or 0.0), 1.0, funding_notional * 0.002)
+    threshold = 0.0 if mode is EvaluationMode.EXPERIMENTAL_PAPER else strict_threshold
     gross_threshold = max(2.50, funding_notional * 0.005)
     coverage_denominator = execution_cost + basis_stress_loss
     coverage = (
@@ -1702,17 +1731,29 @@ def synchronized_strategy_candidate(
     reasons = list(blockers)
     if str(decision_mode) != "settlement_capture":
         reasons.append("not_next_settlement_capture")
-    if conservative_funding < gross_threshold:
-        reasons.append("conservative_funding_below_minimum")
-    if expected_net < threshold:
-        reasons.append("initial_expected_net_below_minimum")
-    if coverage < 1.50:
-        reasons.append("initial_cost_coverage_below_minimum")
+    warnings: list[str] = []
+    if mode is EvaluationMode.EXPERIMENTAL_PAPER:
+        if conservative_funding < gross_threshold:
+            warnings.append("advisory_conservative_funding_below_minimum")
+        if expected_net < strict_threshold:
+            warnings.append("advisory_initial_expected_net_below_minimum")
+        if coverage < 1.50:
+            warnings.append("advisory_initial_cost_coverage_below_minimum")
+        if expected_net < 0.0:
+            reasons.append("initial_expected_net_below_zero")
+    else:
+        if conservative_funding < gross_threshold:
+            reasons.append("conservative_funding_below_minimum")
+        if expected_net < strict_threshold:
+            reasons.append("initial_expected_net_below_minimum")
+        if coverage < 1.50:
+            reasons.append("initial_cost_coverage_below_minimum")
     return {
         "selection_model": STRATEGY_VERSION,
         "strategy_name": STRATEGY_NAME,
         "strategy_class": STRATEGY_NAME,
         "strategy_version": STRATEGY_VERSION,
+        "evaluation_mode": mode.value,
         "primary_edge": "synchronized_funding",
         "edge_type": "funding_led",
         "edge_label": "Synchronized funding capture",
@@ -1727,10 +1768,11 @@ def synchronized_strategy_candidate(
         "execution_cost": execution_cost,
         "basis_stress_loss": basis_stress_loss,
         "actionable_profit_threshold": threshold,
+        "strict_actionable_profit_threshold": strict_threshold,
         "minimum_conservative_funding_gross": gross_threshold,
         "coverage_ratio": coverage,
         "reasons": list(dict.fromkeys(reasons)),
-        "warnings": [],
+        "warnings": list(dict.fromkeys(warnings)),
         "thesis": (
             "Funding-only synchronized settlement capture: expected spread "
             "convergence is zero; executable spread and basis are modeled as cost/risk."

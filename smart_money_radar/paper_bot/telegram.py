@@ -61,6 +61,10 @@ def status_report_message(
     monitor_count = int(result.get("hot_route_count") or 0)
     urgent_count = int(result.get("urgent_route_count") or 0)
     qualified_count = len(candidates)
+    active_experimental_count = int(
+        result.get("active_experimental_paper_route_count") or 0
+    )
+    hidden_detected_count = int(result.get("hidden_detected_route_count") or 0)
     universe_count = int(result.get("universe_route_count") or 0)
     route_count = int(result.get("route_count") or 0)
     full_depth_count = int(result.get("execution_shortlist_count") or route_count)
@@ -78,6 +82,10 @@ def status_report_message(
         (
             f"Early: {early_count} | Watch: {watch_count} | "
             f"Monitor: {monitor_count} | Urgent: {urgent_count}"
+        ),
+        (
+            f"Active experimental paper: {active_experimental_count} | "
+            f"Hidden/blocked: {hidden_detected_count}"
         ),
         (
             f"<b>Open:</b> {int(summary.get('open_position_count') or 0)} | "
@@ -287,6 +295,18 @@ def screen_reason_label(value: Any) -> str:
         "spread_opportunity_full_depth": "spread отправлен в full-depth",
         "full_execution_required": "funding отправлен в full-depth",
         "pinned_revalidation": "повторная проверка watch-route",
+        "initial_expected_net_below_zero": "net below zero",
+        "conservative_net_not_positive": "net below zero",
+        "focused_recheck_failed": "focused recheck failed",
+        "focused_recheck_timeout": "focused recheck timeout",
+        "outside_lightweight_route_horizon": "outside entry/watch horizon",
+        "entry_window_missed": "outside entry window",
+        "route_plan_blocked": "route plan blocked",
+        "estimated_rate_used": "experimental warning: estimated funding",
+        "exact_next_rate_unavailable": "experimental warning: missing exact rate",
+        "fee_unverified": "experimental warning: unverified fee",
+        "stablecoin_snapshot_missing": "experimental warning: stablecoin provider",
+        "hard_blocked_pairs": "hard readiness blocker",
     }
     key = str(value or "unknown")
     return labels.get(key, key.replace("_", " "))
@@ -302,6 +322,15 @@ def blocker_label(value: Any) -> str:
         "unit_identity_mismatch": "несовместимые contract units",
         "funding_schedule_unavailable": "нет settlement",
         "stale_funding_nowcast": "устаревший nowcast",
+        "initial_expected_net_below_zero": "net below zero",
+        "focused_recheck_failed": "focused recheck failed",
+        "focused_recheck_timeout": "focused recheck timeout",
+        "entry_window_missed": "outside entry window",
+        "route_plan_blocked": "route plan blocked",
+        "estimated_rate_used": "experimental warning: estimated funding",
+        "exact_next_rate_unavailable": "experimental warning: missing exact rate",
+        "fee_unverified": "experimental warning: unverified fee",
+        "stablecoin_snapshot_missing": "experimental warning: stablecoin provider",
     }
     key = str(value or "unknown")
     return labels.get(key, key.replace("_", " "))
