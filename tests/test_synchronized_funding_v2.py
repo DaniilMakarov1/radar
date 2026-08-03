@@ -23,7 +23,10 @@ from smart_money_radar.funding.fees import (
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
     FundingSettlementPlanner,
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION,
     STRATEGY_NAME,
+    STRATEGY_VERSION,
     build_settlement_capture_opportunity,
     basis_duration_floor_bps,
     entry_underwriting,
@@ -105,16 +108,17 @@ def _trusted_paper_market_fields(venue: str, observed_at: str) -> dict:
     }
 
 
-def test_default_profile_uses_all_active_venues_and_sync_strategy() -> None:
+def test_default_profile_uses_risex_hl_and_capture_strategies() -> None:
     profile = funding_bot_profile("default")
 
-    assert profile.venue_set is None
-    assert profile.strategy_set == (STRATEGY_NAME,)
+    assert profile.venue_set == ("risex", "hyperliquid")
+    assert profile.strategy_set == (SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME, STRATEGY_NAME)
 
 
 def test_deactivated_venues_are_excluded_from_default_clients() -> None:
     venues = {client.venue for client in active_default_funding_clients()}
 
+    assert venues == {"risex", "hyperliquid"}
     assert not venues.intersection(DEACTIVATED_FUNDING_VENUES)
     assert "paradex" not in venues
 
@@ -229,7 +233,7 @@ def test_initial_entry_economics_thresholds() -> None:
     assert not failed["eligible"]
 
 
-def test_experimental_entry_economics_allows_nonnegative_net_with_advisories() -> None:
+def test_paper_entry_economics_allows_nonnegative_net_with_advisories() -> None:
     candidate = initial_entry_economics(
         conservative_funding_gross=0.80,
         baseline_round_trip_book_cost=0.20,
@@ -237,7 +241,7 @@ def test_experimental_entry_economics_allows_nonnegative_net_with_advisories() -
         entry_basis_reserve_usd=0.20,
         entry_legging_reserve_usd=0.20,
         reference_notional=500.0,
-        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+        evaluation_mode=EvaluationMode.PAPER,
     )
     negative = initial_entry_economics(
         conservative_funding_gross=0.79,
@@ -246,7 +250,7 @@ def test_experimental_entry_economics_allows_nonnegative_net_with_advisories() -
         entry_basis_reserve_usd=0.20,
         entry_legging_reserve_usd=0.20,
         reference_notional=500.0,
-        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+        evaluation_mode=EvaluationMode.PAPER,
     )
     verified = initial_entry_economics(
         conservative_funding_gross=0.80,
@@ -268,14 +272,14 @@ def test_experimental_entry_economics_allows_nonnegative_net_with_advisories() -
     assert not verified["eligible"]
 
 
-def test_experimental_strategy_candidate_relaxes_old_profit_and_coverage_thresholds() -> None:
+def test_paper_strategy_candidate_relaxes_old_profit_and_coverage_thresholds() -> None:
     candidate = synchronized_strategy_candidate(
         {"funding_notional": 500.0, "execution_cost": 3.20, "basis_stress_loss": 0.0},
         current_funding_gross=3.70,
         actionable_profit_threshold=1.0,
         blocking_risk_flags=[],
         decision_mode="settlement_capture",
-        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+        evaluation_mode=EvaluationMode.PAPER,
     )
     below_old_gross = synchronized_strategy_candidate(
         {"funding_notional": 500.0, "execution_cost": 0.80, "basis_stress_loss": 0.0},
@@ -283,7 +287,7 @@ def test_experimental_strategy_candidate_relaxes_old_profit_and_coverage_thresho
         actionable_profit_threshold=1.0,
         blocking_risk_flags=[],
         decision_mode="settlement_capture",
-        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+        evaluation_mode=EvaluationMode.PAPER,
     )
     negative = synchronized_strategy_candidate(
         {"funding_notional": 500.0, "execution_cost": 3.20, "basis_stress_loss": 0.0},
@@ -291,7 +295,7 @@ def test_experimental_strategy_candidate_relaxes_old_profit_and_coverage_thresho
         actionable_profit_threshold=1.0,
         blocking_risk_flags=[],
         decision_mode="settlement_capture",
-        evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER,
+        evaluation_mode=EvaluationMode.PAPER,
     )
     verified = synchronized_strategy_candidate(
         {"funding_notional": 500.0, "execution_cost": 3.20, "basis_stress_loss": 0.0},
@@ -2291,6 +2295,8 @@ def test_paperbot_v2_accepts_one_settlement_alignment_mismatch(tmp_path) -> None
     position = store.funding_capture_position_by_id(capture_id)
     plan = position["config"]["funding_route_plan"]
     assert plan["opportunity_shape"] == "ONE_SETTLEMENT"
+    assert plan["external_strategy_name"] == SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME
+    assert plan["strategy_version"] == SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION
     assert [event["venue"] for event in plan["included_settlement_events"]] == ["binance"]
     assert [event["venue"] for event in plan["excluded_settlement_events"]] == ["bybit"]
     assert len(store.funding_capture_cycles_for_position(capture_id)) == 1
@@ -2302,7 +2308,7 @@ def test_paperbot_v2_actually_calls_shared_planner(tmp_path) -> None:
     class SpyPlanner:
         def __init__(self) -> None:
             self.delegate = FundingSettlementPlanner(
-                evaluation_mode=EvaluationMode.EXPERIMENTAL_PAPER
+                evaluation_mode=EvaluationMode.PAPER
             )
             self.calls: list[dict] = []
 
@@ -2377,6 +2383,7 @@ def test_paperbot_v2_multi_event_survives_first_event_and_closes_after_last(tmp_
     assert opened == [capture_id]
     plan = store.funding_capture_position_by_id(capture_id)["config"]["funding_route_plan"]
     assert plan["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
+    assert plan["strategy_version"] == STRATEGY_VERSION
     assert len(plan["included_settlement_events"]) == 2
     cycles = store.funding_capture_cycles_for_position(capture_id)
     assert [cycle["scheduled_funding_at"] for cycle in cycles] == [
@@ -2688,7 +2695,7 @@ def test_estimated_funding_paper_entry_default_opens_with_latest_snapshot_estima
     assert position["state"] == "OPEN"
     plan = position["config"]["funding_route_plan"]
     readiness = plan["planner"]["route_readiness"]
-    assert plan["planner"]["evaluation_mode"] == "EXPERIMENTAL_PAPER"
+    assert plan["planner"]["evaluation_mode"] == "PAPER"
     assert readiness["verified_paper_ready"] is False
     assert readiness["experimental_simulation_ready"] is True
     assert readiness["funding_cashflow_status"] == "ESTIMATED_ONLY"
@@ -3581,7 +3588,7 @@ def test_lightweight_discovery_adds_watch_route_without_orderbook(tmp_path) -> N
     assert short_client.orderbook_calls == 0
 
 
-def test_lightweight_route_plan_uses_active_experimental_paper_mode(tmp_path) -> None:
+def test_lightweight_route_plan_uses_active_paper_mode(tmp_path) -> None:
     now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
     settlement = now + timedelta(seconds=90)
     long_client = _LightweightDiscoveryClient(
@@ -3612,9 +3619,9 @@ def test_lightweight_route_plan_uses_active_experimental_paper_mode(tmp_path) ->
     route = routes[0]
     evidence = route["evidence"]
     route_plan = evidence["funding_route_plan"]
-    assert evidence["capability_check"]["evaluation_mode"] == EvaluationMode.EXPERIMENTAL_PAPER.value
-    assert route_plan["planner"]["evaluation_mode"] == EvaluationMode.EXPERIMENTAL_PAPER.value
-    assert evidence["paper_mode"] == "EXPERIMENTAL_PAPER"
+    assert evidence["capability_check"]["evaluation_mode"] == EvaluationMode.PAPER.value
+    assert route_plan["planner"]["evaluation_mode"] == EvaluationMode.PAPER.value
+    assert evidence["paper_mode"] == "PAPER"
     assert evidence["experimental_simulation_ready"] is True
     assert "long_exact_next_rate_missing" in evidence["experimental_warnings"]
     assert "long_exact_next_rate_missing" not in evidence["capability_rejections"]
@@ -6635,7 +6642,7 @@ def test_verified_runtime_rejects_experimental_simulation_ready_route(tmp_path) 
     assert store.funding_capture_position_by_id(capture_id)["state"] == "DISCOVERED"
 
 
-def test_verified_runtime_rejects_experimental_paper_mode(tmp_path) -> None:
+def test_verified_runtime_rejects_experimental_simulation_mode(tmp_path) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot = _paper_bot_for_route(tmp_path, now)
     bot.synchronized_runtime.estimate_paper_enabled = False
@@ -6798,7 +6805,7 @@ def test_cross_stable_requires_fresh_snapshot_and_can_open_with_peg_guard(tmp_pa
     assert opened
 
 
-def test_experimental_paper_cross_stable_without_provider_uses_reserve_and_opens(
+def test_paper_cross_stable_without_provider_uses_reserve_and_opens(
     tmp_path,
 ) -> None:
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
@@ -6847,13 +6854,13 @@ def test_experimental_paper_cross_stable_without_provider_uses_reserve_and_opens
         for estimate in plan["cost_estimates"]
         if estimate["component"] == "stablecoin_reserve"
     )
-    assert stablecoin_reserve["status"] == "EXPERIMENTAL_PAPER_ALLOWED"
+    assert stablecoin_reserve["status"] == "PAPER_ALLOWED"
     assert stablecoin_reserve["verified"] is False
     assert float(stablecoin_reserve["value"]) > 0.0
     assert "provider_unavailable" in str(stablecoin_reserve["assumptions"])
 
 
-def test_experimental_paper_sub_one_net_can_reach_opening_pipeline(tmp_path) -> None:
+def test_paper_sub_one_net_can_reach_opening_pipeline(tmp_path) -> None:
     from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
 
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
@@ -6875,13 +6882,13 @@ def test_experimental_paper_sub_one_net_can_reach_opening_pipeline(tmp_path) -> 
 
     assert result["opened"] is True
     economics = result["economics"]
-    assert economics["evaluation_mode"] == EvaluationMode.EXPERIMENTAL_PAPER.value
+    assert economics["evaluation_mode"] == EvaluationMode.PAPER.value
     assert 0.0 <= economics["initial_expected_net_pnl"] < 1.0
     assert "advisory_initial_expected_net_below_minimum" in economics["warnings"]
     assert store.funding_capture_position_by_id(capture_id)["state"] == "OPEN"
 
 
-def test_major_stablecoin_without_provider_is_experimental_paper_allowed() -> None:
+def test_major_stablecoin_without_provider_is_paper_allowed() -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
 
     snapshot = evaluate_stablecoin_route(
@@ -6894,7 +6901,7 @@ def test_major_stablecoin_without_provider_is_experimental_paper_allowed() -> No
         allow_experimental_paper_fallback=True,
     )
 
-    assert snapshot["status"] == "EXPERIMENTAL_PAPER_ALLOWED"
+    assert snapshot["status"] == "PAPER_ALLOWED"
     assert snapshot["provider_unavailable"] is True
     assert snapshot["stablecoin_basis_assumed"] is True
     assert 20.0 <= snapshot["reserve_bps"] <= 50.0

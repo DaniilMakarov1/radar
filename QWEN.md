@@ -103,8 +103,8 @@ The production paper strategy is `synchronized_funding_capture_v2`:
 - Both legs must be simulated-filled no later than T-20.
 - Latest focused observation age target is <= 10 seconds.
 - Default paper entry snapshot age must be <= 20 seconds.
-- Cross-venue snapshot skew default is <= 5 seconds for VERIFIED_PAPER and <= 15 seconds for EXPERIMENTAL_PAPER.
-- Default paper entry is EXPERIMENTAL_PAPER-capable; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
+- Cross-venue snapshot skew default is <= 5 seconds for VERIFIED_PAPER and <= 15 seconds for PAPER estimate-based entry.
+- Default paper entry is PAPER-capable for typed estimates; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
 - The old 15-second freeze-window fallback is disabled by default.
 - After settlement, probe next schedules around T+5 and decide hold/close around T+30.
 - Normal close before T+20 is disallowed except for hard-risk events.

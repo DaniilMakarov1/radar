@@ -186,7 +186,7 @@ def _route(
             "verified_paper_ready": verified,
             "experimental_simulation_ready": experimental,
             "experimental_paper_ready": experimental,
-            "paper_mode": "VERIFIED_PAPER" if verified else "EXPERIMENTAL_PAPER",
+            "paper_mode": "VERIFIED_PAPER" if verified else "PAPER",
             "readiness_policy": {
                 "hard_blockers": [],
                 "verified_paper_ready": verified,
@@ -403,6 +403,11 @@ def test_open_position_plus_100_watch_routes_scheduler_keeps_p0_first(tmp_path, 
         store,
         PaperBotConfig(telegram_enabled=False, max_focused_routes=8).validated(),
         clock=FakeClock(NOW, monotonic_start=100.0),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_with_focused_selection_capability",
+        lambda route, _clients_by_venue: route,
     )
     bot.discovered_routes = {route["route_key"]: route for route in (_route(index) for index in range(100))}
     bot.apply_focused_selection(NOW)

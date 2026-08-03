@@ -809,7 +809,7 @@ def evaluate_perp_route(
             "readiness_level": capability_check.get("readiness_level"),
             "paper_mode": capability_check.get("paper_mode")
             or (
-                "EXPERIMENTAL_PAPER"
+                "PAPER"
                 if (
                     capability_check.get("experimental_simulation_ready")
                     or capability_check.get("experimental_paper_ready")

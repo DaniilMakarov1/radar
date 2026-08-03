@@ -184,7 +184,7 @@ def test_soft_gaps_do_not_block_discovery_but_block_verified_paper() -> None:
     assert discovery["structurally_eligible"] is True
     assert discovery["economically_observable"] is True
     assert discovery["experimental_paper_ready"] is True
-    assert discovery["paper_mode"] == "EXPERIMENTAL_PAPER"
+    assert discovery["paper_mode"] is None
     assert discovery["funding_cashflow_status"] == "ESTIMATED_ONLY"
     for flag in (
         "long_estimated_rate_used",

@@ -92,8 +92,12 @@ from smart_money_radar.funding.stablecoins import (
     evaluate_stablecoin_route,
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    STRATEGY_NAME as SYNCHRONIZED_FUNDING_STRATEGY_NAME,
     build_settlement_capture_opportunity,
     gross_funding_pnl,
+    route_plan_strategy_name,
+    route_plan_strategy_version,
     settlement_skew_seconds,
 )
 from smart_money_radar.funding.synchronized_market_contract import (
@@ -262,7 +266,8 @@ class CaptureRouteRefreshResult:
 class PaperBotConfig:
     profile_name: str = "default"
     strategy_set: tuple[str, ...] = (
-        "synchronized_funding_capture",
+        SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+        SYNCHRONIZED_FUNDING_STRATEGY_NAME,
     )
     venue_starting_balance: float = 1_000.0
     target_notional_per_leg: float = 500.0
@@ -1538,16 +1543,19 @@ class PaperBot:
         result["hot_route_count"] = stage_counts["monitor"]
         result["urgent_route_count"] = stage_counts["urgent"]
         result["qualified_route_count"] = stage_counts["qualified"]
-        result["active_experimental_paper_route_count"] = sum(
+        result["active_paper_route_count"] = sum(
             1
             for route in [*publishable_routes, *all_watch_routes]
             if str((route.get("evidence") or {}).get("paper_mode") or "").upper()
-            == "EXPERIMENTAL_PAPER"
+            in {"PAPER", "VERIFIED_PAPER"}
             and bool(
-                (route.get("evidence") or {}).get("experimental_simulation_ready")
+                (route.get("evidence") or {}).get("paper_ready")
+                or (route.get("evidence") or {}).get("verified_paper_ready")
+                or (route.get("evidence") or {}).get("experimental_simulation_ready")
                 or (route.get("evidence") or {}).get("experimental_paper_ready")
             )
         )
+        result["active_experimental_paper_route_count"] = 0
         result["hidden_detected_route_count"] = len(all_watch_routes) - len(visible_watch_routes)
         result.setdefault(
             "venue_health",
@@ -1570,9 +1578,8 @@ class PaperBot:
             ],
             "internal_watch_count": len(all_watch_routes),
             "hidden_detected_route_count": result["hidden_detected_route_count"],
-            "active_experimental_paper_route_count": result[
-                "active_experimental_paper_route_count"
-            ],
+            "active_paper_route_count": result["active_paper_route_count"],
+            "active_experimental_paper_route_count": 0,
             "discovery_funnel": stage_counts,
             "venue_health": result.get("venue_health") or {},
         }
@@ -2565,6 +2572,14 @@ class PaperBot:
             if not result.get("opened"):
                 continue
             position_id = str(result["position_id"])
+            opened_plan = result.get("route_plan") or {}
+            opened_strategy_version = (
+                opened_plan.get("strategy_version")
+                or ((active_route.get("evidence") or {}).get("selected_strategy") or {}).get(
+                    "strategy_version"
+                )
+                or "funding_capture"
+            )
             opened.append(position_id)
             self.record_event(
                 "open",
@@ -2574,7 +2589,7 @@ class PaperBot:
                     f"LONG {tg(active_route.get('long_venue'))} / "
                     f"SHORT {tg(active_route.get('short_venue'))}\n"
                     f"Expected net: <b>{format_signed_money((result.get('economics') or {}).get('initial_expected_net_pnl'))}</b>\n"
-                    "Source: synchronized_funding_capture_v2, two simulated fills."
+                    f"Source: {tg(opened_strategy_version)}, two simulated fills."
                 ),
                 {
                     "route": route_summary(active_route),
@@ -3304,7 +3319,7 @@ class PaperBot:
         blocker_examples: list[dict[str, Any]] = []
         nearest_settlement_seconds: float | None = None
         paper_evaluation_mode = (
-            EvaluationMode.EXPERIMENTAL_PAPER
+            EvaluationMode.PAPER
             if self.config.estimate_paper_enabled
             else EvaluationMode.DISCOVERY
         )
@@ -3817,7 +3832,7 @@ class PaperBot:
             short_market=short_market,
             target_notional=float(self.config.target_notional_per_leg),
             mode=(
-                EvaluationMode.EXPERIMENTAL_PAPER
+                EvaluationMode.PAPER
                 if self.config.estimate_paper_enabled
                 else EvaluationMode.DISCOVERY
             ),
@@ -3970,25 +3985,38 @@ class PaperBot:
             route_readiness.get("experimental_simulation_ready")
             or route_readiness.get("experimental_paper_ready")
         )
+        paper_ready = bool(
+            route_readiness.get("verified_paper_ready") or experimental_simulation_ready
+        )
         paper_mode = route_readiness.get("paper_mode") or (
-            "EXPERIMENTAL_PAPER"
-            if experimental_simulation_ready
+            "PAPER"
+            if paper_ready
             else "RESEARCH"
         )
         readiness_label = str(route_readiness.get("readiness_level") or "economically_observable")
+        plan_shape = (route_plan or {}).get("opportunity_shape")
+        strategy_name = route_plan_strategy_name(plan_shape)
+        strategy_version = route_plan_strategy_version(plan_shape)
+        single_settlement = strategy_name == SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME
         selected_strategy = {
             "selection_model": "lightweight_discovery_v1",
-            "strategy_name": "synchronized_funding_capture",
-            "strategy_class": "synchronized_funding_capture",
-            "strategy_version": "synchronized_funding_capture_v2",
-            "primary_edge": "synchronized_funding",
+            "strategy_name": strategy_name,
+            "strategy_class": strategy_name,
+            "strategy_version": strategy_version,
+            "primary_edge": (
+                "single_settlement_funding"
+                if single_settlement
+                else "synchronized_funding"
+            ),
             "edge_type": "funding_led",
             "edge_label": (
                 "WATCH - ESTIMATED RATE"
                 if "estimated_rate_used" in {flag.removeprefix("long_").removeprefix("short_") for flag in risk_flags}
+                else "Single-settlement funding watch"
+                if single_settlement
                 else "Lightweight funding watch"
             ),
-            "eligible": experimental_simulation_ready,
+            "eligible": paper_ready,
             "expected_net_pnl": conservative_expected_net,
             "raw_expected_net_pnl": raw_expected_net,
             "conservative_expected_net_pnl": conservative_expected_net,
@@ -4005,8 +4033,13 @@ class PaperBot:
             "reasons": list(route_readiness.get("verified_paper_blockers") or []),
             "warnings": risk_flags[:8],
             "thesis": (
-                "Preliminary synchronized funding watch. This is not an "
-                "entry candidate until focused orderbook observations pass."
+                "Preliminary single-settlement funding watch. The opposite leg "
+                "is a hedge until focused orderbook observations pass."
+                if single_settlement
+                else (
+                    "Preliminary synchronized funding watch. This is not an "
+                    "entry candidate until focused orderbook observations pass."
+                )
             ),
         }
         route = {
@@ -4090,6 +4123,7 @@ class PaperBot:
                     route_readiness.get("verified_paper_ready")
                     or route_readiness.get("experimental_paper_ready")
                 ),
+                "paper_ready": paper_ready,
                 "experimental_simulation_ready": experimental_simulation_ready,
                 "experimental_paper_ready": bool(
                     route_readiness.get("experimental_paper_ready")

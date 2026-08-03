@@ -13,6 +13,8 @@ from smart_money_radar.paper_bot.helpers import (
     route_settlement_leads,
 )
 from smart_money_radar.funding.strategy_synchronized_funding import (
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION,
     STRATEGY_NAME as SYNCHRONIZED_STRATEGY_NAME,
     STRATEGY_VERSION as SYNCHRONIZED_STRATEGY_VERSION,
     settlement_skew_seconds,
@@ -24,6 +26,10 @@ STRATEGY_ALIASES = {
     "synchronized": SYNCHRONIZED_STRATEGY_NAME,
     "synchronized_funding": SYNCHRONIZED_STRATEGY_NAME,
     "synchronized_funding_capture": SYNCHRONIZED_STRATEGY_NAME,
+    "single_settlement": SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    "single_settlement_hedged": SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    "single_settlement_hedged_capture": SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    "single_settlement_hedged_capture_v1": SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
     "funding": "funding_only",
     "funding_carry": "funding_only",
     "funnel_only": "funding_only",
@@ -43,6 +49,7 @@ STRATEGY_ALIASES = {
     "opportunistic_total_edge": "opportunistic_any",
 }
 ALLOWED_STRATEGIES = (
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
     SYNCHRONIZED_STRATEGY_NAME,
     "funding_only",
     "spread_only",
@@ -270,9 +277,17 @@ def build_position_from_route(
     strategy_name = str(
         selected_strategy.get("strategy_name") or SYNCHRONIZED_STRATEGY_NAME
     )
+    strategy_version = str(
+        selected_strategy.get("strategy_version")
+        or (
+            SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION
+            if strategy_name == SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME
+            else SYNCHRONIZED_STRATEGY_VERSION
+        )
+    )
     strategy_components = {
         "strategy_name": strategy_name,
-        "strategy_version": selected_strategy.get("strategy_version"),
+        "strategy_version": strategy_version,
         "primary_edge": selected_strategy.get("primary_edge"),
         "selection_model": selected_strategy.get("selection_model"),
         "edge_type": selected_strategy.get("edge_type"),
@@ -334,7 +349,7 @@ def build_position_from_route(
         "entry_basis_bps": float(evidence.get("signed_entry_basis") or 0.0) * 10_000.0,
         "notes": {
             "decision": decision,
-            "paper_model": SYNCHRONIZED_STRATEGY_VERSION,
+            "paper_model": strategy_version,
             "strategy": strategy_components,
             "strategy_name": strategy_name,
         },
@@ -344,7 +359,10 @@ def build_position_from_route(
 def normalize_strategy_set(strategies: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
     raw_values = tuple(strategies or ())
     if not raw_values:
-        raw_values = (SYNCHRONIZED_STRATEGY_NAME,)
+        raw_values = (
+            SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+            SYNCHRONIZED_STRATEGY_NAME,
+        )
     normalized: list[str] = []
     for raw in raw_values:
         key = normalize_strategy_name(raw)
@@ -457,6 +475,7 @@ def selected_route_strategy(
     if strict_candidates:
         candidates = strict_candidates
     priority = {
+        SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME: 6,
         SYNCHRONIZED_STRATEGY_NAME: 5,
         "combined": 4,
         "spread_only": 3,
@@ -478,7 +497,7 @@ def selected_route_strategy(
 def synchronized_route_evaluation_mode(route: dict[str, Any]) -> str | None:
     evidence = route.get("evidence") or {}
     raw_mode = str(evidence.get("paper_mode") or "").strip().upper()
-    if raw_mode in {"EXPERIMENTAL_PAPER", "VERIFIED_PAPER"}:
+    if raw_mode in {"PAPER", "EXPERIMENTAL_PAPER", "VERIFIED_PAPER"}:
         return raw_mode
     if raw_mode:
         return None
@@ -488,7 +507,7 @@ def synchronized_route_evaluation_mode(route: dict[str, Any]) -> str | None:
         evidence.get("experimental_simulation_ready")
         or evidence.get("experimental_paper_ready")
     ):
-        return "EXPERIMENTAL_PAPER"
+        return "PAPER"
     return "VERIFIED_PAPER"
 
 

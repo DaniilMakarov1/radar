@@ -807,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--experimental-max-cross-venue-snapshot-skew-seconds",
         type=float,
         default=15.0,
-        help="Maximum cross-venue snapshot skew for experimental paper.",
+        help="Maximum cross-venue snapshot skew for estimate-based paper entry.",
     )
     funding_paper_trader.add_argument(
         "--target-notional-min-fraction",

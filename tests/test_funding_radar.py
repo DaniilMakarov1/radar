@@ -134,8 +134,10 @@ class FundingRadarTest(unittest.TestCase):
     def test_risky_venues_are_not_active_default_funding_clients(self) -> None:
         venues = {str(client.venue) for client in active_default_funding_clients()}
 
+        self.assertEqual(venues, {"hyperliquid", "risex"})
         self.assertFalse(venues & DEACTIVATED_FUNDING_VENUES)
         self.assertIn("risex", venues)
+        self.assertIn("hyperliquid", venues)
         self.assertNotIn("paradex", venues)
 
     def test_core_public_clients_expose_verified_endpoint_identity(self) -> None:
@@ -500,7 +502,7 @@ class FundingRadarTest(unittest.TestCase):
                             self.assertEqual(routes[0]["status"], "watch")
                             self.assertEqual(
                                 routes[0]["evidence"]["paper_mode"],
-                                "EXPERIMENTAL_PAPER",
+                                "PAPER",
                             )
                             self.assertTrue(
                                 routes[0]["evidence"]["experimental_simulation_ready"]

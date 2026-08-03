@@ -12,6 +12,7 @@ from smart_money_radar.funding.route_identity import (
 )
 from smart_money_radar.funding.readiness_policy import (
     EvaluationMode,
+    estimate_based_paper_mode,
     estimated_paper_blockers,
     modeled_fee_rate,
 )
@@ -19,13 +20,18 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
     EventWindowPlannerConfig,
     FundingRoutePlan,
     FundingSettlementPlanner,
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION,
     STRATEGY_NAME,
     STRATEGY_VERSION,
+    SUPPORTED_CAPTURE_STRATEGIES,
     entry_underwriting,
     gross_funding_pnl,
     hold_economics,
     initial_entry_economics,
     parse_time,
+    route_plan_strategy_name,
+    route_plan_strategy_version,
     summarize_funding_observations,
     validate_focused_observation,
 )
@@ -88,7 +94,8 @@ def schedule_seconds_to_next(probe_decision: dict[str, Any], now: datetime) -> f
 
 
 def synchronized_runtime_enabled(config: Any) -> bool:
-    return STRATEGY_NAME in set(str(item) for item in getattr(config, "strategy_set", ()))
+    configured = set(str(item) for item in getattr(config, "strategy_set", ()))
+    return bool(configured.intersection(SUPPORTED_CAPTURE_STRATEGIES))
 
 
 def capture_position_id_for_route(route: dict[str, Any]) -> str:
@@ -139,6 +146,38 @@ def route_next_settlement(route: dict[str, Any]) -> datetime | None:
     if long_next is None or short_next is None:
         return None
     return min(long_next.astimezone(UTC), short_next.astimezone(UTC))
+
+
+def _capture_strategy_metadata(
+    route_plan: dict[str, Any] | None,
+    route: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    planner = (route_plan or {}).get("planner") or {}
+    name = (
+        (route_plan or {}).get("compatibility_alias")
+        or planner.get("strategy_name")
+        or ""
+    )
+    version = (
+        (route_plan or {}).get("strategy_version")
+        or planner.get("strategy_version")
+        or ""
+    )
+    if not name and route is not None:
+        selected = (
+            ((route.get("evidence") or {}).get("selected_strategy"))
+            or ((route.get("evidence") or {}).get("strategy_classification"))
+            or {}
+        )
+        name = selected.get("strategy_name") or selected.get("strategy_class") or ""
+        version = version or selected.get("strategy_version") or ""
+    if not name and route_plan is not None:
+        name = route_plan_strategy_name(route_plan.get("opportunity_shape"))
+    if not version and route_plan is not None:
+        version = route_plan_strategy_version(route_plan.get("opportunity_shape"))
+    if name == SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME:
+        version = version or SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION
+    return str(name or STRATEGY_NAME), str(version or STRATEGY_VERSION)
 
 
 def _leg_response_time(leg: dict[str, Any]) -> datetime | None:
@@ -352,7 +391,7 @@ class SynchronizedFundingRuntimeV2:
         )
         self.settlement_data_provider = settlement_data_provider
         planner_mode = (
-            EvaluationMode.EXPERIMENTAL_PAPER
+            EvaluationMode.PAPER
             if self.estimate_paper_enabled
             else EvaluationMode.VERIFIED_PAPER
         )
@@ -1926,11 +1965,13 @@ class SynchronizedFundingRuntimeV2:
             str(reason) for reason in readiness.get("mode_blockers") or []
         ]
         if self.estimate_paper_enabled:
-            if (
-                str(planner.get("evaluation_mode") or "")
-                != EvaluationMode.EXPERIMENTAL_PAPER.value
-            ):
-                blockers.append("estimate_runtime_requires_experimental_paper_evaluation")
+            raw_mode = str(planner.get("evaluation_mode") or "")
+            try:
+                evaluation_mode = EvaluationMode(raw_mode)
+            except ValueError:
+                evaluation_mode = None
+            if evaluation_mode is None or not estimate_based_paper_mode(evaluation_mode):
+                blockers.append("estimate_runtime_requires_paper_evaluation")
             filtered_verified = estimated_paper_blockers(raw_verified_blockers)
             estimate_ready = (
                 bool(
@@ -2028,7 +2069,14 @@ class SynchronizedFundingRuntimeV2:
         guard = self._opportunity_guard(capture_id)
         if not guard["allowed"]:
             return {"opened": False, **guard}
-        self._ensure_discovered_or_armed(route, capture_id, settlement_at, lead, now)
+        self._ensure_discovered_or_armed(
+            route,
+            capture_id,
+            settlement_at,
+            lead,
+            now,
+            route_plan=route_plan,
+        )
         if route_plan is None:
             return {"opened": False, "reason": "route_plan_missing"}
         lifecycle_state = str(route_plan.get("lifecycle_state") or "")
@@ -2502,8 +2550,11 @@ class SynchronizedFundingRuntimeV2:
         settlement_at: datetime,
         lead: float,
         now: datetime,
+        *,
+        route_plan: dict[str, Any] | None = None,
     ) -> None:
         route = route_with_canonical_identity(route)
+        strategy_name, strategy_version = _capture_strategy_metadata(route_plan, route)
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
         short_leg = leg_by_side(legs, "short") or {}
@@ -2511,8 +2562,8 @@ class SynchronizedFundingRuntimeV2:
         self.store.upsert_funding_capture_position(
             {
                 "position_id": capture_id,
-                "strategy_name": STRATEGY_NAME,
-                "strategy_version": STRATEGY_VERSION,
+                "strategy_name": strategy_name,
+                "strategy_version": strategy_version,
                 "canonical_asset": route.get("canonical_asset", ""),
                 "long_venue": long_leg.get("venue") or route.get("long_venue") or "",
                 "long_symbol": long_leg.get("symbol") or route.get("long_symbol") or "",
@@ -2635,11 +2686,14 @@ class SynchronizedFundingRuntimeV2:
         gate_result: dict[str, Any],
     ) -> None:
         route = route_with_canonical_identity(route)
-        cycle_identity = f"{STRATEGY_VERSION}:{capture_id}:1:{settlement_at.astimezone(UTC).isoformat()}"
+        strategy_name, strategy_version = _capture_strategy_metadata(route_plan, route)
+        cycle_identity = f"{strategy_version}:{capture_id}:1:{settlement_at.astimezone(UTC).isoformat()}"
         position = self.store.funding_capture_position_by_id(capture_id)
         config = dict((position or {}).get("config") or {})
         config.update(
             {
+                "strategy_name": strategy_name,
+                "strategy_version": strategy_version,
                 "candidate_state": "ARMED",
                 "armed_at": now.astimezone(UTC).isoformat(),
                 "entry_gate_result": gate_result,
@@ -2882,12 +2936,15 @@ class SynchronizedFundingRuntimeV2:
             evaluation_mode=(
                 ((route_plan or {}).get("planner") or {}).get("evaluation_mode")
                 or (
-                    EvaluationMode.EXPERIMENTAL_PAPER.value
+                    EvaluationMode.PAPER.value
                     if self.estimate_paper_enabled
                     else EvaluationMode.VERIFIED_PAPER.value
                 )
             ),
         )
+        strategy_name, strategy_version = _capture_strategy_metadata(route_plan, route)
+        result["strategy_name"] = strategy_name
+        result["strategy_version"] = strategy_version
         result["entry_basis_reserve_bps"] = basis_reserve_bps
         result["entry_legging_reserve_bps"] = legging_reserve_bps
         if route_plan is not None:
@@ -3569,6 +3626,7 @@ class SynchronizedFundingRuntimeV2:
         route_plan: dict[str, Any] | None = None,
     ) -> None:
         route = route_with_canonical_identity(route)
+        strategy_name, strategy_version = _capture_strategy_metadata(route_plan, route)
         legs = route.get("legs") or []
         long_leg = dict(leg_by_side(legs, "long") or {})
         short_leg = dict(leg_by_side(legs, "short") or {})
@@ -3580,8 +3638,8 @@ class SynchronizedFundingRuntimeV2:
         self.store.upsert_funding_capture_position(
             {
                 "position_id": capture_id,
-                "strategy_name": STRATEGY_NAME,
-                "strategy_version": STRATEGY_VERSION,
+                "strategy_name": strategy_name,
+                "strategy_version": strategy_version,
                 "canonical_asset": route.get("canonical_asset", ""),
                 "long_venue": long_leg.get("venue") or route.get("long_venue") or "",
                 "long_symbol": long_leg.get("symbol") or route.get("long_symbol") or "",
@@ -3603,6 +3661,8 @@ class SynchronizedFundingRuntimeV2:
                 "legacy_route_entry_key": route.get("legacy_route_entry_key"),
                 "config": {
                     **existing_config,
+                    "strategy_name": strategy_name,
+                    "strategy_version": strategy_version,
                     "opportunity_id": capture_id,
                     "attempt_id": attempt_id,
                     "entry_attempt_id": attempt_id,

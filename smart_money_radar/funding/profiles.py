@@ -19,7 +19,12 @@ class FundingBotProfile:
 BUILTIN_FUNDING_BOT_PROFILES: dict[str, FundingBotProfile] = {
     "default": FundingBotProfile(
         name="default",
-        description="All active funding venues with standard paper trading gates.",
+        description="RiseX plus Hyperliquid paper funding routes.",
+        venue_set=("risex", "hyperliquid"),
+        strategy_set=(
+            "single_settlement_hedged_capture",
+            "synchronized_funding_capture",
+        ),
     ),
     "core_cex": FundingBotProfile(
         name="core_cex",
@@ -40,10 +45,11 @@ BUILTIN_FUNDING_BOT_PROFILES: dict[str, FundingBotProfile] = {
         name="risex_points",
         description=(
             "Points-farming profile shell. It keeps the shared funding "
-            "logic while whitelisting RiseX plus core hedging venues."
+            "logic while whitelisting RiseX plus Hyperliquid."
         ),
-        venue_set=("risex", "binance", "bybit", "okx"),
+        venue_set=("risex", "hyperliquid"),
         strategy_set=(
+            "single_settlement_hedged_capture",
             "synchronized_funding_capture",
         ),
         metadata={"purpose": "risex_points_farming_research"},

@@ -443,16 +443,18 @@ recheck interval for a found candidate/watch route; it defaults to 2 seconds.
 second, used when both legs are near the synchronized entry window or when a paper
 position is pending/open.
 
-Paper entries use `synchronized_funding_capture_v2`: both legs must have the same
-next settlement within 1 second, and entry is authorized only from T-35 to T-25
-seconds before that settlement. The target is T-30, both simulated fills must be
+Paper entries use `single_settlement_hedged_capture_v1` for one favorable near
+settlement with the other leg as a hedge, and
+`synchronized_funding_capture_v2` only when both legs have the same next
+settlement within 1 second. Entry is authorized only from T-35 to T-25 seconds
+before the captured settlement. The target is T-30, both simulated fills must be
 done by T-20, and the route snapshot must be no older than
 `--max-entry-snapshot-age-seconds` (20 seconds by default). Focused/hot
 observations target <=10 seconds, and cross-venue snapshot skew defaults to 5
-seconds for verified paper and 15 seconds for experimental paper. The old 0-15
-second entry window and 30-second freeze-window fallback are disabled by
-default. The default paper trader allows EXPERIMENTAL_PAPER typed funding
-estimates; pass `--no-estimated-funding-paper-entry` for a verified-only run.
+seconds for verified paper and 15 seconds for PAPER estimate-based entry. The
+old 0-15 second entry window and 30-second freeze-window fallback are disabled
+by default. The default paper trader allows typed funding estimates; pass
+`--no-estimated-funding-paper-entry` for a verified-only run.
 
 For the default synchronized strategy, spread convergence is always zero expected
 profit. Settlement-capture sizing and blockers use funding-only net economics;

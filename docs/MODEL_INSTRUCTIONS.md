@@ -243,30 +243,34 @@ The scanner must not create a final `paper_candidate` for synchronized funding.
 The dashboard may display actionable `watch` routes in its main table, but the
 row status must remain `watch` until focused underwriting opens a paper position.
 
-Entry can happen only through `SynchronizedFundingRuntimeV2.consider_route`.
-The default paper trader is EXPERIMENTAL_PAPER-capable: typed funding estimates
-may open paper positions when the required semantics are known. Use
-`--no-estimated-funding-paper-entry` only for a verified-only dry run.
+Entry can happen only through `SynchronizedFundingRuntimeV2.consider_route`
+(the runtime name is legacy; it now handles both synchronized and
+single-settlement hedged capture plans). The default paper trader is
+PAPER-capable for typed funding estimates when the required semantics are
+known. Use `--no-estimated-funding-paper-entry` only for a verified-only dry run.
 Required conditions:
 
 1. Both venues pass the fail-closed capability contract.
 2. Paper entry still requires collateral/quote compatibility owned by the paper
-   risk model. Native USDC/USDT routes share a USD-family numeraire in
-   EXPERIMENTAL_PAPER; without a fresh independent price provider they must carry
-   an explicit conservative stablecoin reserve and `provider_unavailable`
+   risk model. Native USDC/USDT routes share a USD-family numeraire in PAPER
+   estimate-based entry; without a fresh independent price provider they must
+   carry an explicit conservative stablecoin reserve and `provider_unavailable`
    evidence. VERIFIED_PAPER may still require fresh independent stablecoin
    sources.
 3. VERIFIED_PAPER requires a normalized next-settlement funding rate.
-   EXPERIMENTAL_PAPER may use a typed `rate_estimate_per_settlement` when sign
+   PAPER may use a typed `rate_estimate_per_settlement` when sign
    convention, unit/scale, funding interval, next funding timestamp, and source
    identity/estimate kind are known.
-4. Both `next_funding_at` timestamps align within 1 second.
+4. `single_settlement_hedged_capture_v1` requires one favorable near
+   settlement and uses the other leg as a hedge; the hedge leg settlement may be
+   later. `synchronized_funding_capture_v2` still requires both
+   `next_funding_at` timestamps to align within 1 second.
 5. Current lead is inside T-35 to T-25 seconds, target T-30.
 6. Focused observations contain at least 10 valid paired snapshots over at least
    20 seconds.
 7. Latest entry observation age is at most 20 seconds. Cross-venue response skew
    defaults to at most 5 seconds for VERIFIED_PAPER and 15 seconds for
-   EXPERIMENTAL_PAPER.
+   PAPER estimate-based entry.
 8. All observed gross funding PnL values are positive and latest gross is at
    least 80% of the median.
 9. Conservative funding is `0.90 * min(observed gross funding)`.

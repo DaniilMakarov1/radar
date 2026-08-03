@@ -15,6 +15,7 @@ from smart_money_radar.funding.readiness_policy import (
     EvaluationMode,
     FundingRiskPolicy,
     evaluate_synchronized_route,
+    estimate_based_paper_mode,
     modeled_fee_rate,
     rate_estimate_from_market,
 )
@@ -26,6 +27,12 @@ from smart_money_radar.funding.settlement_contracts import (
 
 STRATEGY_NAME = "synchronized_funding_capture"
 STRATEGY_VERSION = "synchronized_funding_capture_v2"
+SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME = "single_settlement_hedged_capture"
+SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION = "single_settlement_hedged_capture_v1"
+SUPPORTED_CAPTURE_STRATEGIES = (
+    SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME,
+    STRATEGY_NAME,
+)
 INTERNAL_STRATEGY_NAME = "FUNDING_SETTLEMENT_CAPTURE"
 ONE_SETTLEMENT = "ONE_SETTLEMENT"
 MULTIPLE_SETTLEMENTS = "MULTIPLE_SETTLEMENTS"
@@ -33,6 +40,18 @@ MULTIPLE_SETTLEMENTS = "MULTIPLE_SETTLEMENTS"
 
 def clamp(minimum: float, maximum: float, value: float) -> float:
     return max(float(minimum), min(float(maximum), float(value)))
+
+
+def route_plan_strategy_name(opportunity_shape: Any) -> str:
+    if str(opportunity_shape or "").upper() == ONE_SETTLEMENT:
+        return SINGLE_SETTLEMENT_HEDGED_STRATEGY_NAME
+    return STRATEGY_NAME
+
+
+def route_plan_strategy_version(opportunity_shape: Any) -> str:
+    if str(opportunity_shape or "").upper() == ONE_SETTLEMENT:
+        return SINGLE_SETTLEMENT_HEDGED_STRATEGY_VERSION
+    return STRATEGY_VERSION
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -637,7 +656,7 @@ def _stablecoin_cost_gate(
             collateral_family(long_asset) == USD_MAJOR_STABLE
             and collateral_family(short_asset) == USD_MAJOR_STABLE
         )
-        if evaluation_mode is EvaluationMode.EXPERIMENTAL_PAPER and major_pair:
+        if estimate_based_paper_mode(evaluation_mode) and major_pair:
             reserve_bps = Decimal("25")
             reserve_usd = (
                 _non_negative_decimal(target_notional)
@@ -646,7 +665,11 @@ def _stablecoin_cost_gate(
             )
             return reserve_usd, [], {
                 "schema_version": 1,
-                "status": "EXPERIMENTAL_PAPER_ALLOWED",
+                "status": (
+                    "EXPERIMENTAL_PAPER_ALLOWED"
+                    if evaluation_mode is EvaluationMode.EXPERIMENTAL_PAPER
+                    else "PAPER_ALLOWED"
+                ),
                 "cross_stable": True,
                 "stablecoin_pair": expected_pair,
                 "canonical_pair": expected_pair,
@@ -663,7 +686,7 @@ def _stablecoin_cost_gate(
                 "assumptions": [
                     "provider_unavailable",
                     "stablecoin_basis_assumed",
-                    "USDC/USDT USD-family collateral priced at par for experimental paper with conservative reserve"
+                    "USDC/USDT USD-family collateral priced at par for estimate-based paper with conservative reserve"
                 ],
             }
         return Decimal("0"), [
@@ -700,8 +723,8 @@ def _stablecoin_cost_gate(
         blockers.append("stablecoin_snapshot_expired")
     snapshot_status = str(snapshot.get("status") or "").upper()
     experimental_allowed = (
-        evaluation_mode is EvaluationMode.EXPERIMENTAL_PAPER
-        and snapshot_status == "EXPERIMENTAL_PAPER_ALLOWED"
+        estimate_based_paper_mode(evaluation_mode)
+        and snapshot_status in {"PAPER_ALLOWED", "EXPERIMENTAL_PAPER_ALLOWED"}
         and collateral_family(long_asset) == USD_MAJOR_STABLE
         and collateral_family(short_asset) == USD_MAJOR_STABLE
     )
@@ -1395,10 +1418,12 @@ class FundingSettlementPlanner:
             if event.evidence_version
         ]
         monitor_until = str(selected.get("monitor_until") or selected.get("planned_exit_at") or "")
+        plan_strategy_name = route_plan_strategy_name(selected.get("opportunity_shape"))
+        plan_strategy_version = route_plan_strategy_version(selected.get("opportunity_shape"))
         return FundingRoutePlan(
             strategy_name=INTERNAL_STRATEGY_NAME,
-            compatibility_alias=STRATEGY_NAME,
-            strategy_version=STRATEGY_VERSION,
+            compatibility_alias=plan_strategy_name,
+            strategy_version=plan_strategy_version,
             opportunity_shape=str(selected["opportunity_shape"]),
             leg_a=long_market,
             leg_b=short_market,
@@ -1436,6 +1461,8 @@ class FundingSettlementPlanner:
             ],
             planner={
                 "selected_plan": selected["plan_name"],
+                "strategy_name": plan_strategy_name,
+                "strategy_version": plan_strategy_version,
                 "plans": plans,
                 "config": asdict(config),
                 "evaluation_mode": self.evaluation_mode.value,
@@ -1539,9 +1566,9 @@ def initial_entry_economics(
     coverage = funding / modeled_cost if modeled_cost > 0 else math.inf if funding > 0 else 0.0
     gross_threshold = max(2.50, reference * 0.005)
     strict_net_threshold = max(1.00, reference * 0.002)
-    net_threshold = 0.0 if mode is EvaluationMode.EXPERIMENTAL_PAPER else strict_net_threshold
+    net_threshold = 0.0 if estimate_based_paper_mode(mode) else strict_net_threshold
     advisory_warnings: list[str] = []
-    if mode is EvaluationMode.EXPERIMENTAL_PAPER:
+    if estimate_based_paper_mode(mode):
         if funding < gross_threshold:
             advisory_warnings.append("advisory_conservative_funding_below_minimum")
         if expected_net < strict_net_threshold:
@@ -1567,7 +1594,7 @@ def initial_entry_economics(
         "strict_minimum_initial_expected_net_pnl": strict_net_threshold,
         "eligible": (
             expected_net >= 0.0
-            if mode is EvaluationMode.EXPERIMENTAL_PAPER
+            if estimate_based_paper_mode(mode)
             else (
                 funding >= gross_threshold
                 and expected_net >= strict_net_threshold
@@ -1715,7 +1742,7 @@ def synchronized_strategy_candidate(
     conservative_funding = float(current_funding_gross)
     expected_net = conservative_funding - execution_cost - basis_stress_loss
     strict_threshold = max(float(actionable_profit_threshold or 0.0), 1.0, funding_notional * 0.002)
-    threshold = 0.0 if mode is EvaluationMode.EXPERIMENTAL_PAPER else strict_threshold
+    threshold = 0.0 if estimate_based_paper_mode(mode) else strict_threshold
     gross_threshold = max(2.50, funding_notional * 0.005)
     coverage_denominator = execution_cost + basis_stress_loss
     coverage = (
@@ -1732,7 +1759,7 @@ def synchronized_strategy_candidate(
     if str(decision_mode) != "settlement_capture":
         reasons.append("not_next_settlement_capture")
     warnings: list[str] = []
-    if mode is EvaluationMode.EXPERIMENTAL_PAPER:
+    if estimate_based_paper_mode(mode):
         if conservative_funding < gross_threshold:
             warnings.append("advisory_conservative_funding_below_minimum")
         if expected_net < strict_threshold:

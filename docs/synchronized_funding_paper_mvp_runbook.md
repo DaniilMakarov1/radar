@@ -59,7 +59,7 @@ Live execution must remain disabled. Do not set live-order credentials for this
 MVP run. Keep Telegram disabled with `--no-telegram` for smoke commands.
 
 Fee overrides are allowed only as explicit configured evidence inputs for
-VERIFIED_PAPER tests. In default EXPERIMENTAL_PAPER runs, unverified fees must
+VERIFIED_PAPER tests. In default PAPER estimate-based runs, unverified fees must
 carry conservative reserves and visible evidence instead of silently becoming
 verified fees.
 
@@ -104,8 +104,8 @@ Public smoke:
 - HOLD requires reliable reconciled history; insufficient history closes or
   treats the next cycle as a fresh independent entry.
 - Cross USDC/USDT routes share the USD-family collateral class. Verified paper
-  requires fresh independent stablecoin sources; experimental paper may proceed
-  without the provider only with explicit `provider_unavailable`,
+  requires fresh independent stablecoin sources; PAPER estimate-based entry may
+  proceed without the provider only with explicit `provider_unavailable`,
   `stablecoin_basis_assumed`, and conservative reserve evidence.
 - Full scans are background work and are not required for the hot lifecycle
   scenario.

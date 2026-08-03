@@ -623,7 +623,7 @@ def evaluate_stablecoin_route(
             reserve_usd = max(0.0, float(reference_notional)) * reserve_bps / 10_000.0
             return {
                 **base_result(
-                    "EXPERIMENTAL_PAPER_ALLOWED",
+                    "PAPER_ALLOWED",
                     ["stablecoin_price_provider_unavailable"],
                     cross_stable=True,
                 ),
@@ -643,7 +643,7 @@ def evaluate_stablecoin_route(
                 "assumptions": [
                     "provider_unavailable",
                     "stablecoin_basis_assumed",
-                    "USDC/USDT USD-family collateral priced at par for experimental paper with conservative reserve"
+                    "USDC/USDT USD-family collateral priced at par for estimate-based paper with conservative reserve"
                 ],
             }
         return {

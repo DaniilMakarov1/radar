@@ -31,6 +31,7 @@ from smart_money_radar.funding.trader import (
     price_stop_loss_triggered,
     spread_stop_loss_triggered,
 )
+from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.notifications import NotificationResult
 from smart_money_radar.paper_bot.helpers import format_seconds
 from smart_money_radar.paper_bot.position import settlement_rate_or_entry
@@ -52,16 +53,17 @@ def test_format_seconds_shows_overdue_settlement() -> None:
     assert format_seconds(-75) == "просрочено 1m 15s"
 
 
-def test_telegram_uses_experimental_paper_badge_for_experimental_paper() -> None:
+def test_telegram_uses_paper_badge_for_estimate_paper() -> None:
     now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
     route = paper_route(now, long_lead=90, short_lead=90)
-    route["evidence"]["paper_mode"] = "EXPERIMENTAL_PAPER"
+    route["evidence"]["paper_mode"] = "PAPER"
     route["evidence"]["experimental_paper_ready"] = True
     route["evidence"]["readiness_level"] = "experimental_paper_ready"
 
     line = status_route_line(route, 1)
 
-    assert "EXPERIMENTAL PAPER" in line
+    assert "PAPER" in line
+    assert "EXPERIMENTAL PAPER" not in line
     assert "SIMULATION READY" not in line
 
 
@@ -572,7 +574,10 @@ def test_invalid_strategy_config_fails_closed() -> None:
 
 def test_default_paper_bot_strategy_set_is_funding_led() -> None:
     config = PaperBotConfig().validated()
-    assert config.strategy_set == ("synchronized_funding_capture",)
+    assert config.strategy_set == (
+        "single_settlement_hedged_capture",
+        "synchronized_funding_capture",
+    )
     assert "spread_only" not in config.strategy_set
     assert "opportunistic_any" not in config.strategy_set
 
@@ -1782,7 +1787,7 @@ def test_status_report_hides_negative_detected_routes(tmp_path) -> None:
     assert "Preliminary funding before focused costs" not in notifier.messages[0]
 
 
-def test_status_report_distinguishes_active_experimental_and_hidden_detected() -> None:
+def test_status_report_distinguishes_active_paper_and_hidden_detected() -> None:
     message = status_report_message(
         {
             "mode": "hot_routes",
@@ -1792,7 +1797,7 @@ def test_status_report_distinguishes_active_experimental_and_hidden_detected() -
             "watch_stage_route_count": 2,
             "hot_route_count": 1,
             "urgent_route_count": 1,
-            "active_experimental_paper_route_count": 3,
+            "active_paper_route_count": 3,
             "hidden_detected_route_count": 2,
         },
         [],
@@ -1803,7 +1808,7 @@ def test_status_report_distinguishes_active_experimental_and_hidden_detected() -
 
     assert "Routes detected: 5" in message
     assert "Early: 1 | Watch: 2 | Monitor: 1 | Urgent: 1" in message
-    assert "Active experimental paper: 3 | Hidden/blocked: 2" in message
+    assert "Paper-ready routes: 3 | Hidden/blocked: 2" in message
 
 
 def test_status_report_bounds_many_verbose_detected_routes_for_telegram(tmp_path) -> None:
@@ -3708,13 +3713,7 @@ def test_build_close_payload_includes_basis_pnl() -> None:
 
 
 def test_funding_client_for_venue_covers_all_active_venues() -> None:
-    active_venues = [
-        "aevo", "apex", "aster", "backpack", "binance",
-        "bitget", "bybit", "deribit", "dydx",
-        "edgex", "ethereal", "extended", "gate", "grvt",
-        "hyperliquid", "kraken", "kucoin", "lighter", "mexc", "okx",
-        "nado", "pacifica", "risex",
-    ]
+    active_venues = ["hyperliquid", "risex"]
     for venue in active_venues:
         client = funding_client_for_venue(venue)
         assert client is not None, f"Missing client for {venue}"
@@ -3725,17 +3724,13 @@ def test_funding_client_for_venue_covers_all_active_venues() -> None:
 
 
 def test_funding_client_for_venue_rejects_deactivated() -> None:
-    for venue in (
-        "bingx", "bitmart", "bitunix", "blofin", "coinex", "drift",
-        "htx", "paradex", "phemex", "reya", "variational", "vertex_base", "woox",
-    ):
+    for venue in DEACTIVATED_FUNDING_VENUES:
         assert funding_client_for_venue(venue) is None
 
 
-def test_funding_client_factory_returns_verified_identity_for_research_data_venues() -> None:
+def test_funding_client_factory_returns_verified_identity_for_active_venues() -> None:
     for venue, environment in (
-        ("pacifica", "mainnet"),
-        ("nado", "mainnet"),
+        ("hyperliquid", "mainnet"),
         ("risex", "mainnet"),
     ):
         client = funding_client_for_venue(venue)

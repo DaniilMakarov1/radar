@@ -26,6 +26,7 @@ class EvaluationMode(str, Enum):
     DISCOVERY = "DISCOVERY"
     EXPERIMENTAL_SIMULATION = "EXPERIMENTAL_SIMULATION"
     EXPERIMENTAL_PAPER = "EXPERIMENTAL_PAPER"
+    PAPER = "PAPER"
     VERIFIED_PAPER = "VERIFIED_PAPER"
 
 
@@ -37,6 +38,16 @@ class ReadinessLevel(str, Enum):
     EXPERIMENTAL_PAPER_READY = "experimental_paper_ready"
     VERIFIED_PAPER_READY = "verified_paper_ready"
     SETTLEMENT_VALIDATION_READY = "settlement_validation_ready"
+
+
+ESTIMATE_BASED_PAPER_MODES = frozenset({
+    EvaluationMode.EXPERIMENTAL_PAPER,
+    EvaluationMode.PAPER,
+})
+
+
+def estimate_based_paper_mode(mode: EvaluationMode) -> bool:
+    return mode in ESTIMATE_BASED_PAPER_MODES
 
 
 class RateEstimateKind(str, Enum):
@@ -978,8 +989,11 @@ def evaluate_synchronized_route(
         "paper_mode": (
             "VERIFIED_PAPER"
             if verified_ready
-            else "EXPERIMENTAL_PAPER"
+            else evaluation_mode.value
+            if experimental_simulation_ready and estimate_based_paper_mode(evaluation_mode)
+            else "EXPERIMENTAL_SIMULATION"
             if experimental_simulation_ready
+            and evaluation_mode is EvaluationMode.EXPERIMENTAL_SIMULATION
             else None
         ),
         "experimental_warnings": [

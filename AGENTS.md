@@ -9,15 +9,20 @@ This repository is currently Funding-first.
 
 ## Active Strategy
 
-Default paper trading uses `synchronized_funding_capture_v2` only.
+Default paper trading uses `single_settlement_hedged_capture_v1` for one near
+funding settlement with a hedge leg, and `synchronized_funding_capture_v2` only
+when both funding settlements align.
 
-- Entry reason: nearest synchronized funding settlement.
+- Entry reason: nearest favorable funding settlement, with synchronized capture
+  used only when both legs settle together.
 - Position shape: long one venue, short another venue, same canonical base quantity.
-- Default paper entry is EXPERIMENTAL_PAPER-capable for typed estimated funding; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
+- Default paper entry is PAPER-capable for typed estimated funding; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
 - Scanner status before focused observations is `watch`, not `paper_candidate`.
-- Entry window: both legs 25-35 seconds before settlement, target T-30.
-- Fill deadline: both legs filled by T-20.
-- Settlement alignment: long and short next funding timestamps must differ by at most 1 second.
+- Entry window: both legs 25-35 seconds before the captured settlement, target T-30.
+- Fill deadline: both legs filled by T-20 before the captured settlement.
+- Settlement alignment: synchronized routes require long/short next funding
+  timestamps to differ by at most 1 second; single-settlement hedged routes do
+  not require the hedge leg settlement timestamp to align.
 - Spread convergence is not expected profit for the default strategy; spread/basis is modeled as cost and risk.
 - Funding estimates are not cashflow; confirmed funding enters paper PnL only
   after public rate plus settlement mark reconciliation.
@@ -28,7 +33,8 @@ Default paper trading uses `synchronized_funding_capture_v2` only.
 ## Runtime Safety
 
 - Paper-only. Do not enable live trading or real exchange order placement.
-- Use all active registered funding adapters by default; do not hardcode a small allowed venue list.
+- Use only the active RiseX and Hyperliquid funding adapters by default; other
+  registered venues stay deactivated unless explicitly promoted.
 - Respect `DEACTIVATED_FUNDING_VENUES`.
 - Incompatible active venues are diagnostics/research-only, not paper-eligible candidates.
 - A common 10% price move is telemetry and a fresh-risk warning, not an automatic close.
@@ -37,7 +43,9 @@ Default paper trading uses `synchronized_funding_capture_v2` only.
 
 ## Design Rules From Project History
 
-- Prove one full synchronized funding cycle before expanding scope: scan, watch, focused observations, T-30 entry, T-20 fill deadline, settlement, reconciliation, hold/close, and restart recovery.
+- Prove one full funding capture cycle before expanding scope: scan, watch,
+  focused observations, T-30 entry, T-20 fill deadline, settlement,
+  reconciliation, hold/close, and restart recovery.
 - Do not add a venue to paper eligibility just because it returns data. Promote venues through explicit stages: data-only, research-only, shadow, experimental-ready, then verified paper.
 - Write or confirm the data contract before implementation: funding units, interval, next settlement timestamp, public/final rate source, settlement mark source, symbol identity, collateral, market type, and known failure modes.
 - Treat zero candidates as a diagnostics problem, not permission to weaken gates. Add funnel visibility before relaxing any paper eligibility rule.

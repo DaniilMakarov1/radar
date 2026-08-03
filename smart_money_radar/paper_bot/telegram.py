@@ -61,8 +61,10 @@ def status_report_message(
     monitor_count = int(result.get("hot_route_count") or 0)
     urgent_count = int(result.get("urgent_route_count") or 0)
     qualified_count = len(candidates)
-    active_experimental_count = int(
-        result.get("active_experimental_paper_route_count") or 0
+    active_paper_count = int(
+        result.get("active_paper_route_count")
+        if result.get("active_paper_route_count") is not None
+        else result.get("active_experimental_paper_route_count") or 0
     )
     hidden_detected_count = int(result.get("hidden_detected_route_count") or 0)
     universe_count = int(result.get("universe_route_count") or 0)
@@ -84,7 +86,7 @@ def status_report_message(
             f"Monitor: {monitor_count} | Urgent: {urgent_count}"
         ),
         (
-            f"Active experimental paper: {active_experimental_count} | "
+            f"Paper-ready routes: {active_paper_count} | "
             f"Hidden/blocked: {hidden_detected_count}"
         ),
         (
@@ -501,8 +503,8 @@ def status_route_line(
         "collateral_usdt0_risk": "COLLATERAL RISK",
     }
     badges: list[str] = []
-    if paper_mode in {"EXPERIMENTAL_PAPER"}:
-        badges.append("EXPERIMENTAL PAPER")
+    if paper_mode in {"PAPER", "EXPERIMENTAL_PAPER"}:
+        badges.append("PAPER")
     elif paper_mode in {"EXPERIMENTAL_SIMULATION", "EXPERIMENTAL"}:
         badges.append("SIMULATION READY")
     elif paper_mode in {"VERIFIED_PAPER", "VERIFIED"}:
