@@ -2438,7 +2438,7 @@ def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp
     assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
 
 
-def test_paperbot_v2_closes_after_planned_event_window_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_holds_after_planned_event_window_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -2466,15 +2466,18 @@ def test_paperbot_v2_closes_after_planned_event_window_without_reconciled_prior_
         if outcomes:
             break
 
-    assert all_outcomes == ["closed"]
-    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
-    assert closed["position_id"] == capture_id
+    assert all_outcomes == ["hold"]
+    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
+    assert held["position_id"] == capture_id
     with store.connect() as conn:
         cycles = conn.execute(
             "SELECT cycle_number, state FROM funding_capture_cycles WHERE position_id = ? ORDER BY cycle_number",
             (capture_id,),
         ).fetchall()
-    assert [(row[0], row[1]) for row in cycles] == [(1, "SETTLEMENT_CROSSED")]
+    assert [(row[0], row[1]) for row in cycles] == [
+        (1, "SETTLEMENT_CROSSED"),
+        (2, "HOLDING_NEXT_CYCLE"),
+    ]
     assert all(row["status"] == "PENDING" for row in store.funding_settlement_reconciliation_rows(capture_id))
 
 
@@ -2513,7 +2516,7 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     assert "funding" not in ledger_types
 
 
-def test_paperbot_v2_closes_different_intervals_after_planned_event_window(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_holds_different_intervals_after_planned_event_window(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -2542,9 +2545,9 @@ def test_paperbot_v2_closes_different_intervals_after_planned_event_window(tmp_p
         if outcomes:
             break
 
-    assert all_outcomes == ["closed"]
-    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
-    assert closed["position_id"] == capture_id
+    assert all_outcomes == ["hold"]
+    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
+    assert held["position_id"] == capture_id
 
 
 def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tmp_path, monkeypatch) -> None:
@@ -3084,7 +3087,7 @@ def test_hold_history_insufficient_haircut_no_veto() -> None:
     reliability = evaluate_hold_history_reliability([])
 
     assert reliability.status == "INSUFFICIENT"
-    assert not reliability.gate_passed
+    assert reliability.gate_passed
     assert reliability.history_multiplier == pytest.approx(0.75)
     assert reliability.adjusted_funding(10.0) == pytest.approx(7.5)
     assert reliability.max_extra_cycles_when_insufficient == 1
@@ -4269,6 +4272,50 @@ def test_next_cycle_observation_eligibility() -> None:
     assert result["conservative_funding_gross"] == pytest.approx(0.9 * 5.0)
 
 
+def test_next_cycle_observation_uses_timestamp_latest_not_list_tail() -> None:
+    from smart_money_radar.paper_bot.cycle_manager import next_cycle_observation_decision
+
+    now = datetime(2026, 7, 28, 16, 0, 30, tzinfo=UTC)
+    observations = [
+        {
+            "gross_funding_pnl": 10.0,
+            "observed_at": (now - timedelta(seconds=30 - i * 2)).isoformat(),
+            "cross_venue_skew_seconds": 0.5,
+        }
+        for i in range(15)
+    ]
+    observations[0]["gross_funding_pnl"] = 1.0
+    unsorted_observations = observations[1:] + [observations[0]]
+
+    result = next_cycle_observation_decision(
+        observations=unsorted_observations,
+        now=now,
+    )
+
+    assert result["eligible"], result["reasons"]
+    assert result["latest_gross_funding"] == pytest.approx(10.0)
+    assert result["minimum_gross_funding"] == pytest.approx(1.0)
+
+
+def test_entry_underwriting_uses_timestamp_latest_not_list_tail() -> None:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    observations = [
+        {
+            "gross_funding_pnl": 10.0,
+            "observed_at": (now - timedelta(seconds=30 - i * 2)).isoformat(),
+        }
+        for i in range(15)
+    ]
+    observations[0]["gross_funding_pnl"] = 1.0
+    unsorted_observations = observations[1:] + [observations[0]]
+
+    result = entry_underwriting(unsorted_observations, now=now)
+
+    assert result["eligible"], result["reasons"]
+    assert result["latest_gross_funding"] == pytest.approx(10.0)
+    assert result["minimum_gross_funding"] == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
 # PASS 1: end-to-end runtime defect-fix tests
 # ---------------------------------------------------------------------------
@@ -5038,6 +5085,43 @@ def test_mark_cannot_be_normal_current_executable_close(tmp_path) -> None:
     assert pnl["paper_net_if_exit_now"] is None if "paper_net_if_exit_now" in pnl else True
 
 
+def test_current_executable_pnl_uses_modeled_fee_fallback_without_raw_rates(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, _position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_rows(states={"OPEN"})[0]
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "bids": [[100.0, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "asks": [[100.0, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "orderbook_response_received_at": now.isoformat()},
+        ],
+    }
+
+    pnl = runtime.record_current_executable_pnl(position, route, now)
+
+    assert pnl["decision"] == "recorded"
+    assert pnl["quality"] == "EXECUTABLE_FULL_DEPTH"
+    assert pnl["long_fee_rate"] > 0
+    assert pnl["short_fee_rate"] > 0
+    assert pnl["long_fee_model"]["position_leg_fee_source"] == "route"
+    assert pnl["short_fee_model"]["position_leg_fee_source"] == "route"
+    assert pnl["long_fee_model"]["fee_estimated"] is True
+    assert pnl["short_fee_model"]["fee_estimated"] is True
+
+
 def test_missing_route_is_degraded_and_not_age_zero(tmp_path) -> None:
     from smart_money_radar.funding.trader import PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
@@ -5099,6 +5183,48 @@ def test_direct_basis_risk_denominator_uses_asset_price(tmp_path) -> None:
 
     assert risk["close_reason"] == "basis_deterioration"
     assert risk["dynamic_basis"]["basis_deterioration_bps"] == pytest.approx(104.0)
+
+
+def test_executable_pnl_breach_requires_two_consecutive_strikes(tmp_path) -> None:
+    from smart_money_radar.funding.trader import PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
+
+    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
+    store, position_id = _open_position_for_close_tests(tmp_path, now)
+    position = store.funding_capture_position_by_id(position_id)
+    runtime = SynchronizedFundingRuntimeV2(
+        store=store,
+        config=PaperBotConfig(telegram_enabled=False).validated(),
+        clock=FakeClock(now),
+        observations_by_route={},
+    )
+    route = {
+        "legs": [
+            {"side": "long", "venue": "binance", "symbol": "BTCUSDT",
+             "bids": [[100.02, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT",
+             "asks": [[99.98, 20.0]], "mark_price": 100.0, "index_price": 100.0,
+             "fee_rate": 0.0005, "orderbook_response_received_at": now.isoformat()},
+        ],
+    }
+    pnl = runtime.record_current_executable_pnl(position, route, now)
+    breach_pnl = {**pnl, "paper_net_if_exit_now": -999.0}
+
+    first = runtime.poll_synchronized_position_risk(position, route, breach_pnl, None, now)
+    refreshed = store.funding_capture_position_by_id(position_id)
+    second = runtime.poll_synchronized_position_risk(
+        refreshed,
+        route,
+        breach_pnl,
+        None,
+        now + timedelta(seconds=1),
+    )
+
+    assert first is None
+    assert refreshed["config"]["risk_state"]["executable_pnl_breach"] is True
+    assert second["close_reason"] == "executable_pnl_breach"
 
 
 def test_direct_margin_safety_changes_with_upnl(tmp_path) -> None:

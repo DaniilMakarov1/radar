@@ -450,14 +450,34 @@ def test_close_position_includes_nonzero_confirmed_funding(tmp_path):
             event_type="collateral_reserve", cash_delta=0.0, payload={"amount": 625.0},
         ))
         store.update_funding_paper_account_reserved(v, 625.0)
-    store.upsert_paper_event_ledger(make_ledger_entry(
-        funding_event_key(pid, "binance", SCHEDULED), position_id=pid,
-        cycle_id=f"{pid}:1", venue="binance", event_type="funding", cash_delta=-0.5,
-    ))
-    store.upsert_paper_event_ledger(make_ledger_entry(
-        funding_event_key(pid, "bybit", SCHEDULED), position_id=pid,
-        cycle_id=f"{pid}:1", venue="bybit", event_type="funding", cash_delta=1.0,
-    ))
+    for row in build_settlement_crossing_rows(
+        position_id=pid, cycle_id=f"{pid}:1",
+        long_venue="binance", long_symbol="BTCUSDT",
+        short_venue="bybit", short_symbol="BTCUSDT",
+        scheduled_funding_at=SCHEDULED, quantity=5.0,
+    ):
+        cash_delta = -0.5 if row["venue"] == "binance" else 1.0
+        store.apply_reconciled_funding_effect(
+            {
+                **row,
+                "status": "RATE_AND_MARK_RECONCILED",
+                "confirmed_funding_rate": 0.001,
+                "settlement_mark_price": 100.0,
+                "funding_pnl": cash_delta,
+                "rate_status": "CONFIRMED",
+                "mark_status": "CONFIRMED",
+                "evidence": {"payment_reconciliation_state": "PAYMENT_RECONCILED"},
+            },
+            make_ledger_entry(
+                funding_event_key(pid, row["venue"], SCHEDULED),
+                position_id=pid,
+                cycle_id=f"{pid}:1",
+                venue=row["venue"],
+                event_type="funding",
+                cash_delta=cash_delta,
+                payload={"side": row["side"]},
+            ),
+        )
     config = PaperBotConfig(telegram_enabled=False).validated()
     runtime = SynchronizedFundingRuntimeV2(
         store=store, config=config, clock=FakeClock(now), observations_by_route={},
@@ -486,13 +506,43 @@ def test_confirmed_funding_pnl_excludes_non_funding_events(tmp_path):
         "opened_at": NOW_BEFORE.isoformat(), "paper_open_fees": 0.50,
         "config": {"route_key": "BTC:binance:bybit", "entry_legs": []},
     })
+    store.upsert_funding_capture_cycle({
+        "position_id": pid,
+        "cycle_number": 1,
+        "scheduled_funding_at": SCHEDULED,
+        "state": "SETTLEMENT_CROSSED",
+    })
+    for row in build_settlement_crossing_rows(
+        position_id=pid, cycle_id=f"{pid}:1",
+        long_venue="binance", long_symbol="BTCUSDT",
+        short_venue="bybit", short_symbol="BTCUSDT",
+        scheduled_funding_at=SCHEDULED, quantity=5.0,
+    ):
+        cash_delta = -0.5 if row["venue"] == "binance" else 0.75
+        store.apply_reconciled_funding_effect(
+            {
+                **row,
+                "status": "RATE_AND_MARK_RECONCILED",
+                "confirmed_funding_rate": 0.001,
+                "settlement_mark_price": 100.0,
+                "funding_pnl": cash_delta,
+                "rate_status": "CONFIRMED",
+                "mark_status": "CONFIRMED",
+                "evidence": {"payment_reconciliation_state": "PAYMENT_RECONCILED"},
+            },
+            make_ledger_entry(
+                funding_event_key(pid, row["venue"], SCHEDULED),
+                position_id=pid,
+                cycle_id=f"{pid}:1",
+                venue=row["venue"],
+                event_type="funding",
+                cash_delta=cash_delta,
+                payload={"side": row["side"]},
+            ),
+        )
     store.upsert_paper_event_ledger(make_ledger_entry(
-        funding_event_key(pid, "binance", SCHEDULED), position_id=pid,
-        cycle_id=f"{pid}:1", venue="binance", event_type="funding", cash_delta=-0.5,
-    ))
-    store.upsert_paper_event_ledger(make_ledger_entry(
-        funding_event_key(pid, "bybit", SCHEDULED), position_id=pid,
-        cycle_id=f"{pid}:1", venue="bybit", event_type="funding", cash_delta=0.75,
+        f"funding:{pid}:unreconciled", position_id=pid,
+        cycle_id=f"{pid}:1", venue="binance", event_type="funding", cash_delta=10.0,
     ))
     store.upsert_paper_event_ledger(make_ledger_entry(
         f"order_fee:{pid}:entry:long", position_id=pid,
@@ -561,7 +611,6 @@ def test_paperbot_run_iteration_includes_reconciliation(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "background_full_scan_running", lambda: False)
     monkeypatch.setattr(bot, "maybe_start_background_full_scan", lambda: False)
     monkeypatch.setattr(bot, "_run_lightweight_discovery", lambda: None)
-    monkeypatch.setattr(bot, "run_full_iteration", lambda: {"mode": "fake_full_iteration"})
     monkeypatch.setattr(bot, "process_open_positions", lambda: [])
     monkeypatch.setattr(bot, "process_entry_candidates", lambda *args, **kwargs: [])
     result = bot.run_iteration()
@@ -975,7 +1024,17 @@ def test_open_position_poll_records_current_executable_pnl(tmp_path):
     outcomes = bot.process_synchronized_open_positions()
     assert outcomes == []
     position = store.funding_capture_position_by_id(pid)
-    assert position["paper_net_pnl_estimated"] == pytest.approx(-2.0)
+    snapshot = position["config"]["last_valid_executable_snapshot"]
+    expected_net = (
+        float(snapshot["paper_price_pnl"])
+        + float(snapshot["paper_confirmed_funding_pnl"])
+        - float(snapshot["paper_open_fees"])
+        - float(snapshot["paper_close_fees"])
+        - float(snapshot["paper_emergency_unwind_cost"])
+    )
+    assert position["paper_net_pnl_estimated"] == pytest.approx(expected_net)
+    assert snapshot["long_fee_model"]["fee_estimated"] is True
+    assert snapshot["short_fee_model"]["fee_estimated"] is True
     with store.connect() as connection:
         row = connection.execute(
             """
@@ -987,7 +1046,7 @@ def test_open_position_poll_records_current_executable_pnl(tmp_path):
         ).fetchone()
     assert row is not None
     assert row["phase"] == "current_pnl"
-    assert row["paper_net_if_exit_now"] == pytest.approx(-2.0)
+    assert row["paper_net_if_exit_now"] == pytest.approx(expected_net)
 
 
 def test_no_hardcoded_confirmed_funding_zero_in_runtime():

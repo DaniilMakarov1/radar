@@ -635,10 +635,10 @@ def evaluate_perp_route(
             decision_mode,
         )
         selected_strategy = strategy_evaluation["selected_strategy"]
-        legacy_paper_candidate = not blocking_reasons
         strategy_paper_candidate = bool(
             selected_strategy and selected_strategy.get("eligible")
         )
+        legacy_paper_candidate = not blocking_reasons and strategy_paper_candidate
         status = "paper_candidate" if legacy_paper_candidate else "watch"
     current_depth_score = min(1.0, capacity / max(config.target_notional, 1.0))
     sequence_depth_score = (

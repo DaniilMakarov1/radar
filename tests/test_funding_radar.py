@@ -1048,7 +1048,7 @@ class FundingRadarTest(unittest.TestCase):
             config,
         )
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertEqual(route["long_venue"], "binance")
         self.assertEqual(route["short_venue"], "hyperliquid")
         self.assertAlmostEqual(route["total_fees"], 20.0)
@@ -1371,7 +1371,7 @@ class FundingRadarTest(unittest.TestCase):
             1.25,
         )
 
-    def test_tiny_five_hundred_dollar_profit_is_candidate_with_warning(self) -> None:
+    def test_tiny_five_hundred_dollar_profit_is_watch_with_warning(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
         now = datetime.fromisoformat(observed_at)
         route = evaluate_perp_route(
@@ -1390,7 +1390,7 @@ class FundingRadarTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertEqual(route["target_notional"], 500)
         self.assertGreater(route["expected_net_profit"], 0)
         self.assertLess(
@@ -1403,7 +1403,7 @@ class FundingRadarTest(unittest.TestCase):
             route["evidence"]["advisory_risk_flags"],
         )
 
-    def test_meaningful_five_hundred_dollar_profit_can_be_a_candidate(self) -> None:
+    def test_meaningful_five_hundred_dollar_profit_stays_watch_before_execution(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
         now = datetime.fromisoformat(observed_at)
         route = evaluate_perp_route(
@@ -1422,7 +1422,7 @@ class FundingRadarTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertGreaterEqual(
             route["evidence"]["conservative_net_profit"],
             route["evidence"]["actionable_profit_threshold"],
@@ -1449,7 +1449,7 @@ class FundingRadarTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
         self.assertGreaterEqual(route["target_notional"], 500)
         self.assertLess(route["target_notional"], route["market_capacity"])
         self.assertGreater(len(route["evidence"]["sizing_trials"]), 2)
@@ -2792,7 +2792,7 @@ class FundingRadarTest(unittest.TestCase):
         self.assertGreater(route["evidence"]["conservative_net_profit"], 0)
         self.assertTrue(route["evidence"]["meets_basis_coverage_gate"])
         self.assertGreater(route["evidence"]["basis_stress_net_profit"], 5)
-        self.assertEqual(route["status"], "paper_candidate")
+        self.assertEqual(route["status"], "watch")
 
     def test_crossed_orderbook_fails_closed(self) -> None:
         observed_at = "2026-07-14T12:00:00+00:00"
@@ -5200,8 +5200,8 @@ class FundingRadarTest(unittest.TestCase):
             )
             dashboard = store.funding_dashboard()
 
-        self.assertEqual(first["paper_candidate_count"], 1)
-        self.assertEqual(second["paper_execution_count"], 1)
+        self.assertEqual(first["paper_candidate_count"], 0)
+        self.assertEqual(second["paper_execution_count"], 0)
         self.assertEqual(len(dashboard["routes"]), 1)
         self.assertEqual(dashboard["routes"][0]["canonical_asset"], "BTC")
         self.assertEqual(dashboard["execution_mode"], "paper_only_research")

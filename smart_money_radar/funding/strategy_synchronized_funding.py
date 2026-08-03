@@ -1688,11 +1688,23 @@ def summarize_funding_observations(
     *,
     now: datetime,
 ) -> dict[str, Any]:
-    gross_values = [float(row["gross_funding_pnl"]) for row in observations]
-    observed_times = [
-        parse_time(row.get("observed_at"))
+    timed_observations = [
+        (parse_time(row.get("observed_at")), row)
         for row in observations
-        if parse_time(row.get("observed_at")) is not None
+    ]
+    timed_observations.sort(
+        key=lambda item: (
+            item[0].astimezone(UTC) if item[0] is not None else datetime.min.replace(tzinfo=UTC)
+        )
+    )
+    gross_values = [
+        float(row["gross_funding_pnl"])
+        for _observed_at, row in timed_observations
+    ]
+    observed_times = [
+        observed_at
+        for observed_at, _row in timed_observations
+        if observed_at is not None
     ]
     latest = max(observed_times) if observed_times else None
     earliest = min(observed_times) if observed_times else None
@@ -1701,6 +1713,14 @@ def summarize_funding_observations(
         if latest is not None
         else None
     )
+    latest_gross = 0.0
+    if latest is not None:
+        for observed_at, row in reversed(timed_observations):
+            if observed_at == latest:
+                latest_gross = float(row["gross_funding_pnl"])
+                break
+    elif gross_values:
+        latest_gross = next(reversed(gross_values))
     return {
         "observation_count": len(observations),
         "observation_span_seconds": (
@@ -1711,10 +1731,10 @@ def summarize_funding_observations(
         "latest_observation_age_seconds": latest_age,
         "median_gross_funding": median(gross_values) if gross_values else 0.0,
         "minimum_gross_funding": min(gross_values) if gross_values else 0.0,
-        "latest_gross_funding": gross_values[-1] if gross_values else 0.0,
+        "latest_gross_funding": latest_gross,
         "all_positive": all(value > 0 for value in gross_values),
         "latest_vs_median_ok": (
-            gross_values[-1] >= 0.80 * median(gross_values)
+            latest_gross >= 0.80 * median(gross_values)
             if gross_values
             else False
         ),
@@ -1875,11 +1895,23 @@ def entry_underwriting(
         reasons.append(
             f"insufficient_observations_{len(observations)}<{minimum_observations}"
         )
-    gross_values = [float(row.get("gross_funding_pnl") or 0.0) for row in observations]
-    observed_times = [
-        parse_time(row.get("observed_at"))
+    timed_observations = [
+        (parse_time(row.get("observed_at")), row)
         for row in observations
-        if parse_time(row.get("observed_at")) is not None
+    ]
+    timed_observations.sort(
+        key=lambda item: (
+            item[0].astimezone(UTC) if item[0] is not None else datetime.min.replace(tzinfo=UTC)
+        )
+    )
+    gross_values = [
+        float(row.get("gross_funding_pnl") or 0.0)
+        for _observed_at, row in timed_observations
+    ]
+    observed_times = [
+        observed_at
+        for observed_at, _row in timed_observations
+        if observed_at is not None
     ]
     latest = max(observed_times) if observed_times else None
     earliest = min(observed_times) if observed_times else None
@@ -1905,7 +1937,14 @@ def entry_underwriting(
     if gross_values and not all(value > 0 for value in gross_values):
         reasons.append("not_all_gross_funding_positive")
     median_gross = median(gross_values) if gross_values else 0.0
-    latest_gross = gross_values[-1] if gross_values else 0.0
+    latest_gross = 0.0
+    if latest is not None:
+        for observed_at, row in reversed(timed_observations):
+            if observed_at == latest:
+                latest_gross = float(row.get("gross_funding_pnl") or 0.0)
+                break
+    elif gross_values:
+        latest_gross = next(reversed(gross_values))
     if gross_values and latest_gross < latest_vs_median_fraction * median_gross:
         reasons.append(
             f"latest_gross_{latest_gross:.4f}_below_{latest_vs_median_fraction}*median_{median_gross:.4f}"

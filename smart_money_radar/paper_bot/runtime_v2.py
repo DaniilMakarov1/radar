@@ -216,6 +216,53 @@ def _leg_fee_rate(leg: dict[str, Any]) -> float:
     return float(modeled.get("fee_rate") or 0.0)
 
 
+def _compact_fee_model(model: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: model.get(key)
+        for key in (
+            "fee_rate",
+            "fee_estimated",
+            "fee_source",
+            "fee_reserve_bps",
+            "fee_not_verified",
+            "verified",
+            "source_rate",
+            "venue_default_rate",
+            "global_fallback_rate",
+            "uncertainty_reserve_bps",
+            "risk_flags",
+            "assumptions",
+        )
+        if key in model
+    }
+
+
+def _position_leg_fee_model(
+    route_leg: dict[str, Any],
+    entry_leg: dict[str, Any],
+    *,
+    now: datetime,
+) -> tuple[float | None, dict[str, Any]]:
+    for source, leg in (("route", route_leg), ("entry", entry_leg)):
+        if not leg:
+            continue
+        if not (
+            leg.get("venue")
+            or leg.get("symbol")
+            or leg.get("fee_rate") is not None
+            or leg.get("taker_fee_rate") is not None
+        ):
+            continue
+        model = _compact_fee_model(modeled_fee_rate(leg, now=now))
+        rate = optional_float(model.get("fee_rate"))
+        if rate is not None:
+            model["position_leg_fee_source"] = source
+            model["venue"] = leg.get("venue")
+            model["symbol"] = leg.get("symbol")
+            return float(rate), model
+    return None, {"reason": "fee_context_missing"}
+
+
 def _synthetic_levels(price: float, quantity: float) -> list[list[float]]:
     if price <= 0 or quantity <= 0:
         return []
@@ -723,10 +770,13 @@ class SynchronizedFundingRuntimeV2:
         PUBLIC_RATE_CONFIRMED, expected/provisional funding.
         """
         total = 0.0
-        for row in self.store.paper_event_ledger_rows(position_id):
-            if str(row.get("event_type") or "") != "funding":
+        for row in self.store.funding_settlement_reconciliation_rows(position_id):
+            if str(row.get("status") or "") != "RATE_AND_MARK_RECONCILED":
                 continue
-            total += float(row.get("cash_delta") or 0.0)
+            validation = self._validate_reconciliation_financial_effect(row)
+            if not validation.get("ready"):
+                continue
+            total += float(row.get("funding_pnl") or 0.0)
         return total
 
     def recover_reconciled_funding_effects(self, now: datetime) -> dict[str, Any]:
@@ -1529,26 +1579,24 @@ class SynchronizedFundingRuntimeV2:
                 "reason": "entry_fill_price_missing",
                 "risk_state": "DEGRADED",
             }
-        long_fee_source = optional_float(long_route_leg.get("fee_rate"))
-        if long_fee_source is None:
-            long_fee_source = optional_float(long_route_leg.get("taker_fee_rate"))
-        if long_fee_source is None:
-            long_fee_source = optional_float(long_entry_leg.get("fee_rate"))
-        if long_fee_source is None:
-            long_fee_source = optional_float(long_entry_leg.get("taker_fee_rate"))
-        short_fee_source = optional_float(short_route_leg.get("fee_rate"))
-        if short_fee_source is None:
-            short_fee_source = optional_float(short_route_leg.get("taker_fee_rate"))
-        if short_fee_source is None:
-            short_fee_source = optional_float(short_entry_leg.get("fee_rate"))
-        if short_fee_source is None:
-            short_fee_source = optional_float(short_entry_leg.get("taker_fee_rate"))
+        long_fee_source, long_fee_model = _position_leg_fee_model(
+            long_route_leg,
+            long_entry_leg,
+            now=now,
+        )
+        short_fee_source, short_fee_model = _position_leg_fee_model(
+            short_route_leg,
+            short_entry_leg,
+            now=now,
+        )
         if long_fee_source is None or short_fee_source is None:
             return {
                 **base,
                 "quality": "INVALID_MISSING_FEE",
                 "reason": "fee_rate_missing",
                 "risk_state": "DEGRADED",
+                "long_fee_model": long_fee_model,
+                "short_fee_model": short_fee_model,
             }
         long_levels = long_route_leg.get("bids") or []
         short_levels = short_route_leg.get("asks") or []
@@ -1603,6 +1651,8 @@ class SynchronizedFundingRuntimeV2:
             "short_fill_ratio": short_ratio,
             "long_fee_rate": float(long_fee_source),
             "short_fee_rate": float(short_fee_source),
+            "long_fee_model": long_fee_model,
+            "short_fee_model": short_fee_model,
         }
 
     def _ledger_cash_sum(
@@ -4538,13 +4588,30 @@ class SynchronizedFundingRuntimeV2:
         self.store.update_funding_capture_position_state(position_id, "EXIT_SUBMITTED", now)
         long_exit = simulate_marketable_ioc(long_levels, "sell", quantity, EXECUTION_HAIRCUT_FRACTION)
         short_exit = simulate_marketable_ioc(short_levels, "buy", quantity, EXECUTION_HAIRCUT_FRACTION)
-        long_fee_rate = _leg_fee_rate(long_route_leg) or _leg_fee_rate(long_entry_leg)
-        short_fee_rate = _leg_fee_rate(short_route_leg) or _leg_fee_rate(short_entry_leg)
+        long_fee_model_rate, _long_fee_model = _position_leg_fee_model(
+            long_route_leg,
+            long_entry_leg,
+            now=now,
+        )
+        short_fee_model_rate, _short_fee_model = _position_leg_fee_model(
+            short_route_leg,
+            short_entry_leg,
+            now=now,
+        )
+        long_fee_rate = float(
+            long_fee_model_rate
+            if long_fee_model_rate is not None
+            else (_leg_fee_rate(long_route_leg) or _leg_fee_rate(long_entry_leg))
+        )
+        short_fee_rate = float(
+            short_fee_model_rate
+            if short_fee_model_rate is not None
+            else (_leg_fee_rate(short_route_leg) or _leg_fee_rate(short_entry_leg))
+        )
         long_fee = long_exit["notional"] * long_fee_rate
         short_fee = short_exit["notional"] * short_fee_rate
         submitted_at = now + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
-        close_fees_by_side: dict[str, float] = {"long": long_fee, "short": short_fee}
         close_notional_by_side: dict[str, float] = {
             "long": float(long_exit["notional"] or 0.0),
             "short": float(short_exit["notional"] or 0.0),
@@ -4716,7 +4783,6 @@ class SynchronizedFundingRuntimeV2:
                     },
                 )
             )
-            close_fees_by_side[side] += residual_fee
             close_notional_by_side[side] += residual_notional
             closed_quantity_by_side[side] += residual_qty
             residual_diagnostics.append({"side": side, **diagnostic, "residual_quantity": residual_qty})
@@ -4735,39 +4801,31 @@ class SynchronizedFundingRuntimeV2:
                 "target_quantity": quantity,
             }
 
-        long_exit_avg = close_notional_by_side["long"] / closed_quantity_by_side["long"]
-        short_exit_avg = close_notional_by_side["short"] / closed_quantity_by_side["short"]
-        long_price_pnl = quantity * (long_exit_avg - long_entry_price)
-        short_price_pnl = quantity * (short_entry_price - short_exit_avg)
-        price_pnl = long_price_pnl + short_price_pnl
         confirmed_funding_pnl = self.confirmed_funding_pnl_for_position(position_id)
         open_fees = float(position.get("paper_open_fees") or 0.0)
-        close_fees = close_fees_by_side["long"] + close_fees_by_side["short"]
         emergency_cost = float(position.get("paper_emergency_unwind_cost") or 0.0)
-        paper_net_if_exit_now = (
-            price_pnl
-            + confirmed_funding_pnl
-            - open_fees
-            - close_fees
-            - emergency_cost
+        long_exit_avg = close_notional_by_side["long"] / closed_quantity_by_side["long"]
+        short_exit_avg = close_notional_by_side["short"] / closed_quantity_by_side["short"]
+        pnl = executable_paper_pnl(
+            quantity=quantity,
+            long_entry_price=long_entry_price,
+            long_exit_price=long_exit_avg,
+            short_entry_price=short_entry_price,
+            short_exit_price=short_exit_avg,
+            long_taker_fee=long_fee_rate,
+            short_taker_fee=short_fee_rate,
+            confirmed_funding_pnl=confirmed_funding_pnl,
+            paper_open_fees=open_fees,
+            emergency_unwind_costs_already_incurred=emergency_cost,
         )
-        pnl = {
-            "paper_long_price_pnl": long_price_pnl,
-            "paper_short_price_pnl": short_price_pnl,
-            "paper_price_pnl": price_pnl,
-            "paper_close_fees": close_fees,
-            "paper_confirmed_funding_pnl": confirmed_funding_pnl,
-            "paper_open_fees": open_fees,
-            "paper_emergency_unwind_cost": emergency_cost,
-            "paper_net_if_exit_now": paper_net_if_exit_now,
-        }
+        close_fees = float(pnl["paper_close_fees"])
         self._record_price_pnl_entries(
             position_id=position_id,
             cycle_id=cycle_id,
             long_venue=str((long_route_leg or long_entry_leg).get("venue") or ""),
             short_venue=str((short_route_leg or short_entry_leg).get("venue") or ""),
-            long_price_pnl=long_price_pnl,
-            short_price_pnl=short_price_pnl,
+            long_price_pnl=float(pnl["paper_long_price_pnl"]),
+            short_price_pnl=float(pnl["paper_short_price_pnl"]),
             attempt_id=attempt_id,
             payload={
                 "reason": reason,
