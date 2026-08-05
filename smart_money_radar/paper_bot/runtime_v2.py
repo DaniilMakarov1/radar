@@ -27,7 +27,6 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
     SUPPORTED_CAPTURE_STRATEGIES,
     entry_underwriting,
     gross_funding_pnl,
-    hold_economics,
     initial_entry_economics,
     parse_time,
     route_plan_strategy_name,
@@ -43,13 +42,6 @@ from smart_money_radar.paper_bot.accounting import (
     make_ledger_entry,
     order_fee_event_key,
     price_pnl_event_key,
-)
-from smart_money_radar.paper_bot.cycle_manager import (
-    evaluate_hold_history_reliability,
-    next_cycle_observation_decision,
-    next_cycle_schedule_decision,
-    post_settlement_probe_decision,
-    wait_bucket_for_seconds,
 )
 from smart_money_radar.paper_bot.execution import (
     EXECUTION_HAIRCUT_FRACTION,
@@ -71,26 +63,16 @@ from smart_money_radar.paper_bot.settlement import (
     realized_public_funding_rate,
 )
 from smart_money_radar.storage import (
+    CURRENT_NONFLAT_CAPTURE_STATES,
     FUNDING_CAPTURE_OPEN_EXPOSURE_STATES,
+    LEGACY_NONFLAT_CAPTURE_STATES,
     SQLiteStore,
 )
 
 OBSERVATION_MIN_COUNT = 10
 OBSERVATION_MIN_SPAN_SECONDS = 20.0
 ENTRY_OBSERVATION_TTL_SECONDS = 900.0
-POST_SETTLEMENT_NORMAL_EXIT_DELAY_SECONDS = 20.0
-POST_SETTLEMENT_HOLD_DECISION_SECONDS = 30.0
-POST_SETTLEMENT_PROBE_START_SECONDS = 5.0
-POST_SETTLEMENT_PROBE_END_SECONDS = 15.0
 POST_SETTLEMENT_CLOSE_AT_T20_SECONDS = 20.0
-POST_SETTLEMENT_EVALUATION_START_SECONDS = 5.0
-
-
-def schedule_seconds_to_next(probe_decision: dict[str, Any], now: datetime) -> float | None:
-    next_at = parse_time(probe_decision.get("next_cycle_at"))
-    if next_at is None:
-        return None
-    return max(0.0, (next_at.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
 
 
 def synchronized_runtime_enabled(config: Any) -> bool:
@@ -360,14 +342,14 @@ def build_focused_observation(
     targeted_refresh = evidence.get("targeted_refresh") or {}
     capabilities_passed = (
         bool(evidence.get("synchronized_capability_passed"))
-        or (phase == "hold" and targeted_refresh.get("quality") == "FRESH")
+        or (phase == "exit" and targeted_refresh.get("quality") == "FRESH")
     ) and not capability_reasons
     long_open = optional_float(long_leg.get("open_vwap")) or optional_float(long_leg.get("vwap"))
     short_open = optional_float(short_leg.get("open_vwap")) or optional_float(short_leg.get("vwap"))
     long_close = optional_float(long_leg.get("close_vwap")) or optional_float(long_leg.get("best_bid"))
     short_close = optional_float(short_leg.get("close_vwap")) or optional_float(short_leg.get("best_ask"))
-    long_book_executable = long_close is not None if phase == "hold" else long_open is not None and long_close is not None
-    short_book_executable = short_close is not None if phase == "hold" else short_open is not None and short_close is not None
+    long_book_executable = long_close is not None if phase == "exit" else long_open is not None and long_close is not None
+    short_book_executable = short_close is not None if phase == "exit" else short_open is not None and short_close is not None
     raw = {
         "phase": phase,
         "observed_at": now.astimezone(UTC).isoformat(),
@@ -444,12 +426,6 @@ class SynchronizedFundingRuntimeV2:
         )
         self.planner = planner or FundingSettlementPlanner(
             EventWindowPlannerConfig(
-                max_strategy_hold_seconds=float(
-                    getattr(config, "max_strategy_hold_seconds", 180.0)
-                ),
-                max_gap_between_settlements_seconds=float(
-                    getattr(config, "max_gap_between_settlements_seconds", 180.0)
-                ),
                 entry_safety_buffer_seconds=float(
                     getattr(config, "entry_safety_buffer_seconds", 30.0)
                 ),
@@ -977,15 +953,13 @@ class SynchronizedFundingRuntimeV2:
                 reconciliation_status="RECONCILIATION_EFFECT_MISMATCH",
             )
         position = self.store.funding_capture_position_by_id(position_id) or {}
-        if str(position.get("state") or "") == "CLOSED_PENDING_RECONCILIATION":
+        if str(position.get("state") or "") in {"CLOSED", "CLOSED_PENDING_RECONCILIATION"}:
             config = dict(position.get("config") or {})
-            config["lifecycle_state"] = "CLOSED_REQUIRES_REVIEW"
+            config["lifecycle_state"] = "CLOSED"
+            config["integrity"] = "REQUIRES_REVIEW"
+            config["reconciliation_state"] = "RECONCILIATION_EFFECT_MISMATCH"
             config["requires_review"] = True
             config["blocker"] = "reconciliation_effect_mismatch"
-            self.store.update_funding_capture_position_state(
-                position_id,
-                "CLOSED_REQUIRES_REVIEW",
-            )
             self.store.update_funding_capture_position_config(position_id, config)
 
     def process_pending_reconciliations(self, now: datetime) -> dict[str, Any]:
@@ -1362,7 +1336,7 @@ class SynchronizedFundingRuntimeV2:
         if position is None:
             return
         state = str(position.get("state") or "")
-        if state not in ("CLOSED_PENDING_RECONCILIATION",):
+        if state not in ("CLOSED", "CLOSED_PENDING_RECONCILIATION"):
             return
         cycles = self.store.funding_capture_cycles_for_position(position_id)
         if not cycles:
@@ -1385,9 +1359,9 @@ class SynchronizedFundingRuntimeV2:
             str(c.get("state") or "") == "UNRECONCILED" for c in captured_cycles
         )
         if has_unreconciled:
-            self.store.update_funding_capture_position_state(
-                position_id, "UNRECONCILED",
-            )
+            config = dict(position.get("config") or {})
+            config["reconciliation_state"] = "UNRECONCILED"
+            self.store.update_funding_capture_position_config(position_id, config)
             return
         total_reconciled_funding = sum(
             float(c.get("reconciled_funding_pnl") or 0.0) for c in captured_cycles
@@ -1399,8 +1373,12 @@ class SynchronizedFundingRuntimeV2:
             if str(ledger_row.get("event_type") or "") == "price_pnl":
                 price_pnl += float(ledger_row.get("cash_delta") or 0.0)
         reconciled_net = price_pnl + total_reconciled_funding - total_fees - emergency_cost
+        config = dict(position.get("config") or {})
+        config["reconciliation_state"] = "RECONCILED"
+        self.store.update_funding_capture_position_config(position_id, config)
         self.store.update_funding_capture_position_state(
-            position_id, "RECONCILED",
+            position_id,
+            "CLOSED",
             paper_net_pnl_reconciled=reconciled_net,
         )
 
@@ -2267,7 +2245,7 @@ class SynchronizedFundingRuntimeV2:
             return {"allowed": True}
         state = str(existing.get("state") or "")
         config = existing.get("config") or {}
-        if state in {"OPEN", "HOLDING_NEXT_CYCLE", "SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION"}:
+        if state in FUNDING_CAPTURE_OPEN_EXPOSURE_STATES:
             return {"allowed": False, "reason": "opportunity_already_open", "position_id": capture_id}
         if config.get("entry_attempt_submitted"):
             return {
@@ -2280,6 +2258,7 @@ class SynchronizedFundingRuntimeV2:
         if state in {
             "FAILED",
             "REJECTED_AFTER_SUBMISSION",
+            "CLOSED",
             "CLOSED_PENDING_RECONCILIATION",
             "CLOSED_REQUIRES_REVIEW",
             "RECONCILED",
@@ -2345,13 +2324,164 @@ class SynchronizedFundingRuntimeV2:
         config["entry_attempts"] = attempts
         self.store.update_funding_capture_position_config(capture_id, config, now)
 
+    def _first_crossed_boundary_for_position(
+        self,
+        position: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        position_id = str(position["position_id"])
+        now_utc = now.astimezone(UTC)
+        crossed_states = {
+            "SETTLEMENT_CROSSED",
+            "PUBLIC_RATE_CONFIRMED",
+            "RATE_AND_MARK_RECONCILED",
+            "RECONCILED",
+            "UNRECONCILED",
+        }
+        legacy_position_state = str(position.get("state") or "")
+        candidates: list[dict[str, Any]] = []
+        for cycle in self.store.funding_capture_cycles_for_position(position_id):
+            scheduled = parse_time(cycle.get("scheduled_funding_at"))
+            if scheduled is None:
+                continue
+            scheduled_utc = scheduled.astimezone(UTC)
+            crossed_at = parse_time(cycle.get("settlement_crossed_at"))
+            cycle_state = str(cycle.get("state") or "")
+            crossed_like = (
+                crossed_at is not None
+                or cycle_state in crossed_states
+                or (
+                    legacy_position_state in LEGACY_NONFLAT_CAPTURE_STATES
+                    and scheduled_utc <= now_utc
+                )
+            )
+            if not crossed_like:
+                continue
+            candidates.append(
+                {
+                    "cycle_id": str(cycle.get("cycle_id") or ""),
+                    "cycle_number": int(cycle.get("cycle_number") or 0),
+                    "scheduled_at": scheduled_utc.isoformat(),
+                    "crossed_at": (
+                        crossed_at.astimezone(UTC).isoformat()
+                        if crossed_at is not None
+                        else scheduled_utc.isoformat()
+                    ),
+                    "cycle_state": cycle_state,
+                    "source": "funding_capture_cycles",
+                }
+            )
+        if candidates:
+            return sorted(candidates, key=lambda item: item["scheduled_at"])[0]
+
+        config = position.get("config") or {}
+        for key in ("first_planned_boundary_at", "boundary_crossed_at"):
+            value = parse_time(config.get(key))
+            if value is None:
+                continue
+            return {
+                "cycle_id": str(position.get("current_cycle_id") or ""),
+                "cycle_number": int(position.get("current_cycle_number") or 0),
+                "scheduled_at": value.astimezone(UTC).isoformat(),
+                "crossed_at": (
+                    parse_time(config.get("boundary_crossed_at")) or value
+                ).astimezone(UTC).isoformat(),
+                "cycle_state": str(position.get("current_cycle_state") or ""),
+                "source": f"position_config.{key}",
+            }
+        return None
+
+    def _legacy_exit_mode(
+        self,
+        *,
+        original_state: str,
+        config: dict[str, Any],
+    ) -> str:
+        risk_text = " ".join(
+            str(config.get(key) or "")
+            for key in (
+                "exit_mode",
+                "close_reason",
+                "close_requires_review_reason",
+                "blocker",
+                "risk_close_reason",
+            )
+        ).lower()
+        if original_state == "EMERGENCY_UNWIND" or "hard" in risk_text or "risk" in risk_text:
+            return "EMERGENCY"
+        return "MANDATORY"
+
+    def normalize_legacy_nonflat_positions(self, now: datetime) -> dict[str, Any]:
+        normalized = 0
+        unknown_boundary = 0
+        states_seen: dict[str, int] = {}
+        for position in self.store.funding_capture_position_rows(
+            states=set(LEGACY_NONFLAT_CAPTURE_STATES)
+        ):
+            position_id = str(position["position_id"])
+            original_state = str(position.get("state") or "")
+            states_seen[original_state] = states_seen.get(original_state, 0) + 1
+            config = dict(position.get("config") or {})
+            boundary = self._first_crossed_boundary_for_position(position, now)
+            exit_mode = self._legacy_exit_mode(
+                original_state=original_state,
+                config=config,
+            )
+            event = {
+                "event": "legacy_nonflat_position_normalized",
+                "position_id": position_id,
+                "original_legacy_state": original_state,
+                "normalized_state": "EXITING",
+                "detected_at": now.astimezone(UTC).isoformat(),
+                "exit_mode": exit_mode,
+                "current_nonflat_states": sorted(CURRENT_NONFLAT_CAPTURE_STATES),
+                "legacy_nonflat_states": sorted(LEGACY_NONFLAT_CAPTURE_STATES),
+            }
+            if boundary is not None:
+                event["selected_boundary"] = boundary
+                config["first_planned_boundary_at"] = boundary["scheduled_at"]
+                config["boundary_crossed_at"] = (
+                    config.get("boundary_crossed_at") or boundary["crossed_at"]
+                )
+                config["legacy_recovery_boundary_source"] = boundary["source"]
+                config["legacy_recovery_boundary_cycle_id"] = boundary["cycle_id"]
+            else:
+                unknown_boundary += 1
+                event["selected_boundary"] = "UNKNOWN"
+                config["integrity"] = "REQUIRES_REVIEW"
+                config["legacy_recovery_boundary_source"] = "UNKNOWN"
+            config["original_legacy_state"] = (
+                config.get("original_legacy_state") or original_state
+            )
+            config["legacy_nonflat_recovery"] = event
+            events = list(config.get("legacy_nonflat_recovery_events") or [])
+            events.append(event)
+            config["legacy_nonflat_recovery_events"] = events[-10:]
+            config["exit_mode"] = exit_mode
+            try:
+                state_version = int(config.get("state_version") or 1)
+            except (TypeError, ValueError):
+                state_version = 1
+            config["state_version"] = state_version
+            config["mandatory_exit_after_first_boundary"] = exit_mode == "MANDATORY"
+            self.store.update_funding_capture_position_config(position_id, config, now)
+            self.store.update_funding_capture_position_state(position_id, "EXITING", now)
+            normalized += 1
+        return {
+            "normalized": normalized,
+            "unknown_boundary": unknown_boundary,
+            "states_seen": states_seen,
+        }
+
     def recover_runtime_state(self, now: datetime) -> dict[str, Any]:
         boundary = self.store.repair_funding_capture_boundary_consistency(now=now)
+        legacy_nonflat = self.normalize_legacy_nonflat_positions(now)
         entry = self.recover_stale_entry_submissions(now)
         reconciliation = self.recover_reconciled_funding_effects(now)
         accounts = self.store.repair_paper_account_consistency()
         return {
             "boundary": boundary,
+            "legacy_nonflat": legacy_nonflat,
             "entry_submitted": entry,
             "reconciliation": reconciliation,
             "accounts": accounts,
@@ -2365,22 +2495,13 @@ class SynchronizedFundingRuntimeV2:
         terminal_states = {
             "FAILED",
             "REJECTED_AFTER_SUBMISSION",
+            "CLOSED",
             "CLOSED_PENDING_RECONCILIATION",
             "CLOSED_REQUIRES_REVIEW",
             "RECONCILED",
             "UNRECONCILED",
         }
-        live_states = {
-            "OPEN",
-            "HOLDING_NEXT_CYCLE",
-            "SETTLEMENT_CROSSED",
-            "POST_SETTLEMENT_EVALUATION",
-            "EXIT_SCHEDULED",
-            "EXIT_SUBMITTED",
-            "PARTIALLY_CLOSED",
-            "EMERGENCY_UNWIND",
-            "SETTLEMENT_PLAN_MISMATCH",
-        }
+        live_states = set(FUNDING_CAPTURE_OPEN_EXPOSURE_STATES)
         candidates: list[dict[str, Any]] = []
         for position in self.store.funding_capture_position_rows():
             state = str(position.get("state") or "")
@@ -3559,7 +3680,7 @@ class SynchronizedFundingRuntimeV2:
         short_adverse_impact_usd = max(0.0, short_unwind_qty * (short_exit_price - short_entry_price))
         adverse_impact_usd = long_adverse_impact_usd + short_adverse_impact_usd
         emergency_cost = 0.0
-        self.store.update_funding_capture_position_state(capture_id, "EMERGENCY_UNWIND", now)
+        self.store.update_funding_capture_position_state(capture_id, "EXITING", now)
         submitted_at = now + timedelta(milliseconds=750)
         filled_at = submitted_at + timedelta(milliseconds=750)
         for side, leg, qty, price, fee in (
@@ -3808,42 +3929,6 @@ class SynchronizedFundingRuntimeV2:
                 }
             )
 
-    def collect_hold_observation(
-        self,
-        position: dict[str, Any],
-        route: dict[str, Any],
-        now: datetime,
-    ) -> dict[str, Any]:
-        position_id = str(position["position_id"])
-        cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
-        scheduled = parse_time(position.get("current_cycle_scheduled_funding_at")) or now
-        observation = build_focused_observation(
-            route,
-            now=now,
-            phase="hold",
-            max_age_seconds=float(
-                getattr(
-                    self.config,
-                    "focused_observation_age_target_seconds",
-                    10.0,
-                )
-            ),
-            max_response_skew_seconds=self._entry_snapshot_skew_seconds(),
-        )
-        self._store_observation(
-            route,
-            position_id,
-            scheduled,
-            observation,
-            phase="hold",
-            cycle_id=cycle_id,
-        )
-        return observation
-
-    def _probe_state(self, position: dict[str, Any]) -> dict[str, Any]:
-        config = dict(position.get("config") or {})
-        return dict(config.get("post_settlement_probes") or {})
-
     def _missing_required_route_data(self, route: dict[str, Any]) -> list[str]:
         legs = route.get("legs") or []
         long_leg = leg_by_side(legs, "long") or {}
@@ -3870,651 +3955,80 @@ class SynchronizedFundingRuntimeV2:
                 missing.append(f"{side}_normalized_next_funding_rate_missing")
         return missing
 
-    def _save_probe_state(
-        self,
-        position: dict[str, Any],
-        probe_state: dict[str, Any],
-    ) -> None:
-        position_id = str(position["position_id"])
-        config = dict(position.get("config") or {})
-        config["post_settlement_probes"] = probe_state
-        position["config"] = config
-        self.store.update_funding_capture_position_config(position_id, config)
-
-    def _record_schedule_probe(
-        self,
-        position: dict[str, Any],
-        route: dict[str, Any],
-        now: datetime,
-    ) -> dict[str, Any]:
-        legs = route.get("legs") or []
-        long_leg = leg_by_side(legs, "long") or {}
-        short_leg = leg_by_side(legs, "short") or {}
-        long_response = _leg_response_time(long_leg)
-        short_response = _leg_response_time(short_leg)
-        now_utc = now.astimezone(UTC)
-        long_age = (
-            (now_utc - long_response).total_seconds()
-            if long_response is not None
-            else math.inf
-        )
-        short_age = (
-            (now_utc - short_response).total_seconds()
-            if short_response is not None
-            else math.inf
-        )
-        cross_skew = (
-            abs((long_response - short_response).total_seconds())
-            if long_response is not None and short_response is not None
-            else math.inf
-        )
-        long_next = parse_time(long_leg.get("next_funding_at"))
-        short_next = parse_time(short_leg.get("next_funding_at"))
-        next_funding_skew_seconds = (
-            abs((long_next.astimezone(UTC) - short_next.astimezone(UTC)).total_seconds())
-            if long_next is not None and short_next is not None
-            else None
-        )
-        targeted = (route.get("evidence") or {}).get("targeted_refresh") or {}
-        snapshot_id = targeted.get("snapshot_id")
-        long_rate_ready = optional_float(long_leg.get("normalized_next_funding_rate")) is not None
-        short_rate_ready = optional_float(short_leg.get("normalized_next_funding_rate")) is not None
-        if self.estimate_paper_enabled:
-            long_rate_ready = long_rate_ready or optional_float(long_leg.get("rate_estimate_per_settlement")) is not None
-            short_rate_ready = short_rate_ready or optional_float(short_leg.get("rate_estimate_per_settlement")) is not None
-        max_focused_age_seconds = float(
-            getattr(self.config, "focused_observation_age_target_seconds", 10.0)
-        )
-        fresh = (
-            long_age <= max_focused_age_seconds
-            and short_age <= max_focused_age_seconds
-            and cross_skew <= self._entry_snapshot_skew_seconds()
-            and long_rate_ready
-            and short_rate_ready
-            and targeted.get("quality") == "FRESH"
-            and bool(snapshot_id)
-        )
-        probe = {
-            "observed_at": now.astimezone(UTC).isoformat(),
-            "long_next_funding_at": long_leg.get("next_funding_at"),
-            "short_next_funding_at": short_leg.get("next_funding_at"),
-            "next_funding_skew_seconds": next_funding_skew_seconds,
-            "fresh": fresh,
-            "long_response_age_seconds": long_age,
-            "short_response_age_seconds": short_age,
-            "cross_venue_skew_seconds": cross_skew,
-            "route_snapshot_id": snapshot_id,
-            "invalid_reason": None
-            if fresh
-            else "schedule_probe_not_fresh_targeted_snapshot",
-        }
-        probe_state = self._probe_state(position)
-        probes = list(probe_state.get("probes") or [])
-        probes.append(probe)
-        if len(probes) > 30:
-            probes = probes[-30:]
-        probe_state["probes"] = probes
-        probe_state["latest_probe_at"] = now.astimezone(UTC).isoformat()
-        if not probe_state.get("first_probe_at"):
-            probe_state["first_probe_at"] = now.astimezone(UTC).isoformat()
-        self._save_probe_state(position, probe_state)
-        return probe_state
-
-    def _route_collateral_asset(self, position: dict[str, Any], route: dict[str, Any] | None) -> str:
-        candidates: list[str] = []
-        for leg in (route or {}).get("legs") or []:
-            if leg.get("collateral_asset"):
-                candidates.append(str(leg.get("collateral_asset")).upper())
-        config = position.get("config") or {}
-        if config.get("collateral_asset"):
-            candidates.append(str(config.get("collateral_asset")).upper())
-        for leg in config.get("entry_legs") or []:
-            if leg.get("collateral_asset"):
-                candidates.append(str(leg.get("collateral_asset")).upper())
-        unique = {value for value in candidates if value}
-        if len(unique) == 1:
-            return next(iter(unique))
-        return "UNKNOWN"
-
-    def _hold_history_reliability(
-        self,
-        *,
-        position: dict[str, Any],
-        route: dict[str, Any],
-        now: datetime,
-        wait_seconds: float,
-    ) -> dict[str, Any]:
-        since = (
-            now.astimezone(UTC)
-            - timedelta(days=int(getattr(self.config, "hold_history_window_days", 30)))
-        ).isoformat()
-        collateral = self._route_collateral_asset(position, route)
-        history_rows = self.store.reconciled_funding_capture_hold_cycles(
-            canonical_asset=str(position.get("canonical_asset") or route.get("canonical_asset") or ""),
-            long_venue=str(position.get("long_venue") or route.get("long_venue") or ""),
-            short_venue=str(position.get("short_venue") or route.get("short_venue") or ""),
-            collateral_asset=collateral,
-            wait_bucket=wait_bucket_for_seconds(wait_seconds),
-            since=since,
-            exclude_position_id=str(position.get("position_id") or ""),
-            limit=int(getattr(self.config, "hold_history_max_cycles", 20)),
-        )
-        reliability = evaluate_hold_history_reliability(
-            history_rows,
-            min_cycles_for_gate=int(getattr(self.config, "hold_history_min_cycles_for_gate", 8)),
-            insufficient_multiplier=float(getattr(self.config, "hold_history_insufficient_multiplier", 0.75)),
-            min_positive_realization_rate=float(
-                getattr(self.config, "hold_history_min_positive_realization_rate", 0.70)
-            ),
-            min_p25_realization_ratio=float(
-                getattr(self.config, "hold_history_min_p25_realization_ratio", 0.50)
-            ),
-            max_extra_cycles_when_insufficient=int(
-                getattr(self.config, "hold_history_max_extra_cycles_when_insufficient", 1)
-            ),
-        )
-        return {
-            **reliability.as_dict(),
-            "collateral_asset": collateral,
-            "wait_bucket": wait_bucket_for_seconds(wait_seconds),
-        }
-
-    def _adverse_basis_changes_from_observations(
-        self,
-        observations: list[dict[str, Any]],
-        *,
-        window_seconds: float = 30.0,
-    ) -> list[float]:
-        dated: list[tuple[datetime, float, float]] = []
-        for row in observations:
-            observed_at = parse_time(row.get("observed_at"))
-            spread = optional_float(row.get("current_exit_spread"))
-            long_mark = optional_float(row.get("long_mark"))
-            short_mark = optional_float(row.get("short_mark"))
-            if (
-                observed_at is None
-                or spread is None
-                or long_mark is None
-                or short_mark is None
-                or long_mark <= 0
-                or short_mark <= 0
-            ):
-                continue
-            reference = (float(long_mark) + float(short_mark)) / 2.0
-            dated.append((observed_at.astimezone(UTC), float(spread), reference))
-        dated.sort(key=lambda item: item[0])
-        changes: list[float] = []
-        for idx, (current_time, current_spread, reference) in enumerate(dated):
-            previous_candidates = [
-                item
-                for item in dated[:idx]
-                if (current_time - item[0]).total_seconds() >= window_seconds
-            ]
-            if not previous_candidates:
-                continue
-            previous_time, previous_spread, _previous_reference = previous_candidates[-1]
-            if (current_time - previous_time).total_seconds() > window_seconds * 2:
-                continue
-            changes.append(max(0.0, (current_spread - previous_spread) / reference * 10_000.0))
-        return changes
-
-    def _p95_abs_mark_return_1s_from_observations(
-        self,
-        observations: list[dict[str, Any]],
-    ) -> float | None:
-        dated: list[tuple[datetime, float, float]] = []
-        for row in observations:
-            observed_at = parse_time(row.get("observed_at"))
-            long_mark = optional_float(row.get("long_mark"))
-            short_mark = optional_float(row.get("short_mark"))
-            if (
-                observed_at is None
-                or long_mark is None
-                or short_mark is None
-                or long_mark <= 0
-                or short_mark <= 0
-            ):
-                continue
-            dated.append((observed_at.astimezone(UTC), float(long_mark), float(short_mark)))
-        dated.sort(key=lambda item: item[0])
-        values: list[float] = []
-        for idx, (current_time, current_long, current_short) in enumerate(dated):
-            previous_candidates = [
-                item
-                for item in dated[:idx]
-                if (current_time - item[0]).total_seconds() >= 1.0
-            ]
-            if not previous_candidates:
-                continue
-            previous_time, previous_long, previous_short = previous_candidates[-1]
-            if (current_time - previous_time).total_seconds() > 2.0:
-                continue
-            long_return = abs(current_long / previous_long - 1.0) * 10_000.0
-            short_return = abs(current_short / previous_short - 1.0) * 10_000.0
-            values.append(max(long_return, short_return))
-        if len(values) < 10:
-            return None
-        from smart_money_radar.funding.strategy_synchronized_funding import percentile_95
-        return percentile_95(values)
-
-    def next_cycle_hold_or_close_decision(
+    def mandatory_exit_after_boundary_decision(
         self,
         position: dict[str, Any],
         route: dict[str, Any] | None,
         now: datetime,
     ) -> dict[str, Any]:
-        scheduled = parse_time(position.get("current_cycle_scheduled_funding_at"))
+        config = dict(position.get("config") or {})
+        boundary = self._first_crossed_boundary_for_position(position, now)
+        scheduled = parse_time((boundary or {}).get("scheduled_at"))
         if scheduled is None:
-            return {"decision": "close", "reason": "current_cycle_settlement_missing"}
-        seconds_after = (now.astimezone(UTC) - scheduled.astimezone(UTC)).total_seconds()
+            scheduled = parse_time(config.get("first_planned_boundary_at"))
+        if scheduled is None:
+            scheduled = parse_time(position.get("current_cycle_scheduled_funding_at"))
         position_id = str(position["position_id"])
-        state = str(position.get("state") or "")
+        if scheduled is None:
+            config["integrity"] = "REQUIRES_REVIEW"
+            config["mandatory_exit_after_first_boundary"] = True
+            config["legacy_recovery_boundary_source"] = (
+                config.get("legacy_recovery_boundary_source") or "UNKNOWN"
+            )
+            self.store.update_funding_capture_position_config(position_id, config, now)
+            return {"decision": "wait", "reason": "mandatory_exit_boundary_unknown"}
 
-        if seconds_after < POST_SETTLEMENT_EVALUATION_START_SECONDS:
+        now_utc = now.astimezone(UTC)
+        scheduled_utc = scheduled.astimezone(UTC)
+        seconds_after = (now_utc - scheduled_utc).total_seconds()
+        boundary_crossed_at = config.get("boundary_crossed_at")
+
+        if seconds_after < 0 and not boundary_crossed_at:
             return {
                 "decision": "wait",
-                "reason": "post_settlement_evaluation_not_started",
+                "reason": "first_settlement_boundary_not_crossed",
                 "seconds_after_settlement": seconds_after,
             }
 
-        if state == "SETTLEMENT_CROSSED":
-            self.store.update_funding_capture_position_state(
-                position_id, "POST_SETTLEMENT_EVALUATION", now,
-            )
-            position = {**position, "state": "POST_SETTLEMENT_EVALUATION"}
+        normal_close_at = scheduled_utc + timedelta(seconds=POST_SETTLEMENT_CLOSE_AT_T20_SECONDS)
+        config.update(
+            {
+                "exit_mode": "MANDATORY",
+                "integrity": config.get("integrity") or "OK",
+                "state_version": int(config.get("state_version") or 1),
+                "mandatory_exit_after_first_boundary": True,
+                "normal_close_not_before": normal_close_at.isoformat(),
+                "first_planned_boundary_at": scheduled_utc.isoformat(),
+            }
+        )
+        if boundary is not None:
+            config["mandatory_exit_boundary_cycle_id"] = boundary.get("cycle_id")
+            config["mandatory_exit_boundary_source"] = boundary.get("source")
+        if boundary_crossed_at:
+            config["boundary_crossed_at"] = boundary_crossed_at
+        self.store.update_funding_capture_position_config(position_id, config, now)
 
-        config = dict(position.get("config") or {})
-        planned_exit = parse_time(config.get("planned_exit_at"))
-        route_plan = config.get("funding_route_plan") or {}
-        included_events = [
-            event
-            for event in list(route_plan.get("included_settlement_events") or [])
-            if isinstance(event, dict)
-        ]
-        if included_events and planned_exit is not None:
-            cycles = self.store.funding_capture_cycles_for_position(position_id)
-            unfinished_cycles = [
-                cycle
-                for cycle in cycles
-                if str(cycle.get("state") or "") not in {
-                    "SETTLEMENT_CROSSED",
-                    "PUBLIC_RATE_CONFIRMED",
-                    "RATE_AND_MARK_RECONCILED",
-                    "RECONCILED",
-                    "UNRECONCILED",
-                }
-                and (
-                    parse_time(cycle.get("scheduled_funding_at")) is None
-                    or parse_time(cycle.get("scheduled_funding_at")).astimezone(UTC)
-                    > scheduled.astimezone(UTC)
-                )
-            ]
-            if unfinished_cycles:
-                return {
-                    "decision": "wait",
-                    "reason": "included_settlement_events_pending",
-                    "unfinished_cycle_count": len(unfinished_cycles),
-                }
+        if now_utc < normal_close_at:
+            return {
+                "decision": "wait",
+                "reason": "mandatory_exit_waiting_until_t20",
+                "seconds_after_settlement": seconds_after,
+                "normal_close_not_before": normal_close_at.isoformat(),
+            }
 
         if route is None:
-            if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
-                return {"decision": "close", "reason": "post_settlement_route_missing"}
             return {
                 "decision": "wait",
-                "reason": "post_settlement_route_missing_waiting",
+                "reason": "mandatory_exit_waiting_for_executable_route",
                 "seconds_after_settlement": seconds_after,
+                "normal_close_not_before": normal_close_at.isoformat(),
             }
 
-        missing_data = self._missing_required_route_data(route)
-        if missing_data:
-            if seconds_after < POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
-                return {
-                    "decision": "wait",
-                    "reason": "required_route_data_missing_waiting_until_t20",
-                    "missing": missing_data,
-                    "seconds_after_settlement": seconds_after,
-                }
-            return {
-                "decision": "close",
-                "reason": "required_route_data_missing",
-                "missing": missing_data,
-            }
-
-        next_plan = self._plan_dict_for_route(route, now)
-        next_plan_blockers = self._route_plan_blocking_reasons(next_plan)
-        next_plan_blockers.extend(self._paper_capability_blocking_reasons(next_plan))
-        next_plan_blockers = list(dict.fromkeys(next_plan_blockers))
-        next_settlement_at = self._first_included_settlement_at(next_plan) or route_next_settlement(route)
-        next_cycle_number = int(position.get("current_cycle_number") or 1) + 1
-        replan_record = {
-            "plan_generation": next_cycle_number,
-            "previous_cycle_id": str(position.get("current_cycle_id") or f"{position_id}:1"),
-            "observed_at": now.astimezone(UTC).isoformat(),
-            "previous_scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
-            "new_scheduled_funding_at": (
-                next_settlement_at.astimezone(UTC).isoformat()
-                if next_settlement_at is not None
-                else None
-            ),
-            "blockers": next_plan_blockers,
-            "route_plan": next_plan,
-        }
-        replans = list(config.get("post_settlement_replans") or [])
-        replans = [
-            item
-            for item in replans
-            if int(item.get("plan_generation") or 0) != next_cycle_number
-        ]
-        replans.append(replan_record)
-        config["post_settlement_replans"] = replans[-10:]
-        config["proposed_plan_generation"] = next_cycle_number
-        config["proposed_post_settlement_route_plan"] = next_plan
-        position["config"] = config
-        self.store.update_funding_capture_position_config(position_id, config, now)
-        if next_settlement_at is None:
-            if seconds_after < POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
-                return {
-                    "decision": "wait",
-                    "reason": "next_cycle_plan_settlement_missing_waiting_until_t20",
-                    "route_plan": next_plan,
-                    "seconds_after_settlement": seconds_after,
-                }
-            return {
-                "decision": "close",
-                "reason": "next_cycle_plan_settlement_missing",
-                "route_plan": next_plan,
-            }
-        if (
-            next_settlement_at.astimezone(UTC) <= scheduled.astimezone(UTC)
-            or next_settlement_at.astimezone(UTC) <= now.astimezone(UTC)
-        ):
-            return {
-                "decision": "close",
-                "reason": "next_cycle_stale_or_past_settlement",
-                "route_plan": next_plan,
-                "new_scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
-                "previous_scheduled_funding_at": scheduled.astimezone(UTC).isoformat(),
-            }
-        if next_plan_blockers:
-            if seconds_after < POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
-                return {
-                    "decision": "wait",
-                    "reason": "next_cycle_plan_blocked_waiting_until_t20",
-                    "blockers": next_plan_blockers,
-                    "route_plan": next_plan,
-                    "seconds_after_settlement": seconds_after,
-                }
-            return {
-                "decision": "close",
-                "reason": "next_cycle_plan_blocked",
-                "blockers": next_plan_blockers,
-                "route_plan": next_plan,
-            }
-
-        probe_state = self._probe_state(position)
-        if seconds_after <= POST_SETTLEMENT_PROBE_END_SECONDS:
-            probe_state = self._record_schedule_probe(position, route, now)
-        self.collect_hold_observation(position, route, now)
-
-        probes = list(probe_state.get("probes") or [])
-        probe_decision = post_settlement_probe_decision(
-            probes=probes,
-            now=now.astimezone(UTC),
-            settlement_at=scheduled.astimezone(UTC),
-        )
-
-        if probe_decision.get("decision") == "close_at_t20":
-            if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
-                probe_state["mismatch_reason"] = probe_decision.get("reason", "schedule_mismatch")
-                self._save_probe_state(position, probe_state)
-                return {
-                    "decision": "close",
-                    "reason": "next_settlement_schedule_mismatch",
-                    "probe_decision": probe_decision,
-                    "seconds_after_settlement": seconds_after,
-                }
-            return {
-                "decision": "wait",
-                "reason": "awaiting_t20_close_window",
-                "probe_decision": probe_decision,
-                "seconds_after_settlement": seconds_after,
-            }
-
-        schedule: dict[str, Any] | None = None
-        if probe_decision.get("decision") == "hold_next_cycle":
-            schedule = next_cycle_schedule_decision(
-                long_next_funding_at=probe_decision.get("long_next_funding_at"),
-                short_next_funding_at=probe_decision.get("short_next_funding_at"),
-                now=now,
-                min_wait_seconds=float(getattr(self.config, "min_next_settlement_wait_seconds", 300)),
-                max_wait_seconds=float(getattr(self.config, "max_next_settlement_wait_seconds", 14_400)),
-            )
-            if not schedule["hold_schedule"]:
-                if seconds_after >= POST_SETTLEMENT_CLOSE_AT_T20_SECONDS:
-                    return {
-                        "decision": "close",
-                        "reason": "next_cycle_schedule_failed",
-                        "schedule": schedule,
-                        "probe_decision": probe_decision,
-                    }
-                return {
-                    "decision": "wait",
-                    "reason": "next_cycle_schedule_failed_waiting_until_t20",
-                    "schedule": schedule,
-                    "probe_decision": probe_decision,
-                }
-            probe_decision = {
-                **probe_decision,
-                "seconds_to_next_cycle": schedule.get("seconds_to_next_cycle"),
-            }
-            if probe_state.get("aligned_next_settlement_at") != probe_decision.get("next_cycle_at"):
-                probe_state["aligned_next_settlement_at"] = probe_decision.get("next_cycle_at")
-                probe_state["consecutive_agreements"] = probe_decision.get("consecutive_agreements")
-                self._save_probe_state(position, probe_state)
-
-        if seconds_after < POST_SETTLEMENT_HOLD_DECISION_SECONDS:
-            return {
-                "decision": "wait",
-                "reason": "collecting_next_cycle_observations",
-                "seconds_after_settlement": seconds_after,
-                "probe_decision": probe_decision,
-            }
-
-        if probe_decision.get("decision") not in ("hold_next_cycle",):
-            return {
-                "decision": "close",
-                "reason": "next_settlement_schedule_not_confirmed",
-                "probe_decision": probe_decision,
-                "seconds_after_settlement": seconds_after,
-            }
-
-        cycle_id = str(position.get("current_cycle_id") or f"{position_id}:1")
-        long_leg = leg_by_side(route.get("legs") or [], "long") or {}
-        short_leg = leg_by_side(route.get("legs") or [], "short") or {}
-
-        observations = self._valid_observations(route, now, phase="hold", cycle_id=cycle_id)
-        observation_decision = next_cycle_observation_decision(observations=observations, now=now)
-        plan_conservative_gross = optional_float(
-            (next_plan or {}).get("conservative_funding_cashflow_usd")
-        )
-        if plan_conservative_gross is not None:
-            observation_decision = {
-                **observation_decision,
-                "conservative_funding_gross": plan_conservative_gross,
-                "route_plan_conservative_funding_cashflow_usd": plan_conservative_gross,
-            }
-        if not observation_decision["eligible"]:
-            return {
-                "decision": "close",
-                "reason": "next_cycle_observations_failed",
-                "observation_decision": observation_decision,
-            }
-
-        quantity = float(position.get("quantity") or 0.0)
-        current_pnl_snapshot = self.record_current_executable_pnl(position, route, now)
-        if current_pnl_snapshot.get("quality") != "EXECUTABLE_FULL_DEPTH":
-            return {
-                "decision": "close",
-                "reason": "current_executable_pnl_unavailable",
-                "current_executable_pnl": current_pnl_snapshot,
-            }
-        current_close_fees = float(current_pnl_snapshot.get("paper_close_fees") or 0.0)
-        reference_notional = min(
-            quantity * max(0.0, float(current_pnl_snapshot.get("long_exit_price") or 0.0)),
-            quantity * max(0.0, float(current_pnl_snapshot.get("short_exit_price") or 0.0)),
-        )
-        entry_economics = (position.get("config") or {}).get("entry_economics") or {}
-        entry_basis_reserve_bps = float(entry_economics.get("entry_basis_reserve_bps") or 0.0)
-        if entry_basis_reserve_bps <= 0:
-            entry_basis_reserve_bps = 30.0
-        adverse_basis_changes = self._adverse_basis_changes_from_observations(observations)
-        p95_mark_return = self._p95_abs_mark_return_1s_from_observations(observations)
-        wait_seconds = float(
-            probe_decision.get("seconds_to_next_cycle")
-            or schedule_seconds_to_next(probe_decision, now)
-            or 0.0
-        )
-        unadjusted_next_conservative = float(observation_decision["conservative_funding_gross"])
-        hold_history = self._hold_history_reliability(
-            position=position,
-            route=route,
-            now=now,
-            wait_seconds=wait_seconds,
-        )
-        history_adjusted_next_funding = unadjusted_next_conservative * float(
-            hold_history["history_multiplier"]
-        )
-        hold = hold_economics(
-            next_conservative_funding_gross=history_adjusted_next_funding,
-            current_close_fees=current_close_fees,
-            reference_notional=reference_notional,
-            wait_seconds=wait_seconds,
-            entry_basis_reserve_bps=entry_basis_reserve_bps,
-            adverse_basis_change_30s_bps=adverse_basis_changes if len(adverse_basis_changes) >= 10 else None,
-            p95_abs_mark_return_1s_bps=p95_mark_return,
-        )
-        hold["unadjusted_next_conservative_funding_gross"] = unadjusted_next_conservative
-        hold["history_adjusted_next_funding"] = history_adjusted_next_funding
-        hold["hold_history"] = hold_history
-        current_executable_pnl = float(current_pnl_snapshot["paper_net_if_exit_now"])
-        projected_total = current_executable_pnl + float(
-            hold["incremental_hold_net_pnl"]
-        )
-        opened_at = parse_time(position.get("opened_at")) or now
-        next_cycle_time = parse_time(probe_decision.get("next_cycle_at"))
-        projected_age = (
-            (next_cycle_time.astimezone(UTC) - opened_at.astimezone(UTC)).total_seconds()
-            + POST_SETTLEMENT_NORMAL_EXIT_DELAY_SECONDS
-            if next_cycle_time is not None
-            else math.inf
-        )
-        settlements_count = int(position.get("settlements_captured_count") or 0)
-        reference = max(0.0, reference_notional)
-        reasons: list[str] = []
-        if not bool(getattr(self.config, "hold_enabled", True)):
-            reasons.append("hold_disabled")
-        if not bool(hold_history.get("hold_history_gate_passed")):
-            reasons.extend(list(hold_history.get("reasons") or []))
-        if (
-            hold_history.get("history_status") == "INSUFFICIENT"
-            and max(0, settlements_count - 1)
-            >= int(hold_history.get("hold_history_max_extra_cycles_when_insufficient") or 0)
-        ):
-            reasons.append("hold_history_insufficient_extra_cycle_limit")
-        if history_adjusted_next_funding < max(2.50, reference * 0.005):
-            reasons.append("next_conservative_funding_below_minimum")
-        if float(hold["incremental_hold_net_pnl"]) < max(1.00, reference * 0.002):
-            reasons.append("incremental_hold_net_below_minimum")
-        if float(hold["hold_cost_coverage_ratio"]) < 1.50:
-            reasons.append("hold_coverage_below_minimum")
-        if projected_total < 0:
-            reasons.append("projected_total_after_next_cycle_negative")
-        if settlements_count >= int(getattr(self.config, "max_settlements_per_position", 4)):
-            reasons.append("max_settlements_reached")
-        if projected_age > float(getattr(self.config, "max_position_age_seconds", 14_700)):
-            reasons.append("max_position_age_exceeded")
-        if reasons:
-            return {
-                "decision": "close",
-                "reason": "hold_economics_failed",
-                "reasons": reasons,
-                "observation_decision": observation_decision,
-                "hold_economics": hold,
-                "current_executable_pnl": current_pnl_snapshot,
-                "projected_total_after_next_cycle": projected_total,
-                "projected_position_age_at_next_exit": projected_age,
-            }
-
-        next_cycle_id = f"{position_id}:{next_cycle_number}"
-        active_config = dict(config)
-        active_config.update(
-            {
-                "plan_generation": next_cycle_number,
-                "active_plan_generation": next_cycle_number,
-                "active_cycle_id": next_cycle_id,
-                "active_cycle_number": next_cycle_number,
-                "active_cycle_scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
-                "funding_route_plan": next_plan,
-                "included_settlement_events": next_plan.get("included_settlement_events") or [],
-                "excluded_settlement_events": next_plan.get("excluded_settlement_events") or [],
-                "ambiguous_settlement_events": next_plan.get("ambiguous_settlement_events") or [],
-                "planned_exit_at": next_plan.get("planned_exit_at"),
-                "monitor_until": next_plan.get("monitor_until"),
-                "last_post_settlement_route_plan": next_plan,
-            }
-        )
-        active_plan = self._cycle_plan_snapshot(
-            position_id=position_id,
-            cycle_id=next_cycle_id,
-            cycle_number=next_cycle_number,
-            plan_generation=next_cycle_number,
-            scheduled_at=next_settlement_at,
-            route=route,
-            route_plan=next_plan,
-            now=now,
-        )
-        next_cycle_id = self.store.activate_funding_capture_hold_cycle(
-            cycle_row={
-                "cycle_id": next_cycle_id,
-                "position_id": position_id,
-                "cycle_number": next_cycle_number,
-                "plan_generation": next_cycle_number,
-                "scheduled_funding_at": next_settlement_at.astimezone(UTC).isoformat(),
-                "long_next_funding_rate_at_decision": _leg_rate(long_leg),
-                "short_next_funding_rate_at_decision": _leg_rate(short_leg),
-                "conservative_funding_gross": observation_decision["conservative_funding_gross"],
-                "conservative_funding_edge_bps": (
-                    float(observation_decision["conservative_funding_gross"]) / reference * 10_000.0
-                    if reference > 0
-                    else 0.0
-                ),
-                "hold_basis_reserve_bps": hold["hold_basis_reserve_bps"],
-                "hold_legging_reserve_bps": hold["hold_legging_reserve_bps"],
-                "hold_time_reserve_bps": hold["hold_time_reserve_bps"],
-                "hold_liquidity_reserve_bps": hold["hold_liquidity_reserve_bps"],
-                "incremental_hold_cost": hold["incremental_hold_cost"],
-                "incremental_hold_net_pnl": hold["incremental_hold_net_pnl"],
-                "hold_cost_coverage_ratio": hold["hold_cost_coverage_ratio"],
-                "paper_net_if_exit_at_decision": current_executable_pnl,
-                "decision": "HOLD",
-                "decision_reason": "next_cycle_underwriting_passed",
-                "state": "HOLDING_NEXT_CYCLE",
-                "active_plan": active_plan,
-            },
-            active_config=active_config,
-            now=now,
-            paper_net_pnl_estimated=projected_total,
-        )
         return {
-            "decision": "hold",
-            "reason": "next_cycle_underwriting_passed",
-            "cycle_id": next_cycle_id,
-            "cycle_number": next_cycle_number,
-            "route_plan": next_plan,
-            "observation_decision": observation_decision,
-            "hold_economics": hold,
-            "current_executable_pnl": current_pnl_snapshot,
-            "projected_total_after_next_cycle": projected_total,
+            "decision": "close",
+            "reason": "mandatory_exit_after_first_settlement",
+            "seconds_after_settlement": seconds_after,
+            "normal_close_not_before": normal_close_at.isoformat(),
         }
 
     def close_position(
@@ -4557,7 +4071,7 @@ class SynchronizedFundingRuntimeV2:
                     "missing_short_asks": not short_has_book,
                 }
         else:
-            self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+            self.store.update_funding_capture_position_state(position_id, "EXITING", now)
 
         def fallback_reference(leg: dict[str, Any], entry_leg: dict[str, Any]) -> tuple[float, str]:
             mark = optional_float(leg.get("mark_price")) or optional_float(entry_leg.get("mark_price"))
@@ -4573,19 +4087,19 @@ class SynchronizedFundingRuntimeV2:
         if emergency and not long_levels:
             reference, quality = fallback_reference(long_route_leg, long_entry_leg)
             if reference <= 0:
-                return {"decision": "rejected", "reason": quality, "state": "EMERGENCY_UNWIND"}
+                return {"decision": "rejected", "reason": quality, "state": "EXITING"}
             pricing_quality = quality
             long_levels = _synthetic_levels(reference * (1.0 - 300.0 / 10_000.0), quantity)
         if emergency and not short_levels:
             reference, quality = fallback_reference(short_route_leg, short_entry_leg)
             if reference <= 0:
-                return {"decision": "rejected", "reason": quality, "state": "EMERGENCY_UNWIND"}
+                return {"decision": "rejected", "reason": quality, "state": "EXITING"}
             pricing_quality = "fallback_entry_300bps" if quality == "fallback_entry_300bps" else pricing_quality
             if pricing_quality == "executable_book":
                 pricing_quality = quality
             short_levels = _synthetic_levels(reference * (1.0 + 300.0 / 10_000.0), quantity)
 
-        self.store.update_funding_capture_position_state(position_id, "EXIT_SUBMITTED", now)
+        self.store.update_funding_capture_position_state(position_id, "EXITING", now)
         long_exit = simulate_marketable_ioc(long_levels, "sell", quantity, EXECUTION_HAIRCUT_FRACTION)
         short_exit = simulate_marketable_ioc(short_levels, "buy", quantity, EXECUTION_HAIRCUT_FRACTION)
         long_fee_model_rate, _long_fee_model = _position_leg_fee_model(
@@ -4717,7 +4231,7 @@ class SynchronizedFundingRuntimeV2:
             ("short", short_route_leg or short_entry_leg, short_entry_leg, short_levels, short_exit, short_fee_rate),
         )
         if any(float(fill["unfilled_quantity"] or 0.0) > 1e-12 for _, _, _, _, fill, _ in residual_specs):
-            self.store.update_funding_capture_position_state(position_id, "PARTIALLY_CLOSED", now)
+            self.store.update_funding_capture_position_state(position_id, "EXITING", now)
         for side, leg, entry_leg, levels, fill, fee_rate in residual_specs:
             residual_qty = float(fill["unfilled_quantity"] or 0.0)
             if residual_qty <= 1e-12:
@@ -4730,11 +4244,11 @@ class SynchronizedFundingRuntimeV2:
                 residual_qty=residual_qty,
             )
             if price <= 0:
-                self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+                self.store.update_funding_capture_position_state(position_id, "EXITING", now)
                 return {
                     "decision": "failed",
                     "reason": "residual_pricing_unavailable",
-                    "state": "EMERGENCY_UNWIND",
+                    "state": "EXITING",
                     "residual_side": side,
                     "pricing_quality": diagnostic.get("pricing_quality"),
                 }
@@ -4791,11 +4305,11 @@ class SynchronizedFundingRuntimeV2:
             abs(closed_quantity_by_side["long"] - quantity) > 1e-12
             or abs(closed_quantity_by_side["short"] - quantity) > 1e-12
         ):
-            self.store.update_funding_capture_position_state(position_id, "EMERGENCY_UNWIND", now)
+            self.store.update_funding_capture_position_state(position_id, "EXITING", now)
             return {
                 "decision": "failed",
                 "reason": "residual_exposure_remaining",
-                "state": "EMERGENCY_UNWIND",
+                "state": "EXITING",
                 "long_closed_quantity": closed_quantity_by_side["long"],
                 "short_closed_quantity": closed_quantity_by_side["short"],
                 "target_quantity": quantity,
@@ -4859,7 +4373,7 @@ class SynchronizedFundingRuntimeV2:
             or str(position.get("current_cycle_state") or "") == "SETTLEMENT_PLAN_MISMATCH"
             or str((position.get("config") or {}).get("blocker") or "") == "settlement_plan_event_mismatch"
         )
-        final_state = "CLOSED_REQUIRES_REVIEW" if mismatch_close else "CLOSED_PENDING_RECONCILIATION"
+        final_state = "CLOSED"
         self.store.update_funding_capture_position_state(
             position_id,
             final_state,
@@ -4872,7 +4386,8 @@ class SynchronizedFundingRuntimeV2:
         if mismatch_close:
             latest = self.store.funding_capture_position_by_id(position_id) or position
             review_config = dict(latest.get("config") or position.get("config") or {})
-            review_config["lifecycle_state"] = "CLOSED_REQUIRES_REVIEW"
+            review_config["lifecycle_state"] = "CLOSED"
+            review_config["integrity"] = "REQUIRES_REVIEW"
             review_config["close_requires_review_reason"] = "settlement_plan_event_mismatch"
             review_config["blocker"] = "settlement_plan_event_mismatch"
             review_config["requires_review"] = True
@@ -5088,6 +4603,7 @@ class SynchronizedFundingRuntimeV2:
                 boundary_evidence=boundary_evidence,
                 position_config_update=config_update,
                 now=now,
+                position_state="OPEN",
             )
             crossed_cycles.append({**cycle, "cycle_id": cycle_id, "scheduled_funding_at": scheduled.isoformat()})
 

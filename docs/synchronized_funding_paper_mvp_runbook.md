@@ -1,7 +1,9 @@
 # Synchronized Funding Paper MVP Runbook
 
-This is the first runnable paper-trading MVP for `synchronized_funding_capture_v2`.
-It is not production live trading.
+This is the first runnable paper-trading MVP for `FUNDING_SETTLEMENT_CAPTURE`.
+The historical `synchronized_funding_capture_v2` name is runtime compatibility
+metadata, not a separate production strategy. This is not production live
+trading.
 
 ## Test Commands
 
@@ -27,10 +29,10 @@ The scenario uses a temp SQLite database, fake clock, fixture market snapshots,
 fixture endpoint identity, trusted configured fee evidence, and
 `FakeFundingSettlementDataProvider`. It runs:
 
-`discover -> qualify -> arm -> open -> boundary -> replan -> close -> reconcile`
+`discover -> qualify -> arm -> open -> boundary -> mandatory close -> reconcile`
 
 Expected output is JSON lines for `armed`, `open`, `boundary`,
-`post_boundary_iteration`, `replan_close`, and `reconcile`.
+`post_boundary_iteration`, mandatory close, and `reconcile`.
 
 ## Read-Only Public Smoke
 

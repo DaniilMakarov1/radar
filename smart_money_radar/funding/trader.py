@@ -134,9 +134,7 @@ from smart_money_radar.paper_bot.clock import SystemClock
 from smart_money_radar.paper_bot.position import (
     build_close_payload,
     build_position_from_route,
-    build_settlement_accrual_payload,
     close_decision,
-    close_reason_from_hold_reasons,
     compute_price_move_snapshot,
     compute_spread_snapshot,
     current_position_leg,
@@ -146,7 +144,6 @@ from smart_money_radar.paper_bot.position import (
     funding_leg_pnl,
     leg_vwap,
     normalize_strategy_set,
-    position_hold_decision,
     required_live_net_profit,
     route_discovery_stage,
     route_entry_decision,
@@ -174,11 +171,6 @@ from smart_money_radar.paper_bot.risk import (
     risk_warnings,
     stale_data_decision,
 )
-from smart_money_radar.paper_bot.cycle_manager import (
-    next_cycle_observation_decision,
-    post_settlement_probe_decision,
-    settlement_crossing_decision,
-)
 from smart_money_radar.paper_bot.telegram import (
     armed_message,
     close_decision_details_message,
@@ -189,7 +181,6 @@ from smart_money_radar.paper_bot.telegram import (
     funding_leg_compact_line,
     funding_rate_lines,
     funding_settlement_mismatch_line,
-    hold_message,
     hold_reason_labels,
     lead_seconds,
     open_message,
@@ -291,23 +282,9 @@ class PaperBotConfig:
     settlement_grace_seconds: int = 30
     max_settlement_publication_lag_seconds: int = 300
     no_normal_exit_before_settlement_plus_seconds: int = 20
-    post_settlement_schedule_probe_seconds: int = 5
-    post_settlement_hold_decision_seconds: int = 30
-    hold_enabled: bool = True
     estimate_paper_enabled: bool = True
     entry_history_required: bool = False
     entry_history_mode: str = "disabled"
-    hold_history_window_days: int = 30
-    hold_history_max_cycles: int = 20
-    hold_history_min_cycles_for_gate: int = 8
-    hold_history_insufficient_multiplier: float = 0.75
-    hold_history_min_positive_realization_rate: float = 0.70
-    hold_history_min_p25_realization_ratio: float = 0.50
-    hold_history_max_extra_cycles_when_insufficient: int = 1
-    max_settlements_per_position: int = 4
-    max_position_age_seconds: int = 14_700
-    min_next_settlement_wait_seconds: int = 300
-    max_next_settlement_wait_seconds: int = 14_400
     collateral_reserve_fraction: float = 0.25
     min_live_net_profit: float = 0.0
     scan_interval_seconds: int = 300
@@ -436,56 +413,9 @@ class PaperBotConfig:
                 0,
                 min(int(self.no_normal_exit_before_settlement_plus_seconds), 300),
             ),
-            post_settlement_schedule_probe_seconds=max(
-                0,
-                min(int(self.post_settlement_schedule_probe_seconds), 300),
-            ),
-            post_settlement_hold_decision_seconds=max(
-                1,
-                min(int(self.post_settlement_hold_decision_seconds), 900),
-            ),
-            hold_enabled=bool(self.hold_enabled),
             estimate_paper_enabled=bool(self.estimate_paper_enabled),
             entry_history_required=False,
             entry_history_mode="disabled",
-            hold_history_window_days=max(1, min(int(self.hold_history_window_days), 365)),
-            hold_history_max_cycles=max(1, min(int(self.hold_history_max_cycles), 1_000)),
-            hold_history_min_cycles_for_gate=max(
-                1,
-                min(int(self.hold_history_min_cycles_for_gate), 1_000),
-            ),
-            hold_history_insufficient_multiplier=max(
-                0.0,
-                min(float(self.hold_history_insufficient_multiplier), 1.0),
-            ),
-            hold_history_min_positive_realization_rate=max(
-                0.0,
-                min(float(self.hold_history_min_positive_realization_rate), 1.0),
-            ),
-            hold_history_min_p25_realization_ratio=max(
-                0.0,
-                min(float(self.hold_history_min_p25_realization_ratio), 10.0),
-            ),
-            hold_history_max_extra_cycles_when_insufficient=max(
-                0,
-                min(int(self.hold_history_max_extra_cycles_when_insufficient), 24),
-            ),
-            max_settlements_per_position=max(
-                1,
-                min(int(self.max_settlements_per_position), 24),
-            ),
-            max_position_age_seconds=max(
-                60,
-                min(int(self.max_position_age_seconds), 86_400),
-            ),
-            min_next_settlement_wait_seconds=max(
-                1,
-                min(int(self.min_next_settlement_wait_seconds), 86_400),
-            ),
-            max_next_settlement_wait_seconds=max(
-                1,
-                min(int(self.max_next_settlement_wait_seconds), 86_400),
-            ),
             collateral_reserve_fraction=max(
                 0.0,
                 min(float(self.collateral_reserve_fraction), 1.0),
@@ -4607,6 +4537,7 @@ class PaperBot:
             position_id = str(position["position_id"])
             state = str(position.get("state") or "")
             if state in {
+                "CLOSED",
                 "CLOSED_PENDING_RECONCILIATION",
                 "RECONCILED",
                 "UNRECONCILED",
@@ -4720,12 +4651,7 @@ class PaperBot:
                 )
                 continue
             crossed = None
-            if state in {
-                "OPEN",
-                "HOLDING_NEXT_CYCLE",
-                "SETTLEMENT_CROSSED",
-                "POST_SETTLEMENT_EVALUATION",
-            }:
+            if state in {"OPEN", "EXITING", "SETTLEMENT_CROSSED"}:
                 crossed = self.synchronized_runtime.mark_settlement_crossed(position, now)
                 if crossed is not None:
                     self.record_event(
@@ -4772,7 +4698,7 @@ class PaperBot:
                             continue
                         self.store.update_funding_capture_position_state(
                             position_id,
-                            "SETTLEMENT_PLAN_MISMATCH",
+                            "EXITING",
                             now,
                         )
                         self.record_event(
@@ -4791,7 +4717,11 @@ class PaperBot:
                         outcomes.append("close_failed")
                         continue
                     state = str(position.get("state") or state)
-            if state == "SETTLEMENT_PLAN_MISMATCH":
+            position_config = position.get("config") or {}
+            if (
+                state == "SETTLEMENT_PLAN_MISMATCH"
+                or str(position_config.get("blocker") or "") == "settlement_plan_event_mismatch"
+            ):
                 close_payload = self.synchronized_runtime.close_position(
                     position,
                     live_route,
@@ -4815,7 +4745,7 @@ class PaperBot:
                     continue
                 self.store.update_funding_capture_position_state(
                     position_id,
-                    "SETTLEMENT_PLAN_MISMATCH",
+                    "EXITING",
                     now,
                 )
                 outcomes.append("close_failed")
@@ -4845,11 +4775,7 @@ class PaperBot:
                 now,
             )
             if risk_exit is not None:
-                self.store.update_funding_capture_position_state(
-                    position_id,
-                    "EXIT_SUBMITTED",
-                    now,
-                )
+                self.store.update_funding_capture_position_state(position_id, "EXITING", now)
                 close_payload = self.synchronized_runtime.close_position(
                     position,
                     live_route,
@@ -4858,11 +4784,7 @@ class PaperBot:
                     emergency=True,
                 )
                 if close_payload.get("decision") != "closed":
-                    self.store.update_funding_capture_position_state(
-                        position_id,
-                        "EMERGENCY_UNWIND",
-                        now,
-                    )
+                    self.store.update_funding_capture_position_state(position_id, "EXITING", now)
                     self.record_event(
                         "close_failed",
                         (
@@ -4904,29 +4826,17 @@ class PaperBot:
                 )
                 outcomes.append("emergency_unwind")
                 continue
-            if state in {"SETTLEMENT_CROSSED", "POST_SETTLEMENT_EVALUATION"}:
-                decision = self.synchronized_runtime.next_cycle_hold_or_close_decision(
+            boundary_crossed = (
+                bool((position.get("config") or {}).get("boundary_crossed_at"))
+                or state == "SETTLEMENT_CROSSED"
+            )
+            if boundary_crossed:
+                decision = self.synchronized_runtime.mandatory_exit_after_boundary_decision(
                     position,
                     live_route,
                     now,
                 )
                 if decision["decision"] == "wait":
-                    continue
-                if decision["decision"] == "hold":
-                    self.record_event(
-                        "hold",
-                        (
-                            f"V2 HOLD NEXT CYCLE {position.get('canonical_asset')} "
-                            f"{position.get('long_venue')}/{position.get('short_venue')}\n"
-                            f"Reason: {decision['reason']}\n"
-                            f"Incremental net: "
-                            f"{format_signed_money((decision.get('hold_economics') or {}).get('incremental_hold_net_pnl'))}"
-                        ),
-                        {"position": position, "decision": decision},
-                        route_key=route_key,
-                        notify=True,
-                    )
-                    outcomes.append("hold")
                     continue
                 close_payload = self.synchronized_runtime.close_position(
                     position,
@@ -5143,32 +5053,6 @@ class PaperBot:
                         notify=True,
                     )
                 outcomes.append("settlement_pending")
-                continue
-            if result["status"] == "hold":
-                accrued = self.store.accrue_funding_paper_settlement(
-                    position_id,
-                    result["accrual"],
-                )
-                self.pending_notified_positions.discard(position_id)
-                if accrued:
-                    self.record_event(
-                        "hold",
-                        hold_message(position, result["accrual"]),
-                        {
-                            "position": position_summary(position),
-                            "accrual": result["accrual"],
-                        },
-                        funding_paper_position_id=position_id,
-                        funding_scan_id=result["accrual"].get(
-                            "next_funding_scan_id"
-                        ),
-                        funding_route_id=result["accrual"].get(
-                            "next_funding_route_id"
-                        ),
-                        route_key=position.get("route_key"),
-                        notify=True,
-                    )
-                outcomes.append("held")
                 continue
             if result["status"] == "close":
                 self.store.close_funding_paper_position(position_id, result["close"])

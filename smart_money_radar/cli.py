@@ -1019,16 +1019,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bounded run duration. The command never starts a permanent service.",
     )
     funding_shadow_monitor.add_argument(
-        "--max-strategy-hold-seconds",
-        type=float,
-        default=180.0,
-    )
-    funding_shadow_monitor.add_argument(
-        "--max-gap-between-settlements-seconds",
-        type=float,
-        default=60.0,
-    )
-    funding_shadow_monitor.add_argument(
         "--entry-safety-buffer-seconds",
         type=float,
         default=30.0,
@@ -1352,8 +1342,6 @@ def funding_shadow_config(args: argparse.Namespace) -> FundingShadowConfig:
         profile=args.profile,
         environment=args.environment,
         target_notional=args.target_notional,
-        max_strategy_hold_seconds=args.max_strategy_hold_seconds,
-        max_gap_between_settlements_seconds=args.max_gap_between_settlements_seconds,
         entry_safety_buffer_seconds=args.entry_safety_buffer_seconds,
         exit_safety_buffer_seconds=args.exit_safety_buffer_seconds,
         settlement_confirmation_timeout_seconds=(

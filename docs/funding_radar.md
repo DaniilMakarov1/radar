@@ -304,10 +304,12 @@ identity graph. These are explicit risk flags rather than hidden assumptions.
 
 ## Paper Validation
 
-For `synchronized_funding_capture_v2`, the first qualifying scanner snapshot
-creates a `watch` route, not a final candidate and not a fill. The focused engine
-must collect paired fresh observations before entry. A paper position opens only
-after two simulated marketable IOC fills complete before T-20.
+For `FUNDING_SETTLEMENT_CAPTURE`, the first qualifying scanner snapshot creates a
+`watch` route, not a final candidate and not a fill. The focused engine must
+collect paired fresh observations before entry. A paper position opens only after
+two simulated marketable IOC fills complete before T-20. `ONE_SETTLEMENT` and
+`MULTIPLE_SETTLEMENTS` are plan shapes of one capture plan, not separate
+production strategies.
 
 Initial entry is deliberately independent from 7/30/90-day raw funding history.
 Historical persistence, old medians, old win rate, or forecast windows can inform
@@ -321,10 +323,10 @@ cashflow. Reconciled PnL requires both the public funding rate and a nearby
 settlement mark; until then, funding remains pending and excluded from realized
 profitability.
 
-For a hold after settlement, history is allowed only as a compact reliability
-haircut from local fully reconciled prior hold cycles of the same directed route,
-collateral, asset, and wait bucket. Insufficient history applies a 0.75 multiplier
-and allows at most one extra settlement; bad realized history closes the position.
+RF-001 production behavior has no planned hold after settlement. After the first
+captured settlement boundary, normal close is allowed at T+20; hard risk can exit
+earlier. Prior-cycle reconciliation may remain pending, but it never authorizes a
+new funding cycle, hold underwriting, or estimated funding cashflow.
 
 ## Commands
 
@@ -349,20 +351,20 @@ python3 -m smart_money_radar.cli dashboard
 `funding-paper-trader` is a deterministic local paper-trading loop. It does not
 use an LLM or live capital. The trader initializes $1,000 virtual cash per live
 venue, runs `next_settlement` Funding Radar scans, and opens a paper position only
-through the synchronized v2 runtime when both legs are 25-35 seconds from the
-same exact settlement timestamp. It records every action in SQLite, exports CSV
-files under `exports/funding_paper/`, and optionally sends Telegram
-notifications.
+through the funding settlement capture runtime when both legs can be filled 25-35
+seconds before the captured settlement timestamp. It records every action in
+SQLite, exports CSV files under `exports/funding_paper/`, and optionally sends
+Telegram notifications.
 
-After settlement, normal close is blocked until T+20. Around T+30 the bot either
-holds the next aligned cycle after incremental underwriting or closes through two
-simulated reduce-only exit orders. Hold decisions do not wait for the previous
-cycle's funding reconciliation.
+After settlement, normal close is blocked until T+20 and then closes through two
+simulated reduce-only exit orders. There is no production next-cycle hold path.
+Pending funding reconciliation is separate accounting work and does not block
+safe close.
 
 Open positions and critical hot routes have scheduler priority over discovery.
 Full-market scans run as cancellable background work and cannot block
 open-position polling, emergency close, T-35..T-25 entry rechecks, T-20 fill
-deadlines, T+5..T+30 hold observations, or due reconciliation.
+deadlines, T+20 mandatory exit checks, or due reconciliation.
 
 Telegram setup uses `FUNDING_TELEGRAM_BOT_TOKEN` and `FUNDING_TELEGRAM_CHAT_ID`
 in `.env`. After
@@ -443,12 +445,12 @@ recheck interval for a found candidate/watch route; it defaults to 2 seconds.
 second, used when both legs are near the synchronized entry window or when a paper
 position is pending/open.
 
-Paper entries use `single_settlement_hedged_capture_v1` for one favorable near
-settlement with the other leg as a hedge, and
-`synchronized_funding_capture_v2` only when both legs have the same next
-settlement within 1 second. Entry is authorized only from T-35 to T-25 seconds
-before the captured settlement. The target is T-30, both simulated fills must be
-done by T-20, and the route snapshot must be no older than
+Paper entries use `FUNDING_SETTLEMENT_CAPTURE`. The plan shape is
+`ONE_SETTLEMENT` when one favorable near settlement is hedged by the other leg,
+or `MULTIPLE_SETTLEMENTS` when both legs settle within 1 second. Entry is
+authorized only from T-35 to T-25 seconds before the captured settlement. The
+target is T-30, both simulated fills must be done by T-20, and the route snapshot
+must be no older than
 `--max-entry-snapshot-age-seconds` (20 seconds by default). Focused/hot
 observations target <=10 seconds, and cross-venue snapshot skew defaults to 5
 seconds for verified paper and 15 seconds for PAPER estimate-based entry. The
@@ -456,7 +458,7 @@ old 0-15 second entry window and 30-second freeze-window fallback are disabled
 by default. The default paper trader allows typed funding estimates; pass
 `--no-estimated-funding-paper-entry` for a verified-only run.
 
-For the default synchronized strategy, spread convergence is always zero expected
+For the production settlement-capture strategy, spread convergence is always zero expected
 profit. Settlement-capture sizing and blockers use funding-only net economics;
 spread and basis only affect executable cost, price PnL, reserves, and risk.
 

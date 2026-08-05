@@ -28,11 +28,9 @@ from smart_money_radar.funding.strategy_synchronized_funding import (
     STRATEGY_NAME,
     STRATEGY_VERSION,
     build_settlement_capture_opportunity,
-    basis_duration_floor_bps,
     entry_underwriting,
     entry_window_passed,
     gross_funding_pnl,
-    hold_economics,
     initial_entry_economics,
     settlement_alignment_passed,
     synchronized_strategy_candidate,
@@ -55,7 +53,6 @@ from smart_money_radar.funding.stablecoins import (
     stablecoin_pair_compatible,
 )
 from smart_money_radar.paper_bot.accounting import executable_paper_pnl
-from smart_money_radar.paper_bot.cycle_manager import evaluate_hold_history_reliability
 from smart_money_radar.paper_bot.execution import entry_fill_state
 from smart_money_radar.paper_bot.helpers import route_entry_key
 from smart_money_radar.paper_bot.risk import common_price_move_telemetry, hard_risk_triggered
@@ -320,28 +317,6 @@ def test_paper_strategy_candidate_relaxes_old_profit_and_coverage_thresholds() -
     assert "initial_expected_net_below_minimum" in verified["reasons"]
 
 
-@pytest.mark.parametrize(
-    ("wait_seconds", "expected_bps"),
-    [(3600, 25.0), (7200, 50.0), (10_800, 75.0), (14_400, 100.0)],
-)
-def test_hold_basis_duration_floor(wait_seconds: int, expected_bps: float) -> None:
-    assert basis_duration_floor_bps(wait_seconds) == expected_bps
-
-
-def test_hold_economics_does_not_recharge_open_fees() -> None:
-    economics = hold_economics(
-        next_conservative_funding_gross=10.0,
-        current_close_fees=2.0,
-        reference_notional=500.0,
-        wait_seconds=3600,
-        entry_basis_reserve_bps=25.0,
-        adverse_basis_change_30s_bps=[0.0] * 10,
-    )
-
-    assert economics["incremental_hold_net_pnl"] == pytest.approx(6.8)
-    assert economics["hold_cost_coverage_ratio"] == pytest.approx(3.125)
-
-
 def test_current_executable_pnl_excludes_pending_funding() -> None:
     pnl = executable_paper_pnl(
         quantity=5.0,
@@ -534,105 +509,10 @@ def test_capability_contract_happy_path() -> None:
     )
 
 
-def test_close_decision_enforces_max_settlements(tmp_path) -> None:
-    from smart_money_radar.paper_bot.position import close_decision
-    from smart_money_radar.funding.trader import PaperBotConfig
-    store = SQLiteStore(tmp_path / "radar.sqlite")
-    store.init_db()
-    config = PaperBotConfig(
-        max_settlements_per_position=2,
-        max_position_age_seconds=86_400,
-    ).validated()
-    now = datetime(2026, 7, 19, 13, 0, 1, tzinfo=UTC)
-    position = {
-        "funding_paper_position_id": 1,
-        "route_key": "BTC:binance:bybit",
-        "canonical_asset": "BTC",
-        "long_venue": "binance",
-        "long_symbol": "BTCUSDT",
-        "short_venue": "bybit",
-        "short_symbol": "BTCUSDT",
-        "base_quantity": 0.01,
-        "target_notional": 500.0,
-        "long_notional": 500.0,
-        "short_notional": 500.0,
-        "long_settlement_at": "2026-07-19T13:00:00+00:00",
-        "short_settlement_at": "2026-07-19T13:00:00+00:00",
-        "max_settlement_at": "2026-07-19T13:00:00+00:00",
-        "opened_at": "2026-07-19T12:00:00+00:00",
-        "expected_execution_cost": 1.0,
-        "expected_live_net": 5.0,
-        "expected_live_gross": 6.0,
-        "entry_legs": [
-            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T13:00:00+00:00", "funding_rate": 0.001, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
-            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T13:00:00+00:00", "funding_rate": 0.004, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.004},
-        ],
-        "entry_evidence": {},
-        "notes": {
-            "accrued_settlement_count": 2,
-            "accrued_funding_pnl": 3.0,
-        },
-    }
-    result = close_decision(position, now, store, config)
-    assert result["status"] == "close"
-    assert result["close"]["close_reason"] == "max_settlements_reached"
-    assert result["close"]["actual_funding_pnl"] == 3.0
-    assert result["close"]["settlement"]["current_funding_pnl"] == 0.0
-    assert not result["close"]["settlement"]["current_settlement_funding_included"]
-
-
-def test_close_decision_enforces_max_position_age(tmp_path) -> None:
-    from smart_money_radar.paper_bot.position import close_decision
-    from smart_money_radar.funding.trader import PaperBotConfig
-    store = SQLiteStore(tmp_path / "radar.sqlite")
-    store.init_db()
-    config = PaperBotConfig(
-        max_settlements_per_position=10,
-        max_position_age_seconds=3600,
-    ).validated()
-    now = datetime(2026, 7, 19, 14, 0, 1, tzinfo=UTC)
-    position = {
-        "funding_paper_position_id": 1,
-        "route_key": "BTC:binance:bybit",
-        "canonical_asset": "BTC",
-        "long_venue": "binance",
-        "long_symbol": "BTCUSDT",
-        "short_venue": "bybit",
-        "short_symbol": "BTCUSDT",
-        "base_quantity": 0.01,
-        "target_notional": 500.0,
-        "long_notional": 500.0,
-        "short_notional": 500.0,
-        "long_settlement_at": "2026-07-19T14:00:00+00:00",
-        "short_settlement_at": "2026-07-19T14:00:00+00:00",
-        "max_settlement_at": "2026-07-19T14:00:00+00:00",
-        "opened_at": "2026-07-19T12:00:00+00:00",
-        "expected_execution_cost": 1.0,
-        "expected_live_net": 5.0,
-        "expected_live_gross": 6.0,
-        "entry_legs": [
-            {"side": "long", "venue": "binance", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T14:00:00+00:00", "funding_rate": 0.001, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.001},
-            {"side": "short", "venue": "bybit", "symbol": "BTCUSDT", "next_funding_at": "2026-07-19T14:00:00+00:00", "funding_rate": 0.004, "funding_interval_hours": 1.0, "hourly_funding_rate": 0.004},
-        ],
-        "entry_evidence": {},
-        "notes": {
-            "accrued_settlement_count": 1,
-            "accrued_funding_pnl": 1.5,
-        },
-    }
-    result = close_decision(position, now, store, config)
-    assert result["status"] == "close"
-    assert result["close"]["close_reason"] == "max_position_age_reached"
-    assert result["close"]["actual_funding_pnl"] == 1.5
-    assert result["close"]["settlement"]["current_funding_pnl"] == 0.0
-    assert not result["close"]["settlement"]["current_settlement_funding_included"]
-
-
 def test_position_hold_decision_detects_interval_mismatch() -> None:
     """Different nominal intervals (1h vs 4h) but different next timestamps:
     funding_interval_hours is NOT a schedule gate; only timestamp alignment matters.
-    Since position_hold_decision does not check timestamp alignment (that's entry-time),
-    this scenario now holds (intervals alone don't close)."""
+    RF-001 forbids holding, but intervals alone still are not the close reason."""
     from smart_money_radar.paper_bot.position import position_hold_decision
     from smart_money_radar.funding.trader import PaperBotConfig
     config = PaperBotConfig().validated()
@@ -680,7 +560,7 @@ def test_position_hold_decision_detects_interval_mismatch() -> None:
         },
     }
     result = position_hold_decision(position, route, now, config)
-    # funding_interval_hours mismatch alone no longer blocks hold
+    assert not result["hold"]
     assert "funding_interval_mismatch" not in result["reasons"]
 
 
@@ -1620,7 +1500,7 @@ def test_venue_latency_tracker_blocks_high_p95() -> None:
 
 
 def test_exit_close_gate_requires_both_legs_or_residual() -> None:
-    """EXIT_SUBMITTED -> CLOSED_PENDING_RECONCILIATION gate."""
+    """EXITING -> CLOSED gate."""
     from smart_money_radar.paper_bot.cycle_manager import exit_close_gate
     both_closed = exit_close_gate(
         long_filled_quantity=10.0,
@@ -1628,7 +1508,7 @@ def test_exit_close_gate_requires_both_legs_or_residual() -> None:
         target_quantity=10.0,
     )
     assert both_closed["allowed"]
-    assert both_closed["new_state"] == "CLOSED_PENDING_RECONCILIATION"
+    assert both_closed["new_state"] == "CLOSED"
 
     partial_no_residual = exit_close_gate(
         long_filled_quantity=10.0,
@@ -1637,7 +1517,7 @@ def test_exit_close_gate_requires_both_legs_or_residual() -> None:
         residual_recorded=False,
     )
     assert not partial_no_residual["allowed"]
-    assert partial_no_residual["new_state"] == "PARTIALLY_CLOSED"
+    assert partial_no_residual["new_state"] == "EXITING"
 
     partial_with_residual = exit_close_gate(
         long_filled_quantity=10.0,
@@ -1646,6 +1526,7 @@ def test_exit_close_gate_requires_both_legs_or_residual() -> None:
         residual_recorded=True,
     )
     assert partial_with_residual["allowed"]
+    assert partial_with_residual["new_state"] == "CLOSED"
 
 
 def test_reconcile_leg_rate_and_mark() -> None:
@@ -2239,16 +2120,6 @@ def _install_targeted_refresh_clients(bot, route_key: str, fallback_route: dict 
     return clients
 
 
-def _boost_next_cycle_funding(route: dict, *, long_rate: float = -0.018, short_rate: float = 0.020) -> dict:
-    long_leg = next(leg for leg in route["legs"] if leg["side"] == "long")
-    short_leg = next(leg for leg in route["legs"] if leg["side"] == "short")
-    for leg, rate in ((long_leg, long_rate), (short_leg, short_rate)):
-        leg["funding_rate"] = rate
-        leg["normalized_next_funding_rate"] = rate
-        leg["hourly_funding_rate"] = rate / float(leg.get("funding_interval_hours") or 1.0)
-    return route
-
-
 def test_paperbot_v2_entry_uses_new_runtime_not_legacy_open(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, _bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
@@ -2354,7 +2225,7 @@ def test_shadow_and_paperbot_route_plan_parity(tmp_path) -> None:
     ] == [event["event_id"] for event in shadow_plan["included_settlement_events"]]
 
 
-def test_paperbot_v2_multi_event_survives_first_event_and_closes_after_last(tmp_path) -> None:
+def test_paperbot_v2_rejects_plan_that_would_span_later_boundary(tmp_path) -> None:
     from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route
 
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
@@ -2380,44 +2251,11 @@ def test_paperbot_v2_multi_event_survives_first_event_and_closes_after_last(tmp_
 
     opened = bot.process_entry_candidates([route], recheck_before_open=False)
 
-    assert opened == [capture_id]
-    plan = store.funding_capture_position_by_id(capture_id)["config"]["funding_route_plan"]
-    assert plan["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
-    assert plan["strategy_version"] == STRATEGY_VERSION
-    assert len(plan["included_settlement_events"]) == 2
-    cycles = store.funding_capture_cycles_for_position(capture_id)
-    assert [cycle["scheduled_funding_at"] for cycle in cycles] == [
-        first.isoformat(),
-        second.isoformat(),
-    ]
-    _install_targeted_refresh_clients(bot, route["route_key"], route)
-
-    bot.clock.advance(31)
-    bot.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, bot.clock.now())
-    assert bot.process_open_positions() == ["settlement_crossed"]
-    cycles = store.funding_capture_cycles_for_position(capture_id)
-    assert [(cycle["cycle_number"], cycle["state"]) for cycle in cycles] == [
-        (1, "SETTLEMENT_CROSSED"),
-        (2, "OPEN"),
-    ]
-
-    bot.clock.advance(19)
-    bot.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, bot.clock.now())
-    assert bot.process_open_positions() == ["settlement_crossed"]
-    cycles = store.funding_capture_cycles_for_position(capture_id)
-    assert [(cycle["cycle_number"], cycle["state"]) for cycle in cycles] == [
-        (1, "SETTLEMENT_CROSSED"),
-        (2, "SETTLEMENT_CROSSED"),
-    ]
-
-    bot.clock.advance(5)
-    bot.hot_routes[route["route_key"]] = _fresh_route_for_open_position(route, bot.clock.now())
-    assert bot.process_open_positions() == ["closed"]
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_PENDING_RECONCILIATION"
-    assert (
-        store.funding_capture_position_by_id(capture_id)["config"]["payment_reconciliation_source"]
-        == "SIMULATED"
-    )
+    assert opened == []
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "DISCOVERED"
+    assert store.funding_paper_order_rows(capture_id) == []
+    assert store.funding_settlement_reconciliation_rows(capture_id) == []
 
 
 def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp_path, monkeypatch) -> None:
@@ -2429,8 +2267,9 @@ def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp
     outcomes = bot.process_open_positions()
 
     assert outcomes == ["settlement_crossed"]
-    capture = store.funding_capture_position_rows(states={"SETTLEMENT_CROSSED"})[0]
+    capture = store.funding_capture_position_rows(states={"OPEN"})[0]
     assert capture["settlements_captured_count"] == 1
+    assert (capture["config"] or {}).get("boundary_crossed_at")
     recon = store.funding_settlement_reconciliation_rows(capture_id)
     assert len(recon) == 2
     assert {row["status"] for row in recon} == {"PENDING"}
@@ -2438,7 +2277,7 @@ def test_paperbot_v2_settlement_crossing_creates_pending_reconciliation_only(tmp
     assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
 
 
-def test_paperbot_v2_holds_after_planned_event_window_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_mandatory_exit_after_first_boundary_without_reconciled_prior_cycle(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -2446,42 +2285,28 @@ def test_paperbot_v2_holds_after_planned_event_window_without_reconciled_prior_c
     _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
-    next_settlement = settlement_at + timedelta(seconds=3600)
-    outcomes: list[str] = []
-    all_outcomes: list[str] = []
-    for offset in range(5, 31):
-        target = settlement_at + timedelta(seconds=offset)
-        bot.clock.advance((target - bot.clock.now()).total_seconds())
-        current = bot.clock.now()
-        next_route = _v2_runtime_route(
-            current,
-            lead_seconds=30,
-            next_lead_seconds=(next_settlement - current).total_seconds(),
-        )
-        next_route["route_key"] = route["route_key"]
-        _boost_next_cycle_funding(next_route)
-        bot.hot_routes[route["route_key"]] = next_route
-        outcomes = bot.process_open_positions()
-        all_outcomes.extend(outcomes)
-        if outcomes:
-            break
+    target = settlement_at + timedelta(seconds=5)
+    bot.clock.advance((target - bot.clock.now()).total_seconds())
+    next_route = _v2_runtime_route(bot.clock.now(), next_lead_seconds=3600)
+    next_route["route_key"] = route["route_key"]
+    bot.hot_routes[route["route_key"]] = next_route
+    assert bot.process_open_positions() == []
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "OPEN"
 
-    assert all_outcomes == ["hold"]
-    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
-    assert held["position_id"] == capture_id
-    with store.connect() as conn:
-        cycles = conn.execute(
-            "SELECT cycle_number, state FROM funding_capture_cycles WHERE position_id = ? ORDER BY cycle_number",
-            (capture_id,),
-        ).fetchall()
-    assert [(row[0], row[1]) for row in cycles] == [
-        (1, "SETTLEMENT_CROSSED"),
-        (2, "HOLDING_NEXT_CYCLE"),
-    ]
+    target = settlement_at + timedelta(seconds=31)
+    bot.clock.advance((target - bot.clock.now()).total_seconds())
+    next_route = _v2_runtime_route(bot.clock.now(), next_lead_seconds=3600)
+    next_route["route_key"] = route["route_key"]
+    bot.hot_routes[route["route_key"]] = next_route
+    assert bot.process_open_positions() == ["closed"]
+    closed = store.funding_capture_position_by_id(capture_id)
+    assert closed["state"] == "CLOSED"
+    assert (closed["config"] or {}).get("exit_mode") == "MANDATORY"
     assert all(row["status"] == "PENDING" for row in store.funding_settlement_reconciliation_rows(capture_id))
+    assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
 
 
-def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_funding(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_next_timestamps_do_not_affect_mandatory_exit_or_create_phantom_funding(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -2489,25 +2314,21 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
-    outcomes: list[str] = []
-    for offset in range(5, 22):
-        target = settlement_at + timedelta(seconds=offset)
-        bot.clock.advance((target - bot.clock.now()).total_seconds())
-        current = bot.clock.now()
-        mismatch_route = _v2_runtime_route(
-            current,
-            lead_seconds=30,
-            next_lead_seconds=3600,
-            short_next_lead_seconds=3900,
-        )
-        mismatch_route["route_key"] = route["route_key"]
-        bot.hot_routes[route["route_key"]] = mismatch_route
-        outcomes = bot.process_open_positions()
-        if outcomes:
-            break
+    target = settlement_at + timedelta(seconds=21)
+    bot.clock.advance((target - bot.clock.now()).total_seconds())
+    current = bot.clock.now()
+    mismatch_route = _v2_runtime_route(
+        current,
+        lead_seconds=30,
+        next_lead_seconds=3600,
+        short_next_lead_seconds=3900,
+    )
+    mismatch_route["route_key"] = route["route_key"]
+    bot.hot_routes[route["route_key"]] = mismatch_route
+    outcomes = bot.process_open_positions()
 
     assert outcomes == ["closed"]
-    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
+    closed = store.funding_capture_position_rows(states={"CLOSED"})[0]
     assert closed["paper_net_pnl_estimated"] is not None
     assert len(store.funding_paper_order_rows(capture_id)) == 4
     ledger_types = [row["event_type"] for row in store.paper_event_ledger_rows(capture_id)]
@@ -2516,7 +2337,7 @@ def test_paperbot_v2_closes_when_next_timestamps_mismatch_without_phantom_fundin
     assert "funding" not in ledger_types
 
 
-def test_paperbot_v2_holds_different_intervals_after_planned_event_window(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_different_next_intervals_do_not_create_hold(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     settlement_at = now + timedelta(seconds=30)
@@ -2524,74 +2345,44 @@ def test_paperbot_v2_holds_different_intervals_after_planned_event_window(tmp_pa
     _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
-    next_settlement = settlement_at + timedelta(seconds=3600)
-    all_outcomes: list[str] = []
-    for offset in range(5, 31):
-        target = settlement_at + timedelta(seconds=offset)
-        bot.clock.advance((target - bot.clock.now()).total_seconds())
-        current = bot.clock.now()
-        next_route = _v2_runtime_route(
-            current,
-            lead_seconds=30,
-            next_lead_seconds=(next_settlement - current).total_seconds(),
-        )
-        next_route["route_key"] = route["route_key"]
-        next_route["legs"][0]["funding_interval_hours"] = 1.0
-        next_route["legs"][1]["funding_interval_hours"] = 4.0
-        _boost_next_cycle_funding(next_route)
-        bot.hot_routes[route["route_key"]] = next_route
-        outcomes = bot.process_open_positions()
-        all_outcomes.extend(outcomes)
-        if outcomes:
-            break
+    target = settlement_at + timedelta(seconds=31)
+    bot.clock.advance((target - bot.clock.now()).total_seconds())
+    current = bot.clock.now()
+    next_route = _v2_runtime_route(current, lead_seconds=30, next_lead_seconds=3600)
+    next_route["route_key"] = route["route_key"]
+    next_route["legs"][0]["funding_interval_hours"] = 1.0
+    next_route["legs"][1]["funding_interval_hours"] = 4.0
+    bot.hot_routes[route["route_key"]] = next_route
 
-    assert all_outcomes == ["hold"]
-    held = store.funding_capture_position_rows(states={"HOLDING_NEXT_CYCLE"})[0]
-    assert held["position_id"] == capture_id
+    assert bot.process_open_positions() == ["closed"]
+    closed = store.funding_capture_position_by_id(capture_id)
+    assert closed["state"] == "CLOSED"
+    assert (closed["config"] or {}).get("exit_mode") == "MANDATORY"
 
 
-def test_paperbot_v2_rejects_hold_when_current_executable_pnl_is_too_negative(tmp_path, monkeypatch) -> None:
+def test_paperbot_v2_hard_risk_can_close_before_t20_after_boundary(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, _opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
-    for idx in range(8):
-        _seed_reconciled_hold_history_cycle(
-            store,
-            position_id=f"good-history-{idx}",
-            created_at=f"2026-07-27T0{idx}:00:30+00:00",
-            scheduled_at=f"2026-07-27T0{idx + 1}:00:00+00:00",
-            predicted=10.0,
-            realized=10.0,
-        )
     settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
     _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
-    next_settlement = settlement_at + timedelta(seconds=3600)
-    outcomes: list[str] = []
-    all_outcomes: list[str] = []
-    for offset in range(5, 31):
-        target = settlement_at + timedelta(seconds=offset)
-        bot.clock.advance((target - bot.clock.now()).total_seconds())
-        current = bot.clock.now()
-        next_route = _v2_runtime_route(
-            current,
-            lead_seconds=30,
-            next_lead_seconds=(next_settlement - current).total_seconds(),
-        )
-        next_route["route_key"] = route["route_key"]
-        next_route["legs"][0]["close_vwap"] = 80.0
-        next_route["legs"][0]["bids"] = [[80.0, 20.0]]
-        next_route["legs"][0]["best_bid"] = 80.0
-        next_route["legs"][1]["close_vwap"] = 120.0
-        next_route["legs"][1]["asks"] = [[120.0, 20.0]]
-        next_route["legs"][1]["best_ask"] = 120.0
-        bot.hot_routes[route["route_key"]] = next_route
-        outcomes = bot.process_open_positions()
-        all_outcomes.extend(outcomes)
+    target = settlement_at + timedelta(seconds=5)
+    bot.clock.advance((target - bot.clock.now()).total_seconds())
+    current = bot.clock.now()
+    risk_route = _v2_runtime_route(current, lead_seconds=30, next_lead_seconds=3600)
+    risk_route["route_key"] = route["route_key"]
+    risk_route["legs"][0]["close_vwap"] = 80.0
+    risk_route["legs"][0]["bids"] = [[80.0, 20.0]]
+    risk_route["legs"][0]["best_bid"] = 80.0
+    risk_route["legs"][1]["close_vwap"] = 120.0
+    risk_route["legs"][1]["asks"] = [[120.0, 20.0]]
+    risk_route["legs"][1]["best_ask"] = 120.0
+    bot.hot_routes[route["route_key"]] = risk_route
 
-    assert any(item in {"closed", "emergency_unwind"} for item in all_outcomes)
-    closed = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]
+    assert bot.process_open_positions() == ["emergency_unwind"]
+    closed = store.funding_capture_position_rows(states={"CLOSED"})[0]
     assert closed["position_id"] == capture_id
     assert closed["paper_net_pnl_estimated"] < 0
 
@@ -2931,7 +2722,7 @@ def test_hold_proceeds_while_prior_reconciliation_pending(tmp_path) -> None:
         },
     }
     hold = position_hold_decision(position, route, now, config)
-    assert hold["hold"], f"Expected hold but got reasons: {hold['reasons']}"
+    assert not hold["hold"]
 
 
 def test_different_timestamps_are_not_alignment_blockers() -> None:
@@ -3030,190 +2821,7 @@ def test_different_nominal_intervals_equal_next_timestamp_passes() -> None:
         },
     }
     result = position_hold_decision(position, route, now, config)
-    assert result["hold"], f"Expected hold but got reasons: {result['reasons']}"
-
-
-def test_1h_and_4h_aligned_next_settlements_can_hold() -> None:
-    """1h and 4h venues with aligned next settlements can hold."""
-    from smart_money_radar.paper_bot.cycle_manager import next_cycle_schedule_decision
-    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=UTC)
-    next_settlement = "2026-07-19T13:00:00+00:00"
-    result = next_cycle_schedule_decision(
-        long_next_funding_at=next_settlement,
-        short_next_funding_at=next_settlement,
-        now=now,
-    )
-    assert result["hold_schedule"]
-    assert result["settlement_skew_seconds"] == 0.0
-
-
-def test_gt_4h_next_settlement_closes() -> None:
-    """Next settlement > 4h away => close (too far)."""
-    from smart_money_radar.paper_bot.cycle_manager import next_cycle_schedule_decision
-    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=UTC)
-    far_future = "2026-07-19T17:00:01+00:00"  # > 14400s
-    result = next_cycle_schedule_decision(
-        long_next_funding_at=far_future,
-        short_next_funding_at=far_future,
-        now=now,
-        max_wait_seconds=14_400.0,
-    )
-    assert not result["hold_schedule"]
-    assert "next_settlement_too_far" in result["reasons"]
-
-
-def test_open_fees_sunk_in_hold_economics() -> None:
-    """Opening fees are sunk — never charged again in incremental hold."""
-    economics = hold_economics(
-        next_conservative_funding_gross=10.0,
-        current_close_fees=2.0,
-        reference_notional=500.0,
-        wait_seconds=3600,
-        entry_basis_reserve_bps=25.0,
-        adverse_basis_change_30s_bps=[0.0] * 10,
-    )
-    # incremental_hold_net_pnl should NOT subtract original open fees
-    # Only incremental costs (additional fee reserve + basis/legging/time/liquidity reserves)
-    assert economics["incremental_hold_net_pnl"] > 0
-    # Verify: funding=10, close_fee_stress=2.2, additional_fee_reserve=0.2
-    # duration_floor=25, basis_reserve=25, scaled_observed=5 (default)
-    # legging=15, time=10, liquidity=10 => total_reserve_bps=60
-    # reserve_usd=500*60/10000=3.0, incremental_cost=0.2+3.0=3.2
-    # incremental_net=10-3.2=6.8
-    assert economics["incremental_hold_net_pnl"] == pytest.approx(6.8)
-
-
-def test_hold_history_insufficient_haircut_no_veto() -> None:
-    reliability = evaluate_hold_history_reliability([])
-
-    assert reliability.status == "INSUFFICIENT"
-    assert reliability.gate_passed
-    assert reliability.history_multiplier == pytest.approx(0.75)
-    assert reliability.adjusted_funding(10.0) == pytest.approx(7.5)
-    assert reliability.max_extra_cycles_when_insufficient == 1
-
-
-def test_hold_history_positive_rate_fail() -> None:
-    cycles = [
-        {"predicted_gross": 10.0, "realized_gross": value}
-        for value in [1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0]
-    ]
-
-    reliability = evaluate_hold_history_reliability(cycles)
-
-    assert reliability.status == "FAILED"
-    assert not reliability.gate_passed
-    assert "hold_history_positive_realization_rate_failed" in reliability.reasons
-
-
-def test_hold_history_p25_fail() -> None:
-    cycles = [
-        {"predicted_gross": 10.0, "realized_gross": value}
-        for value in [4.0, 4.0, 4.0, 6.0, 7.0, 8.0, 8.0, 8.0]
-    ]
-
-    reliability = evaluate_hold_history_reliability(cycles)
-
-    assert reliability.status == "FAILED"
-    assert reliability.p25_realization_ratio == pytest.approx(0.4)
-    assert "hold_history_p25_realization_ratio_failed" in reliability.reasons
-
-
-def test_good_hold_history_applies_p25_haircut() -> None:
-    cycles = [{"predicted_gross": 10.0, "realized_gross": 8.0} for _ in range(8)]
-
-    reliability = evaluate_hold_history_reliability(cycles)
-
-    assert reliability.status == "PASSED"
-    assert reliability.gate_passed
-    assert reliability.history_multiplier == pytest.approx(0.8)
-    assert reliability.adjusted_funding(10.0) == pytest.approx(8.0)
-
-
-def test_good_hold_history_cannot_override_negative_current_funding() -> None:
-    cycles = [{"predicted_gross": 10.0, "realized_gross": 10.0} for _ in range(8)]
-
-    reliability = evaluate_hold_history_reliability(cycles)
-
-    assert reliability.status == "PASSED"
-    assert reliability.adjusted_funding(-5.0) == pytest.approx(-5.0)
-
-
-def _seed_reconciled_hold_history_cycle(
-    store: SQLiteStore,
-    *,
-    position_id: str,
-    canonical_asset: str = "BTC",
-    long_venue: str = "binance",
-    short_venue: str = "bybit",
-    collateral_asset: str = "USDT",
-    state: str = "RECONCILED",
-    reconciliation_status: str = "RATE_AND_MARK_RECONCILED",
-    predicted: float = 10.0,
-    realized: float = 8.0,
-    created_at: str = "2026-07-28T16:00:30+00:00",
-    scheduled_at: str = "2026-07-28T17:00:00+00:00",
-) -> None:
-    store.upsert_funding_capture_position({
-        "position_id": position_id,
-        "canonical_asset": canonical_asset,
-        "long_venue": long_venue,
-        "long_symbol": f"{canonical_asset}USDT",
-        "short_venue": short_venue,
-        "short_symbol": f"{canonical_asset}USDT",
-        "quantity": 5.0,
-        "target_notional": 500.0,
-        "state": "RECONCILED",
-        "opened_at": "2026-07-28T15:59:30+00:00",
-        "closed_at": scheduled_at,
-        "config": {
-            "route_key": f"{canonical_asset}:{long_venue}:{short_venue}",
-            "entry_legs": [
-                {"side": "long", "venue": long_venue, "collateral_asset": collateral_asset},
-                {"side": "short", "venue": short_venue, "collateral_asset": collateral_asset},
-            ],
-        },
-    })
-    store.upsert_funding_capture_cycle({
-        "position_id": position_id,
-        "cycle_number": 2,
-        "scheduled_funding_at": scheduled_at,
-        "conservative_funding_gross": predicted,
-        "incremental_hold_net_pnl": predicted - 1.0,
-        "decision": "HOLD",
-        "state": state,
-        "reconciliation_status": reconciliation_status,
-        "reconciled_funding_pnl": realized,
-        "created_at": created_at,
-    })
-
-
-def test_hold_history_query_uses_local_reconciled_same_scope_only(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "radar.sqlite")
-    store.init_db()
-    _seed_reconciled_hold_history_cycle(store, position_id="match")
-    _seed_reconciled_hold_history_cycle(store, position_id="reverse", long_venue="bybit", short_venue="binance")
-    _seed_reconciled_hold_history_cycle(store, position_id="other-collateral", collateral_asset="USDC")
-    _seed_reconciled_hold_history_cycle(
-        store,
-        position_id="unreconciled",
-        state="UNRECONCILED",
-        reconciliation_status="UNRECONCILED",
-    )
-
-    rows = store.reconciled_funding_capture_hold_cycles(
-        canonical_asset="BTC",
-        long_venue="binance",
-        short_venue="bybit",
-        collateral_asset="USDT",
-        wait_bucket="<=1h",
-        since="2026-06-28T00:00:00+00:00",
-        limit=20,
-    )
-
-    assert [row["position_id"] for row in rows] == ["match"]
-    assert rows[0]["predicted_gross"] == pytest.approx(10.0)
-    assert rows[0]["realized_gross"] == pytest.approx(8.0)
+    assert not result["hold"]
 
 
 def test_risk_helper_called_by_paperbot_runtime(tmp_path, monkeypatch) -> None:
@@ -4200,103 +3808,6 @@ def test_real_public_adapters_flow_from_lightweight_watch_to_focused_paper_open(
         bot.shutdown_foreground_executors()
 
 
-def test_post_settlement_probe_consecutive_agreement() -> None:
-    """Post-settlement probes: two consecutive fresh agreements => hold next cycle."""
-    from smart_money_radar.paper_bot.cycle_manager import post_settlement_probe_decision
-    settlement = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
-    now = datetime(2026, 7, 28, 16, 0, 10, tzinfo=UTC)  # T+10
-    probes = [
-        {
-            "observed_at": "2026-07-28T16:00:06+00:00",
-            "long_next_funding_at": "2026-07-28T17:00:00+00:00",
-            "short_next_funding_at": "2026-07-28T17:00:00+00:00",
-            "fresh": True,
-        },
-        {
-            "observed_at": "2026-07-28T16:00:07+00:00",
-            "long_next_funding_at": "2026-07-28T17:00:00+00:00",
-            "short_next_funding_at": "2026-07-28T17:00:00+00:00",
-            "fresh": True,
-        },
-    ]
-    result = post_settlement_probe_decision(
-        probes=probes,
-        now=now,
-        settlement_at=settlement,
-    )
-    assert result["decision"] == "hold_next_cycle"
-    assert result["consecutive_agreements"] >= 2
-
-
-def test_post_settlement_probe_no_agreement_by_t15_closes_at_t20() -> None:
-    """No consecutive agreement by T+15 => close at T+20."""
-    from smart_money_radar.paper_bot.cycle_manager import post_settlement_probe_decision
-    settlement = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
-    now = datetime(2026, 7, 28, 16, 0, 16, tzinfo=UTC)  # T+16 (> T+15)
-    probes = [
-        {
-            "observed_at": "2026-07-28T16:00:06+00:00",
-            "long_next_funding_at": "2026-07-28T17:00:00+00:00",
-            "short_next_funding_at": "2026-07-28T18:00:00+00:00",  # mismatch
-            "fresh": True,
-        },
-    ]
-    result = post_settlement_probe_decision(
-        probes=probes,
-        now=now,
-        settlement_at=settlement,
-    )
-    assert result["decision"] == "close_at_t20"
-    assert result["close_at_t20"]
-
-
-def test_next_cycle_observation_eligibility() -> None:
-    """Next-cycle observations: 15+ valid, 20s span, age<=2s, all positive, latest>=0.8*median."""
-    from smart_money_radar.paper_bot.cycle_manager import next_cycle_observation_decision
-    now = datetime(2026, 7, 28, 16, 0, 30, tzinfo=UTC)
-    observations = [
-        {
-            "gross_funding_pnl": 5.0 + i * 0.1,
-            "observed_at": (now - timedelta(seconds=30 - i * 2)).isoformat(),
-            "cross_venue_skew_seconds": 0.5,
-        }
-        for i in range(15)
-    ]
-    result = next_cycle_observation_decision(
-        observations=observations,
-        now=now,
-    )
-    assert result["eligible"], f"Expected eligible but got: {result['reasons']}"
-    assert result["observation_count"] == 15
-    assert result["observation_span_seconds"] >= 20.0
-    assert result["conservative_funding_gross"] == pytest.approx(0.9 * 5.0)
-
-
-def test_next_cycle_observation_uses_timestamp_latest_not_list_tail() -> None:
-    from smart_money_radar.paper_bot.cycle_manager import next_cycle_observation_decision
-
-    now = datetime(2026, 7, 28, 16, 0, 30, tzinfo=UTC)
-    observations = [
-        {
-            "gross_funding_pnl": 10.0,
-            "observed_at": (now - timedelta(seconds=30 - i * 2)).isoformat(),
-            "cross_venue_skew_seconds": 0.5,
-        }
-        for i in range(15)
-    ]
-    observations[0]["gross_funding_pnl"] = 1.0
-    unsorted_observations = observations[1:] + [observations[0]]
-
-    result = next_cycle_observation_decision(
-        observations=unsorted_observations,
-        now=now,
-    )
-
-    assert result["eligible"], result["reasons"]
-    assert result["latest_gross_funding"] == pytest.approx(10.0)
-    assert result["minimum_gross_funding"] == pytest.approx(1.0)
-
-
 def test_entry_underwriting_uses_timestamp_latest_not_list_tail() -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     observations = [
@@ -4370,7 +3881,7 @@ def _open_position_for_close_tests(tmp_path, now: datetime):
 
 
 def test_hard_risk_executes_exit_orders_and_releases_collateral(tmp_path) -> None:
-    """Hard-risk close: 2 exit orders, collateral release, price PnL, CLOSED_PENDING_RECONCILIATION."""
+    """Hard-risk close: 2 exit orders, collateral release, price PnL, CLOSED."""
     from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
     now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
@@ -4414,8 +3925,7 @@ def test_hard_risk_executes_exit_orders_and_releases_collateral(tmp_path) -> Non
     )
     outcomes = bot.process_open_positions()
     assert "emergency_unwind" in outcomes
-    # Position must be CLOSED_PENDING_RECONCILIATION, not EMERGENCY_UNWIND
-    positions = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})
+    positions = store.funding_capture_position_rows(states={"CLOSED"})
     assert len(positions) == 1
     assert positions[0]["position_id"] == position_id
     # Must NOT appear as open
@@ -4485,7 +3995,7 @@ def test_hard_stale_no_fresh_book_uses_emergency_fallback(tmp_path) -> None:
     outcomes = bot.process_open_positions()
     assert "emergency_unwind" in outcomes
     assert refresh_calls == 1
-    positions = store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})
+    positions = store.funding_capture_position_rows(states={"CLOSED"})
     assert len(positions) == 1
     ledger = store.paper_event_ledger_rows(position_id)
     emergency_events = [r for r in ledger if r["event_type"] == "emergency_unwind_cost"]
@@ -4841,7 +4351,7 @@ def test_emergency_300_bps_fallback_penalty_once(tmp_path) -> None:
 
 
 def test_residual_unwind_creates_explicit_orders_and_closes_exposure(tmp_path) -> None:
-    """Partial close IOC must create RESIDUAL_UNWIND orders before final CLOSED_PENDING_RECONCILIATION."""
+    """Partial close IOC must create RESIDUAL_UNWIND orders before final CLOSED."""
     from smart_money_radar.funding.trader import PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
     from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
@@ -4875,11 +4385,11 @@ def test_residual_unwind_creates_explicit_orders_and_closes_exposure(tmp_path) -
     residual_orders = [order for order in orders if order["order_intent"] == "RESIDUAL_UNWIND"]
     assert len(residual_orders) == 2
     assert {order["state"] for order in residual_orders} == {"FILLED"}
-    assert store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"})[0]["position_id"] == position_id
+    assert store.funding_capture_position_rows(states={"CLOSED"})[0]["position_id"] == position_id
 
 
 def test_position_cannot_close_with_unpriced_residual(tmp_path) -> None:
-    """If residual cannot be priced, exposure stays actionable in EMERGENCY_UNWIND."""
+    """If residual cannot be priced, exposure stays actionable in EXITING."""
     from smart_money_radar.funding.trader import PaperBotConfig
     from smart_money_radar.paper_bot.clock import FakeClock
     from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
@@ -4903,9 +4413,9 @@ def test_position_cannot_close_with_unpriced_residual(tmp_path) -> None:
     close = runtime.close_position(position, route, now, reason="bad_residual")
 
     assert close["decision"] == "failed"
-    assert close["state"] == "EMERGENCY_UNWIND"
-    assert store.funding_capture_position_by_id(position_id)["state"] == "EMERGENCY_UNWIND"
-    assert store.funding_capture_position_rows(states={"CLOSED_PENDING_RECONCILIATION"}) == []
+    assert close["state"] == "EXITING"
+    assert store.funding_capture_position_by_id(position_id)["state"] == "EXITING"
+    assert store.funding_capture_position_rows(states={"CLOSED"}) == []
 
 
 def test_collateral_release_uses_original_reserve_amount(tmp_path) -> None:
@@ -5578,29 +5088,29 @@ def test_hold_observations_use_focused_age_target_not_two_seconds(tmp_path) -> N
     capture_id = capture_position_id_for_route(route)
     cycle_id = f"{capture_id}:1"
     runtime._ensure_discovered_or_armed(route, capture_id, settlement, 30.0, now)
-    hold_observation = _valid_v2_observation(
+    exit_observation = _valid_v2_observation(
         now - timedelta(seconds=9),
         settlement,
-        phase="hold",
+        phase="exit",
     )
-    hold_observation["long_age_seconds"] = 9.0
-    hold_observation["short_age_seconds"] = 9.0
-    hold_observation["long_response_received_at"] = (now - timedelta(seconds=9)).isoformat()
-    hold_observation["short_response_received_at"] = (now - timedelta(seconds=8.5)).isoformat()
+    exit_observation["long_age_seconds"] = 9.0
+    exit_observation["short_age_seconds"] = 9.0
+    exit_observation["long_response_received_at"] = (now - timedelta(seconds=9)).isoformat()
+    exit_observation["short_response_received_at"] = (now - timedelta(seconds=8.5)).isoformat()
 
     runtime._store_observation(
         route,
         capture_id,
         settlement,
-        hold_observation,
-        phase="hold",
+        exit_observation,
+        phase="exit",
         cycle_id=cycle_id,
     )
 
-    valid = runtime._valid_observations(route, now, phase="hold", cycle_id=cycle_id)
+    valid = runtime._valid_observations(route, now, phase="exit", cycle_id=cycle_id)
 
     assert len(valid) == 1
-    assert valid[0]["observed_at"] == hold_observation["observed_at"]
+    assert valid[0]["observed_at"] == exit_observation["observed_at"]
 
 
 def _partial_attempt_route(now: datetime) -> dict:
@@ -6175,111 +5685,6 @@ def test_empty_history_and_negative_old_history_produce_identical_entry_decision
     assert empty == negative
     assert empty[1] == pytest.approx(5.0)
     assert empty[2] == 2
-
-
-def _fresh_probe_route(now: datetime) -> dict:
-    route = _v2_runtime_route(now, next_lead_seconds=3600)
-    route["evidence"]["targeted_refresh"] = {
-        "quality": "FRESH",
-        "snapshot_id": "probe-refresh-1",
-    }
-    return route
-
-
-def test_schedule_probe_with_stale_response_does_not_count(tmp_path) -> None:
-    from smart_money_radar.funding.trader import PaperBotConfig
-    from smart_money_radar.paper_bot.clock import FakeClock
-    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
-
-    now = datetime(2026, 7, 28, 16, 0, 10, tzinfo=UTC)
-    store, position_id = _open_position_for_close_tests(tmp_path, now)
-    position = store.funding_capture_position_by_id(position_id)
-    runtime = SynchronizedFundingRuntimeV2(
-        store=store,
-        config=PaperBotConfig(telegram_enabled=False).validated(),
-        clock=FakeClock(now),
-        observations_by_route={},
-    )
-    route = _fresh_probe_route(now)
-    for leg in route["legs"]:
-        leg["response_received_at"] = (now - timedelta(seconds=10.001)).isoformat()
-        leg["orderbook_response_received_at"] = (now - timedelta(seconds=10.001)).isoformat()
-
-    probe_state = runtime._record_schedule_probe(position, route, now)
-
-    assert probe_state["probes"][-1]["fresh"] is False
-    assert probe_state["probes"][-1]["invalid_reason"] == "schedule_probe_not_fresh_targeted_snapshot"
-
-
-def test_schedule_probe_with_5001ms_skew_does_not_count(tmp_path) -> None:
-    from smart_money_radar.funding.trader import PaperBotConfig
-    from smart_money_radar.paper_bot.clock import FakeClock
-    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
-
-    now = datetime(2026, 7, 28, 16, 0, 10, tzinfo=UTC)
-    store, position_id = _open_position_for_close_tests(tmp_path, now)
-    position = store.funding_capture_position_by_id(position_id)
-    runtime = SynchronizedFundingRuntimeV2(
-        store=store,
-        config=PaperBotConfig(
-            telegram_enabled=False,
-            estimate_paper_enabled=False,
-        ).validated(),
-        clock=FakeClock(now),
-        observations_by_route={},
-    )
-    route = _fresh_probe_route(now)
-    route["legs"][0]["response_received_at"] = now.isoformat()
-    route["legs"][0]["orderbook_response_received_at"] = now.isoformat()
-    route["legs"][1]["response_received_at"] = (now - timedelta(milliseconds=5001)).isoformat()
-    route["legs"][1]["orderbook_response_received_at"] = (now - timedelta(milliseconds=5001)).isoformat()
-
-    probe_state = runtime._record_schedule_probe(position, route, now)
-
-    assert probe_state["probes"][-1]["fresh"] is False
-    assert probe_state["probes"][-1]["cross_venue_skew_seconds"] == pytest.approx(5.001)
-
-
-def test_hold_legging_reserve_uses_observed_returns(tmp_path) -> None:
-    from smart_money_radar.funding.trader import PaperBotConfig
-    from smart_money_radar.paper_bot.clock import FakeClock
-    from smart_money_radar.paper_bot.runtime_v2 import SynchronizedFundingRuntimeV2
-
-    now = datetime(2026, 7, 28, 16, 0, 0, tzinfo=UTC)
-    store = SQLiteStore(tmp_path / "radar.sqlite")
-    store.init_db()
-    runtime = SynchronizedFundingRuntimeV2(
-        store=store,
-        config=PaperBotConfig(telegram_enabled=False).validated(),
-        clock=FakeClock(now),
-        observations_by_route={},
-    )
-    observations = []
-    long_mark = 100.0
-    for index, return_bps in enumerate([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]):
-        if index > 0:
-            long_mark *= 1.0 + return_bps / 10_000.0
-        observations.append(
-            {
-                "observed_at": (now + timedelta(seconds=index)).isoformat(),
-                "long_mark": long_mark,
-                "short_mark": 100.0,
-            }
-        )
-
-    p95 = runtime._p95_abs_mark_return_1s_from_observations(observations)
-    hold = hold_economics(
-        next_conservative_funding_gross=10.0,
-        current_close_fees=0.50,
-        reference_notional=500.0,
-        wait_seconds=3600.0,
-        entry_basis_reserve_bps=30.0,
-        adverse_basis_change_30s_bps=[0.0] * 10,
-        p95_abs_mark_return_1s_bps=p95,
-    )
-
-    assert p95 == pytest.approx(10.0)
-    assert hold["hold_legging_reserve_bps"] == pytest.approx(20.0)
 
 
 def test_generic_funding_rate_cannot_become_normalized_next_rate_in_core() -> None:
@@ -7254,7 +6659,7 @@ def test_boundary_is_recorded_before_hard_stale_exit_and_reconciles_after_close(
     assert {row["status"] for row in rows} == {"PENDING"}
     assert {row["evidence"]["lifecycle_state"] for row in rows} == {"BOUNDARY_CROSSED"}
     assert {row["evidence"]["venue_event_state"] for row in rows} == {"VENUE_EVENT_PENDING"}
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_PENDING_RECONCILIATION"
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED"
 
     settlement_at = now + timedelta(seconds=30)
     provider = FakeFundingSettlementDataProvider(
@@ -7275,7 +6680,9 @@ def test_boundary_is_recorded_before_hard_stale_exit_and_reconciles_after_close(
     assert first["reconciled"] == 2
     assert second["processed"] == 0
     assert len(funding_rows) == 2
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "RECONCILED"
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "CLOSED"
+    assert (position["config"] or {}).get("reconciliation_state") == "RECONCILED"
 
 
 def _boundary_rows_from_cycle_plan(position: dict, cycle: dict, crossed_at: datetime) -> list[dict]:
@@ -7407,12 +6814,14 @@ def test_zero_obligation_crossed_legacy_cycle_fails_closed(tmp_path, monkeypatch
     assert restarted.last_runtime_recovery["boundary"]["zero_obligation_mismatches"] == 1
     assert store.funding_capture_cycles_for_position(capture_id)[0]["state"] == "SETTLEMENT_PLAN_MISMATCH"
     assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "EXITING"
     assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
 
     _install_targeted_refresh_clients(restarted, route["route_key"], route)
     assert restarted.process_open_positions() == ["closed_requires_review"]
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_REQUIRES_REVIEW"
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "CLOSED"
+    assert position["config"]["integrity"] == "REQUIRES_REVIEW"
     assert store.funding_settlement_reconciliation_rows(capture_id) == []
     assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
 
@@ -7448,7 +6857,8 @@ def test_active_cycle_event_mismatch_does_not_cross_or_create_obligations(tmp_pa
     assert updated_cycle["boundary_evidence"]["blocker"] == "settlement_plan_event_mismatch"
     position = store.funding_capture_position_by_id(capture_id)
     assert position["settlements_captured_count"] == 0
-    assert position["state"] == "CLOSED_REQUIRES_REVIEW"
+    assert position["state"] == "CLOSED"
+    assert position["config"]["integrity"] == "REQUIRES_REVIEW"
     assert position["config"]["close_requires_review_reason"] == "settlement_plan_event_mismatch"
     assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
     assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
@@ -7495,7 +6905,7 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
 
     assert first == ["settlement_plan_mismatch", "close_failed"]
     position = store.funding_capture_position_by_id(capture_id)
-    assert position["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert position["state"] == "EXITING"
     assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
     assert store.funding_settlement_reconciliation_rows(capture_id) == []
     snapshot = store.record_funding_paper_equity_snapshot()
@@ -7533,7 +6943,7 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
     assert open_poll_calls == ["open"]
     assert blocked["mode"] == "open_positions"
     assert blocked["open_position_count"] == 1
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "EXITING"
     bot.process_open_positions = original_process_open_positions  # type: ignore[method-assign]
 
     good_route = _fresh_route_for_open_position(route, bot.clock.now())
@@ -7546,9 +6956,129 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
     second = bot.process_open_positions()
 
     assert second == ["closed_requires_review"]
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "CLOSED_REQUIRES_REVIEW"
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "CLOSED"
+    assert position["config"]["integrity"] == "REQUIRES_REVIEW"
     assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
     assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
+
+
+def _prepare_legacy_nonflat_position(
+    tmp_path,
+    monkeypatch,
+    legacy_state: str,
+) -> tuple[SQLiteStore, dict, str, datetime, int, set[str]]:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    settlement_at = now + timedelta(seconds=30)
+    bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
+    assert bot.process_open_positions() == ["settlement_crossed"]
+    first_cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    reconciliation_ids = {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    }
+    assert len(reconciliation_ids) == 2
+    future_settlement = settlement_at + timedelta(hours=1)
+    store.upsert_funding_capture_cycle(
+        {
+            "cycle_id": f"{capture_id}:2",
+            "position_id": capture_id,
+            "cycle_number": 2,
+            "plan_generation": 2,
+            "scheduled_funding_at": future_settlement.isoformat(),
+            "state": "OPEN",
+            "decision": "legacy_continuation_fixture",
+            "decision_reason": "historical_nonflat_row",
+            "active_plan": first_cycle["active_plan"],
+        }
+    )
+    store.update_funding_capture_position_state(capture_id, legacy_state, bot.clock.now())
+    position = store.funding_capture_position_by_id(capture_id)
+    config = dict(position["config"] or {})
+    config["legacy_fixture_state"] = legacy_state
+    store.update_funding_capture_position_config(capture_id, config, bot.clock.now())
+    assert store.funding_capture_position_by_id(capture_id)["state"] == legacy_state
+    assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
+    return store, route, capture_id, settlement_at, len(store.funding_capture_cycles_for_position(capture_id)), reconciliation_ids
+
+
+def _assert_legacy_nonflat_restart_exits(
+    tmp_path,
+    monkeypatch,
+    legacy_state: str,
+) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    store, route, capture_id, settlement_at, cycle_count, reconciliation_ids = (
+        _prepare_legacy_nonflat_position(tmp_path, monkeypatch, legacy_state)
+    )
+    restart_at = settlement_at + timedelta(seconds=31)
+    restarted = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False, focused_recheck_enabled=False).validated(),
+        clock=FakeClock(restart_at),
+    )
+
+    recovery = restarted.last_runtime_recovery["legacy_nonflat"]
+    assert recovery["normalized"] == 1
+    assert recovery["states_seen"] == {legacy_state: 1}
+    assert not hasattr(restarted.synchronized_runtime, "next_cycle_hold_or_close_decision")
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "EXITING"
+    assert position["config"]["original_legacy_state"] == legacy_state
+    assert position["config"]["exit_mode"] == "MANDATORY"
+    assert position["config"]["first_planned_boundary_at"] == settlement_at.isoformat()
+    assert position["current_cycle_scheduled_funding_at"] != settlement_at.isoformat()
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+    assert {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    } == reconciliation_ids
+
+    guard = restarted.synchronized_runtime._opportunity_guard(capture_id)
+    assert guard["allowed"] is False
+    assert guard["reason"] == "opportunity_already_open"
+    assert restarted.process_entry_candidates([route], recheck_before_open=False) == []
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+
+    restarted.build_venue_clients = lambda: []  # type: ignore[method-assign]
+    restarted.hot_routes.pop(route["route_key"], None)
+    assert restarted.process_open_positions() == []
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "EXITING"
+    assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+    assert {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    } == reconciliation_ids
+
+    safe_route = _fresh_route_for_open_position(route, restart_at)
+    _install_targeted_refresh_clients(restarted, route["route_key"], safe_route)
+    restarted.hot_routes[route["route_key"]] = safe_route
+    assert restarted.process_open_positions() == ["closed"]
+    closed = store.funding_capture_position_by_id(capture_id)
+    assert closed["state"] == "CLOSED"
+    assert closed["config"]["normal_close_not_before"] == (
+        settlement_at + timedelta(seconds=20)
+    ).isoformat()
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+    assert {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    } == reconciliation_ids
+
+
+def test_legacy_holding_next_cycle_restart_normalizes_to_mandatory_exit(tmp_path, monkeypatch) -> None:
+    _assert_legacy_nonflat_restart_exits(tmp_path, monkeypatch, "HOLDING_NEXT_CYCLE")
+
+
+def test_legacy_post_settlement_evaluation_restart_normalizes_to_mandatory_exit(tmp_path, monkeypatch) -> None:
+    _assert_legacy_nonflat_restart_exits(tmp_path, monkeypatch, "POST_SETTLEMENT_EVALUATION")
 
 
 def test_restart_between_boundary_and_reconciliation_preserves_obligation(tmp_path, monkeypatch) -> None:
@@ -7589,13 +7119,13 @@ def test_restart_between_boundary_and_reconciliation_preserves_obligation(tmp_pa
     assert {row["status"] for row in rows} == {"RATE_AND_MARK_RECONCILED"}
 
 
-def test_two_cycle_paper_mvp_script_reaches_reconciled_state() -> None:
+def test_two_capture_paper_mvp_script_creates_distinct_capture_ids() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(repo_root)}
     result = subprocess.run(
         [
             sys.executable,
-            str(repo_root / "scripts" / "run_synchronized_funding_two_cycle_paper_mvp.py"),
+            str(repo_root / "scripts" / "run_synchronized_funding_two_capture_paper_mvp.py"),
         ],
         cwd=repo_root,
         env=env,
@@ -7606,17 +7136,13 @@ def test_two_cycle_paper_mvp_script_reaches_reconciled_state() -> None:
     lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     events = {line["event"]: line for line in lines}
 
-    assert events["hold"]["active_plan_generation"] == 2
-    assert events["cycle_1_boundary"]["obligation_count"] == 2
-    assert events["cycle_2_boundary"]["obligation_count"] == 2
-    final = events["reconcile"]
-    assert final["final_state"] == "RECONCILED"
-    assert final["settlements_captured_count"] == 2
-    assert final["cycle_1_obligation_count"] == 2
-    assert final["cycle_2_obligation_count"] == 2
-    assert final["total_funding_ledger_count"] == 4
-    assert final["ledger_account_consistency"]["ok"] is True
-    assert final["repeat_reconciliation"]["processed"] == 0
+    complete = events["complete"]
+    assert complete["first_capture_id"] != complete["second_capture_id"]
+    assert complete["position_count"] == 2
+    assert events["capture_1_boundary"]["obligations"] == 2
+    assert events["capture_2_boundary"]["obligations"] == 2
+    assert events["capture_1_closed"]["state"] == "CLOSED"
+    assert events["capture_2_closed"]["state"] == "CLOSED"
 
 
 def test_risk_close_before_boundary_creates_no_settlement_accrual(tmp_path, monkeypatch) -> None:
@@ -7644,53 +7170,30 @@ def test_risk_close_before_boundary_creates_no_settlement_accrual(tmp_path, monk
     assert [row for row in store.paper_event_ledger_rows(capture_id) if row["event_type"] == "funding"] == []
 
 
-def test_post_settlement_replan_records_new_generation_and_blocks_stale_timestamp(tmp_path, monkeypatch) -> None:
+def test_mandatory_exit_waits_for_fresh_route_then_closes_without_replan(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
     store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
     assert opened == [capture_id]
-    settlement_at = now + timedelta(seconds=30)
     bot.clock.advance(31)
     _install_fresh_hot_route(bot, route)
     assert bot.process_open_positions() == ["settlement_crossed"]
 
     bot.clock.advance(31)
     current = bot.clock.now()
-    next_route = _v2_runtime_route(
-        current,
-        next_lead_seconds=3600,
-        short_next_lead_seconds=3600,
-        route_key=route["route_key"],
-    )
-    next_route["legs"][1]["normalized_next_funding_rate"] = 0.004
-    bot.hot_routes[route["route_key"]] = next_route
-    decision = bot.synchronized_runtime.next_cycle_hold_or_close_decision(
+    decision = bot.synchronized_runtime.mandatory_exit_after_boundary_decision(
         store.funding_capture_position_by_id(capture_id),
-        next_route,
+        None,
         current,
     )
-    replans = store.funding_capture_position_by_id(capture_id)["config"]["post_settlement_replans"]
-    assert replans[-1]["plan_generation"] == 2
-    assert replans[-1]["new_scheduled_funding_at"] != settlement_at.isoformat()
-    assert decision["reason"] in {
-        "hold_economics_failed",
-        "next_cycle_observations_failed",
-        "next_settlement_schedule_mismatch",
-        "next_settlement_schedule_not_confirmed",
-    }
+    assert decision["decision"] == "wait"
+    assert decision["reason"] == "mandatory_exit_waiting_for_executable_route"
 
-    stale_route = _v2_runtime_route(
-        current,
-        next_lead_seconds=-1,
-        short_next_lead_seconds=-1,
-        route_key=route["route_key"],
-    )
-    stale_decision = bot.synchronized_runtime.next_cycle_hold_or_close_decision(
-        store.funding_capture_position_by_id(capture_id),
-        stale_route,
-        current,
-    )
-    assert stale_decision["decision"] == "close"
-    assert stale_decision["reason"] == "next_cycle_stale_or_past_settlement"
+    fresh_route = _v2_runtime_route(current, next_lead_seconds=3600, route_key=route["route_key"])
+    bot.hot_routes[route["route_key"]] = fresh_route
+    assert bot.process_open_positions() == ["closed"]
+    closed = store.funding_capture_position_by_id(capture_id)
+    assert closed["state"] == "CLOSED"
+    assert "post_settlement_replans" not in (closed["config"] or {})
 
 
 def test_dex_adapter_evidence_fields_flow_through_focused_snapshot() -> None:

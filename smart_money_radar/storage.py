@@ -29,17 +29,25 @@ from smart_money_radar.funding.route_identity import (
 
 FUNDING_UNIT_MULTIPLIERS = CANONICAL_ASSET_UNIT_MULTIPLIERS
 
-FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = {
+CURRENT_NONFLAT_CAPTURE_STATES = {
     "OPEN",
-    "SETTLEMENT_CROSSED",
-    "POST_SETTLEMENT_EVALUATION",
+    "EXITING",
+}
+
+LEGACY_NONFLAT_CAPTURE_STATES = {
     "HOLDING_NEXT_CYCLE",
+    "POST_SETTLEMENT_EVALUATION",
+    "SETTLEMENT_CROSSED",
     "EXIT_SCHEDULED",
     "EXIT_SUBMITTED",
     "PARTIALLY_CLOSED",
     "EMERGENCY_UNWIND",
     "SETTLEMENT_PLAN_MISMATCH",
 }
+
+FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = (
+    CURRENT_NONFLAT_CAPTURE_STATES | LEGACY_NONFLAT_CAPTURE_STATES
+)
 
 FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES = FUNDING_CAPTURE_OPEN_EXPOSURE_STATES | {
     "DISCOVERED",
@@ -1152,7 +1160,7 @@ class SQLiteStore:
         boundary_evidence: dict[str, Any],
         position_config_update: dict[str, Any],
         now: datetime,
-        position_state: str = "SETTLEMENT_CROSSED",
+        position_state: str = "OPEN",
         fault_after: str | None = None,
     ) -> dict[str, Any]:
         """Persist obligations, cycle boundary state, and position counter atomically."""
@@ -1319,7 +1327,7 @@ class SQLiteStore:
             "settlements_captured_count": int(captured_count),
         }
 
-    def activate_funding_capture_hold_cycle(
+    def activate_funding_capture_legacy_cycle(
         self,
         *,
         cycle_row: dict[str, Any],
@@ -1327,134 +1335,7 @@ class SQLiteStore:
         now: datetime,
         paper_net_pnl_estimated: float | None = None,
     ) -> str:
-        """Atomically create the next active HOLD cycle and switch position state."""
-        now_iso = now.astimezone(UTC).replace(microsecond=0).isoformat()
-        position_id = str(cycle_row["position_id"])
-        cycle_id = str(
-            cycle_row.get("cycle_id")
-            or f"{position_id}:{int(cycle_row['cycle_number'])}"
-        )
-        active_plan_json = json.dumps(
-            cycle_row.get("active_plan", cycle_row.get("active_plan_json", {})),
-            sort_keys=True,
-        )
-        boundary_evidence_json = json.dumps(
-            cycle_row.get("boundary_evidence", cycle_row.get("boundary_evidence_json", {})),
-            sort_keys=True,
-        )
-        assignments = [
-            "state = 'HOLDING_NEXT_CYCLE'",
-            "config_json = ?",
-            "updated_at = ?",
-        ]
-        parameters: list[Any] = [json.dumps(active_config, sort_keys=True), now_iso]
-        if paper_net_pnl_estimated is not None:
-            assignments.append("paper_net_pnl_estimated = ?")
-            parameters.append(float(paper_net_pnl_estimated))
-        parameters.append(position_id)
-        with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO funding_capture_cycles (
-                    cycle_id,
-                    position_id,
-                    cycle_number,
-                    plan_generation,
-                    scheduled_funding_at,
-                    long_next_funding_rate_at_decision,
-                    short_next_funding_rate_at_decision,
-                    conservative_funding_gross,
-                    conservative_funding_edge_bps,
-                    hold_basis_reserve_bps,
-                    hold_legging_reserve_bps,
-                    hold_time_reserve_bps,
-                    hold_liquidity_reserve_bps,
-                    incremental_hold_cost,
-                    incremental_hold_net_pnl,
-                    hold_cost_coverage_ratio,
-                    paper_net_if_exit_at_decision,
-                    decision,
-                    decision_reason,
-                    state,
-                    settlement_crossed_at,
-                    reconciliation_status,
-                    reconciled_funding_pnl,
-                    active_plan_json,
-                    boundary_evidence_json,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(position_id, cycle_number) DO UPDATE SET
-                    plan_generation = excluded.plan_generation,
-                    scheduled_funding_at = excluded.scheduled_funding_at,
-                    long_next_funding_rate_at_decision = excluded.long_next_funding_rate_at_decision,
-                    short_next_funding_rate_at_decision = excluded.short_next_funding_rate_at_decision,
-                    conservative_funding_gross = excluded.conservative_funding_gross,
-                    conservative_funding_edge_bps = excluded.conservative_funding_edge_bps,
-                    hold_basis_reserve_bps = excluded.hold_basis_reserve_bps,
-                    hold_legging_reserve_bps = excluded.hold_legging_reserve_bps,
-                    hold_time_reserve_bps = excluded.hold_time_reserve_bps,
-                    hold_liquidity_reserve_bps = excluded.hold_liquidity_reserve_bps,
-                    incremental_hold_cost = excluded.incremental_hold_cost,
-                    incremental_hold_net_pnl = excluded.incremental_hold_net_pnl,
-                    hold_cost_coverage_ratio = excluded.hold_cost_coverage_ratio,
-                    paper_net_if_exit_at_decision = excluded.paper_net_if_exit_at_decision,
-                    decision = excluded.decision,
-                    decision_reason = excluded.decision_reason,
-                    state = excluded.state,
-                    settlement_crossed_at = excluded.settlement_crossed_at,
-                    reconciliation_status = excluded.reconciliation_status,
-                    reconciled_funding_pnl = excluded.reconciled_funding_pnl,
-                    active_plan_json = CASE
-                        WHEN excluded.active_plan_json != '{}' THEN excluded.active_plan_json
-                        ELSE funding_capture_cycles.active_plan_json
-                    END,
-                    boundary_evidence_json = CASE
-                        WHEN excluded.boundary_evidence_json != '{}' THEN excluded.boundary_evidence_json
-                        ELSE funding_capture_cycles.boundary_evidence_json
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    cycle_id,
-                    position_id,
-                    int(cycle_row["cycle_number"]),
-                    int(cycle_row.get("plan_generation") or cycle_row.get("cycle_number") or 0),
-                    cycle_row["scheduled_funding_at"],
-                    cycle_row.get("long_next_funding_rate_at_decision"),
-                    cycle_row.get("short_next_funding_rate_at_decision"),
-                    cycle_row.get("conservative_funding_gross"),
-                    cycle_row.get("conservative_funding_edge_bps"),
-                    cycle_row.get("hold_basis_reserve_bps"),
-                    cycle_row.get("hold_legging_reserve_bps"),
-                    cycle_row.get("hold_time_reserve_bps"),
-                    cycle_row.get("hold_liquidity_reserve_bps"),
-                    cycle_row.get("incremental_hold_cost"),
-                    cycle_row.get("incremental_hold_net_pnl"),
-                    cycle_row.get("hold_cost_coverage_ratio"),
-                    cycle_row.get("paper_net_if_exit_at_decision"),
-                    cycle_row.get("decision", "HOLD"),
-                    cycle_row.get("decision_reason", "next_cycle_underwriting_passed"),
-                    cycle_row.get("state", "HOLDING_NEXT_CYCLE"),
-                    cycle_row.get("settlement_crossed_at"),
-                    cycle_row.get("reconciliation_status", "PENDING"),
-                    cycle_row.get("reconciled_funding_pnl"),
-                    active_plan_json,
-                    boundary_evidence_json,
-                    cycle_row.get("created_at", now_iso),
-                    now_iso,
-                ),
-            )
-            connection.execute(
-                f"""
-                UPDATE funding_capture_positions
-                SET {", ".join(assignments)}
-                WHERE position_id = ?
-                """,
-                parameters,
-            )
-        return cycle_id
+        raise RuntimeError("continuation cycles are forbidden in RF-001")
 
     def mark_settlement_plan_mismatch(
         self,
@@ -1495,7 +1376,7 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE funding_capture_positions
-                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                SET state = 'EXITING',
                     config_json = ?,
                     updated_at = ?
                 WHERE position_id = ?
@@ -1513,6 +1394,7 @@ class SQLiteStore:
         repaired_counts = 0
         completed_cycles = 0
         mismatches = 0
+        handled_mismatch_cycle_ids: set[str] = set()
         with self.connect() as connection:
             positions = connection.execute(
                 "SELECT position_id, state, closed_at, config_json FROM funding_capture_positions"
@@ -1586,6 +1468,7 @@ class SQLiteStore:
                             (json.dumps(evidence, sort_keys=True), now_iso, cycle_id),
                         )
                         mismatches += 1
+                        handled_mismatch_cycle_ids.add(cycle_id)
                         if (
                             not position_closed
                             and position_state not in {
@@ -1606,7 +1489,7 @@ class SQLiteStore:
                             connection.execute(
                                 """
                                 UPDATE funding_capture_positions
-                                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                                SET state = 'EXITING',
                                     config_json = ?,
                                     updated_at = ?
                                 WHERE position_id = ?
@@ -1617,7 +1500,7 @@ class SQLiteStore:
                                     position_id,
                                 ),
                             )
-                            position_state = "SETTLEMENT_PLAN_MISMATCH"
+                            position_state = "EXITING"
                         continue
                     if (
                         obligation_count > 0
@@ -1688,9 +1571,15 @@ class SQLiteStore:
                     """,
                     (position_id,),
                 ).fetchone()
+                already_flagged_mismatch = (
+                    position_state == "EXITING"
+                    and position_config.get("blocker") == "settlement_plan_event_mismatch"
+                )
                 if (
                     mismatch_cycle is not None
+                    and str(mismatch_cycle["cycle_id"]) not in handled_mismatch_cycle_ids
                     and not position_closed
+                    and not already_flagged_mismatch
                     and position_state not in {
                         "SETTLEMENT_PLAN_MISMATCH",
                         "FAILED",
@@ -1717,7 +1606,7 @@ class SQLiteStore:
                     connection.execute(
                         """
                         UPDATE funding_capture_positions
-                        SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                        SET state = 'EXITING',
                             config_json = ?,
                             updated_at = ?
                         WHERE position_id = ?

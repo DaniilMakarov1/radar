@@ -22,7 +22,7 @@ Prediction, Dune/local analytics, wallet research, and old on-chain Radar module
 
 Before changing repository logic, read:
 
-1. `docs/MODEL_INSTRUCTIONS.md` — detailed operating contract, entry/hold/close rules, funding-unit invariants, and testing requirements.
+1. `docs/MODEL_INSTRUCTIONS.md` — detailed operating contract, entry/mandatory-exit/close rules, funding-unit invariants, and testing requirements.
 2. `docs/AGENT_HANDOFF.md` — current handoff context and where large raw chat transcripts live.
 3. The specific source file and matching tests for the task.
 
@@ -55,7 +55,7 @@ python3 -m smart_money_radar.cli funding-paper-export
 - Do not enable live trading. This repository is paper-only unless Daniil explicitly approves a separate live-execution phase.
 - Do not add arbitrary route caps, top-N gates, or hard BPS filters without a risk reason and a test.
 - Do not assume all venues report funding in the same units. `funding_rate` means per settlement interval; `hourly_funding_rate` is the normalized comparable value.
-- Do not close a paper position merely because the first settlement happened. Keep it open while the arbitrage window remains valid; close when risk or opportunity logic says so.
+- Do not keep a production paper position for another funding cycle after the first captured settlement. Exit at the first normal-safe opportunity after T+20, except hard-risk exits may happen earlier.
 - Do not show negative-PnL routes as candidates. They may be diagnostics, but not actionable candidates.
 - Do not let deleted modules affect Funding UI startup. The Funding dashboard must load even if archived modules are absent.
 
@@ -84,13 +84,15 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 
 ## Default Strategy
 
-The production paper strategy is `synchronized_funding_capture_v2`:
+The production paper strategy is `FUNDING_SETTLEMENT_CAPTURE`:
 
 - long one perpetual venue and short another with the same canonical base quantity;
 - enter for the nearest synchronized funding settlement;
-- both next settlements must align within 1 second;
+- use plan shape `ONE_SETTLEMENT` or `MULTIPLE_SETTLEMENTS` from one `CapturePlan`;
+- capture exactly one settlement boundary, then require mandatory exit;
 - spread convergence is never expected profit in the default strategy;
 - executable spread, basis deterioration, liquidity, fees, stale data, and margin risk are costs/gates;
+- legacy `single_settlement_hedged_capture_v1` and `synchronized_funding_capture_v2` names are compatibility/version metadata only, not production strategy owners;
 - legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any` are research/experimental labels only unless Codex explicitly enables an experimental profile.
 
 ## Paper Bot Timing
@@ -106,7 +108,7 @@ The production paper strategy is `synchronized_funding_capture_v2`:
 - Cross-venue snapshot skew default is <= 5 seconds for VERIFIED_PAPER and <= 15 seconds for PAPER estimate-based entry.
 - Default paper entry is PAPER-capable for typed estimates; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
 - The old 15-second freeze-window fallback is disabled by default.
-- After settlement, probe next schedules around T+5 and decide hold/close around T+30.
+- After settlement, preserve reconciliation obligations and schedule mandatory exit at the first normal-safe opportunity.
 - Normal close before T+20 is disallowed except for hard-risk events.
 
 ## Project Layout

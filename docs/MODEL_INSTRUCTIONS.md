@@ -42,14 +42,14 @@ Important paths:
 
 - `smart_money_radar/funding/` - venue adapters, scanner, forecasts, economics,
   route construction, liquidity and profiles.
-- `smart_money_radar/paper_bot/` - paper entry, hold, settlement, close,
+- `smart_money_radar/paper_bot/` - paper entry, settlement boundary, mandatory exit, close,
   spread monitoring, Telegram formatting.
 - `smart_money_radar/storage.py` - SQLite schema and dashboard/report queries.
 - `smart_money_radar/cli.py` - operational commands.
 - `smart_money_radar/web/index.html` - local dashboard UI.
 - `scripts/` - local start/stop/status/launchd helpers.
 - `tests/test_funding_radar.py` - scanner/economics/adapters.
-- `tests/test_funding_paper_trader.py` - bot lifecycle, entry/hold/close.
+- `tests/test_funding_paper_trader.py` - bot lifecycle, entry/settlement/mandatory exit/close.
 - `tests/test_funding_retention.py` - pruning and data retention.
 - `QWEN.md` - short worker instructions.
 - `docs/AGENT_HANDOFF.md` - handoff context and where raw transcripts live.
@@ -112,15 +112,16 @@ Default candidate status is not "funding is positive" or "spread is positive"
 by itself. The active paper strategy is:
 
 ```text
-synchronized_funding_capture_v2
+FUNDING_SETTLEMENT_CAPTURE
 ```
 
-This is cross-venue delta-neutral funding capture:
+This is cross-venue delta-neutral funding settlement capture:
 
 - long perpetual on one venue;
 - short perpetual on another venue;
 - same canonical base quantity;
 - entry reason is the nearest synchronized funding settlement;
+- plan shape is `ONE_SETTLEMENT` or `MULTIPLE_SETTLEMENTS`;
 - spread convergence is not expected profit;
 - executable spread, book walking, fees, basis deterioration, stale data,
   liquidation/margin risk, and venue capability are costs/gates.
@@ -182,28 +183,25 @@ PaperBot.process_synchronized_open_positions
   -> risk hard/stale/dynamic-basis checks
   -> SynchronizedFundingRuntimeV2.mark_settlement_crossed
   -> settlement.build_settlement_crossing_rows
-  -> SynchronizedFundingRuntimeV2.next_cycle_hold_or_close_decision
-  -> cycle_manager.next_cycle_schedule_decision
-  -> cycle_manager.next_cycle_observation_decision
-  -> strategy_synchronized_funding.hold_economics
-  -> SynchronizedFundingRuntimeV2.close_position when hold fails
+  -> SynchronizedFundingRuntimeV2.mandatory_exit_after_boundary_decision
+  -> SynchronizedFundingRuntimeV2.close_position after T+20 when a route is executable
 ```
 
 Legacy `position.py` accounting and `funding_paper_positions` remain for old
 profiles and old reports. They are not the source of truth for
-`synchronized_funding_capture_v2`.
+`FUNDING_SETTLEMENT_CAPTURE`.
 
 `funding-shadow-monitor` is a separate read-only mode, not a paper runtime. It
 stores only `funding_shadow_*` rows, sends `SHADOW FUNDING` Telegram messages,
 and must not call paper entry, paper order creation, collateral reservation,
-settlement hold/close, account balance mutation, private exchange endpoints, or
+settlement close, account balance mutation, private exchange endpoints, or
 live execution. Shadow observations include an `environment` field; `mainnet` and
 `testnet` rows cannot be joined into one opportunity or statistic.
 
 The intended runtime cadence is unchanged:
 
 - P0 open v2/legacy positions: cancel background full scan, refresh involved
-  venues, run risk/hold/close, reconciliation, and equity snapshot, then return;
+  venues, run risk/mandatory-exit/close, reconciliation, and equity snapshot, then return;
 - P1 critical hot routes at <=120 seconds to settlement: cancel background scan
   and run due hot rechecks before discovery;
 - P2 due reconciliation;
@@ -232,7 +230,7 @@ return partial results after the venue deadline instead of blocking the loop.
 
 ## 7. Scanner, Watch, and Entry Lifecycle
 
-For `synchronized_funding_capture_v2`, the full scanner is not authoritative for
+For `FUNDING_SETTLEMENT_CAPTURE`, the full scanner is not authoritative for
 entry. It can output only:
 
 - `research_only` when capability/contract/collateral/funding semantics fail;
@@ -261,10 +259,9 @@ Required conditions:
    PAPER may use a typed `rate_estimate_per_settlement` when sign
    convention, unit/scale, funding interval, next funding timestamp, and source
    identity/estimate kind are known.
-4. `single_settlement_hedged_capture_v1` requires one favorable near
-   settlement and uses the other leg as a hedge; the hedge leg settlement may be
-   later. `synchronized_funding_capture_v2` still requires both
-   `next_funding_at` timestamps to align within 1 second.
+4. `ONE_SETTLEMENT` requires one favorable near settlement and uses the other
+   leg as a hedge; the hedge leg settlement may be later. `MULTIPLE_SETTLEMENTS`
+   requires both `next_funding_at` timestamps to align within 1 second.
 5. Current lead is inside T-35 to T-25 seconds, target T-30.
 6. Focused observations contain at least 10 valid paired snapshots over at least
    20 seconds.
@@ -283,11 +280,12 @@ Required conditions:
 `ENTRY_SUBMITTED -> OPEN` is forbidden without two fills. Partial fill produces
 `PARTIALLY_HEDGED`/unwind evidence and does not create an open v2 position.
 
-## 8. Settlement, Hold, and Close Lifecycle
+## 8. Settlement Boundary and Close Lifecycle
 
-Every settlement is a cycle. Crossing a scheduled funding timestamp creates two
-`funding_settlement_reconciliations` rows with `PENDING` status. It does not add
-funding PnL, account cashflow, equity, win rate, or reconciled profitability.
+Every capture owns exactly one scheduled funding boundary. Crossing that
+timestamp creates two `funding_settlement_reconciliations` rows with `PENDING`
+status. It does not add funding PnL, account cashflow, equity, win rate, or
+reconciled profitability.
 
 If public history is missing:
 
@@ -296,45 +294,26 @@ If public history is missing:
 - reconciliation stays `PENDING` or `UNRECONCILED`;
 - paper balance and `paper_net_if_exit_now` do not include that funding.
 
-Normal close is forbidden before T+20. Hold/close evaluation happens around
-T+30 using the next exact timestamps, not `funding_interval_hours` equality.
+Normal close is forbidden before T+20 after the captured boundary. Hard-risk
+exits may close earlier. After T+20, production must exit at the first
+normal-safe opportunity with an executable route. If a route is unavailable,
+the position remains `OPEN` or `EXITING` with mandatory-exit evidence and retries
+until it can close or a hard-risk path takes over.
 
-Hold is allowed only if:
+Production continuation into another funding cycle is forbidden. A later funding
+boundary requires new discovery, focused observations, underwriting, simulated
+fills, and a new `capture_id`. Delayed or partial exits that cross a later event
+are incident/reconciliation cases, not planned strategy behavior.
 
-- next long and short funding timestamps align within 1 second;
-- next settlement is 300-14,400 seconds away;
-- at least 15 valid next-cycle observations cover at least 20 seconds;
-- all next-cycle gross funding values are positive and stable;
-- incremental hold economics pass gross, net, and 1.50x coverage gates;
-- opening fees are treated as sunk costs;
-- projected total after the next cycle is non-negative;
-- captured settlements remain below 4 and projected age remains at most 14,700
-  seconds;
-- hard risk gates pass.
-
-Before those economics are accepted, apply hold history reliability:
+Production capture states are:
 
 ```text
-history_adjusted_next_funding =
-  next_conservative_funding_gross * history_multiplier
+ENTRY_SUBMITTED, OPEN, EXITING, CLOSED, FAILED
 ```
 
-The history sample is local-only and scoped to the same canonical asset,
-directed long venue, directed short venue, collateral asset, and next-settlement
-wait bucket (`<=1h`, `>1h..<=2h`, `>2h..<=4h`). It uses only fully reconciled
-prior hold cycles, never raw exchange funding history.
-
-If valid cycles `< 8`, history is insufficient: multiplier `0.75`, no automatic
-veto, and at most one additional settlement may be held. If valid cycles `>= 8`,
-hold fails when positive realization rate `< 0.70` or p25 realization ratio
-`< 0.50`; otherwise the multiplier is `clamp(0.50, 1.00, p25 ratio)`.
-
-Good history cannot override negative current funding, negative current
-executable PnL, stale data, liquidity failure, basis risk, schedule mismatch, or
-hard risk.
-
-Hold does not wait for the prior cycle's reconciliation. The position can be
-`HOLDING_NEXT_CYCLE` while previous public funding rows are still pending.
+Review and integrity outcomes belong in structured config fields such as
+`integrity`, `reconciliation_state`, `mandatory_exit_after_first_boundary`,
+`normal_close_not_before`, and `boundary_crossed_at`, not in new lifecycle states.
 
 Close uses two simulated reduce-only exit orders. Price PnL is:
 
@@ -419,7 +398,7 @@ resurrect a disabled venue by only changing the UI. A venue is active only when:
 Default profile uses `venue_set=None`, meaning all active registered adapters are
 scanned automatically. Do not replace this with a hardcoded production list.
 
-For `synchronized_funding_capture_v2`, active is still not enough. A venue is
+For `FUNDING_SETTLEMENT_CAPTURE`, active is still not enough. A venue is
 paper-eligible only if it supports perpetuals, linear contracts, USDT/USDC/USD
 collateral, discrete next-settlement funding, next funding timestamp, mark/index
 prices, executable orderbook depth, 24h quote volume, open interest, taker fee,
