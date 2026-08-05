@@ -63,7 +63,9 @@ from smart_money_radar.paper_bot.settlement import (
     realized_public_funding_rate,
 )
 from smart_money_radar.storage import (
+    CURRENT_NONFLAT_CAPTURE_STATES,
     FUNDING_CAPTURE_OPEN_EXPOSURE_STATES,
+    LEGACY_NONFLAT_CAPTURE_STATES,
     SQLiteStore,
 )
 
@@ -2322,13 +2324,164 @@ class SynchronizedFundingRuntimeV2:
         config["entry_attempts"] = attempts
         self.store.update_funding_capture_position_config(capture_id, config, now)
 
+    def _first_crossed_boundary_for_position(
+        self,
+        position: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        position_id = str(position["position_id"])
+        now_utc = now.astimezone(UTC)
+        crossed_states = {
+            "SETTLEMENT_CROSSED",
+            "PUBLIC_RATE_CONFIRMED",
+            "RATE_AND_MARK_RECONCILED",
+            "RECONCILED",
+            "UNRECONCILED",
+        }
+        legacy_position_state = str(position.get("state") or "")
+        candidates: list[dict[str, Any]] = []
+        for cycle in self.store.funding_capture_cycles_for_position(position_id):
+            scheduled = parse_time(cycle.get("scheduled_funding_at"))
+            if scheduled is None:
+                continue
+            scheduled_utc = scheduled.astimezone(UTC)
+            crossed_at = parse_time(cycle.get("settlement_crossed_at"))
+            cycle_state = str(cycle.get("state") or "")
+            crossed_like = (
+                crossed_at is not None
+                or cycle_state in crossed_states
+                or (
+                    legacy_position_state in LEGACY_NONFLAT_CAPTURE_STATES
+                    and scheduled_utc <= now_utc
+                )
+            )
+            if not crossed_like:
+                continue
+            candidates.append(
+                {
+                    "cycle_id": str(cycle.get("cycle_id") or ""),
+                    "cycle_number": int(cycle.get("cycle_number") or 0),
+                    "scheduled_at": scheduled_utc.isoformat(),
+                    "crossed_at": (
+                        crossed_at.astimezone(UTC).isoformat()
+                        if crossed_at is not None
+                        else scheduled_utc.isoformat()
+                    ),
+                    "cycle_state": cycle_state,
+                    "source": "funding_capture_cycles",
+                }
+            )
+        if candidates:
+            return sorted(candidates, key=lambda item: item["scheduled_at"])[0]
+
+        config = position.get("config") or {}
+        for key in ("first_planned_boundary_at", "boundary_crossed_at"):
+            value = parse_time(config.get(key))
+            if value is None:
+                continue
+            return {
+                "cycle_id": str(position.get("current_cycle_id") or ""),
+                "cycle_number": int(position.get("current_cycle_number") or 0),
+                "scheduled_at": value.astimezone(UTC).isoformat(),
+                "crossed_at": (
+                    parse_time(config.get("boundary_crossed_at")) or value
+                ).astimezone(UTC).isoformat(),
+                "cycle_state": str(position.get("current_cycle_state") or ""),
+                "source": f"position_config.{key}",
+            }
+        return None
+
+    def _legacy_exit_mode(
+        self,
+        *,
+        original_state: str,
+        config: dict[str, Any],
+    ) -> str:
+        risk_text = " ".join(
+            str(config.get(key) or "")
+            for key in (
+                "exit_mode",
+                "close_reason",
+                "close_requires_review_reason",
+                "blocker",
+                "risk_close_reason",
+            )
+        ).lower()
+        if original_state == "EMERGENCY_UNWIND" or "hard" in risk_text or "risk" in risk_text:
+            return "EMERGENCY"
+        return "MANDATORY"
+
+    def normalize_legacy_nonflat_positions(self, now: datetime) -> dict[str, Any]:
+        normalized = 0
+        unknown_boundary = 0
+        states_seen: dict[str, int] = {}
+        for position in self.store.funding_capture_position_rows(
+            states=set(LEGACY_NONFLAT_CAPTURE_STATES)
+        ):
+            position_id = str(position["position_id"])
+            original_state = str(position.get("state") or "")
+            states_seen[original_state] = states_seen.get(original_state, 0) + 1
+            config = dict(position.get("config") or {})
+            boundary = self._first_crossed_boundary_for_position(position, now)
+            exit_mode = self._legacy_exit_mode(
+                original_state=original_state,
+                config=config,
+            )
+            event = {
+                "event": "legacy_nonflat_position_normalized",
+                "position_id": position_id,
+                "original_legacy_state": original_state,
+                "normalized_state": "EXITING",
+                "detected_at": now.astimezone(UTC).isoformat(),
+                "exit_mode": exit_mode,
+                "current_nonflat_states": sorted(CURRENT_NONFLAT_CAPTURE_STATES),
+                "legacy_nonflat_states": sorted(LEGACY_NONFLAT_CAPTURE_STATES),
+            }
+            if boundary is not None:
+                event["selected_boundary"] = boundary
+                config["first_planned_boundary_at"] = boundary["scheduled_at"]
+                config["boundary_crossed_at"] = (
+                    config.get("boundary_crossed_at") or boundary["crossed_at"]
+                )
+                config["legacy_recovery_boundary_source"] = boundary["source"]
+                config["legacy_recovery_boundary_cycle_id"] = boundary["cycle_id"]
+            else:
+                unknown_boundary += 1
+                event["selected_boundary"] = "UNKNOWN"
+                config["integrity"] = "REQUIRES_REVIEW"
+                config["legacy_recovery_boundary_source"] = "UNKNOWN"
+            config["original_legacy_state"] = (
+                config.get("original_legacy_state") or original_state
+            )
+            config["legacy_nonflat_recovery"] = event
+            events = list(config.get("legacy_nonflat_recovery_events") or [])
+            events.append(event)
+            config["legacy_nonflat_recovery_events"] = events[-10:]
+            config["exit_mode"] = exit_mode
+            try:
+                state_version = int(config.get("state_version") or 1)
+            except (TypeError, ValueError):
+                state_version = 1
+            config["state_version"] = state_version
+            config["mandatory_exit_after_first_boundary"] = exit_mode == "MANDATORY"
+            self.store.update_funding_capture_position_config(position_id, config, now)
+            self.store.update_funding_capture_position_state(position_id, "EXITING", now)
+            normalized += 1
+        return {
+            "normalized": normalized,
+            "unknown_boundary": unknown_boundary,
+            "states_seen": states_seen,
+        }
+
     def recover_runtime_state(self, now: datetime) -> dict[str, Any]:
         boundary = self.store.repair_funding_capture_boundary_consistency(now=now)
+        legacy_nonflat = self.normalize_legacy_nonflat_positions(now)
         entry = self.recover_stale_entry_submissions(now)
         reconciliation = self.recover_reconciled_funding_effects(now)
         accounts = self.store.repair_paper_account_consistency()
         return {
             "boundary": boundary,
+            "legacy_nonflat": legacy_nonflat,
             "entry_submitted": entry,
             "reconciliation": reconciliation,
             "accounts": accounts,
@@ -2348,16 +2501,7 @@ class SynchronizedFundingRuntimeV2:
             "RECONCILED",
             "UNRECONCILED",
         }
-        live_states = {
-            "OPEN",
-            "EXITING",
-            "SETTLEMENT_CROSSED",
-            "EXIT_SCHEDULED",
-            "EXIT_SUBMITTED",
-            "PARTIALLY_CLOSED",
-            "EMERGENCY_UNWIND",
-            "SETTLEMENT_PLAN_MISMATCH",
-        }
+        live_states = set(FUNDING_CAPTURE_OPEN_EXPOSURE_STATES)
         candidates: list[dict[str, Any]] = []
         for position in self.store.funding_capture_position_rows():
             state = str(position.get("state") or "")
@@ -3817,15 +3961,26 @@ class SynchronizedFundingRuntimeV2:
         route: dict[str, Any] | None,
         now: datetime,
     ) -> dict[str, Any]:
-        scheduled = parse_time(position.get("current_cycle_scheduled_funding_at"))
+        config = dict(position.get("config") or {})
+        boundary = self._first_crossed_boundary_for_position(position, now)
+        scheduled = parse_time((boundary or {}).get("scheduled_at"))
+        if scheduled is None:
+            scheduled = parse_time(config.get("first_planned_boundary_at"))
+        if scheduled is None:
+            scheduled = parse_time(position.get("current_cycle_scheduled_funding_at"))
         position_id = str(position["position_id"])
         if scheduled is None:
-            return {"decision": "close", "reason": "current_cycle_settlement_missing"}
+            config["integrity"] = "REQUIRES_REVIEW"
+            config["mandatory_exit_after_first_boundary"] = True
+            config["legacy_recovery_boundary_source"] = (
+                config.get("legacy_recovery_boundary_source") or "UNKNOWN"
+            )
+            self.store.update_funding_capture_position_config(position_id, config, now)
+            return {"decision": "wait", "reason": "mandatory_exit_boundary_unknown"}
 
         now_utc = now.astimezone(UTC)
         scheduled_utc = scheduled.astimezone(UTC)
         seconds_after = (now_utc - scheduled_utc).total_seconds()
-        config = dict(position.get("config") or {})
         boundary_crossed_at = config.get("boundary_crossed_at")
 
         if seconds_after < 0 and not boundary_crossed_at:
@@ -3846,6 +4001,9 @@ class SynchronizedFundingRuntimeV2:
                 "first_planned_boundary_at": scheduled_utc.isoformat(),
             }
         )
+        if boundary is not None:
+            config["mandatory_exit_boundary_cycle_id"] = boundary.get("cycle_id")
+            config["mandatory_exit_boundary_source"] = boundary.get("source")
         if boundary_crossed_at:
             config["boundary_crossed_at"] = boundary_crossed_at
         self.store.update_funding_capture_position_config(position_id, config, now)

@@ -29,11 +29,14 @@ from smart_money_radar.funding.route_identity import (
 
 FUNDING_UNIT_MULTIPLIERS = CANONICAL_ASSET_UNIT_MULTIPLIERS
 
-FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = {
+CURRENT_NONFLAT_CAPTURE_STATES = {
     "OPEN",
     "EXITING",
-    # Historical/restart-compatible states. RF-001 production writers no longer
-    # emit these, but old rows remain non-flat exposure until proven closed.
+}
+
+LEGACY_NONFLAT_CAPTURE_STATES = {
+    "HOLDING_NEXT_CYCLE",
+    "POST_SETTLEMENT_EVALUATION",
     "SETTLEMENT_CROSSED",
     "EXIT_SCHEDULED",
     "EXIT_SUBMITTED",
@@ -41,6 +44,10 @@ FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = {
     "EMERGENCY_UNWIND",
     "SETTLEMENT_PLAN_MISMATCH",
 }
+
+FUNDING_CAPTURE_OPEN_EXPOSURE_STATES = (
+    CURRENT_NONFLAT_CAPTURE_STATES | LEGACY_NONFLAT_CAPTURE_STATES
+)
 
 FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES = FUNDING_CAPTURE_OPEN_EXPOSURE_STATES | {
     "DISCOVERED",
@@ -1369,7 +1376,7 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE funding_capture_positions
-                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                SET state = 'EXITING',
                     config_json = ?,
                     updated_at = ?
                 WHERE position_id = ?
@@ -1387,6 +1394,7 @@ class SQLiteStore:
         repaired_counts = 0
         completed_cycles = 0
         mismatches = 0
+        handled_mismatch_cycle_ids: set[str] = set()
         with self.connect() as connection:
             positions = connection.execute(
                 "SELECT position_id, state, closed_at, config_json FROM funding_capture_positions"
@@ -1460,6 +1468,7 @@ class SQLiteStore:
                             (json.dumps(evidence, sort_keys=True), now_iso, cycle_id),
                         )
                         mismatches += 1
+                        handled_mismatch_cycle_ids.add(cycle_id)
                         if (
                             not position_closed
                             and position_state not in {
@@ -1480,7 +1489,7 @@ class SQLiteStore:
                             connection.execute(
                                 """
                                 UPDATE funding_capture_positions
-                                SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                                SET state = 'EXITING',
                                     config_json = ?,
                                     updated_at = ?
                                 WHERE position_id = ?
@@ -1491,7 +1500,7 @@ class SQLiteStore:
                                     position_id,
                                 ),
                             )
-                            position_state = "SETTLEMENT_PLAN_MISMATCH"
+                            position_state = "EXITING"
                         continue
                     if (
                         obligation_count > 0
@@ -1562,9 +1571,15 @@ class SQLiteStore:
                     """,
                     (position_id,),
                 ).fetchone()
+                already_flagged_mismatch = (
+                    position_state == "EXITING"
+                    and position_config.get("blocker") == "settlement_plan_event_mismatch"
+                )
                 if (
                     mismatch_cycle is not None
+                    and str(mismatch_cycle["cycle_id"]) not in handled_mismatch_cycle_ids
                     and not position_closed
+                    and not already_flagged_mismatch
                     and position_state not in {
                         "SETTLEMENT_PLAN_MISMATCH",
                         "FAILED",
@@ -1591,7 +1606,7 @@ class SQLiteStore:
                     connection.execute(
                         """
                         UPDATE funding_capture_positions
-                        SET state = 'SETTLEMENT_PLAN_MISMATCH',
+                        SET state = 'EXITING',
                             config_json = ?,
                             updated_at = ?
                         WHERE position_id = ?

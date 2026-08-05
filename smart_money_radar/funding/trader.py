@@ -4698,7 +4698,7 @@ class PaperBot:
                             continue
                         self.store.update_funding_capture_position_state(
                             position_id,
-                            "SETTLEMENT_PLAN_MISMATCH",
+                            "EXITING",
                             now,
                         )
                         self.record_event(
@@ -4717,7 +4717,11 @@ class PaperBot:
                         outcomes.append("close_failed")
                         continue
                     state = str(position.get("state") or state)
-            if state == "SETTLEMENT_PLAN_MISMATCH":
+            position_config = position.get("config") or {}
+            if (
+                state == "SETTLEMENT_PLAN_MISMATCH"
+                or str(position_config.get("blocker") or "") == "settlement_plan_event_mismatch"
+            ):
                 close_payload = self.synchronized_runtime.close_position(
                     position,
                     live_route,
@@ -4741,7 +4745,7 @@ class PaperBot:
                     continue
                 self.store.update_funding_capture_position_state(
                     position_id,
-                    "SETTLEMENT_PLAN_MISMATCH",
+                    "EXITING",
                     now,
                 )
                 outcomes.append("close_failed")

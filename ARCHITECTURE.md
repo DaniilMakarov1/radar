@@ -2,38 +2,73 @@
 
 Last updated: 2026-08-05
 
-## Current Product
+## Architecture Freeze v1
 
-Radar is Funding-first and paper-only. The default paper runtime captures one
-funding settlement boundary, then exits at the first normal-safe opportunity.
-Production must not continue a position into another planned funding cycle.
+Architecture v1 is FROZEN for RF-001. The production strategy is:
 
-Default strategy ownership:
+```text
+FUNDING_SETTLEMENT_CAPTURE
+```
 
-- `single_settlement_hedged_capture_v1`: one favorable near settlement plus a
-  hedge leg; hedge settlement alignment is not required.
-- `synchronized_funding_capture_v2`: used only when both legs settle together
-  within 1 second.
-- Legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any`
-  remain research/experimental labels.
+Plan shapes are:
 
-## Production Call Graph
+```text
+ONE_SETTLEMENT
+MULTIPLE_SETTLEMENTS
+```
+
+These are shapes of one `CapturePlan`, not separate production strategies.
+`single_settlement_hedged_capture_v1` and `synchronized_funding_capture_v2` are
+temporary compatibility/version metadata only; they are deletion targets after
+the alias cutover is reviewed separately.
+
+Evidence allowed to reopen this freeze:
+
+- a failing recovery or accounting regression test;
+- a reproducible paper-runtime incident with exact DB rows and timestamps;
+- a venue contract proof that changes funding units, settlement timing, market
+  type, collateral, or public/final rate source;
+- a performance trace proving the hot path blocks T-30 entry, T-20 fill handling,
+  open-position risk, mandatory exit, or reconciliation;
+- a product decision from Daniil that explicitly changes the paper-only scope.
+
+## Product and Safety Scope
+
+- Funding-first and paper-only.
+- No live trading, no live order placement, no private account mutation.
+- One SQLite store is the local source of truth.
+- Active default venue scope remains constrained by `DEACTIVATED_FUNDING_VENUES`
+  and explicit profile readiness.
+- Estimates are never cashflow.
+- Scanner output is never a trade decision.
+
+Exact NO HOLD:
+
+- production must not plan continuation into another funding cycle;
+- after the first captured settlement boundary, preserve reconciliation
+  obligations and exit at the first normal-safe opportunity;
+- normal close waits until T+20 after the captured boundary unless hard risk
+  requires earlier exit;
+- a delayed or partial exit that crosses another funding event is an
+  incident/reconciliation case, not planned strategy behavior.
+
+## Current Production Call Graph
 
 ```text
 CLI funding-paper-trader
 -> smart_money_radar.cli.funding_paper_trader_config
 -> smart_money_radar.funding.trader.PaperBot
 -> PaperBot.run_loop / run_iteration / run_hot_iteration / run_full_iteration
--> recovery, reconciliation, risk, and background scan scheduling
--> funding discovery or focused recheck
+-> runtime recovery / reconciliation / risk / background scan scheduling
+-> broad discovery or focused recheck
 -> PaperBot.process_synchronized_entry_candidates
 -> SynchronizedFundingRuntimeV2.consider_route
 -> FundingSettlementPlanner.plan
 -> entry_underwriting / initial_entry_economics
 -> risk.entry_risk_gates
 -> execution.simulate_marketable_ioc
--> funding_capture_positions, funding_capture_cycles, funding_paper_orders,
-   paper_event_ledger
+-> funding_capture_positions / funding_capture_cycles /
+   funding_paper_orders / paper_event_ledger
 -> PaperBot.process_synchronized_open_positions
 -> refresh_open_capture_route
 -> mark_settlement_crossed / apply_settlement_boundary
@@ -43,83 +78,209 @@ CLI funding-paper-trader
 -> close_position
 ```
 
-Full scans must not block open-position risk, focused hot checks, T-30 entry,
-T-20 fill handling, settlement reconciliation, or mandatory exit.
-
-## Lifecycle Contract
-
-Production capture states are:
+## Target Production Call Graph
 
 ```text
-ENTRY_SUBMITTED, OPEN, EXITING, CLOSED, FAILED
+RuntimeSpec
+-> CompositionRoot
+-> VenueRegistry.resolve(scope) -> ResolvedVenueScope
+-> PaperRuntime
+-> DiscoveryEngine(BROAD)
+-> DiscoveryEngine(FOCUSED)
+-> CapturePlanner -> CapturePlan
+-> CaptureLifecycle
+-> fills/exposure
+-> SettlementLifecycle -> SettlementAssessment
+-> causal append-only Ledger
+-> StatusSnapshot
 ```
 
-`DISCOVERED`, `REJECTED`, `ARMED`, `LEG_1_FILLED`, and `PARTIALLY_HEDGED` may
-exist as pre-open evidence states. Review and accounting integrity must be stored
-in structured config fields such as `integrity`, `reconciliation_state`,
-`boundary_crossed_at`, and `normal_close_not_before`, not in extra terminal
-states.
+Hierarchy:
 
-Boundary behavior:
+```text
+RuntimeSpec -> CapturePlan -> fills/exposure ->
+SettlementAssessment -> Ledger -> StatusSnapshot
+```
 
-- Crossing the captured settlement creates reconciliation obligations.
-- Pending funding is excluded from cash, equity, win rate, and realized paper PnL.
-- Normal close waits until T+20 after the captured boundary.
-- Hard-risk close may happen earlier.
-- A missing executable route after T+20 keeps the exposure actionable and
-  retryable.
-- A delayed or partial exit that crosses a later funding event is an incident and
-  reconciliation case, not a planned continuation.
-- A later planned boundary requires new discovery, underwriting, fills, and a new
-  `capture_id`.
+## RuntimeSpec
 
-## Owner Map
+`RuntimeSpec` owns immutable runtime identity:
 
-| Area | Current owner | Notes |
+- environment/profile;
+- venue allow/deactivate set;
+- target notional and paper account scope;
+- strategy name `FUNDING_SETTLEMENT_CAPTURE`;
+- plan-shape allow set `ONE_SETTLEMENT` / `MULTIPLE_SETTLEMENTS`;
+- paper-only safety mode;
+- code/version metadata.
+
+## PaperRuntime
+
+`PaperRuntime` owns scheduling and hot-path priority:
+
+- open exposure and recovery first;
+- hard-risk checks before normal discovery;
+- T-30 entry and T-20 fill handling;
+- settlement boundary and reconciliation;
+- mandatory exit after T+20;
+- background discovery only when no open exposure and no hot route is blocked.
+
+## One Composition Root
+
+Target architecture has one composition root for production paper runtime. It
+constructs `RuntimeSpec`, `VenueRegistry`, `DiscoveryEngine`, `CapturePlanner`,
+`CaptureLifecycle`, `SettlementLifecycle`, `Ledger`, and `StatusSnapshot`.
+
+CLI, launchd scripts, smoke scripts, and tests should call the composition root
+instead of assembling partially different runtimes.
+
+## VenueRegistry and ResolvedVenueScope
+
+`VenueRegistry` owns venue capability and identity. `ResolvedVenueScope` is the
+only runtime input after profile/deactivation resolution. It contains resolved
+clients, environment, supported market types, collateral policy, contract unit
+proof, fee model, and funding settlement semantics.
+
+## DiscoveryEngine
+
+`DiscoveryEngine` has two modes:
+
+- `BROAD`: cheap funding and catalog sweep. It must not block open exposure,
+  focused routes, or mandatory exit.
+- `FOCUSED`: paired route refresh with executable books and timestamps for entry,
+  risk, boundary handling, and close.
+
+dashboard-triggered scans are deletion targets during the observability cutover;
+they must not be moved onto the shared discovery interface.
+
+## CapturePlanner
+
+`CapturePlanner` creates one `CapturePlan` for
+`FUNDING_SETTLEMENT_CAPTURE`. The plan shape is `ONE_SETTLEMENT` or
+`MULTIPLE_SETTLEMENTS`. The plan captures exactly one settlement boundary and
+does not own continuation cycles.
+
+## CaptureLifecycle
+
+Target capture states:
+
+```text
+ENTRY_SUBMITTED / OPEN / EXITING / CLOSED / FAILED
+```
+
+Pre-open evidence states such as `DISCOVERED`, `REJECTED`, `ARMED`,
+`LEG_1_FILLED`, and `PARTIALLY_HEDGED` may exist as non-production or
+pre-open evidence. Review state belongs in config fields.
+
+## SettlementLifecycle
+
+`SettlementLifecycle` owns boundary obligations and settlement assessment.
+
+`SettlementAssessment` value:
+
+```text
+CONFIRMED_ZERO / CONFIRMED_NONZERO / UNKNOWN
+```
+
+`SettlementAssessment` cause:
+
+```text
+PLANNED / INCIDENT
+```
+
+Pending or unknown funding is excluded from cash, equity, win rate, and realized
+PnL. Confirmed zero is a valid settlement outcome, not missing data.
+
+## Ledger
+
+The target ledger is causal and append-only. Every cash-affecting event has a
+venue. Funding cashflow can enter only through reconciled settlement evidence.
+Price PnL is long exit plus short exit. Do not add a separate basis PnL on top.
+
+## StatusSnapshot
+
+`StatusSnapshot` reads runtime state and ledger-derived balances. It is bounded,
+actionable, and non-authoritative. It must not mutate runtime state.
+
+Dashboard read-only: the dashboard may display state and request reports, but it
+must not be a production scan or lifecycle writer in the target architecture.
+
+## Current-Owner / Target-Owner Matrix
+
+| Area | Current owner | Target owner |
 | --- | --- | --- |
-| Funding venue contracts | `smart_money_radar/funding/settlement_contracts.py`, adapter tests | Fail closed on unknown units, settlement timing, collateral, market type, or source identity. |
-| Route planning | `smart_money_radar/funding/strategy_synchronized_funding.py` | Planner returns first-boundary capture plans only. |
-| Paper runtime | `smart_money_radar/funding/trader.py`, `smart_money_radar/paper_bot/runtime_v2.py` | Default production loop, hot scheduling, entry, boundary, risk, mandatory exit, reconciliation. |
-| Execution simulation | `smart_money_radar/paper_bot/execution.py` | Marketable IOC paper fills and reduce-only close simulation. |
-| Accounting | `smart_money_radar/paper_bot/accounting.py`, `smart_money_radar/storage.py` | Ledger and paper account mutation; funding cash enters only through reconciliation/close rules. |
-| Risk | `smart_money_radar/paper_bot/risk.py` | Hard-risk exits, stale data, basis deterioration, margin/liquidation checks. |
-| UI/Telegram | `smart_money_radar/dashboard.py`, `smart_money_radar/web/index.html`, `smart_money_radar/paper_bot/telegram.py` | Display actionable watch/open/exit/reconciliation state; no hold action surface. |
-| Operations | `scripts/start_funding_bot.sh`, `scripts/run_funding_bot_launchd.sh`, launchd helpers, smoke scripts | Paper-only process management. |
+| Runtime config | `PaperBotConfig`, CLI flags, scripts, profiles | `RuntimeSpec` |
+| Venue construction | profile helpers, direct adapter factories, CLI/script fallbacks | `VenueRegistry` + `ResolvedVenueScope` |
+| Broad discovery | funding service, lightweight discovery, dashboard scan jobs, smoke scripts | `DiscoveryEngine(BROAD)` |
+| Focused refresh | PaperBot targeted refresh and focused selection | `DiscoveryEngine(FOCUSED)` |
+| Capture planning | `FundingSettlementPlanner` plus compatibility names | `CapturePlanner` |
+| Entry/open/exit | `PaperBot` + `SynchronizedFundingRuntimeV2` | `CaptureLifecycle` |
+| Boundary/reconciliation | storage methods + runtime reconciliation worker | `SettlementLifecycle` |
+| Cash/accounting | `paper_event_ledger`, account mutation helpers, repair jobs | causal append-only `Ledger` |
+| UI/Telegram/status | dashboard, Telegram helpers, report/export queries | read-only `StatusSnapshot` |
+| SQLite writes | multiple methods in `SQLiteStore` | one writer boundary over one SQLite |
 
-## Duplication Inventory
+## Recovery and Legacy-State Rules
 
-The repository still contains older product surface that should be preserved
-until a separate deletion PR:
+Current non-flat position states:
 
-- Binance announcements, token registry, wallet buys, holding metrics, backtest,
-  prediction, Dune/local analytics, and on-chain research paths in CLI, storage,
-  dashboard, scripts, and docs.
-- Two paper lifecycle families:
-  `funding_capture_positions`/`funding_capture_cycles` for the production v2
-  runtime and `funding_paper_positions` for legacy reports/profiles.
-- Multiple discovery entrypoints:
-  funding scan service, lightweight discovery, background full discovery,
-  focused route refresh, dashboard scan endpoints, scanner paper revalidation,
-  shadow monitor, and script smoke runs.
-- Venue construction in profiles, venue registry helpers, CLI/script factories,
-  adapter imports, and fallback client builders.
-- Configuration in `PaperBotConfig`, profile files, CLI flags, environment
-  variables, launchd scripts, start/status scripts, and smoke gates.
-- Financial writers in ledger functions, direct account updates, close payloads,
-  reconciliation effects, legacy paper-position accounting, account repair, and
-  report exports.
-- SQLite writers in schema init, capture upserts, cycle upserts, order writes,
-  observations, event ledger, reserves, reconciled funding effects, route rows,
-  legacy position open/close, dashboard jobs, and scan history.
+```text
+OPEN / EXITING
+```
 
-## Safety Boundaries
+Legacy non-flat position states remain read-compatible until deletion:
 
-- Paper-only: no live order placement and no live exchange trading mode.
-- Active default funding adapters are RiseX and Hyperliquid unless explicitly
-  promoted.
-- Respect `DEACTIVATED_FUNDING_VENUES`.
-- Scanner output is not a trade decision.
-- Estimates are not cashflow.
-- Route identity must include venue, canonical base, venue symbol,
-  quote/collateral, market type, environment/profile, and settlement timestamps
-  wherever it affects storage, dedupe, or risk.
+```text
+HOLDING_NEXT_CYCLE / POST_SETTLEMENT_EVALUATION / SETTLEMENT_CROSSED /
+EXIT_SCHEDULED / EXIT_SUBMITTED / PARTIALLY_CLOSED / EMERGENCY_UNWIND /
+SETTLEMENT_PLAN_MISMATCH
+```
+
+Recovery rules:
+
+- all current and legacy non-flat states block new entry;
+- legacy non-flat rows are normalized to `EXITING` with
+  `original_legacy_state` and recovery evidence in config;
+- recovery must use the first already crossed boundary, not a future cycle
+  timestamp;
+- no recovery path may create a new cycle or call continuation underwriting;
+- unknown exposure is non-flat until both legs are proven closed;
+- `CLOSED` and `FAILED` require evidence that both legs are flat.
+
+## One Writer / One SQLite
+
+SQLite remains the single local durable store. The target design has one writer
+boundary for lifecycle, ledger, and status snapshots. Until deletion, legacy
+methods stay compatibility-only and must be documented as deletion targets.
+
+## Dependency Direction
+
+Allowed dependency direction:
+
+```text
+RuntimeSpec
+-> VenueRegistry
+-> DiscoveryEngine
+-> CapturePlanner
+-> CaptureLifecycle
+-> SettlementLifecycle
+-> Ledger
+-> StatusSnapshot
+```
+
+Lower layers must not call UI, Telegram, dashboard scan jobs, or launch scripts.
+
+## Cutover With Deletion
+
+RF-001 freezes behavior and preserves historical rows. Later tasks should delete
+old owners only after tests prove no production call site remains and a DB backup
+or rehearsal plan exists.
+
+## Non-Goals
+
+- No live trading.
+- No destructive schema migration.
+- No deletion of old product modules inside RF-001.
+- No strategy-alias code cutover inside this fix.
+- No dashboard-triggered production scan rewrite.
+- No expansion to new venues without an explicit venue contract task.

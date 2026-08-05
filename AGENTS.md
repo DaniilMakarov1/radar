@@ -9,12 +9,15 @@ This repository is currently Funding-first.
 
 ## Active Strategy
 
-Default paper trading uses `single_settlement_hedged_capture_v1` for one near
-funding settlement with a hedge leg, and `synchronized_funding_capture_v2` only
-when both funding settlements align.
+Default paper trading uses one production strategy:
+`FUNDING_SETTLEMENT_CAPTURE`.
 
-- Entry reason: nearest favorable funding settlement, with synchronized capture
-  used only when both legs settle together.
+Plan shapes are `ONE_SETTLEMENT` and `MULTIPLE_SETTLEMENTS`; they are forms of
+one `CapturePlan`, not separate production strategies. Legacy
+`single_settlement_hedged_capture_v1` and `synchronized_funding_capture_v2`
+names are temporary compatibility/version metadata only.
+
+- Entry reason: nearest favorable funding settlement.
 - Position shape: long one venue, short another venue, same canonical base quantity.
 - Default paper entry is PAPER-capable for typed estimated funding; use `--no-estimated-funding-paper-entry` for verified-only dry runs.
 - Scanner status before focused observations is `watch`, not `paper_candidate`.

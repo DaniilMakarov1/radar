@@ -39,20 +39,16 @@ from smart_money_radar.funding.trader import (  # noqa: E402
 )
 from smart_money_radar.paper_bot.clock import FakeClock  # noqa: E402
 from smart_money_radar.paper_bot.runtime_v2 import capture_position_id_for_route  # noqa: E402
-from smart_money_radar.storage import SQLiteStore  # noqa: E402
+from smart_money_radar.storage import (  # noqa: E402
+    FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES,
+    SQLiteStore,
+)
 
 PASS = "PASS"
 FAIL = "FAIL"
 NOT_RUN = "NOT_RUN"
 TRUTHY = {"1", "true", "yes", "on", "enabled"}
-ACTIVE_STATES = {
-    "DISCOVERED",
-    "ARMED",
-    "ENTRY_SUBMITTED",
-    "OPEN",
-    "SETTLEMENT_CROSSED",
-    "EXITING",
-}
+ACTIVE_STATES = set(FUNDING_CAPTURE_IDENTITY_ACTIVE_STATES)
 
 
 def _json_default(value: Any) -> Any:

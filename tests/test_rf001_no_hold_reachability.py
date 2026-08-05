@@ -93,3 +93,54 @@ def test_rf001_status_surfaces_do_not_offer_hold_actions() -> None:
         offenders.extend(f"{path}: {term}" for term in forbidden if term in text)
 
     assert offenders == []
+
+
+def test_rf001_legacy_nonflat_states_are_recovery_visible_not_terminal() -> None:
+    from smart_money_radar.storage import (
+        CURRENT_NONFLAT_CAPTURE_STATES,
+        FUNDING_CAPTURE_OPEN_EXPOSURE_STATES,
+        LEGACY_NONFLAT_CAPTURE_STATES,
+    )
+
+    expected_legacy = {
+        _term("HOLDING", "_NEXT", "_CYCLE"),
+        _term("POST", "_SETTLEMENT", "_EVALUATION"),
+        "SETTLEMENT_CROSSED",
+        "EXIT_SCHEDULED",
+        "EXIT_SUBMITTED",
+        "PARTIALLY_CLOSED",
+        "EMERGENCY_UNWIND",
+        "SETTLEMENT_PLAN_MISMATCH",
+    }
+
+    assert LEGACY_NONFLAT_CAPTURE_STATES == expected_legacy
+    assert CURRENT_NONFLAT_CAPTURE_STATES == {"OPEN", "EXITING"}
+    assert LEGACY_NONFLAT_CAPTURE_STATES <= FUNDING_CAPTURE_OPEN_EXPOSURE_STATES
+    assert CURRENT_NONFLAT_CAPTURE_STATES <= FUNDING_CAPTURE_OPEN_EXPOSURE_STATES
+    assert {"CLOSED", "FAILED"}.isdisjoint(FUNDING_CAPTURE_OPEN_EXPOSURE_STATES)
+
+
+def test_rf001_authoritative_docs_define_one_production_strategy() -> None:
+    docs = "\n".join(
+        _read(path)
+        for path in [
+            "ARCHITECTURE.md",
+            "AGENTS.md",
+            "QWEN.md",
+            "docs/MODEL_INSTRUCTIONS.md",
+        ]
+    )
+
+    assert "FUNDING_SETTLEMENT_CAPTURE" in docs
+    assert "ONE_SETTLEMENT" in docs
+    assert "MULTIPLE_SETTLEMENTS" in docs
+    assert "single_settlement_hedged_capture_v1 for one near" not in docs
+    assert "synchronized_funding_capture_v2 only when both funding settlements align" not in docs
+
+
+def test_rf001_dashboard_target_is_read_only_without_scan_jobs() -> None:
+    architecture = _read("ARCHITECTURE.md")
+
+    assert "Dashboard read-only" in architecture
+    assert "dashboard-triggered scans are deletion targets" in architecture
+    assert "dashboard-triggered scans onto the same discovery interface" not in architecture

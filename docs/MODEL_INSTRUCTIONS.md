@@ -112,15 +112,16 @@ Default candidate status is not "funding is positive" or "spread is positive"
 by itself. The active paper strategy is:
 
 ```text
-synchronized_funding_capture_v2
+FUNDING_SETTLEMENT_CAPTURE
 ```
 
-This is cross-venue delta-neutral funding capture:
+This is cross-venue delta-neutral funding settlement capture:
 
 - long perpetual on one venue;
 - short perpetual on another venue;
 - same canonical base quantity;
 - entry reason is the nearest synchronized funding settlement;
+- plan shape is `ONE_SETTLEMENT` or `MULTIPLE_SETTLEMENTS`;
 - spread convergence is not expected profit;
 - executable spread, book walking, fees, basis deterioration, stale data,
   liquidation/margin risk, and venue capability are costs/gates.
@@ -188,7 +189,7 @@ PaperBot.process_synchronized_open_positions
 
 Legacy `position.py` accounting and `funding_paper_positions` remain for old
 profiles and old reports. They are not the source of truth for
-`synchronized_funding_capture_v2`.
+`FUNDING_SETTLEMENT_CAPTURE`.
 
 `funding-shadow-monitor` is a separate read-only mode, not a paper runtime. It
 stores only `funding_shadow_*` rows, sends `SHADOW FUNDING` Telegram messages,
@@ -229,7 +230,7 @@ return partial results after the venue deadline instead of blocking the loop.
 
 ## 7. Scanner, Watch, and Entry Lifecycle
 
-For `synchronized_funding_capture_v2`, the full scanner is not authoritative for
+For `FUNDING_SETTLEMENT_CAPTURE`, the full scanner is not authoritative for
 entry. It can output only:
 
 - `research_only` when capability/contract/collateral/funding semantics fail;
@@ -258,10 +259,9 @@ Required conditions:
    PAPER may use a typed `rate_estimate_per_settlement` when sign
    convention, unit/scale, funding interval, next funding timestamp, and source
    identity/estimate kind are known.
-4. `single_settlement_hedged_capture_v1` requires one favorable near
-   settlement and uses the other leg as a hedge; the hedge leg settlement may be
-   later. `synchronized_funding_capture_v2` still requires both
-   `next_funding_at` timestamps to align within 1 second.
+4. `ONE_SETTLEMENT` requires one favorable near settlement and uses the other
+   leg as a hedge; the hedge leg settlement may be later. `MULTIPLE_SETTLEMENTS`
+   requires both `next_funding_at` timestamps to align within 1 second.
 5. Current lead is inside T-35 to T-25 seconds, target T-30.
 6. Focused observations contain at least 10 valid paired snapshots over at least
    20 seconds.
@@ -398,7 +398,7 @@ resurrect a disabled venue by only changing the UI. A venue is active only when:
 Default profile uses `venue_set=None`, meaning all active registered adapters are
 scanned automatically. Do not replace this with a hardcoded production list.
 
-For `synchronized_funding_capture_v2`, active is still not enough. A venue is
+For `FUNDING_SETTLEMENT_CAPTURE`, active is still not enough. A venue is
 paper-eligible only if it supports perpetuals, linear contracts, USDT/USDC/USD
 collateral, discrete next-settlement funding, next funding timestamp, mark/index
 prices, executable orderbook depth, 24h quote volume, open interest, taker fee,

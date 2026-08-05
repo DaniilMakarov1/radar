@@ -7,7 +7,12 @@ Smart Money Radar uses a two-agent workflow by default:
 
 Codex owns architecture, formulas, trading assumptions, risk gates, venue eligibility, final review, and commit boundaries. Qwen/QN can edit files, write tests, run shell commands, run the app, and perform mechanical refactors directly inside a scoped task, but must not change product direction, risk thresholds, funding semantics, live-trading status, or strategy behavior independently.
 
-The active paper strategy is `synchronized_funding_capture_v2`. Legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any` are experimental/research labels unless Codex explicitly enables an experimental profile.
+The active paper strategy is `FUNDING_SETTLEMENT_CAPTURE`. `ONE_SETTLEMENT` and
+`MULTIPLE_SETTLEMENTS` are plan shapes of one capture plan, while legacy names
+such as `synchronized_funding_capture_v2`, `single_settlement_hedged_capture_v1`,
+`funding_only`, `spread_only`, `combined`, and `opportunistic_any` are
+compatibility, diagnostics, or research labels unless Codex explicitly enables an
+experimental profile.
 
 ## Default Flow
 

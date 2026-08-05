@@ -84,14 +84,15 @@ If a venue only publishes an hourly equivalent, set `funding_interval_hours` to 
 
 ## Default Strategy
 
-The production paper strategy is `synchronized_funding_capture_v2`:
+The production paper strategy is `FUNDING_SETTLEMENT_CAPTURE`:
 
 - long one perpetual venue and short another with the same canonical base quantity;
 - enter for the nearest synchronized funding settlement;
-- both next settlements must align within 1 second;
+- use plan shape `ONE_SETTLEMENT` or `MULTIPLE_SETTLEMENTS` from one `CapturePlan`;
 - capture exactly one settlement boundary, then require mandatory exit;
 - spread convergence is never expected profit in the default strategy;
 - executable spread, basis deterioration, liquidity, fees, stale data, and margin risk are costs/gates;
+- legacy `single_settlement_hedged_capture_v1` and `synchronized_funding_capture_v2` names are compatibility/version metadata only, not production strategy owners;
 - legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any` are research/experimental labels only unless Codex explicitly enables an experimental profile.
 
 ## Paper Bot Timing

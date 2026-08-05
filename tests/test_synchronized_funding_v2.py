@@ -6814,7 +6814,7 @@ def test_zero_obligation_crossed_legacy_cycle_fails_closed(tmp_path, monkeypatch
     assert restarted.last_runtime_recovery["boundary"]["zero_obligation_mismatches"] == 1
     assert store.funding_capture_cycles_for_position(capture_id)[0]["state"] == "SETTLEMENT_PLAN_MISMATCH"
     assert store.funding_capture_position_by_id(capture_id)["settlements_captured_count"] == 0
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "EXITING"
     assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
 
     _install_targeted_refresh_clients(restarted, route["route_key"], route)
@@ -6905,7 +6905,7 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
 
     assert first == ["settlement_plan_mismatch", "close_failed"]
     position = store.funding_capture_position_by_id(capture_id)
-    assert position["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert position["state"] == "EXITING"
     assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
     assert store.funding_settlement_reconciliation_rows(capture_id) == []
     snapshot = store.record_funding_paper_equity_snapshot()
@@ -6943,7 +6943,7 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
     assert open_poll_calls == ["open"]
     assert blocked["mode"] == "open_positions"
     assert blocked["open_position_count"] == 1
-    assert store.funding_capture_position_by_id(capture_id)["state"] == "SETTLEMENT_PLAN_MISMATCH"
+    assert store.funding_capture_position_by_id(capture_id)["state"] == "EXITING"
     bot.process_open_positions = original_process_open_positions  # type: ignore[method-assign]
 
     good_route = _fresh_route_for_open_position(route, bot.clock.now())
@@ -6961,6 +6961,124 @@ def test_settlement_plan_mismatch_close_failure_remains_retryable(tmp_path, monk
     assert position["config"]["integrity"] == "REQUIRES_REVIEW"
     assert all(row["reserved_margin"] == pytest.approx(0.0) for row in store.funding_paper_account_rows())
     assert "funding" not in {row["event_type"] for row in store.paper_event_ledger_rows(capture_id)}
+
+
+def _prepare_legacy_nonflat_position(
+    tmp_path,
+    monkeypatch,
+    legacy_state: str,
+) -> tuple[SQLiteStore, dict, str, datetime, int, set[str]]:
+    now = datetime(2026, 7, 28, 15, 59, 30, tzinfo=UTC)
+    store, bot, route, capture_id, opened = _open_v2_runtime_position(tmp_path, monkeypatch, now)
+    assert opened == [capture_id]
+    settlement_at = now + timedelta(seconds=30)
+    bot.clock.advance(31)
+    _install_fresh_hot_route(bot, route)
+    assert bot.process_open_positions() == ["settlement_crossed"]
+    first_cycle = store.funding_capture_cycles_for_position(capture_id)[0]
+    reconciliation_ids = {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    }
+    assert len(reconciliation_ids) == 2
+    future_settlement = settlement_at + timedelta(hours=1)
+    store.upsert_funding_capture_cycle(
+        {
+            "cycle_id": f"{capture_id}:2",
+            "position_id": capture_id,
+            "cycle_number": 2,
+            "plan_generation": 2,
+            "scheduled_funding_at": future_settlement.isoformat(),
+            "state": "OPEN",
+            "decision": "legacy_continuation_fixture",
+            "decision_reason": "historical_nonflat_row",
+            "active_plan": first_cycle["active_plan"],
+        }
+    )
+    store.update_funding_capture_position_state(capture_id, legacy_state, bot.clock.now())
+    position = store.funding_capture_position_by_id(capture_id)
+    config = dict(position["config"] or {})
+    config["legacy_fixture_state"] = legacy_state
+    store.update_funding_capture_position_config(capture_id, config, bot.clock.now())
+    assert store.funding_capture_position_by_id(capture_id)["state"] == legacy_state
+    assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
+    return store, route, capture_id, settlement_at, len(store.funding_capture_cycles_for_position(capture_id)), reconciliation_ids
+
+
+def _assert_legacy_nonflat_restart_exits(
+    tmp_path,
+    monkeypatch,
+    legacy_state: str,
+) -> None:
+    from smart_money_radar.funding.trader import PaperBot, PaperBotConfig
+    from smart_money_radar.paper_bot.clock import FakeClock
+
+    store, route, capture_id, settlement_at, cycle_count, reconciliation_ids = (
+        _prepare_legacy_nonflat_position(tmp_path, monkeypatch, legacy_state)
+    )
+    restart_at = settlement_at + timedelta(seconds=31)
+    restarted = PaperBot(
+        store,
+        PaperBotConfig(telegram_enabled=False, focused_recheck_enabled=False).validated(),
+        clock=FakeClock(restart_at),
+    )
+
+    recovery = restarted.last_runtime_recovery["legacy_nonflat"]
+    assert recovery["normalized"] == 1
+    assert recovery["states_seen"] == {legacy_state: 1}
+    assert not hasattr(restarted.synchronized_runtime, "next_cycle_hold_or_close_decision")
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "EXITING"
+    assert position["config"]["original_legacy_state"] == legacy_state
+    assert position["config"]["exit_mode"] == "MANDATORY"
+    assert position["config"]["first_planned_boundary_at"] == settlement_at.isoformat()
+    assert position["current_cycle_scheduled_funding_at"] != settlement_at.isoformat()
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+    assert {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    } == reconciliation_ids
+
+    guard = restarted.synchronized_runtime._opportunity_guard(capture_id)
+    assert guard["allowed"] is False
+    assert guard["reason"] == "opportunity_already_open"
+    assert restarted.process_entry_candidates([route], recheck_before_open=False) == []
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+
+    restarted.build_venue_clients = lambda: []  # type: ignore[method-assign]
+    restarted.hot_routes.pop(route["route_key"], None)
+    assert restarted.process_open_positions() == []
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position["state"] == "EXITING"
+    assert any(row["position_id"] == capture_id for row in store.funding_capture_open_positions())
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+    assert {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    } == reconciliation_ids
+
+    safe_route = _fresh_route_for_open_position(route, restart_at)
+    _install_targeted_refresh_clients(restarted, route["route_key"], safe_route)
+    restarted.hot_routes[route["route_key"]] = safe_route
+    assert restarted.process_open_positions() == ["closed"]
+    closed = store.funding_capture_position_by_id(capture_id)
+    assert closed["state"] == "CLOSED"
+    assert closed["config"]["normal_close_not_before"] == (
+        settlement_at + timedelta(seconds=20)
+    ).isoformat()
+    assert len(store.funding_capture_cycles_for_position(capture_id)) == cycle_count
+    assert {
+        str(row["reconciliation_id"])
+        for row in store.funding_settlement_reconciliation_rows(capture_id)
+    } == reconciliation_ids
+
+
+def test_legacy_holding_next_cycle_restart_normalizes_to_mandatory_exit(tmp_path, monkeypatch) -> None:
+    _assert_legacy_nonflat_restart_exits(tmp_path, monkeypatch, "HOLDING_NEXT_CYCLE")
+
+
+def test_legacy_post_settlement_evaluation_restart_normalizes_to_mandatory_exit(tmp_path, monkeypatch) -> None:
+    _assert_legacy_nonflat_restart_exits(tmp_path, monkeypatch, "POST_SETTLEMENT_EVALUATION")
 
 
 def test_restart_between_boundary_and_reconciliation_preserves_obligation(tmp_path, monkeypatch) -> None:
