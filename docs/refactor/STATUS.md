@@ -4,14 +4,16 @@ Last updated: 2026-08-05
 
 ## RF-001
 
-Status: implementation validated; draft PR pending.
+Status: draft PR open.
 
 Branch: `task/rf-001-no-hold-cutover`
 
 Base: `origin/integration` at
 `43e0f87ac296d614c405ba4b5e65d978f12e3fbe`.
 
-PR: pending.
+PR: https://github.com/DaniilMakarov1/radar/pull/1
+
+Initial PR head: `bbac33e8722eafc2bcc7d4628fd278c7bfeecd6b`.
 
 Qwen used: no.
 
@@ -57,7 +59,8 @@ Qwen used: no.
 - Exact old-symbol search found only the migration compatibility test fixture
   listed below.
 
-PR metadata will be recorded after the branch is pushed and the draft PR exists.
+PR metadata recorded above. Later status changes should update this file in the
+follow-up PR that changes the relevant code.
 
 ## Exact Search Classification
 
