@@ -51,9 +51,7 @@ ACTIVE_STATES = {
     "ENTRY_SUBMITTED",
     "OPEN",
     "SETTLEMENT_CROSSED",
-    "POST_SETTLEMENT_EVALUATION",
-    "HOLDING_NEXT_CYCLE",
-    "EXIT_SUBMITTED",
+    "EXITING",
 }
 
 
@@ -460,7 +458,7 @@ def _duplicate_ledger_events(path: Path) -> list[dict[str, Any]]:
 def _check_runtime_scripts() -> dict[str, Any]:
     commands = [
         [sys.executable, "scripts/run_synchronized_funding_paper_mvp.py"],
-        [sys.executable, "scripts/run_synchronized_funding_two_cycle_paper_mvp.py"],
+        [sys.executable, "scripts/run_synchronized_funding_two_capture_paper_mvp.py"],
     ]
     results = []
     for command in commands:

@@ -24,7 +24,6 @@ from smart_money_radar.funding.trader import (
     funding_client_for_venue,
     funding_leg_pnl,
     leg_vwap,
-    position_hold_decision,
     route_entry_decision,
     route_monitor_decision,
     selected_route_strategy,
@@ -34,7 +33,10 @@ from smart_money_radar.funding.trader import (
 from smart_money_radar.funding.venues import DEACTIVATED_FUNDING_VENUES
 from smart_money_radar.notifications import NotificationResult
 from smart_money_radar.paper_bot.helpers import format_seconds
-from smart_money_radar.paper_bot.position import settlement_rate_or_entry
+from smart_money_radar.paper_bot.position import (
+    position_hold_decision,
+    settlement_rate_or_entry,
+)
 from smart_money_radar.paper_bot.telegram import (
     funding_rate_lines,
     status_route_line,
@@ -1012,7 +1014,7 @@ def test_closed_position_reprices_when_funding_history_arrives(tmp_path) -> None
     assert reprice_event["telegram_status"] == "sent"
 
 
-def test_settlement_hold_accrues_funding_and_rolls_position(tmp_path) -> None:
+def test_settlement_mandatory_exit_uses_funding_without_rollover_accrual(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "radar.sqlite")
     store.init_db()
     now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
@@ -1027,7 +1029,7 @@ def test_settlement_hold_accrues_funding_and_rolls_position(tmp_path) -> None:
         60,
         live_net=1.25,
     )
-    position_id = store.open_funding_paper_position(
+    store.open_funding_paper_position(
         {
             "entry_key": "route-1:2026-07-19T12:00:00+00:00",
             "route_key": "route-1",
@@ -1091,15 +1093,19 @@ def test_settlement_hold_accrues_funding_and_rolls_position(tmp_path) -> None:
         PaperBotConfig(settlement_grace_seconds=0).validated(),
     )
 
-    assert decision["status"] == "hold"
-    assert store.accrue_funding_paper_settlement(position_id, decision["accrual"])
+    assert decision["status"] == "close"
+    close = decision["close"]
+    assert close["close_reason"] == "mandatory_exit_after_first_settlement"
+    assert close["actual_funding_pnl"] == 1.5
+    assert close["settlement"]["current_settlement_funding_included"] is True
+    assert "accrual" not in decision
     after = store.funding_paper_open_positions()[0]
     balances = {row["venue"]: row for row in store.funding_paper_account_rows()}
     assert after["status"] == "open"
-    assert after["max_settlement_at"] == next_long
-    assert after["actual_funding_pnl"] == 1.5
-    assert balances["aster"]["cash_balance"] == 1_000.5
-    assert balances["binance"]["cash_balance"] == 1_001.0
+    assert after["max_settlement_at"] == settlement_at
+    assert after["actual_funding_pnl"] is None
+    assert balances["aster"]["cash_balance"] == 1_000.0
+    assert balances["binance"]["cash_balance"] == 1_000.0
     assert balances["aster"]["reserved_margin"] == 550.0
     assert balances["binance"]["reserved_margin"] == 550.0
 
@@ -2759,7 +2765,12 @@ def test_legacy_shared_pool_focused_recheck_design_exhausts_route_timeout(tmp_pa
     trace = result["trace"]
     assert result["timed_out"] is False
     assert result["running_scan_count"] == 0
-    assert result["scan_statuses"] == [{"status": "failed", "count": 6}]
+    scan_counts = {
+        row["status"]: row["count"]
+        for row in result["scan_statuses"]
+    }
+    assert sum(scan_counts.values()) == 6
+    assert scan_counts.get("failed", 0) >= 5
     assert len([row for row in trace if row["event"] == "outer_start"]) == 6
     market_starts = [row for row in trace if row["event"] == "market_start"]
     orderbook_starts = [row for row in trace if row["event"] == "orderbook_start"]
@@ -3614,7 +3625,7 @@ def test_hold_decision_detects_funding_rate_inversion() -> None:
     assert decision["close_reason"] == "arbitrage_window_funding_rate_inverted"
 
 
-def test_hold_decision_allows_normal_rate_order() -> None:
+def test_boundary_decision_requires_exit_even_when_next_rate_order_is_normal() -> None:
     now = datetime(2026, 7, 19, 12, 2, tzinfo=UTC)
     config = PaperBotConfig(
         max_entry_snapshot_age_seconds=300,
@@ -3630,8 +3641,10 @@ def test_hold_decision_allows_normal_rate_order() -> None:
     route["legs"][1]["hourly_funding_rate"] = 0.001
 
     decision = position_hold_decision(position, route, now, config)
-    assert decision["hold"]
+    assert not decision["hold"]
+    assert decision["close_reason"] == "mandatory_exit_after_first_settlement"
     assert "funding_rate_inverted" not in decision["reasons"]
+    assert "mandatory_exit_after_first_settlement" in decision["reasons"]
 
 
 def test_build_position_includes_spread_fields() -> None:

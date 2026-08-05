@@ -75,8 +75,6 @@ def funding_leg_pnl(side: str, quantity: float, mark_price: float, funding_rate:
 
 @dataclass(frozen=True)
 class EventWindowPlannerConfig:
-    max_strategy_hold_seconds: float = 180.0
-    max_gap_between_settlements_seconds: float = 180.0
     entry_safety_buffer_seconds: float = 30.0
     exit_safety_buffer_seconds: float = 5.0
     settlement_confirmation_timeout_seconds: float = 5.0
@@ -568,7 +566,7 @@ def _event_time_range(event: FundingSettlementEvent) -> tuple[datetime, datetime
     return earliest.astimezone(UTC), latest.astimezone(UTC)
 
 
-def classify_event_for_hold_window(
+def classify_event_for_capture_window(
     event: FundingSettlementEvent,
     *,
     planned_entry_at: datetime,
@@ -1018,7 +1016,7 @@ def _planned_costs(
     }, blockers, estimates, total_cost
 
 
-def _build_hold_plan(
+def _build_capture_plan(
     *,
     plan_name: str,
     exit_after_event: FundingSettlementEvent,
@@ -1041,7 +1039,7 @@ def _build_hold_plan(
     excluded: list[FundingSettlementEvent] = []
     ambiguous: list[FundingSettlementEvent] = []
     for event in events:
-        classification = classify_event_for_hold_window(
+        classification = classify_event_for_capture_window(
             event,
             planned_entry_at=planned_entry_at,
             planned_exit_at=planned_exit_at,
@@ -1074,9 +1072,6 @@ def _build_hold_plan(
     conservative_net = conservative_cashflow - total_cost
     reference_decimal = _non_negative_decimal(target_notional)
     blockers: list[str] = []
-    hold_seconds = (planned_exit_at - planned_entry_at).total_seconds()
-    if hold_seconds > float(config.max_strategy_hold_seconds):
-        blockers.append("max_strategy_hold_seconds_exceeded")
     if ambiguous:
         blockers.append("settlement_timing_ambiguous")
     blockers.extend(cost_blockers)
@@ -1111,8 +1106,7 @@ def _build_hold_plan(
         "entry_deadline_at": entry_deadline_at.astimezone(UTC).isoformat(),
         "planned_exit_at": planned_exit_at.astimezone(UTC).isoformat(),
         "monitor_until": monitor_until.astimezone(UTC).isoformat(),
-        "max_hold_seconds": float(config.max_strategy_hold_seconds),
-        "planned_hold_seconds": hold_seconds,
+        "planned_capture_seconds": (planned_exit_at - planned_entry_at).total_seconds(),
         "opportunity_shape": (
             MULTIPLE_SETTLEMENTS if len(included_sorted) > 1 else ONE_SETTLEMENT
         ),
@@ -1334,52 +1328,20 @@ class FundingSettlementPlanner:
         planned_entry_at = first_time - timedelta(
             seconds=max(0.0, float(config.entry_safety_buffer_seconds))
         )
-        plans: list[dict[str, Any]] = []
-        first_event_time = parse_time(first_event.scheduled_at) or first_time
-        for index, event in enumerate(events):
-            event_time = parse_time(event.scheduled_at)
-            if event_time is None:
-                continue
-            gap = abs((event_time.astimezone(UTC) - first_event_time.astimezone(UTC)).total_seconds())
-            if gap > min(
-                float(config.max_strategy_hold_seconds),
-                float(config.max_gap_between_settlements_seconds),
-            ):
-                continue
-            plan_name = {
-                0: "exit_after_first_settlement",
-                1: "exit_after_second_settlement",
-                2: "exit_after_third_settlement",
-            }.get(index, f"exit_after_{index + 1}_settlement")
-            plans.append(
-                _build_hold_plan(
-                    plan_name=plan_name,
-                    exit_after_event=event,
-                    events=events,
-                    planned_entry_at=planned_entry_at,
-                    now=now,
-                    long_market=long_market,
-                    short_market=short_market,
-                    target_notional=target_notional,
-                    config=config,
-                    evaluation_mode=self.evaluation_mode,
-                )
+        plans: list[dict[str, Any]] = [
+            _build_capture_plan(
+                plan_name="exit_after_first_settlement",
+                exit_after_event=first_event,
+                events=events,
+                planned_entry_at=planned_entry_at,
+                now=now,
+                long_market=long_market,
+                short_market=short_market,
+                target_notional=target_notional,
+                config=config,
+                evaluation_mode=self.evaluation_mode,
             )
-        if not plans:
-            plans.append(
-                _build_hold_plan(
-                    plan_name="exit_after_first_settlement",
-                    exit_after_event=first_event,
-                    events=events,
-                    planned_entry_at=planned_entry_at,
-                    now=now,
-                    long_market=long_market,
-                    short_market=short_market,
-                    target_notional=target_notional,
-                    config=config,
-                    evaluation_mode=self.evaluation_mode,
-                )
-            )
+        ]
         feasible = [plan for plan in plans if not plan["blockers"]]
         selected = max(
             feasible or plans,
@@ -1612,75 +1574,6 @@ def percentile_95(values: list[float]) -> float:
     ordered = sorted(float(value) for value in values)
     index = min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)
     return ordered[index]
-
-
-def basis_duration_floor_bps(wait_seconds: float) -> float:
-    wait_hours = max(0.0, float(wait_seconds)) / 3600.0
-    return min(100.0, max(25.0, 25.0 * math.ceil(max(wait_hours, 1e-12))))
-
-
-def hold_economics(
-    *,
-    next_conservative_funding_gross: float,
-    current_close_fees: float,
-    reference_notional: float,
-    wait_seconds: float,
-    entry_basis_reserve_bps: float,
-    adverse_basis_change_30s_bps: list[float] | None = None,
-    p95_abs_mark_return_1s_bps: float | None = None,
-    close_depth_multiple: float = 10.0,
-) -> dict[str, Any]:
-    reference = max(0.0, float(reference_notional))
-    current_close_fee_stress = max(0.0, float(current_close_fees)) * 1.10
-    additional_fee_reserve = max(0.0, current_close_fee_stress - max(0.0, float(current_close_fees)))
-    observed_changes = [max(0.0, float(value)) for value in adverse_basis_change_30s_bps or []]
-    p95_adverse = percentile_95(observed_changes) if len(observed_changes) >= 10 else 5.0
-    scaled_observed = p95_adverse * math.sqrt(max(0.0, float(wait_seconds)) / 30.0)
-    basis_reserve_bps = clamp(
-        25.0,
-        200.0,
-        max(
-            float(entry_basis_reserve_bps),
-            basis_duration_floor_bps(wait_seconds),
-            scaled_observed,
-        ),
-    )
-    legging_reserve_bps = (
-        clamp(10.0, 30.0, 2.0 * float(p95_abs_mark_return_1s_bps))
-        if p95_abs_mark_return_1s_bps is not None
-        else 15.0
-    )
-    wait_hours = max(0.0, float(wait_seconds)) / 3600.0
-    time_reserve_bps = min(40.0, 10.0 * math.ceil(max(wait_hours, 1e-12)))
-    liquidity_reserve_bps = 10.0 if float(close_depth_multiple) >= 10.0 else 20.0
-    total_reserve_bps = (
-        basis_reserve_bps
-        + legging_reserve_bps
-        + time_reserve_bps
-        + liquidity_reserve_bps
-    )
-    reserve_usd = reference * total_reserve_bps / 10_000.0
-    incremental_cost = additional_fee_reserve + reserve_usd
-    funding = float(next_conservative_funding_gross)
-    incremental_net = funding - incremental_cost
-    coverage = funding / incremental_cost if incremental_cost > 0 else math.inf if funding > 0 else 0.0
-    return {
-        "current_close_fee_stress": current_close_fee_stress,
-        "additional_fee_reserve": additional_fee_reserve,
-        "p95_adverse_basis_change_30s_bps": p95_adverse,
-        "duration_basis_floor_bps": basis_duration_floor_bps(wait_seconds),
-        "scaled_observed_basis_bps": scaled_observed,
-        "hold_basis_reserve_bps": basis_reserve_bps,
-        "hold_legging_reserve_bps": legging_reserve_bps,
-        "hold_time_reserve_bps": time_reserve_bps,
-        "hold_liquidity_reserve_bps": liquidity_reserve_bps,
-        "hold_total_reserve_bps": total_reserve_bps,
-        "hold_total_reserve_usd": reserve_usd,
-        "incremental_hold_cost": incremental_cost,
-        "incremental_hold_net_pnl": incremental_net,
-        "incremental_hold_edge_bps": incremental_net / reference * 10_000.0 if reference > 0 else 0.0,
-        "hold_cost_coverage_ratio": coverage,
-    }
 
 
 def summarize_funding_observations(

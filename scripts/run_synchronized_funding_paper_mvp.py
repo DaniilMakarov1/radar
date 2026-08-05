@@ -300,6 +300,8 @@ def main() -> None:
     assert len(rows) == 2
     assert {row["evidence"]["lifecycle_state"] for row in rows} == {"BOUNDARY_CROSSED"}
     assert not [row for row in store.paper_event_ledger_rows(capture_id) if row["event_type"] == "funding"]
+    position = store.funding_capture_position_by_id(capture_id)
+    assert position and position["state"] == "OPEN"
     emit("boundary", position_id=capture_id, outcomes=boundary_outcomes, obligations=len(rows))
 
     for offset in (5, 6, 31):
@@ -311,15 +313,15 @@ def main() -> None:
             emit("post_boundary_iteration", offset_seconds=offset, outcomes=outcomes)
 
     position = store.funding_capture_position_by_id(capture_id)
-    replans = (position["config"] or {}).get("post_settlement_replans") or []
-    assert replans and replans[-1]["plan_generation"] == 2
-    assert position["state"] == "CLOSED_PENDING_RECONCILIATION"
+    assert position and position["state"] == "CLOSED"
+    config = position["config"] or {}
+    assert config.get("mandatory_exit_after_first_boundary") is True
+    assert config.get("exit_mode") == "MANDATORY"
     emit(
-        "replan_close",
+        "mandatory_close",
         position_id=capture_id,
-        plan_generation=replans[-1]["plan_generation"],
-        next_settlement=replans[-1]["new_scheduled_funding_at"],
         state=position["state"],
+        exit_mode=config.get("exit_mode"),
     )
 
     bot.synchronized_runtime.settlement_data_provider = FakeFundingSettlementDataProvider(
@@ -339,7 +341,8 @@ def main() -> None:
     funding_rows = [row for row in store.paper_event_ledger_rows(capture_id) if row["event_type"] == "funding"]
     assert len(funding_rows) == 2
     final_position = store.funding_capture_position_by_id(capture_id)
-    assert final_position["state"] == "RECONCILED"
+    assert final_position["state"] == "CLOSED"
+    assert (final_position["config"] or {}).get("reconciliation_state") == "RECONCILED"
     emit(
         "reconcile",
         position_id=capture_id,

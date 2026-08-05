@@ -595,57 +595,6 @@ def close_decision(
     accrued_count = int(notes.get("accrued_settlement_count") or 0)
     opened_at = parse_iso(position.get("opened_at"))
 
-    if accrued_count >= config.max_settlements_per_position:
-        close = build_close_payload(
-            position,
-            {"long": None, "short": None},
-            close_route,
-            use_entry_estimate_for_missing=False,
-            close_reason="max_settlements_reached",
-            hold_decision={
-                "hold": False,
-                "close_reason": "max_settlements_reached",
-                "current_settlement_funding_included": False,
-                "reasons": [
-                    f"accrued_settlements={accrued_count}",
-                    f"max_settlements={config.max_settlements_per_position}",
-                ],
-            },
-            include_current_settlement_funding=False,
-        )
-        return {"status": "close", "close": close}
-
-    if opened_at is not None:
-        position_age = (now - opened_at).total_seconds()
-        if position_age >= config.max_position_age_seconds:
-            include_current = now >= max_settlement + timedelta(
-                seconds=config.settlement_grace_seconds
-            )
-            settlement = (
-                settlement_rates_for_position(position, store)
-                if include_current
-                else {"long": None, "short": None}
-            )
-            missing = [side for side, row in settlement.items() if row is None]
-            close = build_close_payload(
-                position,
-                settlement,
-                close_route,
-                use_entry_estimate_for_missing=bool(missing) if include_current else False,
-                close_reason="max_position_age_reached",
-                hold_decision={
-                    "hold": False,
-                    "close_reason": "max_position_age_reached",
-                    "current_settlement_funding_included": include_current,
-                    "reasons": [
-                        f"position_age_seconds={position_age:.0f}",
-                        f"max_position_age_seconds={config.max_position_age_seconds}",
-                    ],
-                },
-                include_current_settlement_funding=include_current,
-            )
-            return {"status": "close", "close": close}
-
     if now < max_settlement + timedelta(seconds=config.settlement_grace_seconds):
         pre_settlement_exit_reasons = {
             "live_net_not_positive",
@@ -702,33 +651,15 @@ def close_decision(
         not hold["hold"]
         and str(hold.get("close_reason") or "") in hard_risk_close_reasons
     )
-    if now < t20_deadline and not hold["hold"] and not is_hard_risk:
-        # Normal close before T+20: suppress, force hold
-        accrual = build_settlement_accrual_payload(
-            position,
-            settlement,
-            close_route or {},
-            use_entry_estimate_for_missing=bool(missing),
-            hold_decision={
-                **hold,
-                "hold": True,
-                "close_reason": "",
-                "t20_suppressed": True,
-                "reasons": list(hold.get("reasons") or [])
-                + ["normal_exit_before_t20_suppressed"],
-            },
-        )
-        return {"status": "hold", "accrual": accrual}
-
+    if now < t20_deadline and not is_hard_risk:
+        return {"status": "wait", "reason": "normal_exit_before_t20"}
     if hold["hold"]:
-        accrual = build_settlement_accrual_payload(
-            position,
-            settlement,
-            close_route or {},
-            use_entry_estimate_for_missing=bool(missing),
-            hold_decision=hold,
-        )
-        return {"status": "hold", "accrual": accrual}
+        hold = {
+            **hold,
+            "hold": False,
+            "close_reason": "mandatory_exit_after_first_settlement",
+            "reasons": ["mandatory_exit_after_first_settlement"],
+        }
     close = build_close_payload(
         position,
         settlement,
@@ -817,11 +748,15 @@ def position_hold_decision(
             reasons.append("funding_rate_inverted")
         # funding_interval_hours equality is NOT a schedule gate.
         # Only exact next-settlement timestamp alignment (<=1s) matters.
-    close_reason = close_reason_from_hold_reasons(reasons)
+    close_reason = (
+        close_reason_from_hold_reasons(reasons)
+        if reasons
+        else "mandatory_exit_after_first_settlement"
+    )
     return {
-        "hold": not reasons,
+        "hold": False,
         "close_reason": close_reason,
-        "reasons": reasons,
+        "reasons": reasons or ["mandatory_exit_after_first_settlement"],
         "live_net": live_net,
         "selected_strategy": selected_strategy,
         "strategy_name": (selected_strategy or {}).get("strategy_name"),
@@ -855,77 +790,6 @@ def close_reason_from_hold_reasons(reasons: list[str]) -> str:
     if "funding_rate_inverted" in reasons:
         return "arbitrage_window_funding_rate_inverted"
     return "arbitrage_window_unverifiable"
-
-
-def build_settlement_accrual_payload(
-    position: dict[str, Any],
-    settlement: dict[str, dict[str, Any] | None],
-    continuation_route: dict[str, Any],
-    *,
-    use_entry_estimate_for_missing: bool,
-    hold_decision: dict[str, Any],
-) -> dict[str, Any]:
-    current_long = current_position_leg(position, "long")
-    current_short = current_position_leg(position, "short")
-    long_rate = settlement_rate_or_entry(settlement.get("long"), current_long)
-    short_rate = settlement_rate_or_entry(settlement.get("short"), current_short)
-    long_notional = float(position.get("long_notional") or 0.0)
-    short_notional = float(position.get("short_notional") or 0.0)
-    long_funding_pnl = funding_leg_pnl("long", long_notional, long_rate)
-    short_funding_pnl = funding_leg_pnl("short", short_notional, short_rate)
-    next_legs = continuation_route.get("legs") or []
-    next_long = leg_by_side(next_legs, "long") or {}
-    next_short = leg_by_side(next_legs, "short") or {}
-    next_long_settlement = str(next_long.get("next_funding_at") or "")
-    next_short_settlement = str(next_short.get("next_funding_at") or "")
-    next_max_settlement = max(
-        parse_iso(next_long_settlement) or datetime.min.replace(tzinfo=UTC),
-        parse_iso(next_short_settlement) or datetime.min.replace(tzinfo=UTC),
-    ).isoformat()
-    funding_pnl_delta = long_funding_pnl + short_funding_pnl
-    evidence = continuation_route.get("evidence") or {}
-    selected_strategy = (
-        evidence.get("selected_strategy")
-        or evidence.get("strategy_classification")
-        or {}
-    )
-    next_expected_live_gross = selected_strategy.get("gross_edge_pnl")
-    if next_expected_live_gross is None:
-        next_expected_live_gross = evidence.get("current_nowcast_gross")
-    next_expected_live_net = selected_strategy.get("expected_net_pnl")
-    if next_expected_live_net is None:
-        next_expected_live_net = evidence.get("current_nowcast_net")
-    settlement_payload_value = {
-        "long": settlement_payload(settlement.get("long"), current_long, long_rate),
-        "short": settlement_payload(settlement.get("short"), current_short, short_rate),
-        "funding_pnl_delta": funding_pnl_delta,
-        "history_missing_fallback": use_entry_estimate_for_missing,
-        "continued_live_net": next_expected_live_net,
-        "continued_strategy": selected_strategy,
-    }
-    return {
-        "settlement_key": ":".join(
-            [
-                str(position.get("funding_paper_position_id") or ""),
-                str(position.get("max_settlement_at") or ""),
-            ]
-        ),
-        "long_cash_delta": long_funding_pnl,
-        "short_cash_delta": short_funding_pnl,
-        "funding_pnl_delta": funding_pnl_delta,
-        "history_missing_fallback": use_entry_estimate_for_missing,
-        "settlement": settlement_payload_value,
-        "hold_decision": hold_decision,
-        "next_funding_scan_id": continuation_route.get("funding_scan_id"),
-        "next_funding_route_id": continuation_route.get("funding_route_id"),
-        "next_long_settlement_at": next_long_settlement,
-        "next_short_settlement_at": next_short_settlement,
-        "next_max_settlement_at": next_max_settlement,
-        "next_entry_legs": next_legs,
-        "next_entry_evidence": evidence,
-        "next_expected_live_gross": next_expected_live_gross,
-        "next_expected_live_net": next_expected_live_net,
-    }
 
 
 def settlement_rates_for_position(

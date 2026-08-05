@@ -6,6 +6,11 @@ Starting branch: `review/synchronized-funding-v2-qwen-20260728-075432`
 
 Starting HEAD: `5f153a73cea2ccab7dafb3fd83b3d81c021dbf96`
 
+RF-001 note: this is a historical pre-cutover audit. The production runtime has
+since been changed to one captured settlement boundary followed by mandatory
+exit; old continuation-cycle references below are retained only as historical
+inventory.
+
 Baseline command: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q`
 
 Baseline result: `493 passed in 8.60s` on Python 3.11.5.
@@ -42,7 +47,7 @@ CLI funding-paper-trader
 -> funding_capture_positions / funding_paper_orders / paper_event_ledger
 -> refresh_open_capture_route / _open_capture_route_quality
 -> mark_settlement_crossed / build_settlement_crossing_rows
--> next_cycle_hold_or_close_decision / close_position
+-> old continuation decision helper / close_position
 -> process_pending_reconciliations / StoredFundingSettlementDataProvider
 ```
 
@@ -64,7 +69,7 @@ CLI funding-shadow-monitor
 | Production PaperBot alignment gates | `smart_money_radar/paper_bot/runtime_v2.py:89`, `:1289`, `:2351`, `smart_money_radar/funding/trader.py:2444`, `:3024`, legacy `smart_money_radar/paper_bot/position.py:99`, `:198` | `route_next_settlement`, lightweight discovery, open refresh quality and legacy position path block on aligned funding timestamps. |
 | Shadow-only event planner | `smart_money_radar/funding/strategy_synchronized_funding.py:401`, `smart_money_radar/funding/shadow_monitor.py:794` | `build_settlement_capture_opportunity` is used by shadow. PaperBot does not consume this route plan before opening. |
 | Duplicate planning paths | `strategy_synchronized_funding.build_settlement_capture_opportunity`, `runtime_v2.entry_underwriting/_initial_economics`, `trader._build_lightweight_watch_routes`, legacy `paper_bot.position.route_entry_decision` | PaperBot v2 uses observation/economics helpers with synchronized timestamp assumptions instead of the event-window result. |
-| Two-event limit | `smart_money_radar/funding/strategy_synchronized_funding.py:520` | Planner creates `exit_after_first_settlement` and optionally `exit_after_second_settlement`; no source-of-truth list beyond two exit points. |
+| Historical two-event limit | `smart_money_radar/funding/strategy_synchronized_funding.py:520` | The pre-RF-001 planner could create first-boundary and later-boundary exits; RF-001 production now plans only first-boundary capture and mandatory exit. |
 | Float math in critical funding planner | `smart_money_radar/funding/strategy_synchronized_funding.py` | `FundingSettlementEvent` rate/cashflow fields and planner economics use `float`. |
 | Trust self-promotion | `smart_money_radar/funding/settlement_contracts.py:433` | Market rows can override `verification_level`, `official_evidence_urls`, `position_inclusion_rule_verified`, timing windows and evidence date. |
 | Environment fallback | `smart_money_radar/funding/shadow_monitor.py:960`, `smart_money_radar/funding/trader.py:3024`, adapter constructors | Starting HEAD could use monitor config as a substitute when actual client identity was missing; most clients lacked typed endpoint identity. |

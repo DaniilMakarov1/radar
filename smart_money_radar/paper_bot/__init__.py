@@ -30,7 +30,6 @@ from smart_money_radar.paper_bot.helpers import (  # noqa: F401
 from smart_money_radar.paper_bot.position import (  # noqa: F401
     build_close_payload,
     build_position_from_route,
-    build_settlement_accrual_payload,
     close_decision,
     close_reason_from_hold_reasons,
     compute_price_move_snapshot,
@@ -41,7 +40,6 @@ from smart_money_radar.paper_bot.position import (  # noqa: F401
     final_recheck_freeze_window_active,
     funding_leg_pnl,
     leg_vwap,
-    position_hold_decision,
     required_live_net_profit,
     route_entry_decision,
     route_monitor_decision,
@@ -60,7 +58,6 @@ from smart_money_radar.paper_bot.telegram import (  # noqa: F401
     funding_leg_compact_line,
     funding_rate_lines,
     funding_settlement_mismatch_line,
-    hold_message,
     hold_reason_labels,
     lead_seconds,
     open_message,

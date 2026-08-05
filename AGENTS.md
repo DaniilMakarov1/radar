@@ -26,8 +26,10 @@ when both funding settlements align.
 - Spread convergence is not expected profit for the default strategy; spread/basis is modeled as cost and risk.
 - Funding estimates are not cashflow; confirmed funding enters paper PnL only
   after public rate plus settlement mark reconciliation.
-- Hold uses exact next timestamps and incremental economics. Pending
-  reconciliation from the previous cycle does not block hold.
+- Hold/next-cycle continuation is forbidden in production. After the first
+  captured settlement boundary, preserve reconciliation obligations, keep
+  pending funding out of cash/equity, and exit at the first normal-safe
+  opportunity; normal close is not allowed before T+20 unless hard risk fires.
 - Legacy `funding_only`, `spread_only`, `combined`, and `opportunistic_any` belong to experimental/research profiles unless Codex explicitly says otherwise.
 
 ## Runtime Safety
@@ -38,14 +40,16 @@ when both funding settlements align.
 - Respect `DEACTIVATED_FUNDING_VENUES`.
 - Incompatible active venues are diagnostics/research-only, not paper-eligible candidates.
 - A common 10% price move is telemetry and a fresh-risk warning, not an automatic close.
-- Every settlement is a separate cycle; reconciliation does not block hold/close decisions.
-- A position can capture at most 4 settlements and live about 4 hours 5 minutes.
+- Every settlement boundary is a separate capture. A later boundary requires new
+  discovery, underwriting, fills, and a new capture id.
+- A delayed or partial exit that crosses a later funding event is an
+  incident/reconciliation case, never planned continuation.
 
 ## Design Rules From Project History
 
 - Prove one full funding capture cycle before expanding scope: scan, watch,
-  focused observations, T-30 entry, T-20 fill deadline, settlement,
-  reconciliation, hold/close, and restart recovery.
+  focused observations, T-30 entry, T-20 fill deadline, settlement boundary,
+  mandatory exit, reconciliation, and restart recovery.
 - Do not add a venue to paper eligibility just because it returns data. Promote venues through explicit stages: data-only, research-only, shadow, experimental-ready, then verified paper.
 - Write or confirm the data contract before implementation: funding units, interval, next settlement timestamp, public/final rate source, settlement mark source, symbol identity, collateral, market type, and known failure modes.
 - Treat zero candidates as a diagnostics problem, not permission to weaken gates. Add funnel visibility before relaxing any paper eligibility rule.

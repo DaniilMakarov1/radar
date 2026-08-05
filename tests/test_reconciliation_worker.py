@@ -29,7 +29,7 @@ NOW_AFTER = datetime(2026, 7, 28, 16, 1, 0, tzinfo=UTC)
 
 def _seed_closed_pending_position(
     store, *, position_id="fc-recon-test", quantity=5.0,
-    scheduled_funding_at=SCHEDULED, state="CLOSED_PENDING_RECONCILIATION",
+    scheduled_funding_at=SCHEDULED, state="CLOSED",
 ):
     store.upsert_funding_capture_position({
         "position_id": position_id, "canonical_asset": "BTC",
@@ -142,7 +142,8 @@ def test_reconciliation_success_rate_and_mark(tmp_path):
     assert cycles[0]["state"] == "RECONCILED"
     assert cycles[0]["reconciled_funding_pnl"] == pytest.approx(0.0)
     position = store.funding_capture_position_by_id("fc-recon-test")
-    assert position["state"] == "RECONCILED"
+    assert position["state"] == "CLOSED"
+    assert position["config"]["reconciliation_state"] == "RECONCILED"
     assert position["paper_net_pnl_reconciled"] == pytest.approx(-2.0)
 
 
@@ -274,7 +275,9 @@ def test_reconciliation_recovery_finalizes_after_row_ledger_cash_without_cycle_f
 
     assert recovery["reconciliation"]["finalized_cycles"] == 1
     assert store.funding_capture_cycles_for_position("fc-recon-test")[0]["state"] == "RECONCILED"
-    assert store.funding_capture_position_by_id("fc-recon-test")["state"] == "RECONCILED"
+    position = store.funding_capture_position_by_id("fc-recon-test")
+    assert position["state"] == "CLOSED"
+    assert position["config"]["reconciliation_state"] == "RECONCILED"
 
 
 def test_reconciliation_amount_mismatch_blocks_finalization_even_when_account_matches_ledger(tmp_path):
@@ -344,7 +347,10 @@ def test_reconciliation_amount_mismatch_blocks_finalization_even_when_account_ma
     assert binance["status"] == "RECONCILIATION_EFFECT_MISMATCH"
     assert "cash_delta" in binance["evidence"]["financial_effect_mismatch"]["mismatches"]
     assert store.funding_capture_cycles_for_position(position_id)[0]["state"] == "RECONCILIATION_EFFECT_MISMATCH"
-    assert store.funding_capture_position_by_id(position_id)["state"] == "CLOSED_REQUIRES_REVIEW"
+    position = store.funding_capture_position_by_id(position_id)
+    assert position["state"] == "CLOSED"
+    assert position["config"]["integrity"] == "REQUIRES_REVIEW"
+    assert position["config"]["reconciliation_state"] == "RECONCILIATION_EFFECT_MISMATCH"
     assert recovery["reconciliation"]["finalized_cycles"] == 0
     assert recovery["reconciliation"]["finalized_positions"] == 0
     assert recovery["reconciliation"]["account_consistency"]["ok"] is False
@@ -364,7 +370,8 @@ def test_reconciliation_timeout_marks_unreconciled(tmp_path):
     cycles = store.funding_capture_cycles_for_position("fc-recon-test")
     assert cycles[0]["state"] == "UNRECONCILED"
     position = store.funding_capture_position_by_id("fc-recon-test")
-    assert position["state"] == "UNRECONCILED"
+    assert position["state"] == "CLOSED"
+    assert position["config"]["reconciliation_state"] == "UNRECONCILED"
     assert position["paper_net_pnl_reconciled"] is None
 
 

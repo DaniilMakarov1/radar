@@ -18,10 +18,6 @@ from smart_money_radar.paper_bot.helpers import (
     tg,
 )
 from smart_money_radar.paper_bot.position import (
-    close_reason_from_hold_reasons,
-    position_hold_decision,
-    required_live_net_profit,
-    route_monitor_decision,
     selected_route_strategy,
     status_publishable_candidate,
 )
@@ -721,35 +717,6 @@ def pending_message(position: dict[str, Any], result: dict[str, Any]) -> str:
         f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
         f"Причина: {tg(result.get('reason'))}\n"
         "Жду публикацию funding history."
-    )
-
-
-def hold_message(position: dict[str, Any], accrual: dict[str, Any]) -> str:
-    settlement = accrual.get("settlement") or {}
-    strategy = (position.get("notes") or {}).get("strategy") or (
-        settlement.get("continued_strategy") or {}
-    )
-    quality = (
-        "Начисление предварительное: одна или обе funding history еще не "
-        "опубликованы, использована ставка на входе."
-        if accrual.get("history_missing_fallback")
-        else "Начисление финальное: использована опубликованная funding history."
-    )
-    hold_decision = accrual.get("hold_decision") or {}
-    return (
-        "<b>Paper Bot HOLD</b>\n\n"
-        f"<b>{tg(position['canonical_asset'])}</b>\n"
-        f"LONG <code>{tg(position['long_venue'])}</code> / "
-        f"SHORT <code>{tg(position['short_venue'])}</code>\n\n"
-        f"Edge: <code>{tg(opportunity_label(strategy))}</code>\n"
-        "Funding settlement начислен, позиция остается открытой: "
-        "арбитражное окно все еще положительное.\n"
-        f"Settlement PnL: <b>{format_money(accrual.get('funding_pnl_delta'))}</b>\n"
-        f"Current live net: {format_money(hold_decision.get('live_net'))}\n"
-        f"Next settlement: {tg(accrual.get('next_max_settlement_at'))}\n"
-        f"{tg(quality)}\n"
-        f"Rates: long {format_rate((settlement.get('long') or {}).get('funding_rate'))}, "
-        f"short {format_rate((settlement.get('short') or {}).get('funding_rate'))}"
     )
 
 

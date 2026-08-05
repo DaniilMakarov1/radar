@@ -44,8 +44,8 @@ jobs:
         run: python -m pytest -q
       - name: Single-cycle paper MVP scenario
         run: python scripts/run_synchronized_funding_paper_mvp.py
-      - name: Two-cycle paper MVP scenario
-        run: python scripts/run_synchronized_funding_two_cycle_paper_mvp.py
+      - name: Two independent captures paper MVP scenario
+        run: python scripts/run_synchronized_funding_two_capture_paper_mvp.py
       - name: Diff check
         shell: bash
         run: |

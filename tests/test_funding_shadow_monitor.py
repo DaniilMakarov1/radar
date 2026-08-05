@@ -497,7 +497,7 @@ def test_simultaneous_positive_settlements_are_summed() -> None:
     assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(4.5)
 
 
-def test_close_after_second_near_settlement_when_it_improves_net() -> None:
+def test_later_near_settlement_is_not_selected_to_improve_net() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     first = now + timedelta(seconds=30)
     second = first + timedelta(seconds=20)
@@ -521,9 +521,10 @@ def test_close_after_second_near_settlement_when_it_improves_net() -> None:
         target_notional=500.0,
     )
 
-    assert opportunity["planner"]["selected_plan"] == "exit_after_second_settlement"
-    assert opportunity["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
-    assert len(opportunity["included_settlement_events"]) == 2
+    assert opportunity["planner"]["selected_plan"] == "exit_after_first_settlement"
+    assert opportunity["opportunity_shape"] == "ONE_SETTLEMENT"
+    assert [event["venue"] for event in opportunity["included_settlement_events"]] == ["binance"]
+    assert [event["venue"] for event in opportunity["excluded_settlement_events"]] == ["bybit"]
 
 
 def test_negative_second_settlement_is_excluded_when_exit_is_guaranteed() -> None:
@@ -555,7 +556,7 @@ def test_negative_second_settlement_is_excluded_when_exit_is_guaranteed() -> Non
     assert [event["venue"] for event in opportunity["excluded_settlement_events"]] == ["bybit"]
 
 
-def test_unavoidable_negative_second_settlement_is_deducted() -> None:
+def test_near_negative_second_settlement_is_ambiguous_not_planned_profit() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     first = now + timedelta(seconds=30)
     second = first + timedelta(seconds=4)
@@ -579,11 +580,13 @@ def test_unavoidable_negative_second_settlement_is_deducted() -> None:
         target_notional=500.0,
     )
 
-    assert len(opportunity["included_settlement_events"]) == 2
-    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(5.0)
+    assert [event["venue"] for event in opportunity["included_settlement_events"]] == ["binance"]
+    assert [event["venue"] for event in opportunity["ambiguous_settlement_events"]] == ["bybit"]
+    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(7.0)
+    assert "settlement_timing_ambiguous" in opportunity["blockers"]
 
 
-def test_three_settlement_events_are_considered_as_timeline() -> None:
+def test_three_settlement_events_do_not_extend_capture_timeline() -> None:
     now = datetime(2026, 7, 28, 12, tzinfo=UTC)
     first = now + timedelta(seconds=30)
     second = first + timedelta(seconds=20)
@@ -615,18 +618,19 @@ def test_three_settlement_events_are_considered_as_timeline() -> None:
         target_notional=500.0,
     )
 
-    assert opportunity["planner"]["selected_plan"] == "exit_after_third_settlement"
-    assert opportunity["opportunity_shape"] == "MULTIPLE_SETTLEMENTS"
-    assert len(opportunity["included_settlement_events"]) == 3
+    assert opportunity["planner"]["selected_plan"] == "exit_after_first_settlement"
+    assert opportunity["opportunity_shape"] == "ONE_SETTLEMENT"
     assert [
         (event["venue"], event["scheduled_at"])
         for event in opportunity["included_settlement_events"]
     ] == [
         ("binance", first.isoformat()),
-        ("bybit", second.isoformat()),
-        ("binance", third.isoformat()),
     ]
-    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(4.5)
+    assert [event["scheduled_at"] for event in opportunity["excluded_settlement_events"]] == [
+        second.isoformat(),
+        third.isoformat(),
+    ]
+    assert opportunity["expected_funding_cashflow_usd"] == pytest.approx(2.0)
 
 
 def test_second_settlement_too_far_does_not_extend_hold() -> None:
@@ -990,7 +994,7 @@ def test_risex_payload_promotion_remains_research_only(tmp_path) -> None:
     assert one["status"] == "RESEARCH_ONLY"
     assert one["planner"]["route_readiness"]["not_verified_alpha"] is True
     assert "short_position_inclusion_rule_unverified" in one["planner"]["route_readiness"]["risk_flags"]
-    assert multi["status"] == "SHADOW_CANDIDATE"
+    assert multi["status"] == "RESEARCH_ONLY"
     assert multi["planner"]["route_readiness"]["not_verified_alpha"] is True
     assert "short_position_inclusion_rule_unverified" in multi["planner"]["route_readiness"]["risk_flags"]
 

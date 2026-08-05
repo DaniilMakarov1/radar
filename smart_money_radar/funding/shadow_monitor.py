@@ -61,8 +61,6 @@ class FundingShadowConfig:
     venue_deadline_seconds: float = 2.0
     periodic_summary_seconds: float = 900.0
     unchanged_opportunity_cooldown_seconds: float = 900.0
-    max_strategy_hold_seconds: float = 180.0
-    max_gap_between_settlements_seconds: float = 60.0
     entry_safety_buffer_seconds: float = 30.0
     exit_safety_buffer_seconds: float = 5.0
     settlement_confirmation_timeout_seconds: float = 5.0
@@ -98,11 +96,6 @@ class FundingShadowConfig:
                 60.0,
                 float(self.unchanged_opportunity_cooldown_seconds),
             ),
-            max_strategy_hold_seconds=max(1.0, float(self.max_strategy_hold_seconds)),
-            max_gap_between_settlements_seconds=max(
-                0.0,
-                float(self.max_gap_between_settlements_seconds),
-            ),
             entry_safety_buffer_seconds=max(0.0, float(self.entry_safety_buffer_seconds)),
             exit_safety_buffer_seconds=max(0.0, float(self.exit_safety_buffer_seconds)),
             settlement_confirmation_timeout_seconds=max(
@@ -132,8 +125,6 @@ class FundingShadowConfig:
 
     def planner_config(self, *, stablecoin_reserve_usd: float = 0.0) -> EventWindowPlannerConfig:
         return EventWindowPlannerConfig(
-            max_strategy_hold_seconds=self.max_strategy_hold_seconds,
-            max_gap_between_settlements_seconds=self.max_gap_between_settlements_seconds,
             entry_safety_buffer_seconds=self.entry_safety_buffer_seconds,
             exit_safety_buffer_seconds=self.exit_safety_buffer_seconds,
             settlement_confirmation_timeout_seconds=self.settlement_confirmation_timeout_seconds,
